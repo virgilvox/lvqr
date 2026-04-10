@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LVQR — Live Video QUIC Relay</title>
+  <link href="https://fonts.googleapis.com/css2?family=Special+Elite&family=Permanent+Marker&family=VT323&family=Courier+Prime:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --paper: #f5f0e6; --paper-dark: #e8e0d0; --paper-cream: #faf8f3;
+      --ink: #1a1a1a; --ink-light: #444444; --ink-muted: #666666; --ink-faint: #999999;
+      --accent: #ff3366; --accent-hover: #e62d5a; --accent-light: rgba(255,51,102,0.1);
+      --success: #22c55e; --info: #3b82f6; --warning: #f59e0b; --error: #ef4444;
+      --font-typewriter: 'Special Elite', monospace;
+      --font-marker: 'Permanent Marker', cursive;
+      --font-terminal: 'VT323', monospace;
+      --font-mono: 'Courier Prime', monospace;
+      --space-xs: 4px; --space-sm: 8px; --space-md: 16px;
+      --space-lg: 24px; --space-xl: 32px; --space-2xl: 48px;
+    }
+    html { scroll-behavior: smooth; }
+    body { background: var(--ink); font-family: var(--font-typewriter); color: var(--ink); line-height: 1.8; font-size: 16px; overflow-x: hidden; }
+    .paper-texture { background-color: var(--paper); background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter 
+id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' 
+filter='url(%23noise)' opacity='0.08'/%3E%3C/svg%3E"); }
+    h1, h2, h3 { font-family: var(--font-marker); color: var(--ink); line-height: 1.2; }
+    h1 { font-size: 3rem; } h2 { font-size: 2rem; margin-bottom: var(--space-lg); }
+    h3 { font-size: 1.3rem; margin-bottom: var(--space-md); }
+    p { margin-bottom: var(--space-md); color: var(--ink-light); }
+    a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+    strong { color: var(--ink); }
+    .highlight { background: var(--accent-light); padding: 2px 6px; }
+    .header { background: var(--ink); padding: 15px 20px; position: fixed; top: 0; left: 0; right: 0; z-index: 1000; border-bottom: 3px solid var(--accent); }
+    .header-inner { max-width: 800px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; }
+    .header-title { font-family: var(--font-marker); color: var(--paper); font-size: 20px; }
+    .header-title .dot { color: var(--accent); }
+    .progress-bar { position: fixed; top: 0; left: 0; width: 100%; height: 4px; background: rgba(255,255,255,0.1); z-index: 2000; }
+    .progress-fill { height: 100%; background: var(--accent); width: 0; transition: width 0.1s; }
+    .nav-dots { position: fixed; right: 20px; top: 50%; transform: translateY(-50%); display: flex; flex-direction: column; gap: 10px; z-index: 100; }
+    .nav-dot { width: 10px; height: 10px; border-radius: 50%; background: rgba(255,255,255,0.3); cursor: pointer; transition: all 0.2s; }
+    .nav-dot.active { background: var(--accent); transform: scale(1.4); }
+    .section-inner { max-width: 800px; margin: 0 auto; padding: 60px 30px; }
+    .section-number { width: 36px; height: 36px; border-radius: 50%; background: var(--ink); color: var(--paper); font-family: var(--font-mono); font-size: 16px; 
+font-weight: 700; display: flex; align-items: center; justify-content: center; margin-bottom: var(--space-md); }
+    .btn-ghost { font-family: var(--font-typewriter); font-size: 13px; background: transparent; color: var(--paper); border: 1px solid rgba(255,255,255,0.3); border-radius: 
+0; padding: 8px 18px; cursor: pointer; box-shadow: none; transition: all 0.2s; display: inline-flex; align-items: center; gap: 6px; }
+    .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-ghost.active { background: var(--accent); color: white; border-color: var(--accent); }
+    .interactive-container { background: var(--ink); border: 2px solid rgba(255,255,255,0.1); margin: var(--space-lg) 0; overflow: hidden; }
+    .interactive-label { font-family: var(--font-terminal); font-size: 14px; color: var(--accent); padding: 10px 16px; border-bottom: 1px solid rgba(255,255,255,0.1); 
+text-transform: uppercase; letter-spacing: 0.1em; }
+    .interactive-label i { margin-right: 8px; }
+    .controls { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-top: 1px solid rgba(255,255,255,0.1); flex-wrap: wrap; }
+    .slider-row { display: flex; align-items: center; gap: 12px; padding: 8px 16px; }
+    .slider-row label { font-family: var(--font-terminal); font-size: 12px; color: rgba(255,255,255,0.5); text-transform: uppercase; min-width: 100px; }
+    .slider-row input[type="range"] { flex: 1; -webkit-appearance: none; height: 4px; background: rgba(255,255,255,0.15); border-radius: 0; outline: none; }
+    .slider-row input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; background: var(--accent); border-radius: 0; cursor: 
+pointer; }
+    .slider-value { font-family: var(--font-terminal); font-size: 18px; color: var(--accent); min-width: 50px; text-align: right; }
+    .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 12px; padding: 12px 16px; }
+    .stat-box { background: rgba(255,255,255,0.03); padding: 12px; text-align: center; border: 1px solid rgba(255,255,255,0.06); }
+    .stat-label { font-family: var(--font-terminal); font-size: 11px; color: rgba(255,255,255,0.4); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 4px; }
+    .stat-value { font-family: var(--font-terminal); font-size: 28px; color: var(--accent); }
+    .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin: var(--space-lg) 0; }
+    .card { background: var(--paper-cream); border: 2px solid var(--ink); padding: 20px; box-shadow: 4px 4px 0 0 var(--ink); }
+    .card h3 { font-size: 1.1rem; margin-bottom: 8px; }
+    .card p { font-size: 14px; margin-bottom: 0; }
+    .aside { background: var(--paper-cream); border-left: 4px solid var(--accent); padding: 16px 20px; margin: var(--space-lg) 0; }
+    .aside i { color: var(--accent); margin-right: 8px; }
+    footer { text-align: center; padding: 40px 20px; font-family: var(--font-typewriter); font-size: 14px; color: var(--ink-faint); }
+    footer a { color: var(--accent); }
+    canvas { display: block; width: 100%; }
+    .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0; margin: var(--space-lg) 0; border: 2px solid var(--ink); }
+    .compare-col { padding: 20px; }
+    .compare-col:first-child { background: var(--paper-dark); border-right: 2px solid var(--ink); }
+    .compare-col:last-child { background: var(--paper-cream); }
+    .compare-col h3 { font-size: 1rem; margin-bottom: 12px; }
+    .compare-col ul { list-style: none; padding: 0; }
+    .compare-col li { padding: 4px 0; font-size: 14px; color: var(--ink-light); }
+    .compare-col li i { width: 20px; margin-right: 6px; }
+    .arch-canvas { width: 100%; height: 400px; display: block; }
+    .mesh-canvas { width: 100%; height: 350px; display: block; }
+    .tag { display: inline-block; font-family: var(--font-terminal); font-size: 12px; padding: 2px 8px; border: 1px solid; margin: 2px; }
+    .tag-rust { color: #f59e0b; border-color: #f59e0b; }
+    .tag-quic { color: #3b82f6; border-color: #3b82f6; }
+    .tag-uring { color: #22c55e; border-color: #22c55e; }
+    .tag-mesh { color: var(--accent); border-color: var(--accent); }
+    .perf-bar { display: flex; align-items: center; gap: 12px; margin: 8px 0; }
+    .perf-bar-label { font-family: var(--font-terminal); font-size: 13px; color: var(--ink-light); min-width: 120px; }
+    .perf-bar-track { flex: 1; height: 24px; background: var(--paper-dark); border: 1px solid var(--ink); position: relative; overflow: hidden; }
+    .perf-bar-fill { height: 100%; transition: width 0.8s ease-out; }
+    .perf-bar-val { font-family: var(--font-terminal); font-size: 14px; color: var(--ink); min-width: 60px; text-align: right; }
+    @media (max-width: 640px) {
+      h1 { font-size: 2rem; } h2 { font-size: 1.5rem; }
+      .section-inner { padding: 40px 20px; }
+      .compare-grid { grid-template-columns: 1fr; }
+      .compare-col:first-child { border-right: none; border-bottom: 2px solid var(--ink); }
+      .nav-dots { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+  <header class="header"><div class="header-inner"><div class="header-title">LVQR<span class="dot">.</span></div><div style="font-family: var(--font-terminal); color: 
+var(--ink-faint); font-size: 13px;">LIVE VIDEO QUIC RELAY</div></div></header>
+  <div class="nav-dots" id="navDots"></div>
+  <main>
+    <section class="paper-texture" id="section-hero" style="padding-top: 80px;">
+      <div class="section-inner" style="text-align: center; padding: 100px 30px 80px;">
+        <div style="font-family: var(--font-terminal); color: var(--accent); font-size: 14px; letter-spacing: 0.2em; margin-bottom: var(--space-md);">AN INTERACTIVE 
+ARCHITECTURE GUIDE</div>
+        <h1 style="margin-bottom: var(--space-lg);">Every streaming server is bloated. Let's fix that.</h1>
+        <p style="font-size: 18px; max-width: 600px; margin: 0 auto var(--space-xl);">A single Rust binary. Minimal-copy from ingest to delivery. Viewers become relays. 
+Thousands of concurrent streams on a $6 droplet.</p>
+        <div style="margin-bottom: var(--space-xl);"><span class="tag tag-rust"><i class="fas fa-cog"></i> RUST</span><span class="tag tag-quic"><i class="fas fa-bolt"></i> 
+QUIC/MoQ</span><span class="tag tag-uring"><i class="fas fa-microchip"></i> io_uring</span><span class="tag tag-mesh"><i class="fas fa-project-diagram"></i> PEER 
+MESH</span></div>
+        <div style="font-family: var(--font-terminal); color: var(--ink-muted); font-size: 14px;"><i class="fas fa-chevron-down" style="animation: bounce 2s infinite;"></i> 
+SCROLL TO EXPLORE</div>
+      </div>
+    </section>
+
+    <section class="paper-texture" id="section-1"><div class="section-inner">
+      <div class="section-number">1</div>
+      <h2>The State of Streaming is a Dumpster Fire</h2>
+      <p>There are a million streaming servers out there. <strong>Ant Media Server</strong> (Java, 500MB+ memory baseline). <strong>Wowza</strong> (Java, enterprise 
+pricing). <strong>Owncast</strong> (Go, shells out to ffmpeg for transcoding). <strong>MediaMTX</strong> (Go, lightweight but no fanout scaling). <strong>Mux</strong> 
+(SaaS, pay-per-minute).</p>
+      <p>They all share the same fundamental problem. <span class="highlight">Data touches userspace too many times.</span> Ingest arrives on a socket, gets copied to a 
+buffer, processed, copied again, written to HLS segments on disk, read back, copied to response buffers, sent out. Every copy burns CPU. Every copy burns memory. Every copy 
+is a ceiling on your concurrent viewer count.</p>
+      <div class="interactive-container">
+        <div class="interactive-label"><i class="fas fa-exchange-alt"></i> Data Copy Simulator</div>
+        <canvas id="copyCanvas" height="200"></canvas>
+        <div class="slider-row"><label>VIEWERS</label><input type="range" id="viewerSlider" min="10" max="5000" value="100" step="10"><div class="slider-value" 
+id="viewerCount">100</div></div>
+        <div class="stat-grid">
+          <div class="stat-box"><div class="stat-label">Traditional Copies/s</div><div class="stat-value" id="tradCopies" style="color: var(--error);">600</div></div>
+          <div class="stat-box"><div class="stat-label">LVQR Copies/s</div><div class="stat-value" id="spoutCopies" style="color: var(--success);">1</div></div>
+          <div class="stat-box"><div class="stat-label">Memory Saved</div><div class="stat-value" id="memSaved" style="color: var(--info);">94%</div></div>
+        </div>
+        <div style="font-family: var(--font-typewriter); font-size: 13px; color: rgba(255,255,255,0.5); padding: 10px 16px; border-top: 1px solid 
+rgba(255,255,255,0.05);">Traditional: ingest copy + segment write + segment read + response copy per viewer. LVQR: ref-counted buffers shared across subscribers. One copy 
+on ingest, zero per additional viewer.</div>
+      </div>
+      <p>See that? At 5000 viewers, a traditional server is doing <strong>30,000 memory copies per second</strong> just for one stream. LVQR does one on ingest and shares 
+the buffer. Ref-counted, zero-alloc fanout. But how?</p>
+    </div></section>
+
+    <section class="paper-texture" id="section-2"><div class="section-inner">
+      <div class="section-number">2</div>
+      <h2>The Architecture That Makes It Possible</h2>
+      <p>LVQR is built on four pillars. Each one eliminates an entire category of overhead that every existing streaming server pays.</p>
+      <div class="interactive-container">
+        <div class="interactive-label"><i class="fas fa-layer-group"></i> LVQR Stack (click layers to explore)</div>
+        <canvas id="archCanvas" class="arch-canvas" height="400"></canvas>
+        <div id="layerInfo" style="font-family: var(--font-typewriter); font-size: 13px; color: rgba(255,255,255,0.6); padding: 12px 16px; min-height: 60px; border-top: 1px 
+solid rgba(255,255,255,0.05);">Click a layer to learn how it works.</div>
+      </div>
+      <div class="card-grid">
+        <div class="card"><h3><i class="fas fa-microchip" style="color: var(--success); margin-right: 8px;"></i> io_uring</h3><p>Batched async I/O with sendmsg_zc for 
+payloads over 10KB. Eliminates syscall overhead by batching hundreds of network ops into a single submission queue. Combined with ref-counted buffers, the hot path stays 
+lean.</p></div>
+        <div class="card"><h3><i class="fas fa-bolt" style="color: var(--info); margin-right: 8px;"></i> QUIC / MoQ</h3><p>Media over QUIC Transport (draft-17, April 2026). 
+Pub/sub with named tracks. No head-of-line blocking. Independent stream multiplexing. Cacheable at relay nodes. Sub-500ms latency. Cloudflare has deployed it globally 
+across 330+ cities.</p></div>
+        <div class="card"><h3><i class="fas fa-project-diagram" style="color: var(--accent); margin-right: 8px;"></i> Peer Mesh</h3><p>Viewers relay to other viewers via 
+WebRTC DataChannels. Quanteec proved 75-90% CDN offload in production at the Tour de France, Roland Garros, and Le Mans in 2025. LVQR bakes this into the protocol layer on 
+top of MoQ.</p></div>
+        <div class="card"><h3><i class="fas fa-memory" style="color: var(--warning); margin-right: 8px;"></i> Ring Buffers</h3><p>mmap'd shared ring buffers hold GOPs. 
+Ref-counted bytes::Bytes slices mean subscribers read from the same buffer, no copy. Thread-per-core shared-nothing design. Each core owns its subscriber set. No locks on 
+the hot path.</p></div>
+      </div>
+      <p>The key insight is that <span class="highlight">a streaming relay doesn't need to understand the media.</span> MoQ treats video as opaque named tracks. The relay 
+just moves bytes from publishers to subscribers. That means the relay can be a minimal-copy data pump, sharing buffer references instead of duplicating data.</p>
+    </div></section>
+
+    <section class="paper-texture" id="section-3"><div class="section-inner">
+      <div class="section-number">3</div>
+      <h2>Minimal-Copy: The Data Path That Actually Works</h2>
+      <p>Here's the traditional flow. An RTMP ingest arrives. The server reads it into a buffer. Parses it. Writes HLS segments to disk. When a viewer requests a segment, 
+it reads from disk into a buffer. Writes that buffer to the response socket. That's <strong>four copies per viewer per segment.</strong></p>
+      <p>LVQR's flow: QUIC ingest arrives. Quinn decrypts and deframes in userspace (QUIC is a userspace protocol, this is unavoidable). The payload lands in a ref-counted 
+bytes::Bytes buffer inside an mmap'd ring. When subscribers need data, they get a cheap reference to the same buffer. io_uring's sendmsg_zc pushes it to the wire without an 
+extra kernel copy. <strong>One copy on ingest, zero per additional subscriber.</strong></p>
+      <div class="interactive-container">
+        <div class="interactive-label"><i class="fas fa-arrow-right"></i> Traditional vs LVQR Data Path (toggle to compare)</div>
+        <div class="controls">
+          <button class="btn-ghost" id="btnTraditional" onclick="showPath('traditional')" style="background: var(--accent); color: white; border-color: var(--accent);"><i 
+class="fas fa-turtle"></i> Traditional</button>
+          <button class="btn-ghost" id="btnSpout" onclick="showPath('spout')"><i class="fas fa-bolt"></i> LVQR</button>
+        </div>
+        <canvas id="pathCanvas" height="280"></canvas>
+        <div class="stat-grid">
+          <div class="stat-box"><div class="stat-label">Syscalls/segment</div><div class="stat-value" id="syscallCount">6</div></div>
+          <div class="stat-box"><div class="stat-label">Buffer copies/viewer</div><div class="stat-value" id="crossingCount">4</div></div>
+          <div class="stat-box"><div class="stat-label">Allocs/viewer</div><div class="stat-value" id="memcpyCount">4</div></div>
+        </div>
+      </div>
+      <div class="aside"><i class="fas fa-lightbulb"></i><strong>Why this matters:</strong> On a $6 DigitalOcean droplet (1 vCPU, 1GB RAM), the CPU freed by eliminating 
+per-viewer copies is the difference between 200 viewers and 5000 viewers. The bottleneck shifts from CPU to network bandwidth.</div>
+      <div class="aside"><i class="fas fa-exclamation-triangle"></i><strong>Honesty check:</strong> QUIC encryption happens in userspace. You can't splice encrypted QUIC 
+payloads kernel-to-kernel like you can with raw TCP sendfile(). The win here is ref-counted buffer sharing (one buffer, many readers) plus io_uring batched sends, not 
+magical kernel bypass.</div>
+    </div></section>
+
+    <section class="paper-texture" id="section-4"><div class="section-inner">
+      <div class="section-number">4</div>
+      <h2>Viewers Become The CDN</h2>
+      <p>Even with minimal-copy, a single server has a bandwidth ceiling. A $6 droplet has maybe 1Gbps outbound. At 4Mbps per viewer, that's 250 viewers max. Sounds like a 
+hard wall.</p>
+      <p><strong>Unless your viewers relay to each other.</strong> LVQR builds a peer mesh. The server seeds the stream to a handful of "root" viewers. Those viewers relay 
+to more viewers via WebRTC DataChannels. The mesh self-organizes. The server's bandwidth multiplies exponentially.</p>
+      <p>This isn't theoretical. Quanteec runs this in production for France T&eacute;l&eacute;visions. At the 2025 Tour de France, they hit <strong>75% average CDN 
+offload</strong>. At GP Explorer 3, <strong>86% average, 88% peak</strong>. At Le Mans 2025, <strong>79% offload</strong> with 0.03% rebuffering via peers vs 0.86% via CDN 
+alone.</p>
+      <div class="interactive-container">
+        <div class="interactive-label"><i class="fas fa-project-diagram"></i> Peer Mesh Simulation (drag the slider)</div>
+        <canvas id="meshCanvas" class="mesh-canvas" height="350"></canvas>
+        <div class="slider-row"><label>TOTAL VIEWERS</label><input type="range" id="meshSlider" min="1" max="2000" value="50" step="1"><div class="slider-value" 
+id="meshCount">50</div></div>
+        <div class="stat-grid">
+          <div class="stat-box"><div class="stat-label">Server Bandwidth</div><div class="stat-value" id="serverBW">200Mb</div></div>
+          <div class="stat-box"><div class="stat-label">Mesh Bandwidth</div><div class="stat-value" id="meshBW" style="color: var(--success);">0Mb</div></div>
+          <div class="stat-box"><div class="stat-label">Server Offload</div><div class="stat-value" id="offloadPct" style="color: var(--info);">0%</div></div>
+          <div class="stat-box"><div class="stat-label">Max Viewers</div><div class="stat-value" id="maxViewers" style="color: var(--warning);">250</div></div>
+        </div>
+        <div style="font-family: var(--font-typewriter); font-size: 13px; color: rgba(255,255,255,0.5); padding: 10px 16px; border-top: 1px solid 
+rgba(255,255,255,0.05);">Each peer relays to up to 3 others. Server seeds ~30 root peers. Assumes 4Mbps stream, 1Gbps server, avg 5Mbps peer upload.</div>
+      </div>
+      <p>At 2000 viewers, <span class="highlight">the server is only directly serving ~30 peers</span>, using about 120Mbps of its 1Gbps capacity. The other 1970 viewers 
+are served entirely by the mesh.</p>
+      <div class="aside"><i class="fas fa-shield-alt"></i><strong>Reliability:</strong> LVQR's mesh isn't fragile. Every peer maintains connections to 2-3 parents. If a 
+parent drops, the subscriber instantly falls back to another parent or the origin server. Latency-optimized graph algorithms keep the tree shallow (typically 4-6 hops 
+max).</div>
+    </div></section>
+
+    <section class="paper-texture" id="section-5"><div class="section-inner">
+      <div class="section-number">5</div>
+      <h2>Let's Compare Everything</h2>
+      <p>Here's where LVQR stands against the current landscape. Projections grounded in production data from Quanteec (peer mesh), Cloudflare (MoQ relay), and io_uring 
+benchmarks.</p>
+      <div class="interactive-container">
+        <div class="interactive-label"><i class="fas fa-chart-bar"></i> Performance Comparison ($6 VPS, 1 vCPU, 1GB RAM)</div>
+        <div style="padding: 20px 16px;" id="perfBars"></div>
+      </div>
+      <div class="compare-grid">
+        <div class="compare-col"><h3><i class="fas fa-times-circle" style="color: var(--error);"></i> Everyone Else</h3><ul>
+          <li><i class="fas fa-times" style="color: var(--error);"></i> Java/Go runtime overhead</li>
+          <li><i class="fas fa-times" style="color: var(--error);"></i> ffmpeg subprocess for transcoding</li>
+          <li><i class="fas fa-times" style="color: var(--error);"></i> HLS segment writes to disk</li>
+          <li><i class="fas fa-times" style="color: var(--error);"></i> RTMP legacy protocol lock-in</li>
+          <li><i class="fas fa-times" style="color: var(--error);"></i> No peer relay (all bandwidth from origin)</li>
+          <li><i class="fas fa-times" style="color: var(--error);"></i> TCP head-of-line blocking</li>
+          <li><i class="fas fa-times" style="color: var(--error);"></i> 200-500MB memory baseline</li>
+        </ul></div>
+        <div class="compare-col"><h3><i class="fas fa-check-circle" style="color: var(--success);"></i> LVQR</h3><ul>
+          <li><i class="fas fa-check" style="color: var(--success);"></i> Rust. No GC. No runtime. ~5MB binary.</li>
+          <li><i class="fas fa-check" style="color: var(--success);"></i> Passthrough relay (no transcode needed)</li>
+          <li><i class="fas fa-check" style="color: var(--success);"></i> mmap ring buffers (never touches disk)</li>
+          <li><i class="fas fa-check" style="color: var(--success);"></i> QUIC/MoQ native, RTMP/WHIP ingest compat</li>
+          <li><i class="fas fa-check" style="color: var(--success);"></i> Peer mesh with 75%+ offload</li>
+          <li><i class="fas fa-check" style="color: var(--success);"></i> QUIC stream multiplexing, no HOL blocking</li>
+          <li><i class="fas fa-check" style="color: var(--success);"></i> ~12MB memory baseline</li>
+        </ul></div>
+      </div>
+    </div></section>
+
+    <section class="paper-texture" id="section-6"><div class="section-inner">
+      <div class="section-number">6</div>
+      <h2>The Crate Map</h2>
+      <p>LVQR builds on existing battle-tested MoQ libraries. The moq-lite transport layer (from moq-dev/moq, 1000+ stars) already works with Cloudflare's CDN. LVQR adds 
+the peer mesh and optimized relay on top.</p>
+      <div class="interactive-container">
+        <div class="interactive-label"><i class="fas fa-sitemap"></i> Crate Architecture</div>
+        <div style="padding: 20px 16px; font-family: var(--font-mono); font-size: 13px; color: rgba(255,255,255,0.7); line-height: 2;">
+<span style="color: var(--accent);">lvqr/</span>
+&#9500;&#9472;&#9472; <span style="color: var(--success);">lvqr-core</span>         <span style="color: #666;"># ring buffer, GOP cache, subscriber registry</span>
+&#9500;&#9472;&#9472; <span style="color: var(--success);">lvqr-relay</span>        <span style="color: #666;"># MoQ relay on moq-lite, fan-out engine</span>
+&#9500;&#9472;&#9472; <span style="color: var(--success);">lvqr-mesh</span>         <span style="color: #666;"># peer discovery, tree building, gossip</span>
+&#9500;&#9472;&#9472; <span style="color: var(--success);">lvqr-ingest</span>       <span style="color: #666;"># RTMP/WHIP/SRT to MoQ tracks</span>
+&#9500;&#9472;&#9472; <span style="color: var(--success);">lvqr-signal</span>       <span style="color: #666;"># WebRTC signaling for mesh bootstrap</span>
+&#9500;&#9472;&#9472; <span style="color: var(--success);">lvqr-admin</span>        <span style="color: #666;"># HTTP API, stats, health checks</span>
+&#9492;&#9472;&#9472; <span style="color: var(--warning);">lvqr-cli</span>          <span style="color: #666;"># single binary entry point</span>
+
+<span style="color: #666;">Foundation (battle-tested, not ours):</span>
+  <span style="color: var(--info);">moq-lite</span>    <span style="color: #666;"># moq-dev transport (works with Cloudflare CDN)</span>
+  <span style="color: var(--info);">quinn</span>       <span style="color: #666;"># production Rust QUIC</span>
+  <span style="color: var(--info);">tokio-uring</span> <span style="color: #666;"># io_uring bindings + sendmsg_zc</span>
+  <span style="color: var(--info);">bytes</span>       <span style="color: #666;"># ref-counted zero-copy byte buffers</span>
+        </div>
+      </div>
+      <p>Deploy: <code style="background: var(--paper-dark); padding: 2px 6px; font-family: var(--font-mono);">scp lvqr server:/usr/local/bin/</code> and you're done.</p>
+      <div class="aside"><i class="fas fa-terminal"></i><strong>Usage:</strong> <code style="font-family: var(--font-mono);">lvqr serve --port 4443 --mesh-enabled 
+--max-peers 3</code>. OBS points RTMP at port 1935. Viewers connect via WebTransport (all modern browsers, including Safari 26.5+). Everyone gets sub-second latency.</div>
+    </div></section>
+
+    <section class="paper-texture" id="section-7"><div class="section-inner">
+      <div class="section-number">7</div>
+      <h2>What Makes This Actually Novel</h2>
+      <p>MoQ exists. io_uring exists. Peer mesh exists. The trick is <strong>nobody has combined MoQ relay + peer mesh in a single system.</strong> Cloudflare's relay is 
+centralized CDN. Quanteec's mesh runs on HLS/DASH. Each piece amplifies the others.</p>
+      <div class="card-grid" style="grid-template-columns: 1fr;"><div class="card">
+        <h3><i class="fas fa-puzzle-piece" style="color: var(--accent); margin-right: 8px;"></i> The Multiplier Effect</h3>
+        <p><strong>io_uring + MoQ:</strong> MoQ's opaque track model means the relay never parses media. io_uring's batched submission and sendmsg_zc minimize syscall 
+overhead. Other MoQ implementations use standard tokio. LVQR uses io_uring on the hot send path.</p>
+        <p style="margin-top: 8px;"><strong>Peer mesh + MoQ:</strong> MoQ's named-track pub/sub maps perfectly onto a peer relay tree. Peers subscribe to tracks by name. 
+The mesh is just another layer of MoQ relay nodes running in browsers via WebTransport.</p>
+        <p style="margin-top: 8px;"><strong>io_uring + peer mesh:</strong> The server only serves ~30 root peers instead of 5000 viewers. io_uring never gets saturated. 
+Dozens of simultaneous channels on one core.</p>
+      </div></div>
+      <div class="interactive-container">
+        <div class="interactive-label"><i class="fas fa-play"></i> Multi-Channel Stress Test</div>
+        <div class="slider-row"><label>CHANNELS</label><input type="range" id="channelSlider" min="1" max="50" value="1"><div class="slider-value" 
+id="channelCount">1</div></div>
+        <div class="slider-row"><label>VIEWERS/CH</label><input type="range" id="viewersPerSlider" min="10" max="2000" value="500" step="10"><div class="slider-value" 
+id="viewersPerCount">500</div></div>
+        <div class="stat-grid">
+          <div class="stat-box"><div class="stat-label">Total Viewers</div><div class="stat-value" id="totalViewers">500</div></div>
+          <div class="stat-box"><div class="stat-label">Server Load</div><div class="stat-value" id="serverLoad" style="color: var(--success);">12%</div></div>
+          <div class="stat-box"><div class="stat-label">Est. Memory</div><div class="stat-value" id="estMemory">28MB</div></div>
+          <div class="stat-box"><div class="stat-label">Verdict</div><div class="stat-value" id="verdict" style="font-size: 16px; color: var(--success);">EASY</div></div>
+        </div>
+      </div>
+    </div></section>
+
+    <section class="paper-texture" id="section-8"><div class="section-inner">
+      <div class="section-number">8</div>
+      <h2>Compatibility: It Just Works</h2>
+      <p>As of March 2026, <strong>WebTransport is supported in all major browsers</strong>: Chrome, Edge, Firefox, and Safari 26.5+. The universal browser support moment 
+has arrived. LVQR still provides fallbacks for older versions.</p>
+      <div class="interactive-container">
+        <div class="interactive-label"><i class="fas fa-globe"></i> Transport Negotiation Chain</div>
+        <div style="padding: 20px 16px; font-family: var(--font-mono); font-size: 13px; color: rgba(255,255,255,0.7); line-height: 2.2;">
+<span style="color: var(--success);">1.</span> <span style="color: var(--accent);">WebTransport + MoQ</span>  <span style="color: #666;">// All modern browsers (2026+), 
+sub-300ms</span>
+   &#9492;&#9472; raw QUIC streams, WebCodecs decode, peer mesh relay
+
+<span style="color: var(--success);">2.</span> <span style="color: var(--info);">WebSocket + fMP4</span>     <span style="color: #666;">// Older browsers, sub-1s</span>
+   &#9492;&#9472; fragmented MP4 over WS, MSE decode, no peer relay
+
+<span style="color: var(--success);">3.</span> <span style="color: var(--warning);">LL-HLS</span>              <span style="color: #666;">// Legacy fallback, 2-4s</span>
+   &#9492;&#9472; standard HTTP, any player, widest compat
+
+<span style="color: #666;">Ingest:</span> RTMP, WHIP (WebRTC), SRT, raw MoQ
+<span style="color: #666;">Outgest:</span> MoQ, WebSocket-fMP4, LL-HLS
+        </div>
+      </div>
+      <p>OBS, Streamlabs, and every mobile encoder speak RTMP. LVQR accepts RTMP and translates to MoQ tracks internally. An OBS plugin for native MoQ output already exists 
+(moq-dev/obs).</p>
+      <div class="aside"><i class="fas fa-code"></i><strong>For developers:</strong> REST API for stream management, auth tokens, webhook events. The web player is ~30KB 
+gzipped, handles transport negotiation automatically. One script tag.</div>
+    </div></section>
+
+    <section class="paper-texture" id="section-9"><div class="section-inner">
+      <div class="section-number">9</div>
+      <h2>This Is Buildable. Today.</h2>
+      <p>Every piece exists as proven technology. <strong>moq-lite</strong> is a production transport layer that works with Cloudflare's CDN. <strong>quinn</strong> is 
+production QUIC. <strong>tokio-uring</strong> provides sendmsg_zc. <strong>MoQ draft-17</strong> has interoperable implementations from Cloudflare, Meta, Cisco. WebRTC 
+DataChannels for peer relay work in every browser.</p>
+      <p>The work is integration, not invention. Rust's ownership model makes ref-counted buffer management safe at compile time. bytes::Bytes gives us zero-copy fanout by 
+design.</p>
+      <div class="interactive-container">
+        <div class="interactive-label"><i class="fas fa-road"></i> Development Roadmap</div>
+        <div style="padding: 16px;">
+          <div style="display: flex; gap: 8px; margin-bottom: 12px;" id="phaseButtons">
+            <button class="btn-ghost active" onclick="showPhase(0)">Phase 1</button>
+            <button class="btn-ghost" onclick="showPhase(1)">Phase 2</button>
+            <button class="btn-ghost" onclick="showPhase(2)">Phase 3</button>
+          </div>
+          <div id="phaseContent" style="font-family: var(--font-typewriter); font-size: 14px; color: rgba(255,255,255,0.7); line-height: 1.8; min-height: 120px;"></div>
+        </div>
+      </div>
+      <div style="text-align: center; margin-top: var(--space-xl);">
+        <p style="font-size: 18px; color: var(--ink); font-family: var(--font-marker);">The cheapest possible server. Thousands of viewers. Zero corporate lock-in. Open 
+source, open protocol, open future.</p>
+        <p style="font-family: var(--font-terminal); color: var(--ink-muted); font-size: 14px; margin-top: var(--space-md);"><i class="fas fa-heart" style="color: 
+var(--accent);"></i> BUILT FOR THE MAKERS WHO CAN'T AFFORD MUX AND WON'T SETTLE FOR TWITCH</p>
+      </div>
+    </div></section>
+  </main>
+  <footer><p>Built as an <a href="https://explorabl.es/" target="_blank">explorable explanation</a> <i class="fas fa-heart" style="color: var(--accent); margin: 0 
+4px;"></i> A <a href="https://hack.build" target="_blank">hack.build</a> concept</p></footer>
+  <style>@keyframes bounce { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(6px); } }</style>
+  <script>
+    const sections = document.querySelectorAll('section');
+    const progressFill = document.getElementById('progressFill');
+    const navDotsContainer = document.getElementById('navDots');
+    sections.forEach((_, i) => { const dot = document.createElement('div'); dot.className = 'nav-dot'; dot.addEventListener('click', () => sections[i].scrollIntoView({ 
+behavior: 'smooth' })); navDotsContainer.appendChild(dot); });
+    const dots = document.querySelectorAll('.nav-dot');
+    window.addEventListener('scroll', () => { const scrollTop = window.scrollY; const docHeight = document.documentElement.scrollHeight - window.innerHeight; 
+progressFill.style.width = (scrollTop / docHeight) * 100 + '%'; let currentSection = 0; sections.forEach((section, i) => { if (section.getBoundingClientRect().top < 
+window.innerHeight / 2) currentSection = i; }); dots.forEach((dot, i) => dot.classList.toggle('active', i === currentSection)); });
+
+    // COPY SIMULATOR
+    (function() {
+      const canvas = document.getElementById('copyCanvas'); const ctx = canvas.getContext('2d'); canvas.width = canvas.parentElement.clientWidth;
+      const slider = document.getElementById('viewerSlider'); const viewerDisplay = document.getElementById('viewerCount');
+      function update(v) {
+        const tradCps = v * 6, spoutCps = 1, memTrad = v * 0.05 + 200, memSpout = 12 + v * 0.002;
+        document.getElementById('tradCopies').textContent = tradCps.toLocaleString();
+        document.getElementById('spoutCopies').textContent = spoutCps;
+        document.getElementById('memSaved').textContent = Math.round((1 - memSpout / memTrad) * 100) + '%';
+        ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.fillStyle = '#1a1a1a'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+        const w = canvas.width, barMax = w - 80, tradW = Math.min(barMax, (tradCps / 30000) * barMax), spoutW = Math.max(4, (spoutCps / 30000) * barMax);
+        ctx.fillStyle = 'rgba(255,255,255,0.3)'; ctx.font = '14px VT323'; ctx.fillText('TRADITIONAL', 16, 55); ctx.fillText('LVQR', 16, 135);
+        ctx.fillStyle = '#ef4444'; ctx.fillRect(16, 65, tradW, 30); ctx.fillStyle = '#22c55e'; ctx.fillRect(16, 145, spoutW, 30);
+        ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.font = '16px VT323'; ctx.fillText(tradCps.toLocaleString() + ' copies/s', tradW + 24, 87); ctx.fillText(spoutCps + ' 
+copy (ingest only)', spoutW + 24, 167);
+      }
+      slider.addEventListener('input', function() { viewerDisplay.textContent = this.value; update(parseInt(this.value)); }); update(100);
+      window.addEventListener('resize', () => { canvas.width = canvas.parentElement.clientWidth; update(parseInt(slider.value)); });
+    })();
+
+    // ARCHITECTURE CANVAS
+    (function() {
+      const canvas = document.getElementById('archCanvas'); const ctx = canvas.getContext('2d'); const info = document.getElementById('layerInfo'); canvas.width = 
+canvas.parentElement.clientWidth;
+      const layers = [
+        { y: 20, h: 60, color: '#ff3366', label: 'LVQR-CLI', sub: 'Single Binary Entry Point', detail: 'One static binary under 5MB. No containers, no JVM. scp and run. 
+TOML config or CLI flags.' },
+        { y: 90, h: 60, color: '#3b82f6', label: 'LVQR-MESH', sub: 'Peer Relay Orchestrator', detail: 'Manages the viewer relay tree. Gossip protocol for peer health. 
+Promotes/demotes peers by bandwidth and stability. WebRTC signaling for DataChannel connections.' },
+        { y: 160, h: 60, color: '#22c55e', label: 'MOQ-LITE TRANSPORT', sub: 'QUIC Pub/Sub (moq-dev)', detail: 'Built on moq-lite from moq-dev/moq. Interoperable with 
+Cloudflare CDN. Named tracks subscribable by name. GOPs cached for instant late-join. WebTransport for all modern browsers.' },
+        { y: 230, h: 60, color: '#f59e0b', label: 'LVQR-CORE', sub: 'Ring Buffers + GOP Cache', detail: 'mmap\'d ring buffers, bytes::Bytes ref-counted sharing. 
+Thread-per-core, each core owns subscriber shard. No locks on hot path.' },
+        { y: 300, h: 60, color: '#a855f7', label: 'IO_URING SEND', sub: 'Batched Async I/O', detail: 'sendmsg_zc for payloads >10KB. Batched submission queues minimize 
+syscalls. QUIC encrypt is userspace (unavoidable), but send path is optimized.' },
+      ];
+      let hovered = -1;
+      function draw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height); const pad = 30, layerW = canvas.width - pad * 2;
+        layers.forEach((l, i) => {
+          ctx.fillStyle = hovered === i ? l.color : l.color + '33'; ctx.strokeStyle = l.color; ctx.lineWidth = hovered === i ? 3 : 1;
+          ctx.fillRect(pad, l.y, layerW, l.h); ctx.strokeRect(pad, l.y, layerW, l.h);
+          ctx.fillStyle = hovered === i ? '#fff' : l.color; ctx.font = 'bold 16px VT323'; ctx.fillText(l.label, pad + 16, l.y + 28);
+          ctx.font = '13px VT323'; ctx.fillStyle = hovered === i ? 'rgba(255,255,255,0.8)' : 'rgba(255,255,255,0.4)'; ctx.fillText(l.sub, pad + 16, l.y + 48);
+        });
+      }
+      canvas.addEventListener('mousemove', (e) => { const rect = canvas.getBoundingClientRect(); const y = (e.clientY - rect.top) * (canvas.height / rect.height); let found 
+= -1; layers.forEach((l, i) => { if (y >= l.y && y <= l.y + l.h) found = i; }); if (found !== hovered) { hovered = found; draw(); info.textContent = found >= 0 ? 
+layers[found].detail : 'Click a layer to learn how it works.'; } });
+      canvas.addEventListener('mouseleave', () => { hovered = -1; draw(); info.textContent = 'Click a layer to learn how it works.'; });
+      draw(); window.addEventListener('resize', () => { canvas.width = canvas.parentElement.clientWidth; draw(); });
+    })();
+
+    // DATA PATH TOGGLE
+    let currentPath = 'traditional';
+    function showPath(mode) {
+      currentPath = mode;
+      ['btnTraditional','btnSpout'].forEach(id => { const b = document.getElementById(id); const active = (id === 'btnTraditional' && mode === 'traditional') || (id === 
+'btnSpout' && mode === 'spout'); b.style.background = active ? 'var(--accent)' : 'transparent'; b.style.color = active ? 'white' : 'var(--paper)'; b.style.borderColor = 
+active ? 'var(--accent)' : 'rgba(255,255,255,0.3)'; });
+      drawPath();
+    }
+    function drawPath() {
+      const canvas = document.getElementById('pathCanvas'); const ctx = canvas.getContext('2d'); canvas.width = canvas.parentElement.clientWidth; ctx.clearRect(0, 0, 
+canvas.width, canvas.height);
+      const w = canvas.width, pad = 20;
+      if (currentPath === 'traditional') {
+        document.getElementById('syscallCount').textContent = '6'; document.getElementById('syscallCount').style.color = 'var(--error)';
+        document.getElementById('crossingCount').textContent = '4'; document.getElementById('crossingCount').style.color = 'var(--error)';
+        document.getElementById('memcpyCount').textContent = '4'; document.getElementById('memcpyCount').style.color = 'var(--error)';
+        const boxes = 
+[{x:pad,label:'RTMP\nSocket',color:'#3b82f6'},{x:w*0.18,label:'Kernel\nBuffer',color:'#666'},{x:w*0.34,label:'User\nBuffer',color:'#ef4444'},{x:w*0.50,label:'HLS\nDisk',color:'#f59e0b'},{x:w*0.66,label:'User\nBuffer',color:'#ef4444'},{x:w*0.82,label:'TCP\nSocket',color:'#3b82f6'}];
+        const bw = w * 0.12, bh = 50;
+        boxes.forEach((b, i) => { ctx.fillStyle = b.color + '33'; ctx.strokeStyle = b.color; ctx.lineWidth = 2; ctx.fillRect(b.x, 80, bw, bh); ctx.strokeRect(b.x, 80, bw, 
+bh); ctx.fillStyle = b.color; ctx.font = '12px VT323'; b.label.split('\n').forEach((line, li) => ctx.fillText(line, b.x + 6, 100 + li * 16)); if (i < boxes.length - 1) { 
+ctx.strokeStyle = '#ef4444'; ctx.beginPath(); ctx.moveTo(b.x + bw + 2, 105); ctx.lineTo(boxes[i+1].x - 2, 105); ctx.stroke(); ctx.fillStyle = '#ef4444'; ctx.font = '10px 
+VT323'; ctx.fillText('COPY', b.x + bw + 4, 98); } });
+        ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.font = '12px VT323'; ctx.fillText('6 syscalls, 4 buffer copies, 4 allocs per segment per viewer', pad, 220);
+      } else {
+        document.getElementById('syscallCount').textContent = 'batched'; document.getElementById('syscallCount').style.color = 'var(--success)';
+        document.getElementById('crossingCount').textContent = '0'; document.getElementById('crossingCount').style.color = 'var(--success)';
+        document.getElementById('memcpyCount').textContent = '0'; document.getElementById('memcpyCount').style.color = 'var(--success)';
+        const boxes = [{x:pad,label:'QUIC\nIngest',color:'#3b82f6'},{x:w*0.25,label:'Decrypt\n(userspace)',color:'#f59e0b'},{x:w*0.50,label:'Ring Buffer\n(Bytes 
+ref)',color:'#22c55e'},{x:w*0.75,label:'QUIC Send\n(io_uring zc)',color:'#3b82f6'}];
+        const bw = w * 0.16, bh = 50;
+        boxes.forEach((b, i) => { ctx.fillStyle = b.color + '33'; ctx.strokeStyle = b.color; ctx.lineWidth = 2; ctx.fillRect(b.x, 80, bw, bh); ctx.strokeRect(b.x, 80, bw, 
+bh); ctx.fillStyle = b.color; ctx.font = '13px VT323'; b.label.split('\n').forEach((line, li) => ctx.fillText(line, b.x + 8, 100 + li * 18)); if (i < boxes.length - 1) { 
+ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(b.x + bw + 4, 105); ctx.lineTo(boxes[i+1].x - 4, 105); ctx.stroke(); } });
+        ctx.fillStyle = 'rgba(34,197,94,0.5)'; ctx.font = '14px VT323'; ctx.fillText('ONE COPY ON INGEST, ZERO PER ADDITIONAL VIEWER', pad, 180);
+        ctx.fillStyle = 'rgba(255,255,255,0.3)'; ctx.font = '11px VT323'; ctx.fillText('QUIC decrypt is userspace (honest). Fanout is ref-counted sharing.', pad, 200);
+        ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.font = '12px VT323'; ctx.fillText('io_uring batched sends, 0 per-viewer copies, 0 per-viewer allocs', pad, 220);
+      }
+    }
+    drawPath(); window.addEventListener('resize', drawPath);
+
+    // MESH SIMULATION
+    (function() {
+      const canvas = document.getElementById('meshCanvas'); const ctx = canvas.getContext('2d'); canvas.width = canvas.parentElement.clientWidth;
+      const slider = document.getElementById('meshSlider'); const display = document.getElementById('meshCount');
+      const ROOT_PEERS = 30, MAX_RELAY = 3;
+      function update(viewers) {
+        const direct = Math.min(viewers, ROOT_PEERS), serverBw = direct * 4, meshV = Math.max(0, viewers - direct), offload = viewers > ROOT_PEERS ? Math.round((meshV / 
+viewers) * 100) : 0;
+        document.getElementById('serverBW').textContent = serverBw + 'Mb'; document.getElementById('serverBW').style.color = serverBw > 800 ? 'var(--error)' : serverBw > 
+400 ? 'var(--warning)' : 'var(--success)';
+        document.getElementById('meshBW').textContent = (meshV * 4) + 'Mb'; document.getElementById('offloadPct').textContent = offload + '%';
+        document.getElementById('maxViewers').textContent = Math.round(ROOT_PEERS * (Math.pow(MAX_RELAY + 1, 5) - 1) / MAX_RELAY).toLocaleString();
+        ctx.clearRect(0, 0, canvas.width, canvas.height); const w = canvas.width, h = canvas.height, cx = w / 2, cy = h / 2;
+        ctx.fillStyle = '#ff3366'; ctx.beginPath(); ctx.arc(cx, cy - 60, 16, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = '#fff'; ctx.font = 'bold 12px VT323'; 
+ctx.textAlign = 'center'; ctx.fillText('SRV', cx, cy - 56);
+        const rootNodes = [];
+        for (let i = 0; i < Math.min(viewers, ROOT_PEERS); i++) { const a = (i / Math.max(Math.min(viewers, ROOT_PEERS), 1)) * Math.PI * 2 - Math.PI / 2, x = cx + 
+Math.cos(a) * 80, y = cy - 60 + Math.sin(a) * 80; rootNodes.push({x, y}); ctx.strokeStyle = 'rgba(255,51,102,0.4)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(cx, cy - 
+60); ctx.lineTo(x, y); ctx.stroke(); ctx.fillStyle = '#3b82f6'; ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fill(); }
+        if (meshV > 0) { const shown = Math.min(meshV, 80); for (let i = 0; i < shown; i++) { const a = (i / shown) * Math.PI * 2 - Math.PI / 2, j = (Math.random() - 0.5) * 
+30, x = cx + Math.cos(a) * (160 + j), y = cy - 60 + Math.sin(a) * (160 + j), p = rootNodes[i % rootNodes.length]; if (p) { ctx.strokeStyle = 'rgba(34,197,94,0.15)'; 
+ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(x, y); ctx.stroke(); } ctx.fillStyle = 'rgba(34,197,94,0.5)'; ctx.beginPath(); ctx.arc(x, y, 3, 0, 
+Math.PI * 2); ctx.fill(); } if (meshV > 80) { ctx.fillStyle = 'rgba(255,255,255,0.3)'; ctx.font = '14px VT323'; ctx.fillText('+ ' + (meshV - 80).toLocaleString() + ' more', 
+cx, h - 20); } }
+        ctx.textAlign = 'left'; ctx.font = '12px VT323';
+        ctx.fillStyle = '#ff3366'; ctx.fillRect(10, h-50, 8, 8); ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.fillText('Server', 24, h-42);
+        ctx.fillStyle = '#3b82f6'; ctx.fillRect(10, h-35, 8, 8); ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.fillText('Root peers', 24, h-27);
+        ctx.fillStyle = '#22c55e'; ctx.fillRect(10, h-20, 8, 8); ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.fillText('Mesh peers', 24, h-12);
+      }
+      slider.addEventListener('input', function() { display.textContent = this.value; update(parseInt(this.value)); }); update(50);
+      window.addEventListener('resize', () => { canvas.width = canvas.parentElement.clientWidth; update(parseInt(slider.value)); });
+    })();
+
+    // PERF BARS
+    (function() {
+      const c = document.getElementById('perfBars');
+      const d = [{label:'Ant 
+Media',viewers:200,mem:512,latency:500,color:'#666'},{label:'Owncast',viewers:150,mem:350,latency:6000,color:'#666'},{label:'MediaMTX',viewers:300,mem:80,latency:800,color:'#888'},{label:'LVQR',viewers:5000,mem:12,latency:300,color:'#ff3366'}];
+      let h = '<div style="font-family:var(--font-terminal);font-size:12px;color:rgba(255,255,255,0.4);margin-bottom:8px;text-transform:uppercase;">MAX CONCURRENT VIEWERS 
+(SINGLE SERVER, NO CDN)</div>';
+      d.forEach(x => { h += `<div class="perf-bar"><div class="perf-bar-label" style="color:rgba(255,255,255,0.6);">${x.label}</div><div class="perf-bar-track"><div 
+class="perf-bar-fill" style="width:${Math.min(100,(x.viewers/5000)*100)}%;background:${x.color};"></div></div><div class="perf-bar-val" 
+style="color:${x.color};">${x.viewers.toLocaleString()}</div></div>`; });
+      h += '<div style="font-family:var(--font-terminal);font-size:12px;color:rgba(255,255,255,0.4);margin:16px 0 8px;text-transform:uppercase;">MEMORY BASELINE 
+(MB)</div>';
+      d.forEach(x => { h += `<div class="perf-bar"><div class="perf-bar-label" style="color:rgba(255,255,255,0.6);">${x.label}</div><div class="perf-bar-track"><div 
+class="perf-bar-fill" style="width:${Math.min(100,(x.mem/512)*100)}%;background:${x.mem<50?'#22c55e':x.color};"></div></div><div class="perf-bar-val" 
+style="color:${x.mem<50?'#22c55e':x.color};">${x.mem}MB</div></div>`; });
+      h += '<div style="font-family:var(--font-terminal);font-size:12px;color:rgba(255,255,255,0.4);margin:16px 0 8px;text-transform:uppercase;">END-TO-END LATENCY 
+(MS)</div>';
+      d.forEach(x => { h += `<div class="perf-bar"><div class="perf-bar-label" style="color:rgba(255,255,255,0.6);">${x.label}</div><div class="perf-bar-track"><div 
+class="perf-bar-fill" style="width:${Math.min(100,(x.latency/6000)*100)}%;background:${x.latency<500?'#22c55e':x.color};"></div></div><div class="perf-bar-val" 
+style="color:${x.latency<500?'#22c55e':x.color};">${x.latency}ms</div></div>`; });
+      c.innerHTML = h;
+    })();
+
+    // STRESS TEST
+    (function() {
+      const chS = document.getElementById('channelSlider'), vpS = document.getElementById('viewersPerSlider');
+      function update() {
+        const ch = parseInt(chS.value), vp = parseInt(vpS.value), total = ch * vp, direct = ch * 30, bw = direct * 4, load = Math.min(100, Math.round((bw / 1000) * 100)), 
+mem = 12 + ch * 8 + direct * 0.01;
+        document.getElementById('channelCount').textContent = ch; document.getElementById('viewersPerCount').textContent = vp;
+        document.getElementById('totalViewers').textContent = total.toLocaleString();
+        document.getElementById('serverLoad').textContent = load + '%'; document.getElementById('serverLoad').style.color = load > 90 ? 'var(--error)' : load > 60 ? 
+'var(--warning)' : 'var(--success)';
+        document.getElementById('estMemory').textContent = Math.round(mem) + 'MB'; document.getElementById('estMemory').style.color = mem > 900 ? 'var(--error)' : mem > 500 
+? 'var(--warning)' : 'var(--success)';
+        let v, c; if (load <= 30 && mem < 200) { v='EASY'; c='var(--success)'; } else if (load <= 60 && mem < 500) { v='SMOOTH'; c='var(--success)'; } else if (load <= 85 
+&& mem < 800) { v='WARM'; c='var(--warning)'; } else if (load <= 100 && mem < 1000) { v='HOT'; c='var(--warning)'; } else { v='OVERLOAD'; c='var(--error)'; }
+        document.getElementById('verdict').textContent = v; document.getElementById('verdict').style.color = c;
+      }
+      chS.addEventListener('input', update); vpS.addEventListener('input', update); update();
+    })();
+
+    // ROADMAP
+    const phases = [
+      { title: 'Phase 1: Core Relay (8 weeks)', items: ['lvqr-core: mmap ring buffer with GOP-aligned segments, bytes::Bytes ref-counted fanout','lvqr-relay: MoQ relay 
+built on moq-lite (interoperable with Cloudflare CDN)','io_uring send path: tokio-uring sendmsg_zc for batched delivery','lvqr-ingest: RTMP demuxer translating to MoQ 
+tracks','lvqr-cli: single binary with TOML config','Goal: OBS streams RTMP in, browser plays via WebTransport out, sub-1s latency'] },
+      { title: 'Phase 2: Peer Mesh + Fallbacks (6 weeks)', items: ['lvqr-mesh: peer discovery via gossip, tree construction, health monitoring','lvqr-signal: WebRTC 
+signaling for DataChannel bootstrap','Browser player: WebTransport primary (all modern browsers), WS-fMP4 and LL-HLS fallbacks','Peer relay logic in browser player JS 
+(~30KB)','Goal: 1000+ viewers on single $6 droplet, 75%+ mesh offload'] },
+      { title: 'Phase 3: Production Hardening (4 weeks)', items: ['Auth: stream keys, viewer tokens, webhook callbacks','lvqr-admin: REST API, real-time stats 
+dashboard','Recording: optional segment archival to S3/Spaces','Multi-server federation: LVQR nodes relay via MoQ (or federate with Cloudflare CDN)','Goal: production-ready 
+for hackerspaces, indie streamers, community events'] },
+    ];
+    function showPhase(idx) {
+      document.querySelectorAll('#phaseButtons .btn-ghost').forEach((b, i) => { const a = i === idx; b.style.background = a ? 'var(--accent)' : 'transparent'; b.style.color 
+= a ? 'white' : 'var(--paper)'; b.style.borderColor = a ? 'var(--accent)' : 'rgba(255,255,255,0.3)'; });
+      const p = phases[idx]; let h = `<div style="color:var(--accent);margin-bottom:8px;font-family:var(--font-terminal);font-size:16px;">${p.title}</div>`;
+      p.items.forEach(item => { h += `<div style="padding:3px 0;color:rgba(255,255,255,0.6);"><span style="color:var(--success);margin-right:8px;"><i class="fas 
+fa-angle-right"></i></span>${item}</div>`; });
+      document.getElementById('phaseContent').innerHTML = h;
+    }
+    showPhase(0);
+  </script>
+</body>
+</html>

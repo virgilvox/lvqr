@@ -1,0 +1,52 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# WASM
+/pkg/
+crates/lvqr-wasm/pkg/
+bindings/js/packages/*/wasm/
+
+# Node
+node_modules/
+bindings/js/packages/*/dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# TLS dev certs (auto-generated)
+*.pem
+!deploy/certs/*.pem
+
+# Coverage
+lcov.info
+tarpaulin-report.html

@@ -1,0 +1,19 @@
+[package]
+name = "lvqr-test-utils"
+description = "Test utilities for LVQR crates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+lvqr-core = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rcgen = { workspace = true }
+rand = { workspace = true }

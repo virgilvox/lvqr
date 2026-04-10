@@ -1,0 +1,28 @@
+[package]
+name = "lvqr-core"
+description = "Core types, ring buffer, GOP cache, and subscriber registry for LVQR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["streaming", "quic", "moq", "video", "relay"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+bytes = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[[bench]]
+name = "ringbuffer"
+harness = false

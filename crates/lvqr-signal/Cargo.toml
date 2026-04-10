@@ -1,0 +1,25 @@
+[package]
+name = "lvqr-signal"
+description = "WebRTC signaling for LVQR mesh bootstrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["webrtc", "signaling", "streaming"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+lvqr-core = { workspace = true }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

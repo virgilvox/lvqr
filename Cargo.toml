@@ -1,0 +1,95 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lvqr-core",
+    "crates/lvqr-relay",
+    "crates/lvqr-mesh",
+    "crates/lvqr-ingest",
+    "crates/lvqr-signal",
+    "crates/lvqr-admin",
+    "crates/lvqr-wasm",
+    "crates/lvqr-cli",
+    "crates/lvqr-test-utils",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/virgilvox/lvqr"
+homepage = "https://github.com/virgilvox/lvqr"
+rust-version = "1.85"
+authors = ["Moheeb Zara <hackbuildvideo@gmail.com>"]
+
+[workspace.dependencies]
+# MoQ ecosystem
+moq-lite = "0.15"
+moq-native = "0.13"
+
+# QUIC / WebTransport
+quinn = "0.11"
+web-transport-quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Buffers and concurrency
+bytes = "1"
+parking_lot = "0.12"
+dashmap = "6"
+
+# HTTP
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# TLS cert generation
+rcgen = "0.13"
+
+# URL parsing
+url = "2"
+
+# Benchmarks
+criterion = "0.5"
+
+# RTMP
+rml_rtmp = "0.8"
+
+# Random
+rand = "0.8"
+
+# Internal crates
+lvqr-core = { version = "0.1.0", path = "crates/lvqr-core" }
+lvqr-relay = { version = "0.1.0", path = "crates/lvqr-relay" }
+lvqr-mesh = { version = "0.1.0", path = "crates/lvqr-mesh" }
+lvqr-ingest = { version = "0.1.0", path = "crates/lvqr-ingest" }
+lvqr-signal = { version = "0.1.0", path = "crates/lvqr-signal" }
+lvqr-admin = { version = "0.1.0", path = "crates/lvqr-admin" }
+lvqr-test-utils = { version = "0.1.0", path = "crates/lvqr-test-utils" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"

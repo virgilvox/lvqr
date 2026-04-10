@@ -1,0 +1,43 @@
+[package]
+name = "lvqr-relay"
+description = "MoQ relay on moq-lite with fan-out engine for LVQR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["streaming", "quic", "moq", "relay"]
+categories = ["multimedia", "network-programming"]
+
+[features]
+default = ["quinn-transport"]
+quinn-transport = ["dep:quinn", "dep:web-transport-quinn", "dep:rustls", "dep:moq-native", "dep:rcgen"]
+
+[dependencies]
+lvqr-core = { workspace = true }
+moq-lite = { workspace = true }
+
+# Transport (optional backends)
+quinn = { workspace = true, optional = true }
+web-transport-quinn = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+moq-native = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+
+# Async
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# Utils
+bytes = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+dashmap = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+lvqr-test-utils = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
