@@ -16,6 +16,7 @@ rtmp = ["dep:rml_rtmp"]
 
 [dependencies]
 lvqr-core = { workspace = true }
+moq-lite = { workspace = true }
 
 # RTMP
 rml_rtmp = { workspace = true, optional = true }
@@ -26,6 +27,7 @@ futures = { workspace = true }
 
 # Utils
 bytes = { workspace = true }
+dashmap = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 

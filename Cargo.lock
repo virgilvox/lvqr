@@ -1415,9 +1415,11 @@ name = "lvqr-ingest"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "dashmap",
  "futures",
  "lvqr-core",
  "lvqr-test-utils",
+ "moq-lite",
  "rml_rtmp",
  "thiserror 2.0.18",
  "tokio",

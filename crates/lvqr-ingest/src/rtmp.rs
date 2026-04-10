@@ -65,6 +65,23 @@ impl RtmpServer {
         }
     }
 
+    /// Create a new RTMP server from pre-wrapped callbacks.
+    pub fn from_callbacks(
+        config: RtmpConfig,
+        on_video: MediaCallback,
+        on_audio: MediaCallback,
+        on_publish: StreamCallback,
+        on_unpublish: StreamCallback,
+    ) -> Self {
+        Self {
+            config,
+            on_video,
+            on_audio,
+            on_publish,
+            on_unpublish,
+        }
+    }
+
     pub fn config(&self) -> &RtmpConfig {
         &self.config
     }

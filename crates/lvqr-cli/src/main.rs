@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "lvqr", version, about = "Live Video QUIC Relay")]
@@ -54,27 +55,67 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli {
-        Cli::Serve(args) => {
-            tracing::info!(
-                port = args.port,
-                rtmp_port = args.rtmp_port,
-                admin_port = args.admin_port,
-                mesh = args.mesh_enabled,
-                "starting LVQR relay"
-            );
+        Cli::Serve(args) => serve(args).await,
+    }
+}
 
-            let registry = std::sync::Arc::new(lvqr_core::Registry::new());
+async fn serve(args: ServeArgs) -> Result<()> {
+    tracing::info!(
+        quic_port = args.port,
+        rtmp_port = args.rtmp_port,
+        admin_port = args.admin_port,
+        mesh = args.mesh_enabled,
+        "starting LVQR relay"
+    );
 
-            // Start admin HTTP server
-            let admin_registry = registry.clone();
-            let admin_addr: std::net::SocketAddr = ([0, 0, 0, 0], args.admin_port).into();
-            let admin_router = lvqr_admin::build_router(admin_registry);
+    // Create the shared registry for stats
+    let registry = Arc::new(lvqr_core::Registry::new());
 
-            tracing::info!(%admin_addr, "admin API listening");
+    // Create the MoQ relay
+    let relay_config = lvqr_relay::RelayConfig::new(([0, 0, 0, 0], args.port).into());
+    let relay = lvqr_relay::RelayServer::new(relay_config);
+    let (mut moq_server, relay_addr) = relay.init_server()?;
+
+    tracing::info!(addr = %relay_addr, "MoQ relay listening");
+
+    // Create the RTMP-to-MoQ bridge
+    let bridge = lvqr_ingest::RtmpMoqBridge::new(relay.origin().clone());
+    let rtmp_config = lvqr_ingest::RtmpConfig {
+        bind_addr: ([0, 0, 0, 0], args.rtmp_port).into(),
+    };
+    let rtmp_server = bridge.create_rtmp_server(rtmp_config);
+
+    // Start the admin HTTP server
+    let admin_registry = registry.clone();
+    let admin_addr: std::net::SocketAddr = ([0, 0, 0, 0], args.admin_port).into();
+    let admin_router = lvqr_admin::build_router(admin_registry);
+
+    tracing::info!(addr = %admin_addr, "admin API listening");
+
+    // Run all servers concurrently
+    tokio::select! {
+        result = relay.accept_loop(&mut moq_server) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "relay server error");
+            }
+        }
+        result = rtmp_server.run() => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "RTMP server error");
+            }
+        }
+        result = async {
             let listener = tokio::net::TcpListener::bind(admin_addr).await?;
-            axum::serve(listener, admin_router).await?;
-
-            Ok(())
+            axum::serve(listener, admin_router).await
+        } => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "admin server error");
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutting down");
         }
     }
+
+    Ok(())
 }
