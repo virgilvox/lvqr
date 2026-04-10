@@ -21,7 +21,7 @@ lvqr-core = { workspace = true }
 rml_rtmp = { workspace = true, optional = true }
 
 # Async
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util"] }
 futures = { workspace = true }
 
 # Utils
