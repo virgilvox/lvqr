@@ -1,0 +1,15 @@
+# LVQR relay configuration
+# Pass to: lvqr serve --config lvqr.toml
+
+# QUIC/MoQ listen port
+port = 4443
+
+# RTMP ingest listen port
+rtmp_port = 1935
+
+# Admin HTTP API listen port
+admin_port = 8080
+
+# Peer mesh settings
+# mesh_enabled = true
+# max_peers = 3

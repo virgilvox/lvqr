@@ -68,27 +68,44 @@ async fn serve(args: ServeArgs) -> Result<()> {
         "starting LVQR relay"
     );
 
-    // Create the shared registry for stats
     let registry = Arc::new(lvqr_core::Registry::new());
 
-    // Create the MoQ relay
+    // MoQ relay
     let relay_config = lvqr_relay::RelayConfig::new(([0, 0, 0, 0], args.port).into());
     let relay = lvqr_relay::RelayServer::new(relay_config);
     let (mut moq_server, relay_addr) = relay.init_server()?;
-
     tracing::info!(addr = %relay_addr, "MoQ relay listening");
 
-    // Create the RTMP-to-MoQ bridge
+    // RTMP ingest bridged to MoQ
     let bridge = lvqr_ingest::RtmpMoqBridge::new(relay.origin().clone());
     let rtmp_config = lvqr_ingest::RtmpConfig {
         bind_addr: ([0, 0, 0, 0], args.rtmp_port).into(),
     };
     let rtmp_server = bridge.create_rtmp_server(rtmp_config);
 
-    // Start the admin HTTP server
-    let admin_registry = registry.clone();
+    // Admin HTTP + optional signal WebSocket
     let admin_addr: std::net::SocketAddr = ([0, 0, 0, 0], args.admin_port).into();
-    let admin_router = lvqr_admin::build_router(admin_registry);
+    let admin_router = lvqr_admin::build_router(registry.clone());
+
+    let combined_router = if args.mesh_enabled {
+        let mesh_config = lvqr_mesh::MeshConfig {
+            max_children: args.max_peers,
+            ..Default::default()
+        };
+        let _mesh = Arc::new(lvqr_mesh::MeshCoordinator::new(mesh_config));
+
+        let signal = lvqr_signal::SignalServer::new();
+        let signal_router = signal.router();
+
+        tracing::info!(
+            "peer mesh enabled (max_children={}, /signal endpoint active)",
+            args.max_peers
+        );
+
+        admin_router.merge(signal_router)
+    } else {
+        admin_router
+    };
 
     tracing::info!(addr = %admin_addr, "admin API listening");
 
@@ -106,7 +123,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         }
         result = async {
             let listener = tokio::net::TcpListener::bind(admin_addr).await?;
-            axum::serve(listener, admin_router).await
+            axum::serve(listener, combined_router).await
         } => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "admin server error");

@@ -1,5 +1,9 @@
 # LVQR - Live Video QUIC Relay
 
+[![CI](https://github.com/virgilvox/lvqr/actions/workflows/ci.yml/badge.svg)](https://github.com/virgilvox/lvqr/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/lvqr-core.svg)](https://crates.io/crates/lvqr-core)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+
 A single Rust binary that relays live video using QUIC/MoQ. Minimal-copy from ingest to delivery. Viewers become relays. Thousands of concurrent streams on a $6 droplet.
 
 ## Key Numbers

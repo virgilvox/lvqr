@@ -1,0 +1,16 @@
+services:
+  lvqr:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    ports:
+      - "4443:4443/udp"
+      - "1935:1935"
+      - "8080:8080"
+    environment:
+      - RUST_LOG=lvqr=info
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
