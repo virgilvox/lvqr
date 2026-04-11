@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 #[derive(Parser, Debug)]
 #[command(name = "lvqr", version, about = "Live Video QUIC Relay")]
@@ -68,8 +69,6 @@ async fn serve(args: ServeArgs) -> Result<()> {
         "starting LVQR relay"
     );
 
-    let registry = Arc::new(lvqr_core::Registry::new());
-
     // MoQ relay
     let relay_config = lvqr_relay::RelayConfig::new(([0, 0, 0, 0], args.port).into());
     let relay = lvqr_relay::RelayServer::new(relay_config);
@@ -77,15 +76,40 @@ async fn serve(args: ServeArgs) -> Result<()> {
     tracing::info!(addr = %relay_addr, "MoQ relay listening");
 
     // RTMP ingest bridged to MoQ
-    let bridge = lvqr_ingest::RtmpMoqBridge::new(relay.origin().clone());
+    let bridge = Arc::new(lvqr_ingest::RtmpMoqBridge::new(relay.origin().clone()));
     let rtmp_config = lvqr_ingest::RtmpConfig {
         bind_addr: ([0, 0, 0, 0], args.rtmp_port).into(),
     };
     let rtmp_server = bridge.create_rtmp_server(rtmp_config);
 
-    // Admin HTTP + optional signal WebSocket
+    // Admin HTTP API wired to real relay metrics and bridge state
+    let metrics = relay.metrics().clone();
+    let bridge_for_stats = bridge.clone();
+    let bridge_for_streams = bridge.clone();
+
+    let admin_state = lvqr_admin::AdminState::new(
+        move || {
+            let active = bridge_for_stats.active_stream_count() as u64;
+            lvqr_core::RelayStats {
+                publishers: active,
+                tracks: active * 2, // each RTMP stream creates video + audio tracks
+                subscribers: metrics.connections_active.load(Ordering::Relaxed),
+                bytes_received: 0,
+                bytes_sent: 0,
+                uptime_secs: 0,
+            }
+        },
+        move || {
+            bridge_for_streams
+                .stream_names()
+                .into_iter()
+                .map(|name| lvqr_admin::StreamInfo { name, subscribers: 0 })
+                .collect()
+        },
+    );
+
     let admin_addr: std::net::SocketAddr = ([0, 0, 0, 0], args.admin_port).into();
-    let admin_router = lvqr_admin::build_router(registry.clone());
+    let admin_router = lvqr_admin::build_router(admin_state);
 
     let combined_router = if args.mesh_enabled {
         let mesh_config = lvqr_mesh::MeshConfig {

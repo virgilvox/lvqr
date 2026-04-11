@@ -26,3 +26,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 [[bench]]
 name = "ringbuffer"
 harness = false
+
+[[bench]]
+name = "fanout"
+harness = false

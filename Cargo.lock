@@ -1359,7 +1359,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lvqr-admin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "lvqr-core",
@@ -1374,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1398,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-ingest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -1423,11 +1423,12 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "lvqr-mesh"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -1444,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-relay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1466,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-signal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "dashmap",
@@ -1480,7 +1481,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-test-utils"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "lvqr-core",
@@ -1493,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "console_error_panic_hook",

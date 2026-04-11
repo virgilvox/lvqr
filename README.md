@@ -4,17 +4,25 @@
 [![crates.io](https://img.shields.io/crates/v/lvqr-core.svg)](https://crates.io/crates/lvqr-core)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 
-A single Rust binary that relays live video using QUIC/MoQ. Minimal-copy from ingest to delivery. Viewers become relays. Thousands of concurrent streams on a $6 droplet.
+A Rust binary that relays live video using QUIC/MoQ. Built on moq-lite for zero-copy fan-out from ingest to delivery.
 
-## Key Numbers
+## Status (v0.2.0)
 
-| Metric | LVQR | Traditional |
-|--------|------|-------------|
-| Binary size | ~5MB | 200MB+ (Java/Go) |
-| Memory baseline | ~12MB | 200-500MB |
-| Buffer copies per viewer | 0 | 4+ |
-| Latency | <500ms | 2-6s (HLS) |
-| Max viewers (single $6 VPS) | 5000+ (with mesh) | 150-300 |
+**Working and tested:**
+- MoQ relay accepts QUIC/WebTransport connections, fans out tracks to subscribers (3 integration tests)
+- RTMP ingest via OBS/ffmpeg, bridged to MoQ tracks (2 integration tests)
+- Mesh coordinator builds balanced trees, handles orphan reassignment (13 tests)
+- Admin HTTP API reports real relay metrics and active streams (4 tests)
+- Core data structures: ring buffer, GOP cache, subscriber registry (25 tests)
+- Python admin client (8 tests)
+
+**Not yet working:**
+- Browser client (`@lvqr/core`, `@lvqr/player`) connects but cannot play video. The MoQ subscribe protocol framing is not implemented in the WASM/TypeScript layer.
+- Mesh relay between browser peers. The coordinator assigns tree positions but no code relays media between peers via WebRTC DataChannels.
+- Per-stream subscriber counts in the admin API (requires moq-lite to expose per-broadcast state).
+- io_uring zero-copy send path (behind feature flag, not yet implemented).
+
+**Not yet benchmarked at scale.** The "5000+ viewers on a $6 VPS" claim below is a design target, not a measured result. Single-relay fan-out works; mesh offload does not.
 
 ## Install
 
@@ -40,8 +48,7 @@ lvqr serve
 # Server: rtmp://your-server:1935/live
 # Stream Key: my-stream
 
-# Watch (browser)
-# https://your-server:8080/watch/my-stream
+# Watch via MoQ client (browser playback not yet functional)
 ```
 
 ## Architecture
@@ -51,28 +58,18 @@ lvqr/
   lvqr-core         Ring buffer, GOP cache, subscriber registry
   lvqr-relay         MoQ relay on moq-lite, fan-out engine
   lvqr-mesh          Peer discovery, tree building, gossip
-  lvqr-ingest        RTMP/WHIP/SRT to MoQ tracks
+  lvqr-ingest        RTMP to MoQ track bridge
   lvqr-signal        WebRTC signaling for mesh bootstrap
   lvqr-admin         HTTP API, stats, health checks
-  lvqr-wasm          WebAssembly browser bindings
+  lvqr-wasm          WebAssembly browser bindings (incomplete)
   lvqr-cli           Single binary entry point
 ```
 
 ### How It Works
 
-1. **Ingest**: OBS streams RTMP to LVQR. LVQR translates to MoQ tracks.
+1. **Ingest**: OBS streams RTMP to LVQR. The bridge translates FLV video/audio to MoQ tracks.
 2. **Relay**: MoQ subscribers receive tracks via QUIC/WebTransport. Data is ref-counted (`bytes::Bytes`), so each additional subscriber costs zero copies.
-3. **Mesh**: Viewers relay to other viewers via WebRTC DataChannels. The server seeds ~30 root peers; the mesh handles the rest. 75%+ CDN offload in production.
-
-### Zero-Copy Data Path
-
-```
-QUIC Ingest --> Decrypt (userspace) --> Ring Buffer (Bytes ref) --> QUIC Send (io_uring zc)
-                                             |
-                                       Subscriber A gets Bytes::clone() (refcount bump, no copy)
-                                       Subscriber B gets Bytes::clone()
-                                       Subscriber C gets Bytes::clone()
-```
+3. **Mesh** (planned): Viewers relay to other viewers via WebRTC DataChannels. The coordinator assigns tree positions but media relay is not yet implemented.
 
 ## Crates
 
@@ -84,24 +81,11 @@ QUIC Ingest --> Decrypt (userspace) --> Ring Buffer (Bytes ref) --> QUIC Send (i
 
 ## Client Libraries
 
-| Package | Install |
-|---------|---------|
-| JavaScript | `npm install @lvqr/core` |
-| Python | `pip install lvqr` |
-| Rust | `cargo add lvqr-core` |
-
-## Browser Player
-
-```html
-<script src="https://cdn.jsdelivr.net/npm/@lvqr/core/dist/index.global.js"></script>
-<lvqr-player src="https://relay.example.com/live/my-stream"></lvqr-player>
-```
-
-## Docker
-
-```bash
-docker run -p 4443:4443 -p 1935:1935 -p 8080:8080 ghcr.io/virgilvox/lvqr
-```
+| Package | Install | Status |
+|---------|---------|--------|
+| Rust | `cargo add lvqr-core` | Working |
+| Python | `pip install lvqr` | Admin client only |
+| JavaScript | `npm install @lvqr/core` | Connects but cannot play video |
 
 ## CLI Reference
 
@@ -126,32 +110,34 @@ curl http://localhost:8080/healthz
 # List active streams
 curl http://localhost:8080/api/v1/streams
 
-# Server stats
+# Server stats (connections, active publishers, tracks)
 curl http://localhost:8080/api/v1/stats
 ```
 
 ## Built On
 
-- [moq-lite](https://github.com/kixelated/moq) - Media over QUIC transport (interoperable with Cloudflare CDN)
-- [quinn](https://github.com/quinn-rs/quinn) - Production Rust QUIC implementation
+- [moq-lite](https://github.com/kixelated/moq) - Media over QUIC transport
+- [quinn](https://github.com/quinn-rs/quinn) - Rust QUIC implementation
 - [bytes](https://docs.rs/bytes) - Zero-copy byte buffers with ref-counting
 - [tokio](https://tokio.rs) - Async runtime
 
 ## Development
 
 ```bash
-# Run all tests
+# Run a specific crate's tests (fast)
+cargo test -p lvqr-relay --lib
+cargo test -p lvqr-ingest --test rtmp_bridge_integration
+
+# Run all tests (slower)
 cargo test --workspace
 
-# Run relay integration tests
-cargo test -p lvqr-relay --test relay_integration
+# Benchmarks
+cargo bench -p lvqr-core
 
 # Format and lint
 cargo fmt --all
 cargo clippy --workspace
 ```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development guide.
 
 ## License
 

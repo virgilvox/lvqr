@@ -60,33 +60,6 @@ impl WebTransportClient {
         Ok(result.into())
     }
 
-    /// Accept an incoming unidirectional stream from the server.
-    /// Returns the readable stream.
-    pub async fn accept_uni(&self) -> Result<JsValue, JsValue> {
-        let reader = self
-            .inner
-            .incoming_unidirectional_streams()
-            .get_reader()
-            .unchecked_into::<ReadableStreamDefaultReader>();
-
-        let result = JsFuture::from(reader.read()).await?;
-        let done = Reflect::get(&result, &JsValue::from_str("done"))?
-            .as_bool()
-            .unwrap_or(true);
-
-        if done {
-            return Err(JsValue::from_str("no incoming streams"));
-        }
-
-        let stream = Reflect::get(&result, &JsValue::from_str("value"))?;
-        Ok(stream)
-    }
-
-    /// Get the raw WebTransport object (for advanced JS interop).
-    pub fn raw(&self) -> &WebTransport {
-        &self.inner
-    }
-
     /// Close the connection.
     pub fn close(&self) {
         self.inner.close();
@@ -94,7 +67,6 @@ impl WebTransportClient {
 }
 
 /// Read a chunk from a ReadableStream reader.
-/// Returns the chunk as a JsValue (typically Uint8Array), or error.
 pub async fn read_from_stream(reader: &ReadableStreamDefaultReader) -> Result<JsValue, JsValue> {
     let result = JsFuture::from(reader.read()).await?;
     let done = Reflect::get(&result, &JsValue::from_str("done"))?

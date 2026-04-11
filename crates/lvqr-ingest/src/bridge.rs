@@ -154,4 +154,9 @@ impl RtmpMoqBridge {
     pub fn active_stream_count(&self) -> usize {
         self.streams.len()
     }
+
+    /// Names of active RTMP streams (e.g. "live/mystream").
+    pub fn stream_names(&self) -> Vec<String> {
+        self.streams.iter().map(|e| e.key().clone()).collect()
+    }
 }

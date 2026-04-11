@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/virgilvox/lvqr"
@@ -77,13 +77,13 @@ rml_rtmp = "0.8"
 rand = "0.8"
 
 # Internal crates
-lvqr-core = { version = "0.1.0", path = "crates/lvqr-core" }
-lvqr-relay = { version = "0.1.0", path = "crates/lvqr-relay" }
-lvqr-mesh = { version = "0.1.0", path = "crates/lvqr-mesh" }
-lvqr-ingest = { version = "0.1.0", path = "crates/lvqr-ingest" }
-lvqr-signal = { version = "0.1.0", path = "crates/lvqr-signal" }
-lvqr-admin = { version = "0.1.0", path = "crates/lvqr-admin" }
-lvqr-test-utils = { version = "0.1.0", path = "crates/lvqr-test-utils" }
+lvqr-core = { version = "0.2.0", path = "crates/lvqr-core" }
+lvqr-relay = { version = "0.2.0", path = "crates/lvqr-relay" }
+lvqr-mesh = { version = "0.2.0", path = "crates/lvqr-mesh" }
+lvqr-ingest = { version = "0.2.0", path = "crates/lvqr-ingest" }
+lvqr-signal = { version = "0.2.0", path = "crates/lvqr-signal" }
+lvqr-admin = { version = "0.2.0", path = "crates/lvqr-admin" }
+lvqr-test-utils = { version = "0.2.0", path = "crates/lvqr-test-utils" }
 
 [profile.release]
 lto = true
