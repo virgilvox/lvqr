@@ -47,7 +47,13 @@ fn write_full_box(buf: &mut BytesMut, box_type: &[u8; 4], version: u8, flags: u3
 // --- Init segment generation ---
 
 /// Generate a video init segment (ftyp + moov) for H.264/AVC.
+/// If width/height are 0, MSE may reject the segment -- pass actual resolution when known.
 pub fn video_init_segment(config: &VideoConfig) -> Bytes {
+    video_init_segment_with_size(config, 0, 0)
+}
+
+/// Generate a video init segment with explicit dimensions.
+pub fn video_init_segment_with_size(config: &VideoConfig, width: u16, height: u16) -> Bytes {
     let mut buf = BytesMut::with_capacity(512);
 
     // ftyp
@@ -97,8 +103,8 @@ pub fn video_init_segment(config: &VideoConfig) -> Bytes {
                 for &v in &[0x00010000u32, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000] {
                     buf.put_u32(v);
                 }
-                buf.put_u32(0); // width (not known from SPS without parsing)
-                buf.put_u32(0); // height
+                buf.put_u32((width as u32) << 16); // width (fixed-point 16.16)
+                buf.put_u32((height as u32) << 16); // height (fixed-point 16.16)
             });
 
             // mdia
@@ -149,8 +155,8 @@ pub fn video_init_segment(config: &VideoConfig) -> Bytes {
                                 buf.put_bytes(0, 6); // reserved
                                 buf.put_u16(1); // data_reference_index
                                 buf.put_bytes(0, 16); // pre_defined + reserved
-                                buf.put_u16(0); // width (unknown)
-                                buf.put_u16(0); // height (unknown)
+                                buf.put_u16(width);
+                                buf.put_u16(height);
                                 buf.put_u32(0x00480000); // horizresolution = 72 dpi
                                 buf.put_u32(0x00480000); // vertresolution = 72 dpi
                                 buf.put_u32(0); // reserved

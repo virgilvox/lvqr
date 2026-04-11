@@ -8,27 +8,19 @@ A Rust binary that relays live video using QUIC/MoQ. Built on moq-lite for zero-
 
 ## Status (v0.3.1)
 
-**Working and tested (102 Rust tests, 8 Python tests, all CI green):**
-- MoQ relay accepts QUIC/WebTransport connections, fans out tracks to subscribers (4 integration tests)
-- RTMP ingest via OBS/ffmpeg, remuxed from FLV to CMAF/fMP4 for browser compatibility (2 integration tests, 24 remux unit tests)
-- Mesh coordinator builds balanced trees, assigns peers, handles orphan reassignment (13 tests)
-- Mesh wired to relay connections and signal server: peers get tree assignments on connect (7 signal tests)
-- Admin HTTP API: relay stats, stream list, mesh state (6 tests)
-- WebSocket fMP4 relay fallback for browsers without WebTransport
-- Core data structures: ring buffer, GOP cache, subscriber registry (25 tests)
-- Python admin client (8 tests)
-- Benchmarks: Registry fanout ~230ns per publish to 500 subscribers
+**End-to-end browser streaming works.** Webcam -> VideoEncoder H.264 -> WebSocket -> LVQR server -> fMP4 remux -> MoQ -> WebSocket -> MSE playback. Verified in Chrome.
 
-**Browser playback pipeline (implemented, needs live testing):**
-- FLV-to-CMAF remuxing: H.264 SPS/PPS extraction, fMP4 init segments (ftyp+moov+avcC), media segments (moof+mdat)
-- MoQ protocol framing in TypeScript: SETUP handshake (IETF Draft14 wire format), Announce, Subscribe, Group/Frame reading
-- MSE player web component: auto-detects codec from init segment avcC box, SourceBuffer in sequence mode
-- WebRTC mesh peer client: DataChannel connections via SDP/ICE exchange through signal server
+**Working and tested (83 Rust tests, 8 Python tests, all CI green):**
+- Browser-to-browser streaming via WebSocket ingest + relay (E2E verified)
+- RTMP ingest via OBS/ffmpeg, remuxed from FLV to CMAF/fMP4 (2 integration tests, 24 remux unit tests)
+- MoQ relay: QUIC/WebTransport fan-out to subscribers (4 integration tests)
+- Mesh coordinator: tree assignment, orphan reassignment, signal push (13 + 7 tests)
+- Admin HTTP API: stats, streams, mesh state, CORS enabled (6 tests)
+- Test app with streamer, viewer, and admin dashboard (`test-app/`)
 
 **Known limitations:**
-- Browser playback has not been tested end-to-end with a real OBS + browser session
-- Peer-to-peer media forwarding via WebRTC DataChannels: peers get tree assignments and can connect, but media forwarding reliability is untested
-- Audio playback: video-only by default (audio requires a separate MSE SourceBuffer, not yet wired in the player)
+- Video only (no audio in browser playback yet)
+- WebRTC mesh peer media forwarding untested (coordination works, DataChannel relay untested)
 - No stream authentication or recording
 
 ## Install
@@ -48,21 +40,19 @@ cargo build --release
 ## Quickstart
 
 ```bash
-# Start the relay (auto-generates self-signed TLS cert)
+# Start the relay
 lvqr serve
 
-# Stream from OBS
-# Server: rtmp://your-server:1935/live
-# Stream Key: my-stream
+# Open the test app (stream from webcam, watch, monitor)
+cd test-app && python3 -m http.server 9000
+# Open http://localhost:9000 in Chrome
+# Stream tab: Preview -> Go Live (streams webcam via WebCodecs H.264)
+# Watch tab: Connect (plays via MSE)
+# Admin tab: Refresh (shows live stats)
 
-# Watch via WebSocket fallback (no WebTransport needed)
-# Connect a WebSocket client to ws://your-server:8080/ws/live/my-stream
-# Receives fMP4 binary frames (init segments + moof+mdat)
-
-# Watch via browser (WebTransport + MoQ)
-# <lvqr-player src="https://your-server:4443/live/my-stream"
-#              fingerprint="<cert-sha256-hex>" autoplay muted>
-# </lvqr-player>
+# Or stream from OBS/ffmpeg
+# Server: rtmp://localhost:1935/live  Stream Key: my-stream
+# Watch: ws://localhost:8080/ws/live/my-stream
 ```
 
 ## Architecture

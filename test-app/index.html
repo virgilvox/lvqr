@@ -159,7 +159,7 @@
     </div>
     <div class="field">
       <label>Broadcast</label>
-      <input id="watch-broadcast" value="live/test" placeholder="live/test">
+      <input id="watch-broadcast" value="live/webcam" placeholder="live/webcam">
     </div>
   </div>
 
@@ -314,6 +314,13 @@ function startWatch() {
 
   watchWs.onmessage = (e) => {
     const data = new Uint8Array(e.data);
+    const boxType = data.length > 8 ? String.fromCharCode(data[4], data[5], data[6], data[7]) : '??';
+    const hex = Array.from(data.slice(0, 16)).map(b => b.toString(16).padStart(2,'0')).join(' ');
+    if (boxType === 'ftyp') {
+      log('watch-log', '>>> INIT SEGMENT: ' + data.length + 'B [ftyp] ' + hex);
+    } else if (watchQueue.length < 5 || watchQueue.length % 30 === 0) {
+      log('watch-log', '#' + watchQueue.length + ' ' + data.length + 'B [' + boxType + '] ' + hex);
+    }
 
     // Detect init segment
     if (!watchSb && data.length > 8 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
@@ -323,10 +330,15 @@ function startWatch() {
 
       if (watchMs.readyState === 'open') {
         try {
+          log('watch-log', 'creating SourceBuffer: ' + mime);
           watchSb = watchMs.addSourceBuffer(mime);
           watchSb.mode = 'sequence';
-          watchSb.addEventListener('updateend', flushWatch);
-          watchSb.addEventListener('error', () => log('watch-log', 'SourceBuffer error'));
+          watchSb.addEventListener('updateend', () => {
+            if (!watchSb) return;
+            log('watch-log', 'appendBuffer OK, buffered: ' + (watchSb.buffered.length > 0 ? watchSb.buffered.end(0).toFixed(2) + 's' : '0s'));
+            flushWatch();
+          });
+          watchSb.addEventListener('error', (e) => log('watch-log', 'SourceBuffer error event: ' + e));
         } catch(err) {
           log('watch-log', 'addSourceBuffer failed: ' + err);
           setStatus('watch-status', 'err', 'MSE error: ' + err.message);
@@ -366,6 +378,13 @@ function flushWatch() {
       video.play().catch(() => {});
       setStatus('watch-status', 'ok', 'Playing');
       log('watch-log', 'playback started');
+    }
+    // Chase the live edge: if we fall behind, jump forward
+    if (watchSb && watchSb.buffered.length > 0) {
+      const end = watchSb.buffered.end(watchSb.buffered.length - 1);
+      if (end - video.currentTime > 0.5) {
+        video.currentTime = end - 0.1;
+      }
     }
   } catch(e) {
     if (e.name === 'QuotaExceededError') {
@@ -526,9 +545,16 @@ async function startEncoding(width, height) {
     output: (chunk, metadata) => {
       // Send codec config on first output (or when it changes)
       if (metadata?.decoderConfig?.description && !configSent) {
-        const desc = metadata.decoderConfig.description;
-        log('stream-log', 'sending AVCC config (' + desc.byteLength + ' bytes)');
-        sendFrame(0, 0, desc);
+        const desc = new Uint8Array(metadata.decoderConfig.description);
+        // Prepend width+height (u16 BE each) so the server can set them in the init segment
+        const configMsg = new Uint8Array(4 + desc.byteLength);
+        configMsg[0] = (width >> 8) & 0xFF;
+        configMsg[1] = width & 0xFF;
+        configMsg[2] = (height >> 8) & 0xFF;
+        configMsg[3] = height & 0xFF;
+        configMsg.set(desc, 4);
+        log('stream-log', 'sending AVCC config (' + desc.byteLength + ' bytes, ' + width + 'x' + height + ')');
+        sendFrame(0, 0, configMsg.buffer);
         configSent = true;
       }
 
@@ -551,7 +577,7 @@ async function startEncoding(width, height) {
   });
 
   videoEncoder.configure({
-    codec: 'avc1.42001E', // Baseline profile, level 3.0
+    codec: 'avc1.42C028', // Baseline profile, level 4.0 (supports up to 1080p)
     width: width,
     height: height,
     bitrate: 2_000_000,

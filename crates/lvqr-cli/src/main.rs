@@ -8,6 +8,7 @@ use clap::Parser;
 use moq_lite::Track;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use tower_http::cors::CorsLayer;
 
 #[derive(Parser, Debug)]
 #[command(name = "lvqr", version, about = "Live Video QUIC Relay")]
@@ -66,10 +67,12 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Shared state for the WebSocket relay handler.
+/// Shared state for WebSocket relay and ingest handlers.
 #[derive(Clone)]
 struct WsRelayState {
     origin: moq_lite::OriginProducer,
+    /// Stored init segments per broadcast, so viewers get them immediately on connect.
+    init_segments: Arc<dashmap::DashMap<String, Bytes>>,
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
@@ -125,6 +128,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // WebSocket fMP4 relay + WebSocket ingest
     let ws_state = WsRelayState {
         origin: relay.origin().clone(),
+        init_segments: Arc::new(dashmap::DashMap::new()),
     };
     let ws_router = axum::Router::new()
         .route("/ws/{*broadcast}", get(ws_relay_handler))
@@ -226,7 +230,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
         };
 
         admin_router.merge(ws_router)
-    };
+    }
+    .layer(CorsLayer::permissive());
 
     tracing::info!(addr = %admin_addr, "admin API listening");
 
@@ -410,31 +415,43 @@ async fn ws_ingest_session(mut socket: WebSocket, state: WsRelayState, broadcast
         let payload = Bytes::from(data[5..].to_vec());
 
         match msg_type {
-            // Video config: AVCDecoderConfigurationRecord
-            0 => match parse_avcc_record(&payload) {
-                Some(config) => {
-                    tracing::info!(
-                        broadcast = %broadcast,
-                        codec = %config.codec_string(),
-                        "WS ingest: video config received"
-                    );
-                    let init = remux::video_init_segment(&config);
-                    _video_config = Some(config.clone());
-                    video_init = Some(init);
+            // Video config: [u16 BE width][u16 BE height][AVCDecoderConfigurationRecord]
+            0 => {
+                if payload.len() < 6 {
+                    continue;
+                }
+                let vid_width = u16::from_be_bytes([payload[0], payload[1]]);
+                let vid_height = u16::from_be_bytes([payload[2], payload[3]]);
+                let avcc_data = &payload[4..];
 
-                    if !catalog_written {
-                        let json = remux::generate_catalog(Some(&config), None);
-                        if let Ok(mut group) = catalog_track.append_group() {
-                            let _ = group.write_frame(Bytes::from(json));
-                            let _ = group.finish();
-                            catalog_written = true;
+                match parse_avcc_record(avcc_data) {
+                    Some(config) => {
+                        tracing::info!(
+                            broadcast = %broadcast,
+                            codec = %config.codec_string(),
+                            width = vid_width,
+                            height = vid_height,
+                            "WS ingest: video config received"
+                        );
+                        let init = remux::video_init_segment_with_size(&config, vid_width, vid_height);
+                        _video_config = Some(config.clone());
+                        video_init = Some(init.clone());
+                        state.init_segments.insert(broadcast.clone(), init);
+
+                        if !catalog_written {
+                            let json = remux::generate_catalog(Some(&config), None);
+                            if let Ok(mut group) = catalog_track.append_group() {
+                                let _ = group.write_frame(Bytes::from(json));
+                                let _ = group.finish();
+                                catalog_written = true;
+                            }
                         }
                     }
+                    None => {
+                        tracing::warn!("invalid AVCC record from browser");
+                    }
                 }
-                None => {
-                    tracing::warn!("invalid AVCC record from browser");
-                }
-            },
+            }
             // Video keyframe
             1 => {
                 let Some(ref init) = video_init else { continue };

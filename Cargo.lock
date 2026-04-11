@@ -1380,6 +1380,7 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "dashmap",
  "futures",
  "lvqr-admin",
  "lvqr-core",
@@ -1394,6 +1395,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
