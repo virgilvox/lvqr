@@ -82,33 +82,17 @@ function decodeString(buf: Uint8Array, offset: number): [string, number] {
   return [str, newOffset + len];
 }
 
-/** Encode a MoQ Path (array of segments). */
-function encodePath(segments: string[]): Uint8Array {
-  const parts: Uint8Array[] = [encodeVarInt(segments.length)];
-  for (const seg of segments) {
-    parts.push(encodeString(seg));
-  }
-  let totalLen = 0;
-  for (const p of parts) totalLen += p.length;
-  const result = new Uint8Array(totalLen);
-  let off = 0;
-  for (const p of parts) {
-    result.set(p, off);
-    off += p.length;
-  }
-  return result;
+/**
+ * Encode a MoQ Path. In moq-lite, Path is a simple string
+ * (e.g. "live/test"), NOT a segmented array. Encoded as:
+ * varint(byte_length) + utf8_bytes.
+ */
+function encodePath(path: string): Uint8Array {
+  return encodeString(path);
 }
 
-function decodePath(buf: Uint8Array, offset: number): [string[], number] {
-  const [count, off1] = decodeVarInt(buf, offset);
-  const segments: string[] = [];
-  let off = off1;
-  for (let i = 0; i < count; i++) {
-    const [seg, newOff] = decodeString(buf, off);
-    segments.push(seg);
-    off = newOff;
-  }
-  return [segments, off];
+function decodePath(buf: Uint8Array, offset: number): [string, number] {
+  return decodeString(buf, offset);
 }
 
 /** Concatenate multiple Uint8Arrays. */
@@ -138,16 +122,15 @@ const CONTROL_TYPE_SUBSCRIBE = 2;
 
 /** Encode an AnnouncePlease message (request all announcements). */
 export function encodeAnnouncePlease(prefix: string): Uint8Array {
-  // Path with prefix segments. Empty string = 0 segments = request everything.
-  // Must match Rust's Path::from("") which produces Vec::new() (0 segments).
-  const segments = prefix ? prefix.split('/') : [];
-  const pathBytes = encodePath(segments);
+  // Path is encoded as a plain string (varint len + utf8).
+  // Empty string means "request all announcements".
+  const pathBytes = encodePath(prefix);
   return sizePrefix(pathBytes);
 }
 
 export interface AnnounceMessage {
   active: boolean;
-  path: string[];
+  path: string;
 }
 
 /** Decode an Announce message from the wire. Returns null if stream ended. */
@@ -171,7 +154,7 @@ export function decodeAnnounce(buf: Uint8Array, offset: number): [AnnounceMessag
 // --- AnnounceInit (Lite01/02: list of initial broadcasts) ---
 
 export interface AnnounceInit {
-  suffixes: string[][];
+  suffixes: string[];
 }
 
 export function decodeAnnounceInit(buf: Uint8Array, offset: number): [AnnounceInit, number] {
@@ -180,7 +163,7 @@ export function decodeAnnounceInit(buf: Uint8Array, offset: number): [AnnounceIn
   const end = off1 + size;
 
   const [count, off2] = decodeVarInt(buf, off1);
-  const suffixes: string[][] = [];
+  const suffixes: string[] = [];
   let off = off2;
   for (let i = 0; i < count; i++) {
     const [path, newOff] = decodePath(buf, off);
@@ -196,13 +179,13 @@ export function decodeAnnounceInit(buf: Uint8Array, offset: number): [AnnounceIn
 /** Encode a Subscribe message (moq-lite-01 format). */
 export function encodeSubscribe(
   id: number,
-  broadcastPath: string[],
+  broadcastPath: string,
   trackName: string,
   priority: number,
 ): Uint8Array {
   const body = concat(
     encodeVarInt(id),
-    encodePath(broadcastPath),
+    encodePath(broadcastPath),   // path is a plain string, not segmented
     encodeString(trackName),
     new Uint8Array([priority & 0xFF]),  // priority is u8, not varint
   );
@@ -372,7 +355,7 @@ export class MoqSubscriber {
     if (!value) return [];
 
     const [init] = decodeAnnounceInit(Uint8Array.from(value), 0);
-    const broadcasts = init.suffixes.map((segs) => segs.join('/'));
+    const broadcasts = init.suffixes;
 
     reader.releaseLock();
     writer.releaseLock();
@@ -382,7 +365,7 @@ export class MoqSubscriber {
 
   /** Subscribe to a track and start receiving frames. */
   async subscribe(
-    broadcastPath: string[],
+    broadcastPath: string,
     trackName: string,
     onFrame: (data: Uint8Array) => void,
   ): Promise<number> {

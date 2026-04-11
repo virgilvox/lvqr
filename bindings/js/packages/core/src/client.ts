@@ -117,11 +117,10 @@ export class LvqrClient {
     }
 
     if (this.moqSubscriber) {
-      const broadcastPath = broadcast.split('/');
       const trackNames = tracks ?? ['0.mp4', '1.mp4'];
 
       for (const trackName of trackNames) {
-        await this.moqSubscriber.subscribe(broadcastPath, trackName, (data) => {
+        await this.moqSubscriber.subscribe(broadcast, trackName, (data) => {
           this.emit('frame', data, trackName);
         });
       }
