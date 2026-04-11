@@ -1,6 +1,6 @@
 {
   "name": "@lvqr/core",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "LVQR client library for browser and Node.js - Live Video QUIC Relay",
   "license": "MIT OR Apache-2.0",
   "author": "Moheeb Zara <hackbuildvideo@gmail.com>",
