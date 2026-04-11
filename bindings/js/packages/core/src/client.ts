@@ -117,7 +117,9 @@ export class LvqrClient {
     }
 
     if (this.moqSubscriber) {
-      const trackNames = tracks ?? ['0.mp4', '1.mp4'];
+      // Default to video only. Audio requires a separate SourceBuffer in the player
+      // which isn't implemented yet. Pass ['0.mp4', '1.mp4'] to subscribe to both.
+      const trackNames = tracks ?? ['0.mp4'];
 
       for (const trackName of trackNames) {
         await this.moqSubscriber.subscribe(broadcast, trackName, (data) => {
