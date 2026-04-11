@@ -39,21 +39,20 @@ pub struct RelayMetrics {
     pub connections_active: AtomicU64,
 }
 
+/// Callback for connection lifecycle events.
+/// Called with (connection_id, connected: true/false).
+pub type ConnectionCallback = Arc<dyn Fn(u64, bool) + Send + Sync>;
+
 /// The MoQ relay server.
 ///
 /// Uses moq-native to accept WebTransport/QUIC connections and moq-lite's
-/// Origin system for zero-copy track fanout. Publishers and subscribers
-/// connect to the same Origin; moq-lite handles all data forwarding internally.
-///
-/// The relay is a thin connection manager. It does NOT parse or copy media data.
-/// Data flows through ref-counted `bytes::Bytes` buffers inside moq-lite.
+/// Origin system for zero-copy track fanout.
 #[cfg(feature = "quinn-transport")]
 pub struct RelayServer {
     config: RelayConfig,
-    /// Shared Origin: publishers write tracks into this,
-    /// subscribers read tracks from it. moq-lite routes everything.
     origin: moq_lite::OriginProducer,
     metrics: Arc<RelayMetrics>,
+    on_connection: Option<ConnectionCallback>,
 }
 
 #[cfg(feature = "quinn-transport")]
@@ -63,13 +62,17 @@ impl RelayServer {
             config,
             origin: moq_lite::OriginProducer::new(),
             metrics: Arc::new(RelayMetrics::default()),
+            on_connection: None,
         }
     }
 
+    /// Set a callback for connection lifecycle events.
+    /// Called with (conn_id, true) on connect, (conn_id, false) on disconnect.
+    pub fn set_connection_callback(&mut self, cb: ConnectionCallback) {
+        self.on_connection = Some(cb);
+    }
+
     /// Get the shared Origin for external track injection (e.g., RTMP ingest).
-    ///
-    /// An RTMP ingest module can create broadcasts and tracks on this Origin,
-    /// and they will be available to all MoQ subscribers automatically.
     pub fn origin(&self) -> &moq_lite::OriginProducer {
         &self.origin
     }
@@ -80,8 +83,6 @@ impl RelayServer {
     }
 
     /// Initialize and return the moq-native Server.
-    ///
-    /// Returns the server and the local address it is bound to.
     pub fn init_server(&self) -> Result<(moq_native::Server, SocketAddr), RelayError> {
         let mut server_config = moq_native::ServerConfig::default();
         server_config.bind = Some(self.config.bind_addr);
@@ -111,7 +112,6 @@ impl RelayServer {
     }
 
     /// Run the relay on a pre-initialized server.
-    /// Useful for tests where you need the server and local addr before running.
     pub async fn accept_loop(&self, server: &mut moq_native::Server) -> Result<(), RelayError> {
         let mut conn_id: u64 = 0;
 
@@ -123,21 +123,19 @@ impl RelayServer {
             let origin = self.origin.clone();
             let metrics = self.metrics.clone();
             let id = conn_id;
+            let on_conn = self.on_connection.clone();
+
+            if let Some(ref cb) = on_conn {
+                cb(id, true);
+            }
 
             tokio::spawn(async move {
                 info!(conn = id, transport = request.transport(), "new connection");
 
-                // The publish/subscribe swap: from the relay's perspective,
-                // we "publish" what the client wants to subscribe to (OriginConsumer),
-                // and we "consume" what the client wants to publish (OriginProducer).
-                //
-                // Both publishers and subscribers use the same Origin.
-                // moq-lite internally routes ANNOUNCE/SUBSCRIBE between them.
                 let session_result = request.with_publish(origin.consume()).with_consume(origin).ok().await;
 
                 match session_result {
                     Ok(session) => {
-                        // Hold the session open until the client disconnects.
                         if let Err(e) = session.closed().await {
                             warn!(conn = id, error = %e, "session closed with error");
                         } else {
@@ -150,6 +148,9 @@ impl RelayServer {
                 }
 
                 metrics.connections_active.fetch_sub(1, Ordering::Relaxed);
+                if let Some(ref cb) = on_conn {
+                    cb(id, false);
+                }
             });
         }
 

@@ -82,7 +82,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     // MoQ relay
     let relay_config = lvqr_relay::RelayConfig::new(([0, 0, 0, 0], args.port).into());
-    let relay = lvqr_relay::RelayServer::new(relay_config);
+    let mut relay = lvqr_relay::RelayServer::new(relay_config);
     let (mut moq_server, relay_addr) = relay.init_server()?;
     tracing::info!(addr = %relay_addr, "MoQ relay listening");
 
@@ -138,14 +138,77 @@ async fn serve(args: ServeArgs) -> Result<()> {
             max_children: args.max_peers,
             ..Default::default()
         };
-        let _mesh = Arc::new(lvqr_mesh::MeshCoordinator::new(mesh_config));
+        let mesh = Arc::new(lvqr_mesh::MeshCoordinator::new(mesh_config));
+
+        // Wire mesh coordinator to relay connection events
+        let mesh_for_cb = mesh.clone();
+        relay.set_connection_callback(Arc::new(move |conn_id, connected| {
+            let peer_id = format!("conn-{conn_id}");
+            if connected {
+                match mesh_for_cb.add_peer(peer_id.clone(), "default".to_string()) {
+                    Ok(assignment) => {
+                        tracing::info!(
+                            peer = %peer_id,
+                            role = ?assignment.role,
+                            parent = ?assignment.parent,
+                            depth = assignment.depth,
+                            "mesh: peer assigned"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(peer = %peer_id, error = ?e, "mesh: failed to assign peer");
+                    }
+                }
+            } else {
+                let orphans = mesh_for_cb.remove_peer(&peer_id);
+                if !orphans.is_empty() {
+                    tracing::info!(
+                        peer = %peer_id,
+                        orphans = orphans.len(),
+                        "mesh: peer removed, reassigning orphans"
+                    );
+                    for orphan in orphans {
+                        match mesh_for_cb.reassign_peer(&orphan) {
+                            Ok(assignment) => {
+                                tracing::debug!(
+                                    peer = %orphan,
+                                    new_parent = ?assignment.parent,
+                                    "mesh: orphan reassigned"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(peer = %orphan, error = ?e, "mesh: orphan reassign failed");
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+
+        // Background dead peer detection
+        let mesh_for_reaper = mesh.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let dead = mesh_for_reaper.find_dead_peers();
+                for peer_id in dead {
+                    tracing::info!(peer = %peer_id, "mesh: removing dead peer");
+                    let orphans = mesh_for_reaper.remove_peer(&peer_id);
+                    for orphan in orphans {
+                        let _ = mesh_for_reaper.reassign_peer(&orphan);
+                    }
+                }
+            }
+        });
 
         let signal = lvqr_signal::SignalServer::new();
         let signal_router = signal.router();
 
         tracing::info!(
-            "peer mesh enabled (max_children={}, /signal endpoint active)",
-            args.max_peers
+            peers = mesh.peer_count(),
+            max_children = args.max_peers,
+            "peer mesh enabled (/signal endpoint active)"
         );
 
         combined_router = combined_router.merge(signal_router);
