@@ -2,85 +2,89 @@
 
 ## Project Status
 
-**Current Phase**: Milestone 1 complete, ready for Milestone 2 (RTMP ingest)
+**Current Phase**: Milestones 1-5 complete. 6 crates published to crates.io.
 **Last Updated**: 2026-04-10
-**Total Tests**: 32 passing (25 core + 3 relay integration + 4 admin)
-**Clippy**: Zero warnings
-**WASM**: Builds successfully via wasm-pack
+**Total Tests**: 51 passing (25 core + 3 relay + 4 admin + 2 ingest + 13 mesh + 4 signal)
+**Published**: lvqr-core, lvqr-signal, lvqr-relay, lvqr-ingest, lvqr-mesh, lvqr-admin (all 0.1.0)
+**Pending Publish**: lvqr-cli (rate limited, retry after 2026-04-11 01:31 GMT)
 
-## What's Done
+## Published Crates
 
-### Scaffolding
-- Workspace Cargo.toml with 9 crates, workspace.package/dependency inheritance
-- CLAUDE.md, dual license MIT OR Apache-2.0
-- CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md
-- .gitignore, .rustfmt.toml (max_width=120), rust-toolchain.toml (stable + wasm32)
-- GitHub Actions CI (fmt, clippy, test on ubuntu+macos, WASM build, Docker)
-- Issue/PR templates, Dockerfile
-- README.md, per-crate READMEs
-- docs/architecture.md, docs/quickstart.md
+| Crate | Version | crates.io |
+|-------|---------|-----------|
+| lvqr-core | 0.1.0 | https://crates.io/crates/lvqr-core |
+| lvqr-signal | 0.1.0 | https://crates.io/crates/lvqr-signal |
+| lvqr-relay | 0.1.0 | https://crates.io/crates/lvqr-relay |
+| lvqr-ingest | 0.1.0 | https://crates.io/crates/lvqr-ingest |
+| lvqr-mesh | 0.1.0 | https://crates.io/crates/lvqr-mesh |
+| lvqr-admin | 0.1.0 | https://crates.io/crates/lvqr-admin |
+
+## What's Implemented
 
 ### lvqr-core (25 tests)
 - `RingBuffer`: Fixed-capacity circular buffer with `bytes::Bytes` ref-counted sharing
 - `GopCache`: GOP cache with keyframe detection and LRU eviction
 - `Registry`: tokio::sync::broadcast-based subscriber fanout with DashMap
-- Core types: StreamId, SubscriberId, TrackName, Frame, Gop, RelayStats
-- Benchmarks: criterion benchmarks for ring buffer operations
+- Core types, error types, benchmarks
 
 ### lvqr-relay (3 integration tests)
 - `RelayServer`: MoQ relay using moq-native Server + moq-lite Origin
-- Real QUIC integration tests: publish/subscribe, fanout to 3 subscribers, metrics
+- Real QUIC integration tests: publish/subscribe, fanout, metrics
 - Publish/subscribe swap pattern
-- Connection metrics tracking
+
+### lvqr-ingest (2 tests)
+- Full RTMP handshake and session handling via rml_rtmp
+- Callback-based media event architecture
+- `RtmpMoqBridge`: bridges RTMP to MoQ Origin (creates broadcasts/tracks)
+- FLV keyframe detection
+
+### lvqr-mesh (13 tests)
+- `MeshCoordinator`: relay tree topology with balanced peer assignment
+- Root peer management, relay tree depth control
+- Peer removal with orphan detection and reassignment
+- Heartbeat-based dead peer detection
+- 50-peer large tree formation test
+
+### lvqr-signal (4 tests)
+- `SignalServer`: WebSocket signaling for WebRTC peer connections
+- Register/Offer/Answer/IceCandidate message forwarding
+- Per-peer channels for message delivery
 
 ### lvqr-admin (4 tests)
-- Axum HTTP router: /healthz, /api/v1/stats, /api/v1/streams
-- Tests using axum::test::oneshot
+- Axum HTTP: /healthz, /api/v1/stats, /api/v1/streams
 
-### lvqr-test-utils
-- Port allocation, synthetic frame generation, TLS cert generation
+### lvqr-cli
+- Full CLI with relay + RTMP ingest + admin running concurrently
+- Graceful Ctrl+C shutdown
 
-### Stub Crates (Scaffolded, compilable, zero clippy warnings)
-- lvqr-ingest: RtmpServer config + error types
-- lvqr-mesh: MeshCoordinator with MeshConfig, PeerInfo
-- lvqr-signal: SignalServer with SignalMessage
-- lvqr-wasm: WASM init + version
-- lvqr-cli: clap CLI with `serve` subcommand
+### Infrastructure
+- GitHub Actions CI, Dockerfile, README, per-crate READMEs
+- docs/architecture.md, docs/quickstart.md
+- CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md
 
 ## What's Next
 
-### Milestone 2: RTMP Ingest
-1. Wire rml_rtmp to accept RTMP connections
-2. Parse FLV, extract H.264 NALUs
-3. Publish as MoQ tracks via `origin.create_broadcast()` + `broadcast.create_track()`
-4. Integration test: TCP RTMP handshake -> MoQ subscriber receives frames
+1. **Publish lvqr-cli** to crates.io (after rate limit expires ~2026-04-11 01:31 GMT)
+2. **WASM/JS bindings**: lvqr-wasm WebTransport client, @lvqr/core npm package
+3. **Python bindings**: admin client
+4. **Examples**: obs-to-browser walkthrough, docker-compose
+5. **Wire mesh into CLI**: connect MeshCoordinator + SignalServer to relay
 
-### Milestone 3: CLI Wiring
-1. Connect relay + ingest + admin in CLI binary
-2. TOML config file support
-3. Graceful shutdown
+## Key Technical Notes
 
-### Milestone 4: Peer Mesh
-1. MeshCoordinator: tree topology, peer assignment
-2. Gossip protocol for health monitoring
-3. lvqr-signal: WebRTC signaling over WebSocket
+### DashMap Deadlock Prevention
+In `MeshCoordinator::reassign_peer`, we must NOT hold a `get_mut()` write lock while calling `find_best_parent()` (which iterates the map). This causes DashMap deadlock. Fixed by finding the parent first, then acquiring the write lock.
 
-### Milestone 5: Browser Playback
-1. lvqr-wasm: WebTransport MoQ client
-2. @lvqr/core npm package with TypeScript wrapper
-3. @lvqr/player Web Component
-
-## Key Architecture Notes
-
-### moq-lite Origin Pattern
-The relay creates a shared `OriginProducer`. Every connection gets:
-```rust
-request.with_publish(origin.consume()).with_consume(origin).ok().await
+### Publishing Order
+Must publish in strict tier order with waits between:
 ```
-moq-lite handles ALL track routing internally. The relay is just a connection manager.
+Tier 0: lvqr-core
+Tier 1: lvqr-signal
+Tier 2: lvqr-relay, lvqr-ingest, lvqr-mesh
+Tier 3: lvqr-admin
+Tier 4: lvqr-cli
+```
+crates.io has a rate limit: ~10 new crates per period. We hit it after 6.
 
-### RTMP Ingest Integration
-Call `origin.create_broadcast("live/streamkey")` and `broadcast.create_track(Track::new("video"))` to inject media into the Origin. MoQ subscribers see it automatically.
-
-### Edition 2024
-The workspace uses Rust edition 2024 (stabilized in Rust 1.85, Feb 2025). This is correct and intentional. The project requires rust-version 1.85+.
+### Test Performance
+`cargo test --workspace` is slow (~5min) due to compilation + doc-tests. For development, test individual crates: `cargo test -p lvqr-mesh --lib`.

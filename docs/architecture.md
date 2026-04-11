@@ -11,22 +11,18 @@ Publisher (OBS/ffmpeg)
     |
     | RTMP (port 1935)
     v
-lvqr-ingest
+lvqr-ingest (RtmpMoqBridge)
     |
-    | MoQ tracks (bytes::Bytes ref-counted)
+    | MoQ tracks via OriginProducer
     v
-lvqr-core (Registry + Ring Buffer + GOP Cache)
-    |
-    | moq-lite OriginProducer/OriginConsumer
-    v
-lvqr-relay (MoQ over QUIC/WebTransport)
+lvqr-relay (MoQ over QUIC/WebTransport, port 4443)
     |
     +---> Subscriber A (browser via WebTransport)
     +---> Subscriber B (gets Bytes::clone, zero copy)
     +---> Subscriber C (same ref-counted buffer)
     |
     v
-lvqr-mesh (optional)
+lvqr-mesh (optional peer relay)
     |
     +---> Peer D relays to Peer E via WebRTC DataChannel
     +---> Peer E relays to Peers F, G, H
@@ -35,43 +31,83 @@ lvqr-mesh (optional)
 ## Crate Dependency Graph
 
 ```
-lvqr-core (no internal deps)
+lvqr-core (Tier 0 - no internal deps)
     |
-    +---> lvqr-signal
-    +---> lvqr-relay
-    +---> lvqr-ingest
-    +---> lvqr-admin
+    +---> lvqr-signal (Tier 1)
+    +---> lvqr-relay (Tier 2)
+    +---> lvqr-ingest (Tier 2)
+    |         |
+    |         +---> (also depends on moq-lite for bridge)
     |
-    +---> lvqr-mesh (also depends on lvqr-signal)
+    +---> lvqr-mesh (Tier 2, depends on lvqr-signal)
+    +---> lvqr-admin (Tier 3, depends on lvqr-core)
     |
-    +---> lvqr-cli (depends on all above)
-    +---> lvqr-wasm (browser-only subset of core)
+    +---> lvqr-cli (Tier 4 - depends on all above)
+    +---> lvqr-wasm (npm, not crates.io)
 ```
 
 ## Key Design Decisions
 
-### Why moq-lite, not moq-relay?
+### moq-lite Origin Pattern
 
-The `moq-relay` crate is a complete, opinionated relay binary. LVQR uses `moq-lite` (the transport layer only) to control the relay logic -- specifically to integrate our ring buffer, GOP cache, peer mesh, and RTMP ingest.
+The relay does NOT manually forward tracks. It creates a shared `OriginProducer` and gives every connection access:
+
+```rust
+// Every MoQ connection gets the shared Origin
+request.with_publish(origin.consume())  // send data TO subscriber
+       .with_consume(origin)            // receive data FROM publisher
+       .ok().await
+```
+
+moq-lite internally handles all ANNOUNCE/SUBSCRIBE/data routing through the shared Origin. The relay is a thin connection manager.
+
+### RTMP-to-MoQ Bridge
+
+The `RtmpMoqBridge` connects RTMP ingest callbacks to the MoQ Origin:
+
+```rust
+let bridge = RtmpMoqBridge::new(relay.origin().clone());
+let rtmp_server = bridge.create_rtmp_server(rtmp_config);
+```
+
+When RTMP `publish` event fires: `origin.create_broadcast("app/key")` + `broadcast.create_track("video")`
+When video data arrives: keyframes start new MoQ groups, delta frames append to current group.
+
+### Peer Mesh Tree
+
+The `MeshCoordinator` builds a relay tree:
+- First N peers become root peers (directly served by server)
+- Subsequent peers assigned as children of existing peers
+- Assignment algorithm: shallowest depth first, then fewest children (balanced load)
+- Max 3 children per peer, max 6 depth hops
+- Dead peer detection via heartbeat timeout
+- Orphaned children reassigned on parent disconnect
 
 ### Zero-Copy Fanout
 
-The critical performance property: when a publisher sends a frame, it lands in a `bytes::Bytes` buffer. Every subscriber receives a `Bytes::clone()`, which is a ref-count increment (no data copy). This is why LVQR can handle thousands of viewers with minimal CPU.
-
-### io_uring (Linux only)
-
-The `io-uring` feature flag enables `tokio-uring` for batched zero-copy sends on Linux. On macOS and other platforms, LVQR falls back to standard tokio networking. Both paths use the same relay logic.
-
-### Peer Mesh
-
-Viewers become relays via WebRTC DataChannels. The server seeds ~30 root peers; each peer can relay to up to 3 children. The mesh self-organizes, and the server's bandwidth multiplies exponentially.
+```
+QUIC Ingest --> Decrypt (userspace) --> Ring Buffer (Bytes ref) --> QUIC Send
+                                             |
+                                       Subscriber A: Bytes::clone() (refcount++)
+                                       Subscriber B: Bytes::clone() (no data copy)
+                                       Subscriber C: Bytes::clone()
+```
 
 ## Protocol Stack
 
 ```
-Application:  MoQ (Media over QUIC)
-Transport:    QUIC (via quinn)
-Delivery:     WebTransport (browsers), raw QUIC (native clients)
-Fallbacks:    WebSocket + fMP4, LL-HLS
-Mesh:         WebRTC DataChannels
+Application:  MoQ (Media over QUIC) via moq-lite
+Transport:    QUIC (via quinn) / WebTransport
+Ingest:       RTMP (via rml_rtmp)
+Mesh:         WebRTC DataChannels (signaling via WebSocket)
+Admin:        HTTP (via axum)
 ```
+
+## CLI Architecture
+
+`lvqr serve` starts three servers concurrently via `tokio::select!`:
+1. MoQ relay (QUIC/WebTransport on port 4443)
+2. RTMP ingest (TCP on port 1935)
+3. Admin HTTP API (TCP on port 8080)
+
+Graceful shutdown on SIGINT (Ctrl+C).
