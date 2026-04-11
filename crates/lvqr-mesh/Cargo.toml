@@ -26,4 +26,3 @@ rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-lvqr-test-utils = { workspace = true }

@@ -38,6 +38,5 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-lvqr-test-utils = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
