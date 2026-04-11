@@ -1386,6 +1386,7 @@ dependencies = [
  "lvqr-mesh",
  "lvqr-relay",
  "lvqr-signal",
+ "moq-lite",
  "rcgen 0.13.2",
  "rustls",
  "serde",

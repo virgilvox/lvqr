@@ -23,6 +23,7 @@ quinn-transport = ["lvqr-relay/quinn-transport"]
 [dependencies]
 lvqr-core = { workspace = true }
 lvqr-relay = { workspace = true }
+moq-lite = { workspace = true }
 lvqr-mesh = { workspace = true }
 lvqr-ingest = { workspace = true }
 lvqr-signal = { workspace = true }

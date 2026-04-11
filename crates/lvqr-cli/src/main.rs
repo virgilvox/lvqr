@@ -1,5 +1,10 @@
 use anyhow::Result;
+use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{Path, State, WebSocketUpgrade};
+use axum::response::IntoResponse;
+use axum::routing::get;
 use clap::Parser;
+use moq_lite::Track;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -60,6 +65,12 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Shared state for the WebSocket relay handler.
+#[derive(Clone)]
+struct WsRelayState {
+    origin: moq_lite::OriginProducer,
+}
+
 async fn serve(args: ServeArgs) -> Result<()> {
     tracing::info!(
         quic_port = args.port,
@@ -92,7 +103,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
             let active = bridge_for_stats.active_stream_count() as u64;
             lvqr_core::RelayStats {
                 publishers: active,
-                tracks: active * 2, // each RTMP stream creates video + audio tracks
+                tracks: active * 2,
                 subscribers: metrics.connections_active.load(Ordering::Relaxed),
                 bytes_received: 0,
                 bytes_sent: 0,
@@ -111,7 +122,18 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let admin_addr: std::net::SocketAddr = ([0, 0, 0, 0], args.admin_port).into();
     let admin_router = lvqr_admin::build_router(admin_state);
 
-    let combined_router = if args.mesh_enabled {
+    // WebSocket fMP4 relay: /ws/{broadcast_path}
+    // Subscribes to MoQ video+audio tracks server-side, forwards fMP4 frames over WS
+    let ws_state = WsRelayState {
+        origin: relay.origin().clone(),
+    };
+    let ws_router = axum::Router::new()
+        .route("/ws/{*broadcast}", get(ws_relay_handler))
+        .with_state(ws_state);
+
+    let mut combined_router = admin_router.merge(ws_router);
+
+    if args.mesh_enabled {
         let mesh_config = lvqr_mesh::MeshConfig {
             max_children: args.max_peers,
             ..Default::default()
@@ -126,10 +148,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
             args.max_peers
         );
 
-        admin_router.merge(signal_router)
-    } else {
-        admin_router
-    };
+        combined_router = combined_router.merge(signal_router);
+    }
 
     tracing::info!(addr = %admin_addr, "admin API listening");
 
@@ -158,5 +178,80 @@ async fn serve(args: ServeArgs) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// WebSocket relay handler: upgrades to WS, subscribes to MoQ tracks,
+/// forwards fMP4 frames as binary messages.
+async fn ws_relay_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<WsRelayState>,
+    Path(broadcast): Path<String>,
+) -> impl IntoResponse {
+    tracing::info!(broadcast = %broadcast, "WebSocket relay request");
+    ws.on_upgrade(move |socket| ws_relay_session(socket, state, broadcast))
+}
+
+/// Handle a single WebSocket relay session.
+async fn ws_relay_session(mut socket: WebSocket, state: WsRelayState, broadcast: String) {
+    let consumer = state.origin.consume();
+    let Some(bc) = consumer.consume_broadcast(&broadcast) else {
+        tracing::warn!(broadcast = %broadcast, "broadcast not found for WS relay");
+        let _ = socket
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: 4404,
+                reason: "broadcast not found".into(),
+            })))
+            .await;
+        return;
+    };
+
+    tracing::info!(broadcast = %broadcast, "WS relay session started");
+
+    // Subscribe to video track
+    let video_track = match bc.subscribe_track(&Track::new("0.mp4")) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            tracing::debug!(error = ?e, "no video track available");
+            None
+        }
+    };
+
+    // Forward video frames over WebSocket
+    if let Some(mut track) = video_track {
+        loop {
+            let group = match track.next_group().await {
+                Ok(Some(g)) => g,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::debug!(error = ?e, "video track error");
+                    break;
+                }
+            };
+
+            if let Err(e) = forward_group(&mut socket, group).await {
+                tracing::debug!(error = ?e, "WS send error");
+                break;
+            }
+        }
+    }
+
+    tracing::info!(broadcast = %broadcast, "WS relay session ended");
+}
+
+/// Forward all frames from a MoQ group as binary WebSocket messages.
+async fn forward_group(socket: &mut WebSocket, mut group: moq_lite::GroupConsumer) -> Result<(), axum::Error> {
+    loop {
+        match group.read_frame().await {
+            Ok(Some(frame)) => {
+                socket.send(Message::Binary(frame.to_vec().into())).await?;
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::debug!(error = ?e, "group read error");
+                break;
+            }
+        }
+    }
     Ok(())
 }
