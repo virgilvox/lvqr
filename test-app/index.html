@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LVQR Test</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    background: #f5f5f0;
+    color: #1a1a1a;
+    line-height: 1.5;
+  }
+  header {
+    border-bottom: 3px solid #1a1a1a;
+    padding: 20px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  header h1 { font-size: 18px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; }
+  header span { font-size: 12px; color: #888; }
+  nav {
+    display: flex;
+    border-bottom: 1px solid #1a1a1a;
+  }
+  nav a {
+    flex: 1;
+    text-align: center;
+    padding: 14px;
+    text-decoration: none;
+    color: #1a1a1a;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    border-right: 1px solid #1a1a1a;
+    transition: background 0.1s;
+  }
+  nav a:last-child { border-right: none; }
+  nav a:hover { background: #1a1a1a; color: #f5f5f0; }
+  nav a.active { background: #1a1a1a; color: #f5f5f0; }
+  .page { display: none; padding: 24px; max-width: 900px; margin: 0 auto; }
+  .page.active { display: block; }
+  h2 { font-size: 14px; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 16px; border-bottom: 1px solid #ccc; padding-bottom: 8px; }
+  .field { margin-bottom: 16px; }
+  .field label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #666; margin-bottom: 4px; }
+  .field input, .field select {
+    width: 100%;
+    padding: 10px 12px;
+    border: 2px solid #1a1a1a;
+    background: #fff;
+    font-family: inherit;
+    font-size: 14px;
+  }
+  button {
+    padding: 10px 24px;
+    border: 2px solid #1a1a1a;
+    background: #1a1a1a;
+    color: #f5f5f0;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 0.1s;
+  }
+  button:hover { background: #333; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.outline { background: transparent; color: #1a1a1a; }
+  button.outline:hover { background: #1a1a1a; color: #f5f5f0; }
+  button.danger { background: #c00; border-color: #c00; }
+  .row { display: flex; gap: 12px; align-items: flex-end; }
+  .row .field { flex: 1; }
+  video {
+    width: 100%;
+    background: #000;
+    border: 2px solid #1a1a1a;
+    aspect-ratio: 16/9;
+  }
+  .log {
+    background: #1a1a1a;
+    color: #0f0;
+    font-size: 12px;
+    padding: 12px;
+    max-height: 200px;
+    overflow-y: auto;
+    border: 2px solid #1a1a1a;
+    margin-top: 16px;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    border: 2px solid #1a1a1a;
+    padding: 16px;
+    background: #fff;
+  }
+  .stat-card .label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #666; }
+  .stat-card .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+  .stream-list { list-style: none; }
+  .stream-list li {
+    padding: 12px;
+    border: 2px solid #1a1a1a;
+    margin-bottom: -2px;
+    background: #fff;
+    display: flex;
+    justify-content: space-between;
+  }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  .badge.live { background: #0a0; color: #fff; }
+  .badge.off { background: #ccc; color: #666; }
+  .status-line {
+    font-size: 12px;
+    padding: 8px 12px;
+    border: 2px solid;
+    margin-bottom: 16px;
+  }
+  .status-line.ok { border-color: #0a0; background: #e6ffe6; }
+  .status-line.err { border-color: #c00; background: #ffe6e6; }
+  .status-line.info { border-color: #1a1a1a; background: #e6e6e6; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>LVQR Test</h1>
+  <span id="version">v0.3.1</span>
+</header>
+
+<nav>
+  <a href="#watch" class="active" onclick="showPage('watch')">Watch</a>
+  <a href="#stream" onclick="showPage('stream')">Stream</a>
+  <a href="#admin" onclick="showPage('admin')">Admin</a>
+</nav>
+
+<!-- WATCH PAGE -->
+<div id="page-watch" class="page active">
+  <h2>Watch a Stream</h2>
+
+  <div class="row">
+    <div class="field">
+      <label>Server</label>
+      <input id="watch-server" value="http://localhost:8080" placeholder="http://localhost:8080">
+    </div>
+    <div class="field">
+      <label>Broadcast</label>
+      <input id="watch-broadcast" value="live/test" placeholder="live/test">
+    </div>
+  </div>
+
+  <div style="margin-bottom: 16px; display: flex; gap: 8px;">
+    <button id="btn-watch" onclick="startWatch()">Connect</button>
+    <button id="btn-stop-watch" class="outline" onclick="stopWatch()" disabled>Stop</button>
+  </div>
+
+  <div id="watch-status" class="status-line info">Not connected</div>
+
+  <video id="watch-video" muted autoplay playsinline></video>
+
+  <div id="watch-log" class="log">Ready.\n</div>
+</div>
+
+<!-- STREAM PAGE -->
+<div id="page-stream" class="page">
+  <h2>Stream from Webcam</h2>
+
+  <div class="row">
+    <div class="field">
+      <label>RTMP Server</label>
+      <input id="stream-server" value="rtmp://localhost:1935/live" placeholder="rtmp://localhost:1935/live">
+    </div>
+    <div class="field">
+      <label>Stream Key</label>
+      <input id="stream-key" value="test" placeholder="test">
+    </div>
+  </div>
+
+  <div class="row" style="margin-bottom: 16px;">
+    <div class="field">
+      <label>Camera</label>
+      <select id="stream-camera"><option>Loading...</option></select>
+    </div>
+    <div class="field">
+      <label>Resolution</label>
+      <select id="stream-res">
+        <option value="1280x720">720p</option>
+        <option value="640x480">480p</option>
+        <option value="1920x1080">1080p</option>
+      </select>
+    </div>
+  </div>
+
+  <div style="margin-bottom: 16px; display: flex; gap: 8px;">
+    <button id="btn-preview" class="outline" onclick="startPreview()">Preview</button>
+    <button id="btn-stream" onclick="startStream()" disabled>Go Live</button>
+    <button id="btn-stop-stream" class="danger" onclick="stopStream()" disabled>Stop</button>
+  </div>
+
+  <div id="stream-status" class="status-line info">Select a camera and preview</div>
+
+  <video id="stream-preview" muted autoplay playsinline></video>
+
+  <div id="stream-log" class="log">Ready.\n</div>
+</div>
+
+<!-- ADMIN PAGE -->
+<div id="page-admin" class="page">
+  <h2>Admin Dashboard</h2>
+
+  <div class="row" style="margin-bottom: 16px;">
+    <div class="field">
+      <label>Admin URL</label>
+      <input id="admin-url" value="http://localhost:8080" placeholder="http://localhost:8080">
+    </div>
+    <div>
+      <button onclick="refreshAdmin()">Refresh</button>
+      <button class="outline" onclick="toggleAutoRefresh()" id="btn-auto">Auto: Off</button>
+    </div>
+  </div>
+
+  <div id="admin-health" class="status-line info">Not checked</div>
+
+  <div class="stats-grid" id="admin-stats">
+    <div class="stat-card"><div class="label">Publishers</div><div class="value" id="stat-publishers">--</div></div>
+    <div class="stat-card"><div class="label">Subscribers</div><div class="value" id="stat-subscribers">--</div></div>
+    <div class="stat-card"><div class="label">Tracks</div><div class="value" id="stat-tracks">--</div></div>
+    <div class="stat-card"><div class="label">Mesh Peers</div><div class="value" id="stat-mesh-peers">--</div></div>
+    <div class="stat-card"><div class="label">Mesh Offload</div><div class="value" id="stat-mesh-offload">--</div></div>
+  </div>
+
+  <h2>Active Streams</h2>
+  <ul class="stream-list" id="admin-streams">
+    <li style="color: #888;">No data yet</li>
+  </ul>
+
+  <div id="admin-log" class="log">Ready.\n</div>
+</div>
+
+<script>
+// -- Page routing --
+function showPage(name) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('nav a').forEach(a => a.classList.remove('active'));
+  document.getElementById('page-' + name).classList.add('active');
+  document.querySelector(`nav a[href="#${name}"]`).classList.add('active');
+}
+if (location.hash) showPage(location.hash.slice(1));
+
+// -- Logging --
+function log(id, msg) {
+  const el = document.getElementById(id);
+  const ts = new Date().toLocaleTimeString();
+  el.textContent += `[${ts}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function setStatus(id, cls, msg) {
+  const el = document.getElementById(id);
+  el.className = 'status-line ' + cls;
+  el.textContent = msg;
+}
+
+// =====================
+// WATCH (WebSocket fMP4)
+// =====================
+let watchWs = null;
+let watchMs = null;
+let watchSb = null;
+let watchQueue = [];
+
+function startWatch() {
+  const server = document.getElementById('watch-server').value;
+  const broadcast = document.getElementById('watch-broadcast').value;
+  const url = server.replace(/^http/, 'ws') + '/ws/' + broadcast;
+
+  stopWatch();
+  setStatus('watch-status', 'info', 'Connecting to ' + url);
+  log('watch-log', 'connecting: ' + url);
+
+  const video = document.getElementById('watch-video');
+  watchMs = new MediaSource();
+  video.src = URL.createObjectURL(watchMs);
+  watchSb = null;
+  watchQueue = [];
+
+  watchMs.addEventListener('sourceopen', () => {
+    log('watch-log', 'MediaSource open');
+  });
+
+  watchWs = new WebSocket(url);
+  watchWs.binaryType = 'arraybuffer';
+
+  watchWs.onopen = () => {
+    setStatus('watch-status', 'ok', 'Connected. Waiting for video...');
+    log('watch-log', 'WebSocket connected');
+    document.getElementById('btn-watch').disabled = true;
+    document.getElementById('btn-stop-watch').disabled = false;
+  };
+
+  watchWs.onmessage = (e) => {
+    const data = new Uint8Array(e.data);
+
+    // Detect init segment
+    if (!watchSb && data.length > 8 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
+      const codec = extractCodec(data);
+      const mime = `video/mp4; codecs="${codec}"`;
+      log('watch-log', 'init segment received, codec: ' + codec);
+
+      if (watchMs.readyState === 'open') {
+        try {
+          watchSb = watchMs.addSourceBuffer(mime);
+          watchSb.mode = 'sequence';
+          watchSb.addEventListener('updateend', flushWatch);
+          watchSb.addEventListener('error', () => log('watch-log', 'SourceBuffer error'));
+        } catch(err) {
+          log('watch-log', 'addSourceBuffer failed: ' + err);
+          setStatus('watch-status', 'err', 'MSE error: ' + err.message);
+          return;
+        }
+      }
+    }
+
+    if (data.length > 8 && data[4]===0x6D && data[5]===0x6F && data[6]===0x6F && data[7]===0x66) {
+      // moof - media segment, don't log every one
+    }
+
+    watchQueue.push(data);
+    flushWatch();
+  };
+
+  watchWs.onerror = () => {
+    setStatus('watch-status', 'err', 'WebSocket error');
+    log('watch-log', 'WebSocket error');
+  };
+
+  watchWs.onclose = (e) => {
+    setStatus('watch-status', 'info', 'Disconnected: ' + (e.reason || 'closed'));
+    log('watch-log', 'disconnected: code=' + e.code + ' reason=' + (e.reason || 'none'));
+    document.getElementById('btn-watch').disabled = false;
+    document.getElementById('btn-stop-watch').disabled = true;
+  };
+}
+
+function flushWatch() {
+  if (!watchSb || watchSb.updating || watchQueue.length === 0) return;
+  const data = watchQueue.shift();
+  try {
+    watchSb.appendBuffer(data);
+    const video = document.getElementById('watch-video');
+    if (video.paused && video.readyState >= 2) {
+      video.play().catch(() => {});
+      setStatus('watch-status', 'ok', 'Playing');
+      log('watch-log', 'playback started');
+    }
+  } catch(e) {
+    if (e.name === 'QuotaExceededError') {
+      trimWatch();
+      watchQueue.unshift(data);
+    } else {
+      log('watch-log', 'appendBuffer error: ' + e);
+    }
+  }
+}
+
+function trimWatch() {
+  if (!watchSb || watchSb.updating) return;
+  const b = watchSb.buffered;
+  if (b.length > 0 && b.end(b.length-1) - b.start(0) > 10) {
+    try { watchSb.remove(b.start(0), b.end(b.length-1) - 10); } catch {}
+  }
+}
+
+function stopWatch() {
+  if (watchWs) { watchWs.close(); watchWs = null; }
+  if (watchMs && watchMs.readyState === 'open') { try { watchMs.endOfStream(); } catch {} }
+  watchSb = null;
+  watchQueue = [];
+  document.getElementById('btn-watch').disabled = false;
+  document.getElementById('btn-stop-watch').disabled = true;
+}
+
+function extractCodec(data) {
+  for (let i = 0; i < data.length - 12; i++) {
+    if (data[i+4]===0x61 && data[i+5]===0x76 && data[i+6]===0x63 && data[i+7]===0x43) {
+      const p = data[i+8+1], c = data[i+8+2], l = data[i+8+3];
+      return 'avc1.' + [p,c,l].map(b => b.toString(16).toUpperCase().padStart(2,'0')).join('');
+    }
+  }
+  return 'avc1.64001F';
+}
+
+// =====================
+// STREAM (Webcam)
+// =====================
+let previewStream = null;
+let mediaRecorder = null;
+let streamWs = null;
+
+async function loadCameras() {
+  try {
+    await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const sel = document.getElementById('stream-camera');
+    sel.innerHTML = '';
+    devices.filter(d => d.kind === 'videoinput').forEach((d, i) => {
+      const opt = document.createElement('option');
+      opt.value = d.deviceId;
+      opt.textContent = d.label || 'Camera ' + (i+1);
+      sel.appendChild(opt);
+    });
+  } catch(e) {
+    log('stream-log', 'camera access denied: ' + e);
+  }
+}
+loadCameras();
+
+async function startPreview() {
+  const deviceId = document.getElementById('stream-camera').value;
+  const [w, h] = document.getElementById('stream-res').value.split('x').map(Number);
+
+  try {
+    if (previewStream) previewStream.getTracks().forEach(t => t.stop());
+    previewStream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId, width: w, height: h },
+      audio: true,
+    });
+    document.getElementById('stream-preview').srcObject = previewStream;
+    document.getElementById('btn-stream').disabled = false;
+    setStatus('stream-status', 'ok', 'Preview active. Click Go Live to stream.');
+    log('stream-log', 'preview started: ' + w + 'x' + h);
+  } catch(e) {
+    setStatus('stream-status', 'err', 'Camera error: ' + e.message);
+    log('stream-log', 'camera error: ' + e);
+  }
+}
+
+async function startStream() {
+  if (!previewStream) { log('stream-log', 'no preview active'); return; }
+
+  // Browser can't do RTMP directly. Instead, we use MediaRecorder to capture
+  // WebM/MP4 chunks and send via WebSocket. The server would need a WebSocket
+  // ingest endpoint to handle this (not yet implemented in LVQR).
+  //
+  // For now, this demonstrates the capture pipeline. To actually stream to LVQR,
+  // use OBS or ffmpeg pointed at the RTMP endpoint.
+
+  const server = document.getElementById('stream-server').value;
+  const key = document.getElementById('stream-key').value;
+
+  setStatus('stream-status', 'info', 'Starting capture...');
+  log('stream-log', 'Note: Browser cannot push RTMP directly.');
+  log('stream-log', 'Capturing locally via MediaRecorder.');
+  log('stream-log', 'To push to LVQR, use ffmpeg or OBS with:');
+  log('stream-log', '  Server: ' + server);
+  log('stream-log', '  Key: ' + key);
+
+  try {
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+      ? 'video/webm;codecs=vp9,opus'
+      : 'video/webm;codecs=vp8,opus';
+
+    mediaRecorder = new MediaRecorder(previewStream, {
+      mimeType,
+      videoBitsPerSecond: 2_000_000,
+    });
+
+    let chunks = 0;
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) {
+        chunks++;
+        if (chunks % 10 === 1) {
+          log('stream-log', 'captured ' + chunks + ' chunks (' + (e.data.size/1024).toFixed(1) + ' KB)');
+        }
+      }
+    };
+
+    mediaRecorder.start(1000); // 1s chunks
+    setStatus('stream-status', 'ok', 'Capturing (local only -- push via ffmpeg/OBS for relay)');
+    document.getElementById('btn-stream').disabled = true;
+    document.getElementById('btn-stop-stream').disabled = false;
+    log('stream-log', 'MediaRecorder started: ' + mimeType);
+  } catch(e) {
+    setStatus('stream-status', 'err', 'Capture error: ' + e.message);
+    log('stream-log', 'error: ' + e);
+  }
+}
+
+function stopStream() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();
+    log('stream-log', 'capture stopped');
+  }
+  mediaRecorder = null;
+  setStatus('stream-status', 'info', 'Stopped');
+  document.getElementById('btn-stream').disabled = false;
+  document.getElementById('btn-stop-stream').disabled = true;
+}
+
+// =====================
+// ADMIN
+// =====================
+let autoRefreshInterval = null;
+
+async function refreshAdmin() {
+  const base = document.getElementById('admin-url').value.replace(/\/$/, '');
+
+  // Health
+  try {
+    const r = await fetch(base + '/healthz');
+    if (r.ok) {
+      setStatus('admin-health', 'ok', 'Relay healthy');
+    } else {
+      setStatus('admin-health', 'err', 'Relay unhealthy: HTTP ' + r.status);
+    }
+  } catch(e) {
+    setStatus('admin-health', 'err', 'Cannot reach relay: ' + e.message);
+    log('admin-log', 'health check failed: ' + e);
+    return;
+  }
+
+  // Stats
+  try {
+    const r = await fetch(base + '/api/v1/stats');
+    const stats = await r.json();
+    document.getElementById('stat-publishers').textContent = stats.publishers;
+    document.getElementById('stat-subscribers').textContent = stats.subscribers;
+    document.getElementById('stat-tracks').textContent = stats.tracks;
+    log('admin-log', 'stats: ' + JSON.stringify(stats));
+  } catch(e) {
+    log('admin-log', 'stats error: ' + e);
+  }
+
+  // Mesh
+  try {
+    const r = await fetch(base + '/api/v1/mesh');
+    const mesh = await r.json();
+    document.getElementById('stat-mesh-peers').textContent = mesh.enabled ? mesh.peer_count : 'off';
+    document.getElementById('stat-mesh-offload').textContent = mesh.enabled ? mesh.offload_percentage.toFixed(1) + '%' : 'off';
+  } catch(e) {
+    document.getElementById('stat-mesh-peers').textContent = '--';
+    document.getElementById('stat-mesh-offload').textContent = '--';
+  }
+
+  // Streams
+  try {
+    const r = await fetch(base + '/api/v1/streams');
+    const streams = await r.json();
+    const list = document.getElementById('admin-streams');
+    if (streams.length === 0) {
+      list.innerHTML = '<li style="color: #888;">No active streams</li>';
+    } else {
+      list.innerHTML = streams.map(s =>
+        `<li>
+          <span>${s.name}</span>
+          <span class="badge live">live</span>
+        </li>`
+      ).join('');
+    }
+  } catch(e) {
+    log('admin-log', 'streams error: ' + e);
+  }
+}
+
+function toggleAutoRefresh() {
+  const btn = document.getElementById('btn-auto');
+  if (autoRefreshInterval) {
+    clearInterval(autoRefreshInterval);
+    autoRefreshInterval = null;
+    btn.textContent = 'Auto: Off';
+  } else {
+    refreshAdmin();
+    autoRefreshInterval = setInterval(refreshAdmin, 2000);
+    btn.textContent = 'Auto: On';
+  }
+}
+</script>
+</body>
+</html>

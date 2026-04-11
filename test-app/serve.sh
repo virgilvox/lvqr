@@ -1,0 +1,15 @@
+#!/bin/bash
+# Serve the test app on port 9000
+echo "Test app: http://localhost:9000"
+echo ""
+echo "Make sure lvqr is running:"
+echo "  cargo run -p lvqr-cli -- serve"
+echo ""
+echo "Push a test stream:"
+echo "  ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 \\"
+echo "    -f lavfi -i sine=frequency=440:sample_rate=44100 \\"
+echo "    -c:v libx264 -preset ultrafast -tune zerolatency -g 60 \\"
+echo "    -c:a aac -b:a 128k \\"
+echo "    -f flv rtmp://localhost:1935/live/test"
+echo ""
+python3 -m http.server 9000 --directory "$(dirname "$0")"
