@@ -32,7 +32,7 @@ export class LvqrPlayerElement extends HTMLElement {
   private mediaSource: MediaSource | null = null;
   private sourceBuffer: SourceBuffer | null = null;
   private pendingBuffers: Uint8Array[] = [];
-  private mimeType = 'video/mp4; codecs="avc1.64001F,mp4a.40.2"';
+  private initReceived = false;
 
   static get observedAttributes(): string[] {
     return ['src', 'autoplay', 'muted', 'fingerprint'];
@@ -106,7 +106,6 @@ export class LvqrPlayerElement extends HTMLElement {
     const src = this.getAttribute('src');
     if (!src) return;
 
-    // Parse URL: "https://relay:4443/live/stream" -> relayUrl + broadcast path
     const url = new URL(src);
     const broadcast = url.pathname.replace(/^\//, '');
     const relayUrl = `${url.protocol}//${url.host}`;
@@ -130,15 +129,14 @@ export class LvqrPlayerElement extends HTMLElement {
         this.setStatus(reason ? `disconnected: ${reason}` : 'disconnected');
       });
 
-      // Set up MSE before connecting
-      this.setupMediaSource();
+      // Set up MSE (SourceBuffer is created lazily when first init segment arrives)
+      this.mediaSource = new MediaSource();
+      this.videoEl.src = URL.createObjectURL(this.mediaSource);
 
-      // Connect and subscribe
       await this.client.connect();
 
-      // Receive fMP4 frames and feed to MSE
       this.client.on('frame', (data: Uint8Array, _track: string) => {
-        this.appendToBuffer(data);
+        this.handleFrame(data);
       });
 
       await this.client.subscribe(broadcast);
@@ -162,39 +160,52 @@ export class LvqrPlayerElement extends HTMLElement {
     this.mediaSource = null;
     this.sourceBuffer = null;
     this.pendingBuffers = [];
+    this.initReceived = false;
     this.setStatus('');
   }
 
-  private setupMediaSource(): void {
-    this.mediaSource = new MediaSource();
-    this.videoEl.src = URL.createObjectURL(this.mediaSource);
+  /** Handle an incoming fMP4 frame. Detect init segment and create SourceBuffer. */
+  private handleFrame(data: Uint8Array): void {
+    // Detect fMP4 init segment by checking for 'ftyp' box
+    if (!this.initReceived && data.length > 8 && isInitSegment(data)) {
+      this.initReceived = true;
 
-    this.mediaSource.addEventListener('sourceopen', () => {
-      if (!this.mediaSource) return;
+      // Extract codec from avcC box in the init segment
+      const codec = extractCodecFromInit(data);
+      const mimeType = `video/mp4; codecs="${codec}"`;
 
-      try {
-        this.sourceBuffer = this.mediaSource.addSourceBuffer(this.mimeType);
-        this.sourceBuffer.mode = 'sequence';
-
-        this.sourceBuffer.addEventListener('updateend', () => {
-          this.flushPending();
+      if (this.mediaSource?.readyState === 'open') {
+        this.createSourceBuffer(mimeType);
+      } else {
+        this.mediaSource?.addEventListener('sourceopen', () => {
+          this.createSourceBuffer(mimeType);
         });
-
-        this.sourceBuffer.addEventListener('error', () => {
-          this.setStatus('buffer error');
-        });
-
-        // Flush any frames that arrived before sourceopen
-        this.flushPending();
-      } catch (e) {
-        this.setStatus(`MSE error: ${e}`);
       }
-    });
-  }
+    }
 
-  private appendToBuffer(data: Uint8Array): void {
     this.pendingBuffers.push(data);
     this.flushPending();
+  }
+
+  private createSourceBuffer(mimeType: string): void {
+    if (!this.mediaSource || this.sourceBuffer) return;
+
+    try {
+      this.sourceBuffer = this.mediaSource.addSourceBuffer(mimeType);
+      this.sourceBuffer.mode = 'sequence';
+
+      this.sourceBuffer.addEventListener('updateend', () => {
+        this.flushPending();
+      });
+
+      this.sourceBuffer.addEventListener('error', () => {
+        this.setStatus('buffer error');
+      });
+
+      this.flushPending();
+    } catch (e) {
+      this.setStatus(`MSE error: ${e}`);
+    }
   }
 
   private flushPending(): void {
@@ -206,15 +217,11 @@ export class LvqrPlayerElement extends HTMLElement {
     try {
       this.sourceBuffer.appendBuffer(new Uint8Array(data) as unknown as ArrayBuffer);
 
-      // Auto-play once we have data
       if (this.videoEl.paused && this.videoEl.readyState >= 2) {
-        this.videoEl.play().catch(() => {
-          // Autoplay may be blocked; user interaction needed
-        });
+        this.videoEl.play().catch(() => {});
         this.setStatus('');
       }
     } catch (e) {
-      // QuotaExceededError: trim old buffered data
       if (e instanceof DOMException && e.name === 'QuotaExceededError') {
         this.trimBuffer();
         this.pendingBuffers.unshift(data);
@@ -229,7 +236,6 @@ export class LvqrPlayerElement extends HTMLElement {
     if (buffered.length > 0) {
       const start = buffered.start(0);
       const end = buffered.end(buffered.length - 1);
-      // Keep only the last 10 seconds
       if (end - start > 10) {
         try {
           this.sourceBuffer.remove(start, end - 10);
@@ -243,6 +249,39 @@ export class LvqrPlayerElement extends HTMLElement {
   private setStatus(text: string): void {
     this.statusEl.textContent = text;
   }
+}
+
+/** Check if data starts with an ftyp box (fMP4 init segment). */
+function isInitSegment(data: Uint8Array): boolean {
+  return data[4] === 0x66 && data[5] === 0x74 && data[6] === 0x79 && data[7] === 0x70; // "ftyp"
+}
+
+/**
+ * Extract H.264 codec string from an fMP4 init segment by finding the avcC box.
+ * Falls back to a generic high-profile codec if parsing fails.
+ */
+function extractCodecFromInit(data: Uint8Array): string {
+  // Scan for "avcC" box in the init segment
+  for (let i = 0; i < data.length - 8; i++) {
+    if (data[i + 4] === 0x61 && data[i + 5] === 0x76 && data[i + 6] === 0x63 && data[i + 7] === 0x43) {
+      // avcC found at offset i. Box payload starts at i+8.
+      // AVCDecoderConfigurationRecord: [version][profile][compat][level]
+      const payload = i + 8;
+      if (payload + 4 <= data.length) {
+        const profile = data[payload + 1];
+        const compat = data[payload + 2];
+        const level = data[payload + 3];
+        return `avc1.${hex(profile)}${hex(compat)}${hex(level)}`;
+      }
+    }
+  }
+
+  // Fallback: High profile, level 3.1
+  return 'avc1.64001F';
+}
+
+function hex(n: number): string {
+  return n.toString(16).toUpperCase().padStart(2, '0');
 }
 
 // Register the custom element

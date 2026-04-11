@@ -238,27 +238,49 @@ export function decodeGroupHeader(buf: Uint8Array, offset: number): [GroupHeader
 }
 
 // --- SETUP handshake ---
+//
+// When a browser connects via WebTransport (no ALPN negotiation),
+// the server uses IETF Draft14 encoding for the SETUP exchange:
+// - Type: u8 (CLIENT_SETUP=0x20, SERVER_SETUP=0x21)
+// - Size: u16 big-endian (NOT varint)
+// - Body: varint fields
+//
+// After SETUP, the session switches to the negotiated version (Lite01).
 
 const CLIENT_SETUP = 0x20;
 const SERVER_SETUP = 0x21;
 const VERSION_LITE01 = 0xff0dad01;
 
-/** Encode CLIENT_SETUP message for moq-lite-01. */
+/** Encode u16 as big-endian bytes. */
+function encodeU16(value: number): Uint8Array {
+  return new Uint8Array([(value >> 8) & 0xFF, value & 0xFF]);
+}
+
+/** Decode u16 from big-endian bytes. */
+function decodeU16(buf: Uint8Array, offset: number): [number, number] {
+  const value = (buf[offset] << 8) | buf[offset + 1];
+  return [value, offset + 2];
+}
+
+/** Encode CLIENT_SETUP message (IETF Draft14 wire format). */
 function encodeClientSetup(): Uint8Array {
-  // Body: varint version_count + version codes + parameters (empty)
+  // Body: varint version_count + varint version_code + parameters
+  // Parameters: IETF format with MaxRequestId and Implementation
+  // For simplicity, send empty parameters (server doesn't require them)
   const body = concat(
-    encodeVarInt(1),               // 1 version
-    encodeVarInt(VERSION_LITE01),  // moq-lite-01
+    encodeVarInt(1),               // 1 supported version
+    encodeVarInt(VERSION_LITE01),  // moq-lite-01 (0xff0dad01)
+    // empty parameters
   );
-  // CLIENT_SETUP: type (0x20) + varint size + body
+  // CLIENT_SETUP: [u8 type][u16 BE size][body]
   return concat(
     new Uint8Array([CLIENT_SETUP]),
-    encodeVarInt(body.length),
+    encodeU16(body.length),
     body,
   );
 }
 
-/** Read SERVER_SETUP response, return the negotiated version. */
+/** Read SERVER_SETUP response (IETF Draft14 wire format). */
 function decodeServerSetup(buf: Uint8Array, offset: number): [number, number] {
   const type_ = buf[offset];
   if (type_ !== SERVER_SETUP) {
@@ -266,11 +288,11 @@ function decodeServerSetup(buf: Uint8Array, offset: number): [number, number] {
   }
   offset += 1;
 
-  // varint size
-  const [size, off1] = decodeVarInt(buf, offset);
+  // u16 big-endian size
+  const [size, off1] = decodeU16(buf, offset);
   const end = off1 + size;
 
-  // varint version
+  // varint version code
   const [version, _off2] = decodeVarInt(buf, off1);
 
   return [version, end];
