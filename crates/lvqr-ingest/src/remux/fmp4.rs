@@ -394,8 +394,9 @@ pub fn video_segment(sequence: u32, base_dts: u64, samples: &[VideoSample]) -> B
             // trun: sample_count, data_offset, per-sample: duration, size, flags, cts_offset
             // flags: 0x000001 (data-offset) | 0x000100 (duration) | 0x000200 (size)
             //      | 0x000400 (flags) | 0x000800 (cts offset)
+            // Version 1 for signed composition time offsets (B-frames can have negative CTS)
             let trun_flags: u32 = 0x000001 | 0x000100 | 0x000200 | 0x000400 | 0x000800;
-            write_full_box(buf, b"trun", 0, trun_flags, |buf| {
+            write_full_box(buf, b"trun", 1, trun_flags, |buf| {
                 buf.put_u32(samples.len() as u32);
                 // data_offset placeholder -- we'll fix this after writing moof
                 let data_offset_pos = buf.len();

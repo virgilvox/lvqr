@@ -138,8 +138,9 @@ const CONTROL_TYPE_SUBSCRIBE = 2;
 
 /** Encode an AnnouncePlease message (request all announcements). */
 export function encodeAnnouncePlease(prefix: string): Uint8Array {
-  // Path with prefix segments (empty string = request everything)
-  const segments = prefix ? prefix.split('/') : [''];
+  // Path with prefix segments. Empty string = 0 segments = request everything.
+  // Must match Rust's Path::from("") which produces Vec::new() (0 segments).
+  const segments = prefix ? prefix.split('/') : [];
   const pathBytes = encodePath(segments);
   return sizePrefix(pathBytes);
 }
@@ -203,7 +204,7 @@ export function encodeSubscribe(
     encodeVarInt(id),
     encodePath(broadcastPath),
     encodeString(trackName),
-    encodeVarInt(priority),
+    new Uint8Array([priority & 0xFF]),  // priority is u8, not varint
   );
   return sizePrefix(body);
 }
