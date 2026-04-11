@@ -1,0 +1,48 @@
+{
+  "name": "@lvqr/core",
+  "version": "0.1.0",
+  "description": "LVQR client library for browser and Node.js - Live Video QUIC Relay",
+  "license": "MIT OR Apache-2.0",
+  "author": "Moheeb Zara <hackbuildvideo@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/virgilvox/lvqr",
+    "directory": "bindings/js/packages/core"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./wasm": {
+      "types": "./wasm/lvqr_wasm.d.ts",
+      "import": "./wasm/lvqr_wasm.js"
+    }
+  },
+  "files": [
+    "dist",
+    "wasm"
+  ],
+  "scripts": {
+    "build:wasm": "wasm-pack build ../../../../crates/lvqr-wasm --target web --out-dir ../../bindings/js/packages/core/wasm",
+    "build:ts": "tsc",
+    "build": "npm run build:ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "streaming",
+    "video",
+    "quic",
+    "moq",
+    "webtransport",
+    "relay",
+    "lvqr"
+  ],
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

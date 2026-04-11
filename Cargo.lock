@@ -1495,12 +1495,14 @@ dependencies = [
 name = "lvqr-wasm"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "console_error_panic_hook",
  "js-sys",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
 ]

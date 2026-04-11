@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LVQR Player Demo</title>
+  <style>
+    body {
+      margin: 0;
+      background: #111;
+      color: #eee;
+      font-family: monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem;
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 1rem; }
+    lvqr-player {
+      width: 100%;
+      max-width: 800px;
+      aspect-ratio: 16/9;
+      border: 1px solid #333;
+    }
+    .controls {
+      margin-top: 1rem;
+      display: flex;
+      gap: 0.5rem;
+    }
+    input {
+      background: #222;
+      border: 1px solid #444;
+      color: #eee;
+      padding: 0.5rem;
+      font-family: monospace;
+      width: 400px;
+    }
+    button {
+      background: #ff3366;
+      color: white;
+      border: none;
+      padding: 0.5rem 1rem;
+      cursor: pointer;
+      font-family: monospace;
+    }
+    button:hover { background: #e62d5a; }
+    .info {
+      margin-top: 1rem;
+      font-size: 0.8rem;
+      color: #666;
+      max-width: 600px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <h1>LVQR Player</h1>
+
+  <lvqr-player id="player" muted></lvqr-player>
+
+  <div class="controls">
+    <input id="url" type="text" placeholder="https://relay.example.com:4443/live/stream" />
+    <button onclick="play()">Play</button>
+    <button onclick="stop()">Stop</button>
+  </div>
+
+  <div class="info">
+    Enter the full URL to your LVQR relay stream. Format: https://host:port/broadcast/track
+  </div>
+
+  <!-- Load the player component -->
+  <script type="module">
+    // In production, use: import '@lvqr/player';
+    // For local development, import from the built package:
+    // import '../../bindings/js/packages/player/dist/index.js';
+
+    // Make play/stop available globally
+    window.play = function() {
+      const url = document.getElementById('url').value;
+      if (!url) return;
+      const player = document.getElementById('player');
+      player.setAttribute('src', url);
+      player.startPlayback();
+    };
+
+    window.stop = function() {
+      document.getElementById('player').stop();
+    };
+  </script>
+</body>
+</html>
