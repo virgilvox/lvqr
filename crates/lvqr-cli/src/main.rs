@@ -3,6 +3,7 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use bytes::Bytes;
 use clap::Parser;
 use moq_lite::Track;
 use std::sync::Arc;
@@ -121,12 +122,13 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     let admin_addr: std::net::SocketAddr = ([0, 0, 0, 0], args.admin_port).into();
 
-    // WebSocket fMP4 relay: /ws/{broadcast_path}
+    // WebSocket fMP4 relay + WebSocket ingest
     let ws_state = WsRelayState {
         origin: relay.origin().clone(),
     };
     let ws_router = axum::Router::new()
         .route("/ws/{*broadcast}", get(ws_relay_handler))
+        .route("/ingest/{*broadcast}", get(ws_ingest_handler))
         .with_state(ws_state);
 
     let combined_router = {
@@ -329,4 +331,221 @@ async fn forward_group(socket: &mut WebSocket, mut group: moq_lite::GroupConsume
         }
     }
     Ok(())
+}
+
+// =====================================================================
+// WebSocket Ingest: browser VideoEncoder H.264 -> fMP4 -> MoQ
+// =====================================================================
+//
+// Wire format (binary WebSocket messages):
+//   [u8 type][u32 BE timestamp_ms][payload]
+//
+// Types:
+//   0 = video config (AVCDecoderConfigurationRecord from VideoEncoder)
+//   1 = video keyframe (AVCC-format NALUs)
+//   2 = video delta frame (AVCC-format NALUs)
+
+/// WebSocket ingest handler: browser pushes H.264 frames, server publishes to MoQ.
+async fn ws_ingest_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<WsRelayState>,
+    Path(broadcast): Path<String>,
+) -> impl IntoResponse {
+    tracing::info!(broadcast = %broadcast, "WebSocket ingest request");
+    ws.on_upgrade(move |socket| ws_ingest_session(socket, state, broadcast))
+}
+
+async fn ws_ingest_session(mut socket: WebSocket, state: WsRelayState, broadcast: String) {
+    use lvqr_ingest::remux;
+
+    tracing::info!(broadcast = %broadcast, "WS ingest session started");
+
+    // Create MoQ broadcast and tracks
+    let Some(mut bc) = state.origin.create_broadcast(&broadcast) else {
+        tracing::warn!(broadcast = %broadcast, "broadcast creation failed");
+        let _ = socket
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: 4409,
+                reason: "broadcast already exists".into(),
+            })))
+            .await;
+        return;
+    };
+
+    let Ok(mut video_track) = bc.create_track(Track::new("0.mp4")) else {
+        tracing::warn!("failed to create video track");
+        return;
+    };
+    let Ok(mut catalog_track) = bc.create_track(Track::new(".catalog")) else {
+        tracing::warn!("failed to create catalog track");
+        return;
+    };
+
+    let mut _video_config: Option<remux::VideoConfig> = None;
+    let mut video_init: Option<Bytes> = None;
+    let mut video_group: Option<moq_lite::GroupProducer> = None;
+    let mut video_seq: u32 = 0;
+    let mut catalog_written = false;
+
+    // Confirm to the browser that ingest is ready
+    let _ = socket.send(Message::Text(r#"{"status":"ready"}"#.into())).await;
+
+    while let Some(msg) = socket.recv().await {
+        let data = match msg {
+            Ok(Message::Binary(data)) => data,
+            Ok(Message::Close(_)) => break,
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::debug!(error = ?e, "WS ingest recv error");
+                break;
+            }
+        };
+
+        if data.len() < 5 {
+            continue;
+        }
+
+        let msg_type = data[0];
+        let timestamp = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+        let payload = Bytes::from(data[5..].to_vec());
+
+        match msg_type {
+            // Video config: AVCDecoderConfigurationRecord
+            0 => match parse_avcc_record(&payload) {
+                Some(config) => {
+                    tracing::info!(
+                        broadcast = %broadcast,
+                        codec = %config.codec_string(),
+                        "WS ingest: video config received"
+                    );
+                    let init = remux::video_init_segment(&config);
+                    _video_config = Some(config.clone());
+                    video_init = Some(init);
+
+                    if !catalog_written {
+                        let json = remux::generate_catalog(Some(&config), None);
+                        if let Ok(mut group) = catalog_track.append_group() {
+                            let _ = group.write_frame(Bytes::from(json));
+                            let _ = group.finish();
+                            catalog_written = true;
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!("invalid AVCC record from browser");
+                }
+            },
+            // Video keyframe
+            1 => {
+                let Some(ref init) = video_init else { continue };
+
+                // Finish previous group
+                if let Some(mut g) = video_group.take() {
+                    let _ = g.finish();
+                }
+
+                video_seq += 1;
+                let base_dts = (timestamp as u64) * 90;
+                let sample = remux::VideoSample {
+                    data: payload,
+                    duration: 3000, // ~33ms at 90kHz
+                    cts_offset: 0,
+                    keyframe: true,
+                };
+
+                if let Ok(mut group) = video_track.append_group() {
+                    let _ = group.write_frame(init.clone());
+                    let seg = remux::video_segment(video_seq, base_dts, &[sample]);
+                    let _ = group.write_frame(seg);
+                    video_group = Some(group);
+                }
+            }
+            // Video delta frame
+            2 => {
+                if video_init.is_none() {
+                    continue;
+                }
+
+                video_seq += 1;
+                let base_dts = (timestamp as u64) * 90;
+                let sample = remux::VideoSample {
+                    data: payload,
+                    duration: 3000,
+                    cts_offset: 0,
+                    keyframe: false,
+                };
+
+                if let Some(ref mut group) = video_group {
+                    let seg = remux::video_segment(video_seq, base_dts, &[sample]);
+                    let _ = group.write_frame(seg);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Cleanup
+    if let Some(mut g) = video_group.take() {
+        let _ = g.finish();
+    }
+    tracing::info!(broadcast = %broadcast, "WS ingest session ended");
+}
+
+/// Parse an AVCDecoderConfigurationRecord (from VideoEncoder's decoderConfig.description).
+fn parse_avcc_record(data: &[u8]) -> Option<lvqr_ingest::remux::VideoConfig> {
+    if data.len() < 6 {
+        return None;
+    }
+    let profile = data[1];
+    let compat = data[2];
+    let level = data[3];
+    let nalu_length_size = (data[4] & 0x03) + 1;
+
+    let num_sps = (data[5] & 0x1F) as usize;
+    let mut offset = 6;
+    let mut sps = Vec::new();
+    for _ in 0..num_sps {
+        if offset + 2 > data.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        if offset + len > data.len() {
+            return None;
+        }
+        sps = data[offset..offset + len].to_vec();
+        offset += len;
+    }
+
+    if offset >= data.len() {
+        return None;
+    }
+    let num_pps = data[offset] as usize;
+    offset += 1;
+    let mut pps = Vec::new();
+    for _ in 0..num_pps {
+        if offset + 2 > data.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        if offset + len > data.len() {
+            return None;
+        }
+        pps = data[offset..offset + len].to_vec();
+        offset += len;
+    }
+
+    if sps.is_empty() || pps.is_empty() {
+        return None;
+    }
+
+    Some(lvqr_ingest::remux::VideoConfig {
+        sps,
+        pps,
+        profile,
+        compat,
+        level,
+        nalu_length_size,
+    })
 }

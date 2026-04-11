@@ -181,12 +181,12 @@
 
   <div class="row">
     <div class="field">
-      <label>RTMP Server</label>
-      <input id="stream-server" value="rtmp://localhost:1935/live" placeholder="rtmp://localhost:1935/live">
+      <label>Server</label>
+      <input id="stream-server" value="http://localhost:8080" placeholder="http://localhost:8080">
     </div>
     <div class="field">
-      <label>Stream Key</label>
-      <input id="stream-key" value="test" placeholder="test">
+      <label>Broadcast Name</label>
+      <input id="stream-key" value="live/webcam" placeholder="live/webcam">
     </div>
   </div>
 
@@ -405,11 +405,13 @@ function extractCodec(data) {
 }
 
 // =====================
-// STREAM (Webcam)
+// STREAM (Webcam via WebCodecs + WebSocket ingest)
 // =====================
 let previewStream = null;
-let mediaRecorder = null;
 let streamWs = null;
+let videoEncoder = null;
+let frameReader = null;
+let streaming = false;
 
 async function loadCameras() {
   try {
@@ -436,8 +438,8 @@ async function startPreview() {
   try {
     if (previewStream) previewStream.getTracks().forEach(t => t.stop());
     previewStream = await navigator.mediaDevices.getUserMedia({
-      video: { deviceId, width: w, height: h },
-      audio: true,
+      video: { deviceId, width: w, height: h, frameRate: 30 },
+      audio: false, // audio encoding via WebCodecs AAC is not widely supported yet
     });
     document.getElementById('stream-preview').srcObject = previewStream;
     document.getElementById('btn-stream').disabled = false;
@@ -452,62 +454,164 @@ async function startPreview() {
 async function startStream() {
   if (!previewStream) { log('stream-log', 'no preview active'); return; }
 
-  // Browser can't do RTMP directly. Instead, we use MediaRecorder to capture
-  // WebM/MP4 chunks and send via WebSocket. The server would need a WebSocket
-  // ingest endpoint to handle this (not yet implemented in LVQR).
-  //
-  // For now, this demonstrates the capture pipeline. To actually stream to LVQR,
-  // use OBS or ffmpeg pointed at the RTMP endpoint.
+  // Check WebCodecs support
+  if (typeof VideoEncoder === 'undefined') {
+    setStatus('stream-status', 'err', 'WebCodecs not supported in this browser');
+    log('stream-log', 'VideoEncoder API not available. Use Chrome 94+.');
+    return;
+  }
 
   const server = document.getElementById('stream-server').value;
-  const key = document.getElementById('stream-key').value;
+  const broadcast = document.getElementById('stream-key').value;
+  const wsUrl = server.replace(/^http/, 'ws') + '/ingest/' + broadcast;
+  const [w, h] = document.getElementById('stream-res').value.split('x').map(Number);
 
-  setStatus('stream-status', 'info', 'Starting capture...');
-  log('stream-log', 'Note: Browser cannot push RTMP directly.');
-  log('stream-log', 'Capturing locally via MediaRecorder.');
-  log('stream-log', 'To push to LVQR, use ffmpeg or OBS with:');
-  log('stream-log', '  Server: ' + server);
-  log('stream-log', '  Key: ' + key);
+  setStatus('stream-status', 'info', 'Connecting to ' + wsUrl);
+  log('stream-log', 'connecting: ' + wsUrl);
 
-  try {
-    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
-      ? 'video/webm;codecs=vp9,opus'
-      : 'video/webm;codecs=vp8,opus';
+  // Open WebSocket to ingest endpoint
+  streamWs = new WebSocket(wsUrl);
+  streamWs.binaryType = 'arraybuffer';
 
-    mediaRecorder = new MediaRecorder(previewStream, {
-      mimeType,
-      videoBitsPerSecond: 2_000_000,
-    });
+  streamWs.onopen = () => {
+    log('stream-log', 'WebSocket connected, waiting for server ready...');
+  };
 
-    let chunks = 0;
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) {
-        chunks++;
-        if (chunks % 10 === 1) {
-          log('stream-log', 'captured ' + chunks + ' chunks (' + (e.data.size/1024).toFixed(1) + ' KB)');
-        }
+  streamWs.onmessage = async (e) => {
+    // Server sends {"status":"ready"} when ingest is set up
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.status === 'ready') {
+        log('stream-log', 'server ready, starting encoder');
+        await startEncoding(w, h);
       }
-    };
+    } catch {}
+  };
 
-    mediaRecorder.start(1000); // 1s chunks
-    setStatus('stream-status', 'ok', 'Capturing (local only -- push via ffmpeg/OBS for relay)');
-    document.getElementById('btn-stream').disabled = true;
-    document.getElementById('btn-stop-stream').disabled = false;
-    log('stream-log', 'MediaRecorder started: ' + mimeType);
-  } catch(e) {
-    setStatus('stream-status', 'err', 'Capture error: ' + e.message);
-    log('stream-log', 'error: ' + e);
+  streamWs.onerror = () => {
+    setStatus('stream-status', 'err', 'WebSocket error');
+    log('stream-log', 'WebSocket connection failed');
+  };
+
+  streamWs.onclose = (e) => {
+    log('stream-log', 'WebSocket closed: ' + (e.reason || 'code ' + e.code));
+    stopStream();
+  };
+}
+
+async function startEncoding(width, height) {
+  let configSent = false;
+  let frameCount = 0;
+
+  // Wire format: [u8 type][u32 BE timestamp_ms][payload]
+  // Type 0 = video config (AVCC record)
+  // Type 1 = keyframe (AVCC NALUs)
+  // Type 2 = delta frame (AVCC NALUs)
+  function sendFrame(type, timestampMs, data) {
+    if (!streamWs || streamWs.readyState !== WebSocket.OPEN) return;
+    const header = new Uint8Array(5);
+    header[0] = type;
+    const ts = timestampMs >>> 0;
+    header[1] = (ts >> 24) & 0xFF;
+    header[2] = (ts >> 16) & 0xFF;
+    header[3] = (ts >> 8) & 0xFF;
+    header[4] = ts & 0xFF;
+    const msg = new Uint8Array(5 + data.byteLength);
+    msg.set(header);
+    msg.set(new Uint8Array(data), 5);
+    streamWs.send(msg.buffer);
+  }
+
+  videoEncoder = new VideoEncoder({
+    output: (chunk, metadata) => {
+      // Send codec config on first output (or when it changes)
+      if (metadata?.decoderConfig?.description && !configSent) {
+        const desc = metadata.decoderConfig.description;
+        log('stream-log', 'sending AVCC config (' + desc.byteLength + ' bytes)');
+        sendFrame(0, 0, desc);
+        configSent = true;
+      }
+
+      // Send encoded frame
+      const data = new ArrayBuffer(chunk.byteLength);
+      chunk.copyTo(data);
+      const type = chunk.type === 'key' ? 1 : 2;
+      const ts = Math.round(chunk.timestamp / 1000); // microseconds to ms
+      sendFrame(type, ts, data);
+
+      frameCount++;
+      if (frameCount % 30 === 0) {
+        log('stream-log', 'encoded ' + frameCount + ' frames');
+      }
+    },
+    error: (e) => {
+      log('stream-log', 'encoder error: ' + e.message);
+      setStatus('stream-status', 'err', 'Encoder error');
+    }
+  });
+
+  videoEncoder.configure({
+    codec: 'avc1.42001E', // Baseline profile, level 3.0
+    width: width,
+    height: height,
+    bitrate: 2_000_000,
+    framerate: 30,
+    latencyMode: 'realtime',
+    avc: { format: 'avc' }, // AVCC format (length-prefixed NALUs)
+  });
+
+  log('stream-log', 'encoder configured: H.264 Baseline ' + width + 'x' + height + ' @ 2Mbps');
+  setStatus('stream-status', 'ok', 'Live! Streaming to server.');
+  document.getElementById('btn-stream').disabled = true;
+  document.getElementById('btn-stop-stream').disabled = false;
+  streaming = true;
+
+  // Feed frames from the video track to the encoder
+  const videoTrack = previewStream.getVideoTracks()[0];
+  const trackProcessor = new MediaStreamTrackProcessor({ track: videoTrack });
+  frameReader = trackProcessor.readable.getReader();
+
+  let keyframeCounter = 0;
+  const KEYFRAME_INTERVAL = 60; // keyframe every 60 frames (~2s at 30fps)
+
+  while (streaming) {
+    const { value: frame, done } = await frameReader.read();
+    if (done || !frame) break;
+
+    keyframeCounter++;
+    const keyFrame = keyframeCounter % KEYFRAME_INTERVAL === 1;
+
+    try {
+      if (videoEncoder.encodeQueueSize < 5) {
+        videoEncoder.encode(frame, { keyFrame });
+      }
+    } catch(e) {
+      // encoder might be closed
+    }
+    frame.close();
   }
 }
 
 function stopStream() {
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    mediaRecorder.stop();
-    log('stream-log', 'capture stopped');
+  streaming = false;
+
+  if (frameReader) {
+    try { frameReader.cancel(); } catch {}
+    frameReader = null;
   }
-  mediaRecorder = null;
+
+  if (videoEncoder && videoEncoder.state !== 'closed') {
+    try { videoEncoder.close(); } catch {}
+    videoEncoder = null;
+  }
+
+  if (streamWs) {
+    streamWs.close();
+    streamWs = null;
+  }
+
   setStatus('stream-status', 'info', 'Stopped');
-  document.getElementById('btn-stream').disabled = false;
+  document.getElementById('btn-stream').disabled = !previewStream;
   document.getElementById('btn-stop-stream').disabled = true;
 }
 
