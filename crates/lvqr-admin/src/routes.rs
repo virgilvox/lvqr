@@ -10,6 +10,14 @@ pub struct StreamInfo {
     pub subscribers: usize,
 }
 
+/// Mesh state returned by the API.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MeshState {
+    pub enabled: bool,
+    pub peer_count: usize,
+    pub offload_percentage: f64,
+}
+
 /// Shared state for the admin API.
 ///
 /// Uses callbacks so the admin crate doesn't depend on relay or ingest types.
@@ -18,6 +26,7 @@ pub struct StreamInfo {
 pub struct AdminState {
     get_stats: Arc<dyn Fn() -> RelayStats + Send + Sync>,
     get_streams: Arc<dyn Fn() -> Vec<StreamInfo> + Send + Sync>,
+    get_mesh: Arc<dyn Fn() -> MeshState + Send + Sync>,
 }
 
 impl AdminState {
@@ -28,7 +37,18 @@ impl AdminState {
         Self {
             get_stats: Arc::new(get_stats),
             get_streams: Arc::new(get_streams),
+            get_mesh: Arc::new(|| MeshState {
+                enabled: false,
+                peer_count: 0,
+                offload_percentage: 0.0,
+            }),
         }
+    }
+
+    /// Set the mesh state provider.
+    pub fn with_mesh(mut self, get_mesh: impl Fn() -> MeshState + Send + Sync + 'static) -> Self {
+        self.get_mesh = Arc::new(get_mesh);
+        self
     }
 }
 
@@ -38,6 +58,7 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/healthz", get(healthz))
         .route("/api/v1/stats", get(get_stats))
         .route("/api/v1/streams", get(list_streams))
+        .route("/api/v1/mesh", get(get_mesh))
         .with_state(state)
 }
 
@@ -53,6 +74,10 @@ async fn list_streams(axum::extract::State(state): axum::extract::State<AdminSta
     Json((state.get_streams)())
 }
 
+async fn get_mesh(axum::extract::State(state): axum::extract::State<AdminState>) -> Json<MeshState> {
+    Json((state.get_mesh)())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,7 +91,7 @@ mod tests {
             move || {
                 let total_subs: u64 = streams_for_stats.iter().map(|(_, s)| *s as u64).sum();
                 RelayStats {
-                    tracks: streams_for_stats.len() as u64 * 2, // video + audio per stream
+                    tracks: streams_for_stats.len() as u64 * 2,
                     subscribers: total_subs,
                     publishers: streams_for_stats.len() as u64,
                     ..Default::default()
@@ -129,7 +154,7 @@ mod tests {
         let stats: RelayStats = serde_json::from_slice(&body).unwrap();
         assert_eq!(stats.publishers, 1);
         assert_eq!(stats.subscribers, 5);
-        assert_eq!(stats.tracks, 2); // video + audio
+        assert_eq!(stats.tracks, 2);
     }
 
     #[tokio::test]
@@ -149,5 +174,42 @@ mod tests {
         let mut names: Vec<&str> = streams.iter().map(|s| s.name.as_str()).collect();
         names.sort();
         assert_eq!(names, vec!["live/stream1", "live/stream2"]);
+    }
+
+    #[tokio::test]
+    async fn mesh_disabled_by_default() {
+        let state = test_state(vec![]);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/mesh").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let mesh: MeshState = serde_json::from_slice(&body).unwrap();
+        assert!(!mesh.enabled);
+        assert_eq!(mesh.peer_count, 0);
+    }
+
+    #[tokio::test]
+    async fn mesh_with_peers() {
+        let state = test_state(vec![]).with_mesh(|| MeshState {
+            enabled: true,
+            peer_count: 42,
+            offload_percentage: 73.5,
+        });
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/mesh").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let mesh: MeshState = serde_json::from_slice(&body).unwrap();
+        assert!(mesh.enabled);
+        assert_eq!(mesh.peer_count, 42);
+        assert!((mesh.offload_percentage - 73.5).abs() < 0.01);
     }
 }

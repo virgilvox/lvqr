@@ -120,10 +120,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
     );
 
     let admin_addr: std::net::SocketAddr = ([0, 0, 0, 0], args.admin_port).into();
-    let admin_router = lvqr_admin::build_router(admin_state);
 
     // WebSocket fMP4 relay: /ws/{broadcast_path}
-    // Subscribes to MoQ video+audio tracks server-side, forwards fMP4 frames over WS
     let ws_state = WsRelayState {
         origin: relay.origin().clone(),
     };
@@ -131,88 +129,102 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/ws/{*broadcast}", get(ws_relay_handler))
         .with_state(ws_state);
 
-    let mut combined_router = admin_router.merge(ws_router);
+    let combined_router = {
+        let admin_router = if args.mesh_enabled {
+            // Set up mesh coordinator
+            let mesh_config = lvqr_mesh::MeshConfig {
+                max_children: args.max_peers,
+                ..Default::default()
+            };
+            let mesh = Arc::new(lvqr_mesh::MeshCoordinator::new(mesh_config));
 
-    if args.mesh_enabled {
-        let mesh_config = lvqr_mesh::MeshConfig {
-            max_children: args.max_peers,
-            ..Default::default()
-        };
-        let mesh = Arc::new(lvqr_mesh::MeshCoordinator::new(mesh_config));
-
-        // Wire mesh coordinator to relay connection events
-        let mesh_for_cb = mesh.clone();
-        relay.set_connection_callback(Arc::new(move |conn_id, connected| {
-            let peer_id = format!("conn-{conn_id}");
-            if connected {
-                match mesh_for_cb.add_peer(peer_id.clone(), "default".to_string()) {
-                    Ok(assignment) => {
-                        tracing::info!(
-                            peer = %peer_id,
-                            role = ?assignment.role,
-                            parent = ?assignment.parent,
-                            depth = assignment.depth,
-                            "mesh: peer assigned"
-                        );
+            // Wire mesh to relay connection events
+            let mesh_for_cb = mesh.clone();
+            relay.set_connection_callback(Arc::new(move |conn_id, connected| {
+                let peer_id = format!("conn-{conn_id}");
+                if connected {
+                    match mesh_for_cb.add_peer(peer_id.clone(), "default".to_string()) {
+                        Ok(a) => {
+                            tracing::info!(peer = %peer_id, role = ?a.role, depth = a.depth, "mesh: peer assigned");
+                        }
+                        Err(e) => {
+                            tracing::warn!(peer = %peer_id, error = ?e, "mesh: assign failed");
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(peer = %peer_id, error = ?e, "mesh: failed to assign peer");
+                } else {
+                    let orphans = mesh_for_cb.remove_peer(&peer_id);
+                    for orphan in orphans {
+                        let _ = mesh_for_cb.reassign_peer(&orphan);
                     }
                 }
-            } else {
-                let orphans = mesh_for_cb.remove_peer(&peer_id);
-                if !orphans.is_empty() {
-                    tracing::info!(
-                        peer = %peer_id,
-                        orphans = orphans.len(),
-                        "mesh: peer removed, reassigning orphans"
-                    );
-                    for orphan in orphans {
-                        match mesh_for_cb.reassign_peer(&orphan) {
-                            Ok(assignment) => {
-                                tracing::debug!(
-                                    peer = %orphan,
-                                    new_parent = ?assignment.parent,
-                                    "mesh: orphan reassigned"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(peer = %orphan, error = ?e, "mesh: orphan reassign failed");
-                            }
+            }));
+
+            // Background dead peer detection
+            let mesh_for_reaper = mesh.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    interval.tick().await;
+                    let dead = mesh_for_reaper.find_dead_peers();
+                    for peer_id in dead {
+                        tracing::info!(peer = %peer_id, "mesh: removing dead peer");
+                        let orphans = mesh_for_reaper.remove_peer(&peer_id);
+                        for orphan in orphans {
+                            let _ = mesh_for_reaper.reassign_peer(&orphan);
                         }
                     }
                 }
-            }
-        }));
+            });
 
-        // Background dead peer detection
-        let mesh_for_reaper = mesh.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-            loop {
-                interval.tick().await;
-                let dead = mesh_for_reaper.find_dead_peers();
-                for peer_id in dead {
-                    tracing::info!(peer = %peer_id, "mesh: removing dead peer");
-                    let orphans = mesh_for_reaper.remove_peer(&peer_id);
-                    for orphan in orphans {
-                        let _ = mesh_for_reaper.reassign_peer(&orphan);
+            // Wire signal server with mesh assignments
+            let mesh_for_signal = mesh.clone();
+            let mut signal = lvqr_signal::SignalServer::new();
+            signal.set_peer_callback(Arc::new(move |peer_id, track, connected| {
+                if connected {
+                    match mesh_for_signal.add_peer(peer_id.to_string(), track.to_string()) {
+                        Ok(a) => {
+                            tracing::info!(peer = %peer_id, role = ?a.role, depth = a.depth, "mesh: signal peer assigned");
+                            Some(lvqr_signal::SignalMessage::AssignParent {
+                                peer_id: peer_id.to_string(),
+                                role: format!("{:?}", a.role),
+                                parent_id: a.parent,
+                                depth: a.depth,
+                            })
+                        }
+                        Err(e) => {
+                            tracing::warn!(peer = %peer_id, error = ?e, "mesh: signal assign failed");
+                            None
+                        }
                     }
+                } else {
+                    let orphans = mesh_for_signal.remove_peer(peer_id);
+                    for orphan in orphans {
+                        let _ = mesh_for_signal.reassign_peer(&orphan);
+                    }
+                    None
                 }
-            }
-        });
+            }));
 
-        let signal = lvqr_signal::SignalServer::new();
-        let signal_router = signal.router();
+            let mesh_for_admin = mesh.clone();
+            let admin_with_mesh = admin_state.with_mesh(move || lvqr_admin::MeshState {
+                enabled: true,
+                peer_count: mesh_for_admin.peer_count(),
+                offload_percentage: mesh_for_admin.offload_percentage(),
+            });
 
-        tracing::info!(
-            peers = mesh.peer_count(),
-            max_children = args.max_peers,
-            "peer mesh enabled (/signal endpoint active)"
-        );
+            tracing::info!(
+                max_children = args.max_peers,
+                "peer mesh enabled (/signal endpoint active)"
+            );
 
-        combined_router = combined_router.merge(signal_router);
-    }
+            let router = lvqr_admin::build_router(admin_with_mesh);
+            router.merge(signal.router())
+        } else {
+            lvqr_admin::build_router(admin_state)
+        };
+
+        admin_router.merge(ws_router)
+    };
 
     tracing::info!(addr = %admin_addr, "admin API listening");
 

@@ -239,3 +239,55 @@ async fn relay_metrics() {
 
     relay_handle.abort();
 }
+
+/// Test that the connection callback fires on connect and disconnect.
+#[tokio::test]
+async fn connection_callback() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("lvqr=debug")
+        .with_test_writer()
+        .try_init();
+
+    let relay_config = lvqr_relay::RelayConfig::new("[::]:0".parse().unwrap());
+    let mut relay = lvqr_relay::RelayServer::new(relay_config);
+    let (mut server, relay_addr) = relay.init_server().expect("failed to init relay server");
+
+    let connects = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let disconnects = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let c = connects.clone();
+    let d = disconnects.clone();
+    relay.set_connection_callback(std::sync::Arc::new(move |_conn_id, connected| {
+        if connected {
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            d.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }));
+
+    let relay_handle = tokio::spawn(async move { relay.accept_loop(&mut server).await });
+
+    // Connect a client
+    let sub_origin = Origin::produce();
+    let mut client_config = moq_native::ClientConfig::default();
+    client_config.tls.disable_verify = Some(true);
+    let client = client_config.init().expect("failed to init client");
+
+    let url: url::Url = format!("https://localhost:{}", relay_addr.port()).parse().unwrap();
+    let client = client.with_consume(sub_origin);
+    let session = tokio::time::timeout(TIMEOUT, client.connect(url))
+        .await
+        .expect("connect timed out")
+        .expect("connect failed");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(connects.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(disconnects.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+    // Disconnect
+    drop(session);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(disconnects.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    relay_handle.abort();
+}
