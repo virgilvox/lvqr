@@ -5,6 +5,7 @@ pub mod rtmp;
 pub mod bridge;
 
 pub mod error;
+pub mod remux;
 
 pub use error::IngestError;
 

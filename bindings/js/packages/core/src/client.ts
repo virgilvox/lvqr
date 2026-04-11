@@ -2,10 +2,11 @@
  * LVQR streaming client.
  *
  * Connects to an LVQR relay via WebTransport (preferred) or WebSocket (fallback)
- * and subscribes to live video tracks.
+ * and subscribes to live video/audio tracks using the MoQ-Lite protocol.
  */
 
 import { detectTransport, type TransportType } from './transport';
+import { MoqSubscriber } from './moq';
 
 export interface LvqrClientOptions {
   /** Force a specific transport. Default: auto-detect. */
@@ -15,7 +16,7 @@ export interface LvqrClientOptions {
 }
 
 export interface LvqrEvents {
-  /** Received a video/audio frame. */
+  /** Received an fMP4 frame (init segment or moof+mdat). */
   frame: (data: Uint8Array, track: string) => void;
   /** Connection established. */
   connected: () => void;
@@ -34,7 +35,10 @@ type EventName = keyof LvqrEvents;
  * ```ts
  * const client = new LvqrClient('https://relay.example.com:4443');
  * await client.connect();
- * client.on('frame', (data) => { ... });
+ * client.on('frame', (data, track) => {
+ *   // data is fMP4: init segment (ftyp+moov) or media segment (moof+mdat)
+ *   sourceBuffer.appendBuffer(data);
+ * });
  * await client.subscribe('live/my-stream');
  * ```
  */
@@ -42,6 +46,7 @@ export class LvqrClient {
   private url: string;
   private options: LvqrClientOptions;
   private transport: WebTransport | WebSocket | null = null;
+  private moqSubscriber: MoqSubscriber | null = null;
   private listeners: Map<string, Set<Function>> = new Map();
   private _connected = false;
 
@@ -99,18 +104,39 @@ export class LvqrClient {
     this.emit('connected');
   }
 
-  /** Subscribe to a broadcast track. */
-  async subscribe(_broadcast: string, _track = 'video'): Promise<void> {
+  /**
+   * Subscribe to a broadcast's video and audio tracks.
+   *
+   * The broadcast path is e.g. "live/my-stream". This subscribes to both
+   * the "0.mp4" (video) and "1.mp4" (audio) CMAF tracks. Frame data is
+   * emitted via the 'frame' event as fMP4 segments (init + moof+mdat).
+   */
+  async subscribe(broadcast: string, tracks?: string[]): Promise<void> {
     if (!this._connected) {
       throw new Error('Not connected. Call connect() first.');
     }
-    // MoQ subscription will be handled here once the protocol
-    // framing is implemented in the WASM module or in TypeScript.
-    // For now, this sets up the subscription intent.
+
+    if (this.moqSubscriber) {
+      const broadcastPath = broadcast.split('/');
+      const trackNames = tracks ?? ['0.mp4', '1.mp4'];
+
+      for (const trackName of trackNames) {
+        await this.moqSubscriber.subscribe(broadcastPath, trackName, (data) => {
+          this.emit('frame', data, trackName);
+        });
+      }
+    } else if (this.transport instanceof WebSocket) {
+      // WebSocket fallback: server sends fMP4 frames directly
+      // Nothing to do here -- onmessage handler already emits frames
+    }
   }
 
   /** Close the connection. */
   close(): void {
+    if (this.moqSubscriber) {
+      this.moqSubscriber.close();
+      this.moqSubscriber = null;
+    }
     if (this.transport instanceof WebTransport) {
       this.transport.close();
     } else if (this.transport instanceof WebSocket) {
@@ -148,6 +174,7 @@ export class LvqrClient {
 
     await wt.ready;
     this.transport = wt;
+    this.moqSubscriber = new MoqSubscriber(wt);
   }
 
   private async connectWebSocket(): Promise<void> {
