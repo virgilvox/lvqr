@@ -126,8 +126,15 @@ export class LvqrClient {
         });
       }
     } else if (this.transport instanceof WebSocket) {
-      // WebSocket fallback: server sends fMP4 frames directly
-      // Nothing to do here -- onmessage handler already emits frames
+      // WebSocket fallback: reconnect to the broadcast-specific WS endpoint
+      // The server's /ws/{broadcast} endpoint sends fMP4 frames as binary messages
+      const ws = this.transport;
+      ws.close(); // close the generic connection
+
+      const wsUrl = this.url
+        .replace(/^https:/, 'wss:')
+        .replace(/^http:/, 'ws:');
+      await this.connectWebSocketBroadcast(`${wsUrl}/ws/${broadcast}`);
     }
   }
 
@@ -202,7 +209,35 @@ export class LvqrClient {
 
       ws.onmessage = (event) => {
         if (event.data instanceof ArrayBuffer) {
-          this.emit('frame', new Uint8Array(event.data), 'video');
+          this.emit('frame', new Uint8Array(event.data), '0.mp4');
+        }
+      };
+    });
+  }
+
+  /** Connect to a broadcast-specific WS endpoint that streams fMP4 frames. */
+  private async connectWebSocketBroadcast(url: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        this.transport = ws;
+        resolve();
+      };
+
+      ws.onerror = () => {
+        reject(new Error('WebSocket broadcast connection failed'));
+      };
+
+      ws.onclose = () => {
+        this._connected = false;
+        this.emit('disconnected', 'websocket closed');
+      };
+
+      ws.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          this.emit('frame', new Uint8Array(event.data), '0.mp4');
         }
       };
     });

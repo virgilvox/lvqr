@@ -24,3 +24,4 @@ export { LvqrClient, type LvqrClientOptions, type LvqrEvents } from './client';
 export { LvqrAdminClient, type StreamInfo, type RelayStats } from './admin';
 export { detectTransport, type TransportType } from './transport';
 export { MoqSubscriber } from './moq';
+export { MeshPeer, type MeshConfig } from './mesh';

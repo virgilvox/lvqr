@@ -237,6 +237,45 @@ export function decodeGroupHeader(buf: Uint8Array, offset: number): [GroupHeader
   return [{ subscribeId, sequence }, off1 + size];
 }
 
+// --- SETUP handshake ---
+
+const CLIENT_SETUP = 0x20;
+const SERVER_SETUP = 0x21;
+const VERSION_LITE01 = 0xff0dad01;
+
+/** Encode CLIENT_SETUP message for moq-lite-01. */
+function encodeClientSetup(): Uint8Array {
+  // Body: varint version_count + version codes + parameters (empty)
+  const body = concat(
+    encodeVarInt(1),               // 1 version
+    encodeVarInt(VERSION_LITE01),  // moq-lite-01
+  );
+  // CLIENT_SETUP: type (0x20) + varint size + body
+  return concat(
+    new Uint8Array([CLIENT_SETUP]),
+    encodeVarInt(body.length),
+    body,
+  );
+}
+
+/** Read SERVER_SETUP response, return the negotiated version. */
+function decodeServerSetup(buf: Uint8Array, offset: number): [number, number] {
+  const type_ = buf[offset];
+  if (type_ !== SERVER_SETUP) {
+    throw new Error(`expected SERVER_SETUP (0x21), got 0x${type_.toString(16)}`);
+  }
+  offset += 1;
+
+  // varint size
+  const [size, off1] = decodeVarInt(buf, offset);
+  const end = off1 + size;
+
+  // varint version
+  const [version, _off2] = decodeVarInt(buf, off1);
+
+  return [version, end];
+}
+
 // --- High-level MoQ subscriber ---
 
 export interface MoqTrack {
@@ -247,21 +286,54 @@ export interface MoqTrack {
 /**
  * MoQ subscriber that connects to a relay via WebTransport.
  *
- * Discovers broadcasts via ANNOUNCE, subscribes to tracks,
- * and emits frame data as Uint8Array via callbacks.
+ * Performs SETUP handshake (moq-lite-01), discovers broadcasts via ANNOUNCE,
+ * subscribes to tracks, and emits frame data via callbacks.
  */
 export class MoqSubscriber {
   private wt: WebTransport;
   private subscriptions = new Map<number, { onFrame: (data: Uint8Array) => void }>();
   private nextId = 0;
   private running = false;
+  private setupDone = false;
 
   constructor(wt: WebTransport) {
     this.wt = wt;
   }
 
+  /** Perform the MoQ SETUP handshake. Must be called before subscribe/discover. */
+  async setup(): Promise<void> {
+    if (this.setupDone) return;
+
+    const bidi = await this.wt.createBidirectionalStream();
+    const writer = bidi.writable.getWriter();
+    const reader = bidi.readable.getReader();
+
+    // Send CLIENT_SETUP
+    await writer.write(encodeClientSetup());
+
+    // Read SERVER_SETUP
+    const { value } = await reader.read();
+    if (!value) throw new Error('setup stream closed before server response');
+
+    const buf = Uint8Array.from(value);
+    const [version] = decodeServerSetup(buf, 0);
+
+    if (version !== VERSION_LITE01) {
+      throw new Error(`server chose unsupported version 0x${version.toString(16)}, expected moq-lite-01`);
+    }
+
+    // Setup stream stays open for session lifetime (moq-lite uses it for SessionInfo)
+    // Release the locks but keep the stream alive
+    reader.releaseLock();
+    writer.releaseLock();
+
+    this.setupDone = true;
+  }
+
   /** Discover broadcasts by sending ANNOUNCE_PLEASE and reading announcements. */
   async discoverBroadcasts(prefix = ''): Promise<string[]> {
+    await this.setup();
+
     const bidi = await this.wt.createBidirectionalStream();
     const writer = bidi.writable.getWriter();
     const reader = bidi.readable.getReader();
@@ -276,7 +348,7 @@ export class MoqSubscriber {
     const { value } = await reader.read();
     if (!value) return [];
 
-    const [init] = decodeAnnounceInit(value, 0);
+    const [init] = decodeAnnounceInit(Uint8Array.from(value), 0);
     const broadcasts = init.suffixes.map((segs) => segs.join('/'));
 
     reader.releaseLock();
@@ -291,6 +363,8 @@ export class MoqSubscriber {
     trackName: string,
     onFrame: (data: Uint8Array) => void,
   ): Promise<number> {
+    await this.setup();
+
     const id = this.nextId++;
     this.subscriptions.set(id, { onFrame });
 
