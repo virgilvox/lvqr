@@ -1,12 +1,45 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.1 Landed (Unified Fragment Model)
+## Project Status: v0.4-dev -- Tier 2.1 Landed, Tier 2.2 Scaffold In Progress
 
-**Last Updated**: 2026-04-13 (session 4)
-**Tests**: 43 test binaries across the workspace, 152 individual tests
-(plus ~4200 generated proptest cases across the ingest + fragment
-harnesses per run), all green. cargo clippy --workspace --all-targets
--- -D warnings is clean. cargo fmt --check is clean.
+**Last Updated**: 2026-04-13 (session 4, part 2)
+**Tests**: 48 test binaries across the workspace, 179 individual tests
+(plus ~4700 generated proptest cases per run across the ingest,
+fragment, hevc, and aac harnesses), all green. cargo clippy
+--workspace --all-targets -- -D warnings is clean. cargo fmt --check
+is clean.
+
+## Session 4 part 2 additions (2026-04-13): Tier 2.2 `lvqr-codec` scaffold
+
+The first Tier 2.2 deliverable landed directly after Tier 2.1 was
+committed and pushed: a `lvqr-codec` crate with a shared MSB-first
+forward bit reader (including H.26x exp-Golomb decoders and
+EBSP->RBSP emulation-prevention byte stripping), an HEVC NAL unit
+type classifier + minimal SPS parser (profile / tier / level /
+chroma-format / resolution, enough to build an `hev1` sample entry
+and emit a codec string), and a hardened AAC `AudioSpecificConfig`
+parser that correctly handles the 5-bit + 6-bit escape encoding for
+object types in the 32..=63 range, the 15-index explicit-frequency
+escape, and HE-AAC (SBR) / HE-AAC v2 (PS) signalling.
+
+4-of-5 artifact coverage on day one: proptest never-panic harnesses
+for HEVC and AAC, an integration test that wires the parsers to
+expected codec-string outputs, 19 unit tests covering the bit
+reader + both codec modules. Fuzz is deferred because cargo-fuzz
+harnesses want their own nightly-only crate, and conformance is
+deferred until real encoder fixtures are captured and checked in.
+
+The HEVC SPS parser intentionally only supports
+`sps_max_sub_layers_minus1 == 0` (every consumer HEVC stream LVQR
+has encountered in practice). Multi-sublayer streams return
+`CodecError::Unsupported` so callers know to plug in a more complete
+parser. Full scaling-list / VUI / HRD parsing is explicitly out of
+scope: LVQR does not decode HEVC, it only needs enough metadata to
+build an fMP4 init segment.
+
+The AAC parser is ready to replace the 2-byte ASC assumption baked
+into `lvqr-ingest::remux::fmp4::esds`. That migration will land
+alongside the HEVC RTMP support in a follow-up commit.
 
 ## What a new session must read first
 

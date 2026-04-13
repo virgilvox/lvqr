@@ -8,6 +8,7 @@ members = [
     "crates/lvqr-core",
     "crates/lvqr-moq",
     "crates/lvqr-fragment",
+    "crates/lvqr-codec",
     "crates/lvqr-relay",
     "crates/lvqr-mesh",
     "crates/lvqr-ingest",
@@ -100,6 +101,7 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 lvqr-core = { version = "0.3.1", path = "crates/lvqr-core" }
 lvqr-moq = { version = "0.3.1", path = "crates/lvqr-moq" }
 lvqr-fragment = { version = "0.3.1", path = "crates/lvqr-fragment" }
+lvqr-codec = { version = "0.3.1", path = "crates/lvqr-codec" }
 lvqr-relay = { version = "0.3.1", path = "crates/lvqr-relay" }
 lvqr-mesh = { version = "0.3.1", path = "crates/lvqr-mesh" }
 lvqr-ingest = { version = "0.3.1", path = "crates/lvqr-ingest" }

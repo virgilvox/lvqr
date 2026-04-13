@@ -1,0 +1,19 @@
+[package]
+name = "lvqr-codec"
+description = "Codec parsers for LVQR: HEVC, AAC, and future VP9 / AV1 / Opus. Produces FragmentMeta and init segments from raw codec-private data."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["hevc", "h265", "aac", "codec", "parser"]
+categories = ["multimedia"]
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

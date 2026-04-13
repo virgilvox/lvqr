@@ -1403,6 +1403,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lvqr-codec"
+version = "0.3.1"
+dependencies = [
+ "bytes",
+ "proptest",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "lvqr-conformance"
 version = "0.3.1"
 dependencies = [
