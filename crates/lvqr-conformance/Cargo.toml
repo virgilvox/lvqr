@@ -1,0 +1,16 @@
+[package]
+name = "lvqr-conformance"
+description = "Reference test fixtures and conformance harnesses for LVQR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+bytes = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
