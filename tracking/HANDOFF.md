@@ -12,10 +12,16 @@ segments verified byte-by-byte. See `crates/lvqr-cli/tests/rtmp_ws_e2e.rs`.
 
 The roadmap at `tracking/ROADMAP.md` is the authoritative plan for the next
 18-24 months of work; read it alongside CLAUDE.md before starting anything.
-The competitive audit at `tracking/AUDIT-2026-04-13.md` compares LVQR's
-current surface area against MediaMTX, LiveKit, OvenMediaEngine, SRS, Ant
-Media, AWS Kinesis Video Streams, Janus, and Jitsi, and calibrates the
-strategic bets. Read it before arguing about feature priority.
+Two audits sit next to it:
+
+- `tracking/AUDIT-2026-04-13.md` (external) compares LVQR's current
+  surface area against MediaMTX, LiveKit, OvenMediaEngine, SRS, Ant
+  Media, AWS Kinesis Video Streams, Janus, and Jitsi, and calibrates
+  the five strategic bets.
+- `tracking/AUDIT-INTERNAL-2026-04-13.md` (internal) is the dead-code,
+  latent-bug, and security-hardening audit of LVQR itself. Every
+  critical claim was manually verified before landing. Five fixes
+  shipped the same session.
 
 ## What Tier 0 Closed (2026-04-13)
 
@@ -122,6 +128,51 @@ its parsers and writers: proptest (new), cargo-fuzz (new, nightly),
 integration (existing RTMP bridge test), and conformance (new golden
 plus ffprobe). The fifth slot (browser E2E) is covered transitively
 by the `lvqr-cli` rtmp_ws_e2e test. No other crate has full coverage yet.
+
+## Internal Audit Fixes (2026-04-13)
+
+The internal audit identified confirmed bugs, dead code, and hardening
+targets. Five items landed in the same commit as the audit document:
+
+1. **Broadcast path traversal hardening** in `lvqr-relay::parse_url_token`.
+   A new `is_valid_broadcast_name` validator rejects names containing
+   `..`, backslash, control characters, leading/trailing slashes, or
+   anything outside `[A-Za-z0-9._/-]`. Empty names remain permitted
+   because MoQ sessions legitimately connect to the relay root and
+   select broadcasts via SUBSCRIBE. Six new unit tests, plus the five
+   existing relay integration tests continuing to pass.
+2. **Stale child reference fix** in `lvqr-mesh::reassign_peer`. The
+   function overwrote the peer's parent field but never removed the
+   stale child reference from the old parent's children list. Latent
+   bug that only triggers on live rebalance (the orphan path calls
+   `remove_peer` first which deletes the old parent entirely). Defensive
+   fix plus a new regression test for the live-rebalance path.
+3. **Theatrical heartbeat test replaced** in `lvqr-mesh`. The prior
+   version set `heartbeat_timeout_secs = 0` and asserted nothing
+   meaningful. New version exercises the full lifecycle: fresh peer
+   alive, stale after 1.1s sleep, alive again after heartbeat.
+4. **JWT provider wired into the CLI**. `JwtAuthProvider` was
+   feature-complete but had zero consumers outside its own unit tests.
+   `lvqr-cli` now pulls `lvqr-auth` with the `jwt` feature on and
+   exposes `--jwt-secret` / `--jwt-issuer` / `--jwt-audience` plus
+   matching `LVQR_JWT_*` env vars, taking precedence over static
+   tokens.
+5. **lvqr-mesh scaffolding comment** at the top of `crates/lvqr-mesh/src/lib.rs`
+   making it explicit that the crate is a topology planner and no
+   code in the repo yet drives real WebRTC DataChannel peer forwarding.
+   The offload percentage exposed via the admin API is intended
+   offload, not actual. Documentation change only.
+
+Plus a new Tier 1 test that closes one of the audit's deferred items:
+
+6. **lvqr-record integration test** at
+   `crates/lvqr-record/tests/record_integration.rs`. Drives a
+   synthesized MoQ broadcast through a real `record_broadcast` call
+   in a tempdir and asserts the on-disk layout matches the documented
+   structure. Also verifies that cancellation returns Ok cleanly within
+   a timeout. Before this test, `record_track` had zero integration
+   coverage; only the pure helpers (`looks_like_init`, `track_prefix`,
+   `sanitize_name`) were tested.
 
 ## Tier 1 Remaining Work
 
