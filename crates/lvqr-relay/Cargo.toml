@@ -17,6 +17,7 @@ quinn-transport = ["dep:quinn", "dep:web-transport-quinn", "dep:rustls", "dep:mo
 [dependencies]
 lvqr-core = { workspace = true }
 lvqr-auth = { workspace = true }
+lvqr-moq = { workspace = true }
 moq-lite = { workspace = true }
 url = { workspace = true }
 

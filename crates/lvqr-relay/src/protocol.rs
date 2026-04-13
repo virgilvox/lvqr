@@ -11,7 +11,7 @@
 //! spawns them.
 
 use crate::error::RelayError;
-use moq_lite::OriginProducer;
+use lvqr_moq::OriginProducer;
 use std::future::Future;
 use std::pin::Pin;
 use tokio_util::sync::CancellationToken;

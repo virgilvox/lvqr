@@ -120,43 +120,6 @@ impl Frame {
     }
 }
 
-/// A Group of Pictures: a keyframe followed by its dependent frames.
-#[derive(Debug, Clone)]
-pub struct Gop {
-    /// The sequence number of this GOP (the keyframe's group sequence).
-    pub sequence: u64,
-    /// Frames in this GOP, starting with the keyframe.
-    pub frames: Vec<Frame>,
-}
-
-impl Gop {
-    pub fn new(sequence: u64) -> Self {
-        Self {
-            sequence,
-            frames: Vec::new(),
-        }
-    }
-
-    /// Add a frame to this GOP.
-    pub fn push(&mut self, frame: Frame) {
-        self.frames.push(frame);
-    }
-
-    /// Total payload size across all frames.
-    pub fn total_size(&self) -> usize {
-        self.frames.iter().map(|f| f.size()).sum()
-    }
-
-    /// Number of frames in this GOP.
-    pub fn len(&self) -> usize {
-        self.frames.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
-    }
-}
-
 /// Snapshot of relay statistics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RelayStats {

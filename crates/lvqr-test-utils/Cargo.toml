@@ -11,9 +11,13 @@ publish = false
 
 [dependencies]
 lvqr-core = { workspace = true }
-tokio = { workspace = true }
+lvqr-cli = { workspace = true }
+lvqr-auth = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "net"] }
+tokio-util = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rcgen = { workspace = true }
 rand = { workspace = true }
+anyhow = { workspace = true }

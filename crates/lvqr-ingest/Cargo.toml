@@ -17,6 +17,8 @@ rtmp = ["dep:rml_rtmp"]
 [dependencies]
 lvqr-core = { workspace = true }
 lvqr-auth = { workspace = true }
+lvqr-moq = { workspace = true }
+lvqr-fragment = { workspace = true }
 moq-lite = { workspace = true }
 
 # RTMP
@@ -39,8 +41,8 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-moq-lite = { workspace = true }
 rml_rtmp = { workspace = true }
 tracing-subscriber = { workspace = true }
 proptest = "1"
+serde_json = { workspace = true }
 lvqr-test-utils = { workspace = true }

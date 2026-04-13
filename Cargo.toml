@@ -6,6 +6,8 @@ resolver = "2"
 exclude = ["crates/lvqr-ingest/fuzz"]
 members = [
     "crates/lvqr-core",
+    "crates/lvqr-moq",
+    "crates/lvqr-fragment",
     "crates/lvqr-relay",
     "crates/lvqr-mesh",
     "crates/lvqr-ingest",
@@ -96,6 +98,8 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
 # Internal crates
 lvqr-core = { version = "0.3.1", path = "crates/lvqr-core" }
+lvqr-moq = { version = "0.3.1", path = "crates/lvqr-moq" }
+lvqr-fragment = { version = "0.3.1", path = "crates/lvqr-fragment" }
 lvqr-relay = { version = "0.3.1", path = "crates/lvqr-relay" }
 lvqr-mesh = { version = "0.3.1", path = "crates/lvqr-mesh" }
 lvqr-ingest = { version = "0.3.1", path = "crates/lvqr-ingest" }
@@ -105,6 +109,7 @@ lvqr-auth = { version = "0.3.1", path = "crates/lvqr-auth" }
 lvqr-conformance = { version = "0.3.1", path = "crates/lvqr-conformance" }
 lvqr-record = { version = "0.3.1", path = "crates/lvqr-record" }
 lvqr-test-utils = { version = "0.3.1", path = "crates/lvqr-test-utils" }
+lvqr-cli = { version = "0.3.1", path = "crates/lvqr-cli" }
 
 [profile.release]
 lto = true

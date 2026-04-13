@@ -1,0 +1,30 @@
+name: Test Contract
+
+# Enforces the 5-artifact test contract documented at tests/CONTRACT.md:
+# every in-scope crate must ship a proptest harness, a cargo-fuzz target,
+# an integration test, an E2E test, and a conformance check.
+#
+# Tier 1 (now): educational. The job is soft-fail via continue-on-error
+# so PRs are not blocked on missing slots while the backlog is worked
+# through. Warnings surface as GitHub Actions annotations on the
+# affected crate's Cargo.toml so contributors see them in the PR Checks
+# tab without opening logs.
+#
+# Tier 2 (soon): flip LVQR_CONTRACT_STRICT to 1 and remove
+# continue-on-error. Script exits 1 on any missing slot in strict mode.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  contract:
+    name: 5-artifact contract
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run contract check (educational mode)
+        run: bash scripts/check_test_contract.sh

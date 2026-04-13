@@ -52,7 +52,7 @@ pub type ConnectionCallback = Arc<dyn Fn(u64, bool) + Send + Sync>;
 #[cfg(feature = "quinn-transport")]
 pub struct RelayServer {
     config: RelayConfig,
-    origin: moq_lite::OriginProducer,
+    origin: lvqr_moq::OriginProducer,
     metrics: Arc<RelayMetrics>,
     on_connection: Option<ConnectionCallback>,
     auth: SharedAuth,
@@ -63,7 +63,7 @@ impl RelayServer {
     pub fn new(config: RelayConfig) -> Self {
         Self {
             config,
-            origin: moq_lite::OriginProducer::new(),
+            origin: lvqr_moq::OriginProducer::new(),
             metrics: Arc::new(RelayMetrics::default()),
             on_connection: None,
             auth: Arc::new(NoopAuthProvider),
@@ -82,7 +82,7 @@ impl RelayServer {
     }
 
     /// Get the shared Origin for external track injection (e.g., RTMP ingest).
-    pub fn origin(&self) -> &moq_lite::OriginProducer {
+    pub fn origin(&self) -> &lvqr_moq::OriginProducer {
         &self.origin
     }
 

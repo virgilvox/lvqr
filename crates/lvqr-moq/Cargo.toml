@@ -1,0 +1,20 @@
+[package]
+name = "lvqr-moq"
+description = "Facade crate over moq-lite. All LVQR MoQ usage funnels through this one file so upstream churn has a single point of impact."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["moq", "media-over-quic", "streaming", "facade"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+moq-lite = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+bytes = { workspace = true }

@@ -7,7 +7,7 @@
 //!
 //! ```no_run
 //! # use lvqr_ingest::{IngestError, IngestProtocol};
-//! use moq_lite::OriginProducer;
+//! use lvqr_moq::OriginProducer;
 //! use tokio_util::sync::CancellationToken;
 //!
 //! struct MyIngest;
@@ -25,7 +25,7 @@
 //! ```
 
 use crate::error::IngestError;
-use moq_lite::OriginProducer;
+use lvqr_moq::OriginProducer;
 use std::future::Future;
 use std::pin::Pin;
 use tokio_util::sync::CancellationToken;

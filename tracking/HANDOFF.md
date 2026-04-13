@@ -1,11 +1,384 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 0 Closed, Tier 1 Kickoff Underway
+## Project Status: v0.4-dev -- Tier 2.1 Landed (Unified Fragment Model)
 
-**Last Updated**: 2026-04-13
-**Tests**: 28 test binaries across the workspace, all green. cargo clippy
---workspace --all-targets -- -D warnings is clean. cargo fmt --check is
-clean.
+**Last Updated**: 2026-04-13 (session 4)
+**Tests**: 43 test binaries across the workspace, 152 individual tests
+(plus ~4200 generated proptest cases across the ingest + fragment
+harnesses per run), all green. cargo clippy --workspace --all-targets
+-- -D warnings is clean. cargo fmt --check is clean.
+
+## What a new session must read first
+
+1. `CLAUDE.md` (project rules, hard hard rules)
+2. `tracking/ROADMAP.md` (authoritative 18-24 month plan, 10 load-bearing decisions)
+3. `tracking/AUDIT-2026-04-13.md` (competitive audit, 5 strategic bets, what NOT to ship)
+4. `tracking/AUDIT-INTERNAL-2026-04-13.md` (dead-code, bug, hardening inventory + Fix Plan)
+5. `tracking/AUDIT-READINESS-2026-04-13.md` (CI + supply chain + doc drift + Tier 1 progress)
+6. `tracking/HANDOFF.md` (this file)
+7. `tests/CONTRACT.md` (5-artifact test contract)
+
+The single most important architectural decision in the entire roadmap
+is the Unified Fragment Model (`lvqr-fragment`) plus the `lvqr-moq`
+facade crate, Tier 2.1. As of session 4 both have landed, the RTMP
+bridge has migrated to produce Fragments through `MoqTrackSink`, and
+the dead code in `lvqr-core` (Registry, RingBuffer, GopCache, Gop)
+has been deleted in the same commit. Tier 2.2 (lvqr-codec, HEVC
+scaffold) is the next target.
+
+## Session 4 (2026-04-13) additions -- Tier 2.1 landing
+
+Seven bullets. All of Tier 2.1 as scoped in the roadmap plus one
+follow-up fix for a Tier 1 latent issue that surfaced under ffprobe
+8.1.
+
+1. **`crates/lvqr-moq/` facade crate**. Re-exports the moq-lite types
+   every LVQR crate uses (`Track`, `Origin`, `OriginProducer`,
+   `BroadcastProducer`, `BroadcastConsumer`, `TrackProducer`,
+   `TrackConsumer`, `GroupProducer`, `GroupConsumer`) under one module
+   so upstream churn has a single point of impact. `MOQ_LITE_VERSION`
+   const pins the version the facade was built against. The lib.rs
+   doc is explicit that this is a re-export layer today and that
+   newtypes will be introduced at the facade when downstream crates
+   need behavioral hooks -- honest scoping instead of 500 lines of
+   mechanical wrappers with no current value.
+
+2. **`crates/lvqr-fragment/` Unified Fragment Model**. Core types
+   (`Fragment { track_id, group_id, object_id, priority, dts, pts,
+   duration, flags: FragmentFlags, payload: Bytes }`, `FragmentFlags`
+   with `KEYFRAME` / `AUDIO` / `DELTA` / `DELTA_DISCARDABLE` presets,
+   `FragmentMeta` with lazy `set_init_segment` for the late-binding
+   RTMP sequence-header case) plus the `FragmentStream` trait (an
+   async `next_fragment() -> Option<Fragment>` + a `meta()` accessor,
+   intentionally without `async_trait` since the future is always
+   borrowed from `self`).
+
+3. **`MoqTrackSink` adapter** inside `lvqr-fragment`. The first
+   concrete projection from Fragment into a wire format: holds a
+   `TrackProducer` plus an optional current `GroupProducer`, opens a
+   new MoQ group on every keyframe push (closing the prior group
+   first), prepends `FragmentMeta::init_segment` as frame 0 of every
+   new group so late-joining subscribers can always decode, writes
+   delta fragments into the current group, and silently drops deltas
+   that arrive before any keyframe. `Drop` finishes the current
+   group. This is the load-bearing shape change: every future ingest
+   crate produces Fragments, calls `sink.push(..)`, and never touches
+   MoQ directly.
+
+4. **Facade migration across every downstream crate**. `lvqr-relay`,
+   `lvqr-ingest`, `lvqr-record`, `lvqr-cli`, plus their tests, now
+   import MoQ types from `lvqr_moq::` rather than `moq_lite::`.
+   `lvqr-record` dropped its direct `moq-lite` dep entirely. `lvqr-relay`
+   and `lvqr-cli` kept their direct `moq-lite` deps because they still
+   interoperate with `moq-native` at the transport layer, but every
+   *type reference* in those crates now goes through the facade.
+
+5. **`RtmpMoqBridge` migrated to produce Fragments**. The video and
+   audio RTMP callbacks no longer manipulate MoQ `GroupProducer`s
+   directly. Instead each stream holds a `MoqTrackSink` for video and
+   another for audio; the callbacks build a `Fragment` (with the
+   appropriate `FragmentFlags::KEYFRAME` or `FragmentFlags::DELTA`)
+   and call `sink.push(&frag)`. FLV sequence headers call
+   `sink.set_init_segment(init)`. The audio path finishes its group
+   after every frame so every AAC frame is its own independently-
+   decodable MoQ group (the existing behavior, preserved). Every
+   existing `rtmp_bridge_integration` and `rtmp_ws_e2e` test passes
+   unchanged, which is the real proof the migration is behavior-
+   preserving.
+
+6. **Dead code deletion in `lvqr-core`**. Per the internal audit
+   recommendation at `tracking/AUDIT-INTERNAL-2026-04-13.md`, deleted
+   `Registry`, `RingBuffer`, `GopCache`, and the `Gop` struct in the
+   same commit that lands their replacement. Removed both benches
+   (`fanout.rs` and `ringbuffer.rs`), their `criterion` dev-dep, and
+   the `TestPublisher` + `synthetic_gop` helpers in `lvqr-test-utils`
+   that only existed to exercise `Registry`. `Frame`, `TrackName`,
+   `StreamId`, `SubscriberId`, `RelayStats`, `EventBus`, and
+   `RelayEvent` survive as shared value types. `lvqr-core` is now
+   roughly 40% smaller and every remaining type has at least one
+   production consumer.
+
+7. **5-artifact contract closed for the new crates (4 of 5 slots)**.
+   `lvqr-moq` and `lvqr-fragment` both ship proptest, integration,
+   and e2e coverage on day one; conformance and fuzz slots are still
+   open by design (both require additional infrastructure and belong
+   to their own follow-up work). `scripts/check_test_contract.sh`
+   was updated to include the two new crates in its in-scope list,
+   the contract runs green in educational mode, and the only
+   remaining warnings are the four still-open fuzz/conformance slots
+   across `lvqr-record`, `lvqr-moq`, and `lvqr-fragment`.
+
+### Bonus fix: ffprobe 8.1 false negative in the golden fMP4 conformance slot
+
+`ffprobe_bytes` in `lvqr-test-utils` treated any non-empty stderr on
+an exit-zero ffprobe run as a failure. ffprobe 8.1 (the current
+Homebrew version) emits decoder-level warnings
+(`deblocking_filter_idc 32 out of range`, `no frame!`) on the
+synthetic H.264 NAL payloads the golden tests feed it, even though
+the container parses cleanly. Under older ffprobe builds those
+warnings were silent and the test passed; under 8.1 they broke CI
+the moment ffmpeg got installed locally. Fix: trust the exit code
+as the authoritative verdict (non-zero = rejected, zero = accepted)
+and surface stderr on exit-zero runs via `eprintln!` as diagnostics
+rather than failing on them. This closes the last pre-existing test
+failure that was latent before session 4 and unrelated to Tier 2.1.
+
+## Session 3 (2026-04-13) additions
+
+Seven Tier 1 items landed, one bonus security fix caught by a new
+proptest, one bonus integration harness closing an audit gap. The
+single Tier 1 item still blocked is the conformance fixture corpus
+bootstrap, which requires `ffmpeg` in the dev environment.
+
+1. **`lvqr_cli::start` library target** (`crates/lvqr-cli/src/lib.rs`).
+   Extracted the full server wiring from `main.rs` into a public lib:
+   `ServeConfig`, `ServerHandle`, `async fn start(config) -> Result<ServerHandle>`.
+   All listeners bind before `start` returns so callers that pass
+   `port: 0` get real addresses back off the handle. `main.rs` shrinks
+   to ~150 lines (parse args, build auth, call `start`, wait on
+   ctrl-c, `handle.shutdown().await`). `RtmpServer::run_with_listener`
+   added in `lvqr-ingest` so the pre-bind pattern works without a
+   find-available-port race.
+
+2. **`lvqr_test_utils::TestServer`** (`crates/lvqr-test-utils/src/test_server.rs`).
+   Thin wrapper over `lvqr_cli::start` that binds on `127.0.0.1:0`,
+   disables Prometheus (process-wide, panics on second install), and
+   returns a handle with `rtmp_url()`, `ws_url()`, `ws_ingest_url()`,
+   `http_base()`, `relay_addr()`, etc. Config builder supports
+   `with_mesh(max_peers)`, `with_auth(SharedAuth)`, `with_record_dir`.
+   Dev-dep cycle `lvqr-cli -> lvqr-ingest -> [dev] lvqr-test-utils -> lvqr-cli`
+   is allowed by cargo and works correctly.
+   Smoke tests at `crates/lvqr-test-utils/tests/test_server_smoke.rs`
+   prove every listener binds and every URL helper formats against the
+   bound address.
+
+3. **`lvqr-signal` input validation** (`crates/lvqr-signal/src/signaling.rs`).
+   Closes the internal-audit finding. New `is_valid_peer_id` (enforces
+   `[A-Za-z0-9_-]{1,64}`) and `is_valid_track` (wider alphabet plus
+   explicit rejection of `..`, `//`, leading/trailing slash,
+   backslashes). New `SignalMessage::Error { code, reason }` variant.
+   `wait_for_register` sends a structured error frame on every reject
+   path (`invalid_json`, `invalid_peer_id`, `invalid_track`,
+   `expected_register`) and closes the session. The main loop rejects
+   a second Register on an already-registered connection with
+   `duplicate_register`, enforcing the audit's "cap registrations per
+   connection at 1" explicitly. Peer-id log fields on reject paths
+   record only `len`, never the attacker-controlled bytes.
+   Integration tests at `crates/lvqr-signal/tests/signal_integration.rs`
+   drive the validators through the real `/signal` endpoint on a
+   `TestServer::with_mesh(3)` instance using `tokio-tungstenite`.
+   Five tests: malformed peer_id, traversal track, non-Register first
+   message, duplicate Register, happy path (receives AssignParent).
+
+4. **Proptest extensions for `lvqr-ingest`**
+   (`crates/lvqr-ingest/tests/proptest_parsers.rs`). Four new
+   properties, roughly 4100 generated cases per run (up from 2560):
+   `extract_resolution_never_panics`,
+   `extract_resolution_never_panics_on_sps_prefix`,
+   `generate_catalog_always_parses_as_json` (parses output with
+   `serde_json::from_str`, asserts track count and required fields),
+   `generate_catalog_places_video_before_audio` (ordering invariant
+   the browser MSE player depends on). Added `serde_json` as dev-dep.
+
+5. **Proptest for `lvqr-record` pure helpers**
+   (`crates/lvqr-record/tests/proptest_recorder.rs`). Five
+   properties targeting the internal helpers exposed via a new
+   `#[doc(hidden)] pub mod internals` re-export. **Proptest caught a
+   real path-traversal bypass in `sanitize_name`**: input `".\0."`
+   sanitized to `".."` because the old ordering stripped control
+   chars *after* the `..` replacement pass, so deleting `\0`
+   regenerated a traversal sequence. Fixed by stripping controls
+   first, then replacing `/`, `\`, and `..`. Regression seed pinned
+   in `tests/proptest_recorder.proptest-regressions`.
+
+6. **Nightly cargo-fuzz CI** (`.github/workflows/fuzz.yml`). 60s per
+   target on PR (path-filtered so unrelated PRs don't compile the
+   fuzz harness), 15 min per target on daily 07:00 UTC cron, manual
+   dispatch supported. Matrix over `parse_video_tag` and
+   `parse_audio_tag`. `continue-on-error: true` during Tier 1.
+   Crash artifacts and corpora upload unconditionally with 30-day
+   retention.
+
+7. **cargo-audit CI job** (`.github/workflows/ci.yml`).
+   `continue-on-error: true`, separate `audit-v1` cache key. Step
+   failures surface honestly in the Checks tab without blocking
+   PRs. Promote to required once the baseline is clean.
+
+8. **5-artifact contract enforcement** (`scripts/check_test_contract.sh`
+   plus `.github/workflows/contract.yml`). Portable bash script
+   (no `globstar` / bash 4+ features; runs on macOS bash 3.2). Walks
+   the in-scope crate list, checks each of the five slots, emits
+   GitHub Actions warning annotations on missing slots. Soft-fail
+   during Tier 1; flipped to strict via `LVQR_CONTRACT_STRICT=1` in
+   Tier 2. Per-crate E2E exemption via
+   `CONTRACT_E2E_EXEMPT_<crate_with_underscores>=1`. Current state:
+   `lvqr-ingest` satisfies all 5 slots; `lvqr-record` satisfies 3/5
+   (missing fuzz and conformance slots).
+
+9. **Playwright E2E scaffold** (`tests/e2e/`,
+   `.github/workflows/e2e.yml`). Shell-level specs over the test-app
+   rendered through `python3 -m http.server`. Three specs covering
+   the three-tab navigation, the Watch-tab video element and
+   broadcast input, and the Stream-tab form reachability. Tier 1
+   scope: no live LVQR binary. Tier 2 extends the
+   `playwright.config.ts` webServer array with a `cargo run` entry
+   and specs assert on buffered media.
+
+10. **Admin HTTP + JWT integration tests**
+    (`crates/lvqr-cli/tests/auth_integration.rs`). Six tests driving
+    `TestServer` with three auth providers (Noop, StaticAuthProvider,
+    JwtAuthProvider) over a hand-rolled HTTP/1.1 client on raw
+    `tokio::net::TcpStream`. Closes the
+    `tracking/AUDIT-READINESS-2026-04-13.md` gap: "JWT provider is
+    wired into the CLI but has no integration test ... no test
+    verifies that `lvqr-cli serve --jwt-secret foo` actually
+    validates a real JWT end-to-end". Covers: open access happy
+    path, static token missing/wrong/correct, JWT good token, JWT
+    wrong secret, JWT insufficient scope, JWT expired. Mints tokens
+    via `jsonwebtoken::encode` using `lvqr_auth::JwtClaims` directly
+    so the test cannot drift from the production claim schema. First
+    integration-level coverage of the admin HTTP layer at all.
+
+## Bonus security fix: `sanitize_name` path-traversal bypass
+
+The `lvqr-record` proptest for `sanitize_name` (added in session 3 as
+part of item #5 above) failed on its first run with minimal repro
+`".\0."`. The old ordering stripped control characters *after* the
+`..` replacement pass, so deleting `\0` regenerated the traversal
+sequence `..` from `.\0.`. An attacker-supplied broadcast name like
+`"..\0.."` would sanitize to `"...."`, and `"..\0..\0etc\0passwd"`
+would sanitize to `"....etc..passwd"` — both still containing `..`.
+
+**Fix**: reorder so control-char stripping runs first, then `/`, `\`,
+and `..` replacement. The prior ordering's unit test
+(`sanitize_strips_path_traversal` in `recorder.rs`) was not wrong,
+just incomplete: it only exercised a literal `"../etc/passwd"` which
+the old code did catch. The proptest found the class of input the
+unit test missed in under a second. Minimal repro pinned in
+`crates/lvqr-record/tests/proptest_recorder.proptest-regressions`
+for replay on every future run.
+
+This is the clearest Tier 1 validation that the 5-artifact contract
+pays for itself: adding one proptest to a crate that already had a
+passing unit test suite surfaced a real security bypass that had
+been latent across multiple releases.
+
+## Tier 1 work list status (end of session 3)
+
+| Item | Status |
+|---|---|
+| 1. TestServer in `lvqr-test-utils` | DONE |
+| 2. `lvqr-signal` validators + integration test | DONE |
+| 3. Proptest for `extract_resolution` and catalog JSON | DONE |
+| 4. Nightly cargo-fuzz CI | DONE |
+| 5. `cargo audit` in CI | DONE (soft-fail) |
+| 6. `lvqr-conformance` fixture corpus bootstrap | BLOCKED (ffmpeg missing locally) |
+| 7. 5-artifact CI enforcement script | DONE (educational mode) |
+| 8. Playwright `tests/e2e/` scaffolding | DONE (shell-only) |
+| bonus: `lvqr-record` proptest + `sanitize_name` fix | DONE |
+| bonus: JWT + static admin auth integration tests | DONE |
+| bonus: first integration coverage of admin HTTP layer | DONE |
+
+The load-bearing Tier 2 architectural call
+(`lvqr-fragment` + `lvqr-moq` facade, roadmap decisions 1 and 2)
+remains explicitly the next target now that Tier 1 is substantially
+closed. Item 6 is the only remaining Tier 1 blocker and needs an
+ffmpeg-equipped host for one session to capture fixture bytes.
+
+## Known debt and honest limitations after session 3
+
+These are not bugs; they are tracked follow-ups a future session
+should be aware of so nothing is discovered twice.
+
+- **`start()` fire-and-forget tasks**: the optional recorder task
+  and the mesh reaper task are spawned outside the outer
+  `tokio::join!` in `lvqr_cli::start`. Both respect the shared
+  shutdown token and exit cleanly, but `ServerHandle::shutdown().await`
+  does not block on them. In practice fine (they are short-lived
+  after cancellation), but tests that inspect recorder output after
+  shutdown must drive the recorder directly rather than through
+  `TestServer`. See `crates/lvqr-record/tests/record_integration.rs`
+  for the direct-drive pattern.
+- **`lvqr-record` contract slots**: after session 3, lvqr-record
+  satisfies proptest, integration, and (via the workspace E2E)
+  the e2e slot of the 5-artifact contract. The fuzz and conformance
+  slots are still open. Fuzz is low-marginal-value (the helpers are
+  already proptest-covered); conformance requires ffprobe against
+  recorded segments and is a natural follow-up once a session has
+  ffmpeg available.
+- **`scripts/check_test_contract.sh` cross-crate E2E attribution**:
+  the script accepts workspace-level `tests/e2e/**/*.spec.ts` as
+  satisfying the e2e slot for any in-scope crate. This is over-
+  permissive during Tier 1 and should be tightened in Tier 2 via
+  the `CONTRACT_E2E_EXEMPT_<crate>` knob plus a per-crate e2e
+  convention (e.g. `tests/e2e/<crate-name>/*.spec.ts`).
+- **`docs/architecture.md` and `docs/quickstart.md` are stale**
+  per `tracking/AUDIT-READINESS-2026-04-13.md`. Architecture still
+  says `tokio::select!` for the CLI server composition; the Tier 0
+  fix was `tokio::join!`. Quickstart references a `/watch/*` admin
+  endpoint that does not exist. `CONTRIBUTING.md` crate list is
+  missing `lvqr-auth`, `lvqr-record`, `lvqr-conformance`. None of
+  this affects CI; it is a dedicated docs pass for Tier 5.
+- **`lvqr-cli` stale deps**: `rcgen`, `rustls`, `serde`,
+  `serde_json`, `futures`, and `toml` are declared in
+  `crates/lvqr-cli/Cargo.toml` as normal deps but the new
+  `lib.rs` + `main.rs` don't use them directly (they were
+  dependencies of the old 930-line `main.rs`). Harmless but
+  worth a cleanup pass once the Tier 2 rewrite of the CLI
+  composition root settles.
+- **Admin-level hardening (Tier 3)**: `/metrics` is intentionally
+  unauthenticated for Prometheus scraping; `CorsLayer::permissive()`
+  is applied workspace-wide; admin auth middleware does not emit
+  `lvqr_auth_failures_total{entry="admin"}`; no rate limiting
+  anywhere. All four are already tracked in
+  `tracking/AUDIT-INTERNAL-2026-04-13.md` as Tier 3 work.
+- **Dead code in lvqr-core: DELETED in session 4** alongside the
+  Tier 2.1 landing. `Registry`, `RingBuffer`, `GopCache`, and the
+  `Gop` struct are gone. The remaining surface is `Frame`,
+  `TrackName`, `StreamId`, `SubscriberId`, `RelayStats`, `EventBus`,
+  `RelayEvent`. `StreamId`/`SubscriberId` are still dead (no
+  external consumers) but were deliberately kept to avoid scope
+  creep in this commit; they should be deleted in a later cleanup
+  pass if they remain unused.
+- **`lvqr-wasm`**: entire crate is self-deprecated. Scheduled for
+  removal in v0.5. CI still builds it.
+- **Still-open 5-artifact slots (educational mode, not blocking)**:
+  fuzz for `lvqr-record`, `lvqr-moq`, `lvqr-fragment`; conformance
+  for `lvqr-record`, `lvqr-moq`, `lvqr-fragment`. Fuzz is
+  low-marginal-value for the facade + fragment types (they are
+  pure value types with no parser attack surface); the real target
+  for day-one fuzz is `lvqr-codec` when it lands. Conformance for
+  `lvqr-fragment` will come via the codec crates' golden fixtures.
+
+## Recommended Tier 2.2 entry point (session 5)
+
+With Tier 2.1 landed, the next load-bearing item is Tier 2.2
+`lvqr-codec`: hand-rolled bit readers for HEVC, VP9, AV1, Opus, and
+AAC, producing `FragmentMeta` and the init-segment bytes that
+`MoqTrackSink` expects. The crate should ship:
+
+1. HEVC VPS/SPS/PPS parsing plus codec-string generation in the
+   form `hev1.<profile>.<tier>.<level>`, resolution extraction.
+2. AAC AudioSpecificConfig parsing hardened against malformed
+   descriptors (variable-length MPEG-4 descriptor lengths, HE-AAC
+   SBR+PS, xHE-AAC) to replace the single-byte descriptor assumption
+   in the current `lvqr-ingest::remux::fmp4::esds` writer.
+3. Day-one 5-artifact coverage: proptest on each parser (no panic
+   on arbitrary input), a real cargo-fuzz target per codec seeded
+   from `lvqr-conformance` fixtures, integration test that parses
+   real encoder output, conformance via `ffprobe -show_streams`
+   diff against reference encoders.
+
+Do NOT start any Tier 2 protocol crate (`lvqr-whip`, `lvqr-whep`,
+`lvqr-hls`, `lvqr-dash`, `lvqr-srt`, `lvqr-rtsp`, `lvqr-cmaf`,
+`lvqr-archive`) until `lvqr-codec` has at least HEVC SPS parsing
+working. `lvqr-cmaf` in particular depends on `lvqr-codec` for
+sample-entry construction, and every egress protocol crate consumes
+`lvqr-cmaf`. Get `lvqr-codec` right and every subsequent
+Tier 2 crate becomes mechanical; get it wrong and every Tier 2
+crate becomes a rewrite.
+
+---
 **E2E Verified**: real RTMP publish -> RtmpMoqBridge -> MoQ origin -> axum WS
 relay -> tungstenite WebSocket client, with fMP4 init (ftyp) and media (moof)
 segments verified byte-by-byte. See `crates/lvqr-cli/tests/rtmp_ws_e2e.rs`.

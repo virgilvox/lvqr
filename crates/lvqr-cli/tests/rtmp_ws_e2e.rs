@@ -6,7 +6,7 @@
 //!   rml_rtmp client (real TCP) ->
 //!   lvqr_ingest::RtmpServer (real RTMP handshake) ->
 //!   lvqr_ingest::RtmpMoqBridge (FLV -> fMP4 remux) ->
-//!   moq_lite::OriginProducer (real MoQ fanout) ->
+//!   lvqr_moq::OriginProducer (real MoQ fanout) ->
 //!   axum /ws/{broadcast} handler (real WebSocket upgrade) ->
 //!   tokio_tungstenite client (real TCP) ->
 //!   verification that an fMP4 init segment (ftyp) and a media segment (moof)
@@ -23,7 +23,7 @@ use axum::response::Response;
 use axum::routing::get;
 use bytes::Bytes;
 use futures::StreamExt;
-use moq_lite::Track;
+use lvqr_moq::Track;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
@@ -187,7 +187,7 @@ async fn connect_and_publish(port: u16, app: &str, stream_key: &str) -> (TcpStre
 
 #[derive(Clone)]
 struct TestWsState {
-    origin: moq_lite::OriginProducer,
+    origin: lvqr_moq::OriginProducer,
 }
 
 async fn ws_relay_handler(
@@ -246,7 +246,7 @@ async fn rtmp_publish_reaches_ws_subscriber_as_fmp4() {
         .try_init();
 
     // --- RTMP bridge + server ---
-    let origin = moq_lite::OriginProducer::new();
+    let origin = lvqr_moq::OriginProducer::new();
     let bridge = lvqr_ingest::RtmpMoqBridge::new(origin.clone());
     let rtmp_port = find_available_port();
     let rtmp_config = lvqr_ingest::RtmpConfig {

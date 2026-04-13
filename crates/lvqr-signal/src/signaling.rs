@@ -47,6 +47,51 @@ pub enum SignalMessage {
 
     /// Server notifies that a peer has left.
     PeerLeft { peer_id: String },
+
+    /// Structured error returned to the client before the server closes
+    /// the connection. Emitted when a Register message carries an invalid
+    /// peer_id or track, when a duplicate Register arrives on an
+    /// already-registered session, and on any other protocol violation
+    /// that causes the server to terminate the session.
+    ///
+    /// `code` is a short machine-readable tag (e.g. `invalid_peer_id`,
+    /// `invalid_track`, `expected_register`, `duplicate_register`) and
+    /// `reason` is a human-readable sentence suitable for logging.
+    Error { code: String, reason: String },
+}
+
+/// Maximum accepted `peer_id` byte length. Short enough to make brute-force
+/// peer table pollution expensive; long enough to accept UUIDs and nanoids.
+pub const MAX_PEER_ID_LEN: usize = 64;
+
+/// Maximum accepted `track` byte length. Tracks are path-like (e.g.
+/// `live/test`), so the limit is larger than peer_id.
+pub const MAX_TRACK_LEN: usize = 128;
+
+/// Validate a client-supplied `peer_id`. The audit flagged that peer IDs
+/// flow straight from untrusted JSON into the peer table, into log lines,
+/// and into mesh coordinator calls. The rule: ASCII alphanumeric plus
+/// `_` and `-`, 1..=[`MAX_PEER_ID_LEN`] bytes.
+pub fn is_valid_peer_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_PEER_ID_LEN
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Validate a client-supplied `track` string. Tracks look like
+/// `live/test`, so the character set is wider: alphanumeric plus
+/// `_`, `-`, `.`, and `/`. `..`, leading or trailing `/`, and
+/// embedded control characters are all rejected to keep the value
+/// safe as a routing key and log field.
+pub fn is_valid_track(s: &str) -> bool {
+    if s.is_empty() || s.len() > MAX_TRACK_LEN {
+        return false;
+    }
+    if s.starts_with('/') || s.ends_with('/') || s.contains("..") || s.contains("//") {
+        return false;
+    }
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
 }
 
 /// A connected peer session with a send channel.
@@ -163,6 +208,19 @@ async fn handle_ws_connection(mut socket: WebSocket, server: SignalServer) {
         tokio::select! {
             Some(msg) = recv_ws_message(&mut socket) => {
                 match msg {
+                    Ok(SignalMessage::Register { .. }) => {
+                        // The audit caps registrations per connection at 1.
+                        // A client that sends a second Register after the
+                        // initial handshake is buggy or malicious; reply
+                        // with a structured error and close the session.
+                        warn!(peer = %peer_id, "duplicate Register after handshake, closing");
+                        let err = SignalMessage::Error {
+                            code: "duplicate_register".to_string(),
+                            reason: "register may only be sent once per connection".to_string(),
+                        };
+                        let _ = send_signal(&mut socket, &err).await;
+                        break;
+                    }
                     Ok(signal_msg) => {
                         handle_signal_message(&server, &peer_id, signal_msg);
                     }
@@ -173,14 +231,7 @@ async fn handle_ws_connection(mut socket: WebSocket, server: SignalServer) {
                 }
             }
             Some(msg) = outgoing_rx.recv() => {
-                let json = match serde_json::to_string(&msg) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        warn!(peer = %peer_id, error = %e, "failed to serialize message");
-                        continue;
-                    }
-                };
-                if socket.send(Message::Text(json.into())).await.is_err() {
+                if send_signal(&mut socket, &msg).await.is_err() {
                     break;
                 }
             }
@@ -203,30 +254,82 @@ async fn wait_for_register(
     server: &SignalServer,
 ) -> Option<(String, mpsc::UnboundedReceiver<SignalMessage>)> {
     let msg = socket.recv().await?;
-    let msg = match msg {
+    let text = match msg {
         Ok(Message::Text(text)) => text,
         Ok(Message::Close(_)) | Err(_) => return None,
         _ => return None,
     };
 
-    let signal: SignalMessage = match serde_json::from_str(&msg) {
+    let signal: SignalMessage = match serde_json::from_str(&text) {
         Ok(s) => s,
         Err(e) => {
-            warn!(error = %e, "invalid register message");
+            warn!(error = %e, "invalid register JSON");
+            let err = SignalMessage::Error {
+                code: "invalid_json".to_string(),
+                reason: format!("first message must be a valid Register JSON: {e}"),
+            };
+            let _ = send_signal(socket, &err).await;
             return None;
         }
     };
 
     match signal {
         SignalMessage::Register { peer_id, track } => {
+            if !is_valid_peer_id(&peer_id) {
+                // Do not log the bad peer_id at info level: it is
+                // attacker-controlled and may contain control chars that
+                // corrupt structured logs. Only the length is safe to
+                // record without sanitization.
+                warn!(len = peer_id.len(), "register rejected: invalid peer_id");
+                let err = SignalMessage::Error {
+                    code: "invalid_peer_id".to_string(),
+                    reason: format!("peer_id must match [A-Za-z0-9_-]{{1,{MAX_PEER_ID_LEN}}}"),
+                };
+                let _ = send_signal(socket, &err).await;
+                return None;
+            }
+            if !is_valid_track(&track) {
+                warn!(
+                    peer = %peer_id,
+                    len = track.len(),
+                    "register rejected: invalid track"
+                );
+                let err = SignalMessage::Error {
+                    code: "invalid_track".to_string(),
+                    reason: format!(
+                        "track must match [A-Za-z0-9._/-]{{1,{MAX_TRACK_LEN}}} and must not contain .. or leading/trailing /"
+                    ),
+                };
+                let _ = send_signal(socket, &err).await;
+                return None;
+            }
             let rx = server.register_peer(&peer_id, &track);
             Some((peer_id, rx))
         }
         _ => {
             warn!("expected Register message, got something else");
+            let err = SignalMessage::Error {
+                code: "expected_register".to_string(),
+                reason: "first message on a signaling connection must be Register".to_string(),
+            };
+            let _ = send_signal(socket, &err).await;
             None
         }
     }
+}
+
+/// Serialize and send a [`SignalMessage`] over a WebSocket as a Text
+/// frame. Used by both the outbound-channel pump and the error-response
+/// path so serialization is centralized.
+async fn send_signal(socket: &mut WebSocket, msg: &SignalMessage) -> Result<(), axum::Error> {
+    let json = match serde_json::to_string(msg) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!(error = %e, "failed to serialize signal message");
+            return Ok(());
+        }
+    };
+    socket.send(Message::Text(json.into())).await
 }
 
 async fn recv_ws_message(socket: &mut WebSocket) -> Option<Result<SignalMessage, String>> {
@@ -426,5 +529,71 @@ mod tests {
 
         server.remove_peer("peer-1");
         assert_eq!(server.peer_count(), 0);
+    }
+
+    #[test]
+    fn peer_id_validator_accepts_well_formed() {
+        assert!(is_valid_peer_id("peer-1"));
+        assert!(is_valid_peer_id("PEER_42"));
+        assert!(is_valid_peer_id("abc123"));
+        assert!(is_valid_peer_id("a"));
+        assert!(is_valid_peer_id(&"x".repeat(MAX_PEER_ID_LEN)));
+    }
+
+    #[test]
+    fn peer_id_validator_rejects_malformed() {
+        assert!(!is_valid_peer_id(""));
+        assert!(!is_valid_peer_id(&"x".repeat(MAX_PEER_ID_LEN + 1)));
+        assert!(!is_valid_peer_id("peer 1")); // space
+        assert!(!is_valid_peer_id("peer/1")); // slash
+        assert!(!is_valid_peer_id("peer.1")); // dot
+        assert!(!is_valid_peer_id("peer\n1")); // newline
+        assert!(!is_valid_peer_id("peer\t1")); // tab
+        assert!(!is_valid_peer_id("peer\x00id")); // nul
+        assert!(!is_valid_peer_id("peer<script>")); // html
+        assert!(!is_valid_peer_id("peerü")); // non-ascii
+    }
+
+    #[test]
+    fn track_validator_accepts_well_formed() {
+        assert!(is_valid_track("live/test"));
+        assert!(is_valid_track("live"));
+        assert!(is_valid_track("a.b.c"));
+        assert!(is_valid_track("a/b/c"));
+        assert!(is_valid_track("live-2024/hd.1080p"));
+        assert!(is_valid_track(&"a".repeat(MAX_TRACK_LEN)));
+    }
+
+    #[test]
+    fn track_validator_rejects_traversal_and_garbage() {
+        assert!(!is_valid_track(""));
+        assert!(!is_valid_track(&"a".repeat(MAX_TRACK_LEN + 1)));
+        assert!(!is_valid_track("/leading"));
+        assert!(!is_valid_track("trailing/"));
+        assert!(!is_valid_track("a//b"));
+        assert!(!is_valid_track("a/../b"));
+        assert!(!is_valid_track(".."));
+        assert!(!is_valid_track("a\\b"));
+        assert!(!is_valid_track("live test"));
+        assert!(!is_valid_track("liveü"));
+    }
+
+    #[test]
+    fn error_variant_round_trips() {
+        let err = SignalMessage::Error {
+            code: "invalid_peer_id".into(),
+            reason: "bad".into(),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("\"type\":\"Error\""));
+        assert!(json.contains("\"code\":\"invalid_peer_id\""));
+        let parsed: SignalMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SignalMessage::Error { code, reason } => {
+                assert_eq!(code, "invalid_peer_id");
+                assert_eq!(reason, "bad");
+            }
+            _ => panic!("expected Error"),
+        }
     }
 }

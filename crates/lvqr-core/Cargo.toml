@@ -20,14 +20,5 @@ dashmap = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
-criterion = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 serde_json = { workspace = true }
-
-[[bench]]
-name = "ringbuffer"
-harness = false
-
-[[bench]]
-name = "fanout"
-harness = false

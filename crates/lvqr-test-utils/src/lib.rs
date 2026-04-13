@@ -1,7 +1,8 @@
 use bytes::Bytes;
-use lvqr_core::{Frame, Registry, TrackName};
 use std::net::TcpListener;
-use std::sync::Arc;
+
+mod test_server;
+pub use test_server::{TestServer, TestServerConfig};
 
 /// Find an available TCP port on localhost.
 pub fn find_available_port() -> u16 {
@@ -38,69 +39,6 @@ pub fn synthetic_delta_frame(size: usize) -> Bytes {
         data[4] = 0x41; // non-IDR NAL type
     }
     Bytes::from(data)
-}
-
-/// Generate a synthetic GOP (keyframe + N delta frames).
-pub fn synthetic_gop(gop_sequence: u64, delta_count: usize, frame_size: usize) -> Vec<Frame> {
-    let mut frames = Vec::with_capacity(delta_count + 1);
-    let base_seq = gop_sequence * (delta_count as u64 + 1);
-
-    // Keyframe
-    frames.push(Frame::new(
-        base_seq,
-        base_seq * 3000,
-        true,
-        synthetic_keyframe(frame_size),
-    ));
-
-    // Delta frames
-    for i in 1..=delta_count {
-        frames.push(Frame::new(
-            base_seq + i as u64,
-            (base_seq + i as u64) * 3000,
-            false,
-            synthetic_delta_frame(frame_size / 4), // deltas are typically smaller
-        ));
-    }
-
-    frames
-}
-
-/// A test publisher that pushes synthetic frames to a registry.
-pub struct TestPublisher {
-    registry: Arc<Registry>,
-    track: TrackName,
-    sequence: u64,
-}
-
-impl TestPublisher {
-    pub fn new(registry: Arc<Registry>, track: TrackName) -> Self {
-        Self {
-            registry,
-            track,
-            sequence: 0,
-        }
-    }
-
-    /// Publish a single GOP (keyframe + delta_count delta frames).
-    pub fn publish_gop(&mut self, delta_count: usize, frame_size: usize) {
-        let frames = synthetic_gop(self.sequence, delta_count, frame_size);
-        for frame in frames {
-            self.registry.publish(&self.track, frame);
-        }
-        self.sequence += 1;
-    }
-
-    /// Publish N GOPs.
-    pub fn publish_gops(&mut self, count: usize, delta_count: usize, frame_size: usize) {
-        for _ in 0..count {
-            self.publish_gop(delta_count, frame_size);
-        }
-    }
-
-    pub fn track(&self) -> &TrackName {
-        &self.track
-    }
 }
 
 /// Initialize tracing for tests (call once per test binary).
@@ -200,7 +138,20 @@ pub fn ffprobe_bytes(bytes: &[u8]) -> FfprobeResult {
         }
     };
 
-    if output.status.success() && output.stderr.is_empty() {
+    // ffprobe's authoritative signal is its exit code: non-zero means it
+    // rejected the input. stderr on an exit-zero run is diagnostics, not a
+    // verdict -- ffprobe 8.x emits decoder-level warnings like
+    // "deblocking_filter_idc 32 out of range" even on structurally valid
+    // containers that happen to carry synthesized dummy NAL payloads. Treat
+    // those as noise, but surface them to the test log via eprintln so a
+    // real regression is still visible.
+    if output.status.success() {
+        if !output.stderr.is_empty() {
+            eprintln!(
+                "ffprobe accepted container with decoder warnings:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         FfprobeResult::Ok
     } else {
         FfprobeResult::Failed {

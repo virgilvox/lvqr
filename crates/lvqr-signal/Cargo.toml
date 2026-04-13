@@ -22,4 +22,7 @@ thiserror = { workspace = true }
 dashmap = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+lvqr-test-utils = { workspace = true }
+tokio-tungstenite = "0.24"
+futures = { workspace = true }

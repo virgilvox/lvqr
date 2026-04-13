@@ -18,4 +18,6 @@ mod error;
 mod recorder;
 
 pub use error::RecordError;
+#[doc(hidden)]
+pub use recorder::internals;
 pub use recorder::{BroadcastRecorder, RecordOptions};

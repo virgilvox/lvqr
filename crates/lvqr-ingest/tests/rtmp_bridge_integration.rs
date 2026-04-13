@@ -4,7 +4,7 @@
 //! the bridge creates a MoQ broadcast with CMAF-formatted tracks.
 
 use bytes::Bytes;
-use moq_lite::Track;
+use lvqr_moq::Track;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
@@ -213,7 +213,7 @@ async fn rtmp_video_produces_cmaf() {
         .with_test_writer()
         .try_init();
 
-    let origin = moq_lite::OriginProducer::new();
+    let origin = lvqr_moq::OriginProducer::new();
     let bridge = lvqr_ingest::RtmpMoqBridge::new(origin.clone());
 
     let port = find_available_port();
@@ -346,7 +346,7 @@ async fn rtmp_audio_produces_cmaf() {
         .with_test_writer()
         .try_init();
 
-    let origin = moq_lite::OriginProducer::new();
+    let origin = lvqr_moq::OriginProducer::new();
     let bridge = lvqr_ingest::RtmpMoqBridge::new(origin.clone());
 
     let port = find_available_port();

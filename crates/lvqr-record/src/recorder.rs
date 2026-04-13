@@ -1,6 +1,6 @@
 use crate::error::RecordError;
 use bytes::Bytes;
-use moq_lite::{BroadcastConsumer, Track};
+use lvqr_moq::{BroadcastConsumer, Track};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -91,7 +91,7 @@ impl BroadcastRecorder {
 async fn record_track(
     dir: &Path,
     track_name: &str,
-    mut track: moq_lite::TrackConsumer,
+    mut track: lvqr_moq::TrackConsumer,
     cancel: CancellationToken,
 ) -> Result<(), RecordError> {
     let prefix = track_prefix(track_name);
@@ -144,22 +144,61 @@ async fn record_track(
 
 /// Detect an fMP4 init segment by looking for the `ftyp` box at offset 4.
 fn looks_like_init(bytes: &Bytes) -> bool {
-    bytes.len() >= 8 && &bytes[4..8] == b"ftyp"
+    internals::looks_like_init_bytes(bytes)
 }
 
 /// Convert a track name like "0.mp4" into a filename prefix "0".
 fn track_prefix(track_name: &str) -> String {
-    track_name.split('.').next().unwrap_or(track_name).to_string()
+    internals::track_prefix(track_name)
 }
 
 /// Sanitize a broadcast name for use as a filesystem directory.
 /// Strips path traversal and replaces slashes with underscores.
 fn sanitize_name(name: &str) -> String {
-    name.replace(['/', '\\'], "_")
-        .replace("..", "_")
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect()
+    internals::sanitize_name(name)
+}
+
+/// Internal helpers exposed for proptest and integration testing.
+///
+/// These functions are pure and deterministic and so are safe to make
+/// reachable from tests without exposing a committed stability surface.
+/// They are `#[doc(hidden)]` and not part of the public API; callers
+/// outside the crate should not depend on them.
+#[doc(hidden)]
+pub mod internals {
+    use bytes::Bytes;
+
+    /// See [`super::looks_like_init`]. Takes a `&Bytes` slice to keep
+    /// the inner module signature byte-for-byte compatible with the
+    /// private wrapper.
+    pub fn looks_like_init_bytes(bytes: &Bytes) -> bool {
+        bytes.len() >= 8 && &bytes[4..8] == b"ftyp"
+    }
+
+    /// See [`super::track_prefix`].
+    pub fn track_prefix(track_name: &str) -> String {
+        track_name.split('.').next().unwrap_or(track_name).to_string()
+    }
+
+    /// See [`super::sanitize_name`]. The recorder rejects path
+    /// traversal, backslashes, forward slashes, and control bytes
+    /// here; the `BroadcastRecorder::record_broadcast` entry point
+    /// passes every untrusted broadcast name through this function
+    /// before joining it onto the output directory.
+    ///
+    /// Control characters are stripped FIRST, then `/`, `\`, and `..`
+    /// are replaced. The prior ordering stripped controls last, which
+    /// allowed an input like `".\0."` to survive the `..` replacement
+    /// pass (no literal `..` present while `\0` sits between the dots)
+    /// and then collapse into the traversal sequence `".."` once
+    /// `\0` was filtered out. The proptest test
+    /// `sanitize_name_strips_traversal_and_slashes` in
+    /// `tests/proptest_recorder.rs` catches that class of bypass and
+    /// is load-bearing against regressions here.
+    pub fn sanitize_name(name: &str) -> String {
+        let no_controls: String = name.chars().filter(|c| !c.is_control()).collect();
+        no_controls.replace(['/', '\\'], "_").replace("..", "_")
+    }
 }
 
 #[cfg(test)]

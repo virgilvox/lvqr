@@ -1,0 +1,61 @@
+name: E2E
+
+# Playwright browser E2E suite under tests/e2e/. Tier 1 scope is the
+# test-app shell (three-tab nav + Watch tab structure); Tier 2 will
+# extend the config to spawn a real lvqr binary alongside the static
+# test-app server and assert on buffered media. See tests/e2e/README.md.
+#
+# Soft-fail throughout Tier 1 via continue-on-error so PRs are not
+# blocked on flakes while the harness matures. Flip to required when
+# the full-stack specs land in Tier 2.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "tests/e2e/**"
+      - "test-app/**"
+      - ".github/workflows/e2e.yml"
+  push:
+    branches: [main]
+    paths:
+      - "tests/e2e/**"
+      - "test-app/**"
+      - ".github/workflows/e2e.yml"
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    name: Playwright (chromium)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: tests/e2e
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: tests/e2e/package.json
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Install Chromium (with system deps)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright tests
+        run: npx playwright test
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ github.run_id }}
+          path: tests/e2e/playwright-report
+          if-no-files-found: ignore
+          retention-days: 14

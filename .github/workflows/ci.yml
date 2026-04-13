@@ -51,6 +51,29 @@ jobs:
       - name: Test (lib + integration + doc)
         run: cargo test --workspace
 
+  audit:
+    name: Supply Chain (cargo-audit)
+    runs-on: ubuntu-latest
+    # Soft-fail during Tier 1 so the baseline can land without forcing
+    # immediate advisory triage on every PR. Promote to required once
+    # the RUSTSEC baseline is clean per tracking/AUDIT-READINESS-2026-04-13.md.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: audit-v1
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run cargo audit
+        # Step failure is intentionally surfaced in the Checks tab so
+        # new advisories are visible at a glance. The enclosing job
+        # is marked continue-on-error so a failing step does not block
+        # the PR during Tier 1; promote to required once the RUSTSEC
+        # baseline is clean.
+        run: cargo audit
+
   wasm:
     name: WASM Build
     runs-on: ubuntu-latest

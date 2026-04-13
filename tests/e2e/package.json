@@ -1,0 +1,14 @@
+{
+  "name": "lvqr-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Playwright browser E2E tests for the LVQR test-app. Wired as the E2E slot in the 5-artifact test contract (tests/CONTRACT.md).",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "install-browsers": "playwright install --with-deps chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.47.0"
+  }
+}

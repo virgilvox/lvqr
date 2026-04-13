@@ -3,7 +3,7 @@
 //! These tests start a real MoQ relay, connect publishers and subscribers
 //! over QUIC, and verify that data flows correctly. No mocks.
 
-use moq_lite::{Origin, Track};
+use lvqr_moq::{Origin, Track};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(10);

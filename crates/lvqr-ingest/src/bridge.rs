@@ -8,7 +8,8 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use lvqr_auth::{AuthContext, NoopAuthProvider, SharedAuth};
 use lvqr_core::{EventBus, RelayEvent};
-use moq_lite::Track;
+use lvqr_fragment::{Fragment, FragmentFlags, FragmentMeta, MoqTrackSink};
+use lvqr_moq::Track;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -20,12 +21,16 @@ use crate::remux::{
 use crate::rtmp::{AuthCallback, MediaCallback, RtmpConfig, RtmpServer, StreamCallback};
 
 /// State for a single active RTMP stream being bridged to MoQ.
+///
+/// The track writes go through [`MoqTrackSink`] so this module is a
+/// `Fragment`-shaped producer: every branch below constructs a `Fragment`
+/// and calls `sink.push(..)`. This is the Tier 2.1 migration of the RTMP
+/// bridge to the Unified Fragment Model.
 struct ActiveStream {
-    _broadcast: moq_lite::BroadcastProducer,
-    video_track: moq_lite::TrackProducer,
-    audio_track: moq_lite::TrackProducer,
-    catalog_track: moq_lite::TrackProducer,
-    video_group: Option<moq_lite::GroupProducer>,
+    _broadcast: lvqr_moq::BroadcastProducer,
+    video_sink: MoqTrackSink,
+    audio_sink: MoqTrackSink,
+    catalog_track: lvqr_moq::TrackProducer,
     // Codec configuration (set when sequence headers arrive)
     video_config: Option<VideoConfig>,
     audio_config: Option<AudioConfig>,
@@ -43,14 +48,14 @@ struct ActiveStream {
 /// Creates MoQ broadcasts for each RTMP stream and remuxes video/audio
 /// data from FLV to CMAF/fMP4 segments.
 pub struct RtmpMoqBridge {
-    origin: moq_lite::OriginProducer,
+    origin: lvqr_moq::OriginProducer,
     streams: Arc<DashMap<String, ActiveStream>>,
     auth: SharedAuth,
     events: Option<EventBus>,
 }
 
 impl RtmpMoqBridge {
-    pub fn new(origin: moq_lite::OriginProducer) -> Self {
+    pub fn new(origin: lvqr_moq::OriginProducer) -> Self {
         Self {
             origin,
             streams: Arc::new(DashMap::new()),
@@ -60,7 +65,7 @@ impl RtmpMoqBridge {
     }
 
     /// Construct with a specific auth provider.
-    pub fn with_auth(origin: moq_lite::OriginProducer, auth: SharedAuth) -> Self {
+    pub fn with_auth(origin: lvqr_moq::OriginProducer, auth: SharedAuth) -> Self {
         Self {
             origin,
             streams: Arc::new(DashMap::new()),
@@ -138,14 +143,18 @@ impl RtmpMoqBridge {
                     name: stream_name.clone(),
                 });
             }
+            // Build Fragment sinks around the freshly-created TrackProducers.
+            // Init segments are not yet known (they arrive with the FLV
+            // sequence headers); set_init_segment is called when they do.
+            let video_sink = MoqTrackSink::new(video_track, FragmentMeta::new("avc1", 90000));
+            let audio_sink = MoqTrackSink::new(audio_track, FragmentMeta::new("mp4a", 0));
             streams_publish.insert(
                 stream_name,
                 ActiveStream {
                     _broadcast: broadcast,
-                    video_track,
-                    audio_track,
+                    video_sink,
+                    audio_sink,
                     catalog_track,
-                    video_group: None,
                     video_config: None,
                     audio_config: None,
                     video_init: None,
@@ -160,9 +169,10 @@ impl RtmpMoqBridge {
         let on_unpublish: StreamCallback = Arc::new(move |app: &str, key: &str| {
             let stream_name = format!("{app}/{key}");
             if let Some((_, mut stream)) = streams_unpublish.remove(&stream_name) {
-                if let Some(mut group) = stream.video_group.take() {
-                    let _ = group.finish();
-                }
+                // Explicitly close any open video group. Dropping the sink
+                // would also do this, but being explicit makes the unpublish
+                // path obvious to readers.
+                stream.video_sink.finish_current_group();
                 metrics::gauge!("lvqr_active_streams").decrement(1.0);
                 if let Some(bus) = &events_unpublish {
                     bus.emit(RelayEvent::BroadcastStopped {
@@ -194,6 +204,9 @@ impl RtmpMoqBridge {
                         "video sequence header"
                     );
                     let init = video_init_segment_with_size(&config, width as u16, height as u16);
+                    // Hand the init segment to the sink so every new MoQ
+                    // group starts with it.
+                    stream.video_sink.set_init_segment(init.clone());
                     stream.video_config = Some(config);
                     stream.video_init = Some(init);
                     maybe_write_catalog(stream, &stream_name);
@@ -203,11 +216,8 @@ impl RtmpMoqBridge {
                     cts,
                     data: nalu_data,
                 } => {
-                    let Some(ref _config) = stream.video_config else {
+                    if stream.video_config.is_none() || stream.video_init.is_none() {
                         return; // no sequence header yet
-                    };
-                    let Some(ref init) = stream.video_init else {
-                        return;
                     };
 
                     metrics::counter!("lvqr_frames_published_total", "type" => "video").increment(1);
@@ -229,44 +239,36 @@ impl RtmpMoqBridge {
                         keyframe,
                     };
 
-                    if keyframe {
-                        // Finish previous group
-                        if let Some(mut group) = stream.video_group.take() {
-                            let _ = group.finish();
-                        }
+                    stream.video_seq += 1;
+                    let seg = video_segment(stream.video_seq, base_dts, &[sample]);
 
-                        stream.video_seq += 1;
-
-                        // Start new group: init segment as frame 0, keyframe as frame 1
-                        match stream.video_track.append_group() {
-                            Ok(mut group) => {
-                                if let Err(e) = group.write_frame(init.clone()) {
-                                    debug!(error = ?e, "failed to write video init segment");
-                                    return;
-                                }
-                                let seg = video_segment(stream.video_seq, base_dts, &[sample]);
-                                if let Err(e) = group.write_frame(seg) {
-                                    debug!(error = ?e, "failed to write video keyframe segment");
-                                    return;
-                                }
-                                stream.video_group = Some(group);
-                            }
-                            Err(e) => {
-                                debug!(error = ?e, "failed to append video group");
-                            }
-                        }
-                    } else if let Some(ref mut group) = stream.video_group {
-                        stream.video_seq += 1;
-                        let seg = video_segment(stream.video_seq, base_dts, &[sample]);
-                        if let Err(e) = group.write_frame(seg) {
-                            debug!(error = ?e, "failed to write video delta segment");
-                        }
+                    // Build a Fragment and push it through the sink. On a
+                    // keyframe the sink closes the previous group, opens a
+                    // new one, and prepends the init segment from
+                    // FragmentMeta. On a delta the sink writes into the
+                    // open group.
+                    let flags = if keyframe {
+                        FragmentFlags::KEYFRAME
+                    } else {
+                        FragmentFlags::DELTA
+                    };
+                    let frag = Fragment::new(
+                        "0.mp4",
+                        stream.video_seq as u64,
+                        0,
+                        0,
+                        base_dts,
+                        base_dts.saturating_add((cts as u64) * 90),
+                        duration_ticks as u64,
+                        flags,
+                        seg,
+                    );
+                    if let Err(e) = stream.video_sink.push(&frag) {
+                        debug!(error = ?e, "failed to push video fragment through sink");
                     }
                 }
                 FlvVideoTag::EndOfSequence => {
-                    if let Some(mut group) = stream.video_group.take() {
-                        let _ = group.finish();
-                    }
+                    stream.video_sink.finish_current_group();
                 }
                 FlvVideoTag::Unknown => {}
             }
@@ -283,6 +285,7 @@ impl RtmpMoqBridge {
                 FlvAudioTag::SequenceHeader(config) => {
                     debug!(stream = %stream_name, codec = %config.codec_string(), "audio sequence header");
                     let init = audio_init_segment(&config);
+                    stream.audio_sink.set_init_segment(init.clone());
                     stream.audio_config = Some(config);
                     stream.audio_init = Some(init);
                     maybe_write_catalog(stream, &stream_name);
@@ -291,34 +294,42 @@ impl RtmpMoqBridge {
                     let Some(ref config) = stream.audio_config else {
                         return;
                     };
-                    let Some(ref init) = stream.audio_init else {
+                    if stream.audio_init.is_none() {
                         return;
-                    };
+                    }
 
                     metrics::counter!("lvqr_frames_published_total", "type" => "audio").increment(1);
                     metrics::counter!("lvqr_bytes_ingested_total", "type" => "audio").increment(aac_data.len() as u64);
 
                     stream.audio_seq += 1;
                     // AAC-LC uses 1024 samples per frame at the audio sample rate
-                    let duration = 1024;
+                    let duration: u32 = 1024;
                     let base_dts = (timestamp as u64) * (config.sample_rate as u64) / 1000;
+                    let seg = audio_segment(stream.audio_seq, base_dts, duration, &aac_data);
 
-                    match stream.audio_track.append_group() {
-                        Ok(mut group) => {
-                            if let Err(e) = group.write_frame(init.clone()) {
-                                debug!(error = ?e, "failed to write audio init segment");
-                                return;
-                            }
-                            let seg = audio_segment(stream.audio_seq, base_dts, duration, &aac_data);
-                            if let Err(e) = group.write_frame(seg) {
-                                debug!(error = ?e, "failed to write audio segment");
-                            }
-                            let _ = group.finish();
-                        }
-                        Err(e) => {
-                            debug!(error = ?e, "failed to append audio group");
-                        }
+                    // Every audio fragment opens its own MoQ group (audio
+                    // frames are independently decodable in AAC-LC), so we
+                    // tag every one as a keyframe for the sink's purposes.
+                    // The sink will close the previous group and open a new
+                    // one on each push.
+                    let frag = Fragment::new(
+                        "1.mp4",
+                        stream.audio_seq as u64,
+                        0,
+                        0,
+                        base_dts,
+                        base_dts,
+                        duration as u64,
+                        FragmentFlags::KEYFRAME,
+                        seg,
+                    );
+                    if let Err(e) = stream.audio_sink.push(&frag) {
+                        debug!(error = ?e, "failed to push audio fragment through sink");
                     }
+                    // Close the group immediately so every audio frame is
+                    // its own group on the wire. Subsequent pushes will
+                    // open fresh groups.
+                    stream.audio_sink.finish_current_group();
                 }
                 FlvAudioTag::Unknown => {}
             }

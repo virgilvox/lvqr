@@ -10,6 +10,10 @@ authors.workspace = true
 keywords = ["streaming", "server", "quic", "moq"]
 categories = ["multimedia", "network-programming", "command-line-utilities"]
 
+[lib]
+name = "lvqr_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "lvqr"
 path = "src/main.rs"
@@ -23,6 +27,7 @@ quinn-transport = ["lvqr-relay/quinn-transport"]
 [dependencies]
 lvqr-core = { workspace = true }
 lvqr-relay = { workspace = true }
+lvqr-moq = { workspace = true }
 moq-lite = { workspace = true }
 lvqr-mesh = { workspace = true }
 lvqr-ingest = { workspace = true }
@@ -58,3 +63,9 @@ tokio-tungstenite = "0.24"
 tracing-subscriber = { workspace = true }
 tower = { workspace = true }
 http = "1"
+# Full-stack TestServer for auth_integration.rs.
+lvqr-test-utils = { workspace = true }
+# JWT minting in auth_integration.rs. Matches the version pulled in
+# transitively through `lvqr-auth/jwt`.
+jsonwebtoken = { workspace = true }
+serde_json = { workspace = true }

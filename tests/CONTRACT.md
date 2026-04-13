@@ -27,33 +27,36 @@ Crates currently in scope and their 5-artifact status as of 2026-04-13:
 
 | Crate | proptest | fuzz | integration | E2E | conformance |
 |---|---|---|---|---|---|
-| lvqr-ingest (FLV, fMP4, RTMP) | yes (`tests/proptest_parsers.rs`) | no | yes (`tests/rtmp_bridge_integration.rs`) | yes (`../lvqr-cli/tests/rtmp_ws_e2e.rs`) | golden only (`tests/golden_fmp4.rs`) |
+| lvqr-ingest (FLV, fMP4, RTMP) | yes (`tests/proptest_parsers.rs`, 9 tests, ~4100 generated cases per run) | yes (`fuzz/fuzz_targets/{parse_video_tag,parse_audio_tag}.rs`, nightly via `.github/workflows/fuzz.yml`) | yes (`tests/rtmp_bridge_integration.rs`) | yes (`../lvqr-cli/tests/rtmp_ws_e2e.rs` plus `tests/e2e/test-app.spec.ts`) | golden + ffprobe (`tests/golden_fmp4.rs`, `ffprobe_accepts_concatenated_cmaf`) |
 | lvqr-relay | no | no | yes (`tests/relay_integration.rs`) | partial (via lvqr-cli) | no |
 | lvqr-core | partial (ringbuf, gop) | no | no | n/a | n/a |
 | lvqr-auth | no | no | no | n/a | n/a |
-| lvqr-record | no | no | no | no | no |
+| lvqr-signal | no | no | yes (`tests/signal_integration.rs`, 5 tests, real TestServer+tokio-tungstenite) | workspace `tests/e2e/` | no |
+| lvqr-record | yes (`tests/proptest_recorder.rs`) | no | yes (`tests/record_integration.rs`) | workspace `tests/e2e/` | no |
 
-Gaps relative to the contract are already tracked in the Tier 1 work list.
-The immediate priorities are:
+Gaps relative to the contract are tracked in the Tier 1 work list. The
+immediate priorities are:
 
-1. `cargo-fuzz` target for `parse_video_tag` and `parse_audio_tag` (reuses
-   the proptest strategies from `tests/proptest_parsers.rs`, promoted to
-   a separate fuzz crate under `crates/lvqr-ingest/fuzz/`).
-2. ffprobe-backed conformance wrapper for the fMP4 writer, using the
-   helper in `lvqr-test-utils::ffprobe_bytes`.
-3. `mediastreamvalidator` wrapper for LL-HLS output once Tier 2.5 is
+1. Fixture corpus bootstrap for `lvqr-conformance/fixtures/{rtmp,fmp4,hls}/`.
+   Blocked in the current dev env on `ffmpeg` availability.
+2. `mediastreamvalidator` wrapper for LL-HLS output once Tier 2.5 is
    underway, wired through `lvqr-conformance::ValidatorResult`.
+3. ffprobe-backed conformance slot for `lvqr-record`: run `ffprobe_bytes`
+   against recorded segments in a follow-up test.
 
 ## Enforcement
 
-Tier 1 (now): educational. New crates that land without all five should
-get a PR comment pointing at this document. Existing crates catch up
-incrementally via the Tier 1 test-infra backlog.
+Tier 1 (now): educational. `.github/workflows/contract.yml` runs
+`scripts/check_test_contract.sh` on every PR and push with
+`continue-on-error: true`. Missing slots surface as GitHub Actions
+warning annotations on the affected crate's `Cargo.toml` so
+contributors see them on the Checks tab without opening logs.
 
-Tier 2 (soon): CI script under `.github/workflows/` greps the diff for
-new modules under the in-scope crates and fails the build if any of the
-five artifacts is missing. Educational at first, hard-fail once the
-backlog is cleared.
+Tier 2 (soon): set `LVQR_CONTRACT_STRICT=1` in the workflow and remove
+`continue-on-error`. The script exits non-zero on any missing slot in
+strict mode. Specific per-crate E2E exemptions are declared through
+`CONTRACT_E2E_EXEMPT_<crate_with_underscores>=1` environment variables
+when a crate's E2E legitimately lives in another crate's test binary.
 
 ## Rationale
 

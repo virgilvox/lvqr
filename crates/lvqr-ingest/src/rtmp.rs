@@ -106,7 +106,18 @@ impl RtmpServer {
     pub async fn run(&self, shutdown: CancellationToken) -> Result<(), IngestError> {
         let listener = TcpListener::bind(self.config.bind_addr).await?;
         info!(addr = %self.config.bind_addr, "RTMP ingest listening");
+        self.run_with_listener(listener, shutdown).await
+    }
 
+    /// Run the RTMP ingest server on an already-bound `TcpListener`. Useful
+    /// for tests that need to know the bound port before the server starts
+    /// accepting connections (pre-bind at port 0, read `local_addr`, hand
+    /// the listener to the server).
+    pub async fn run_with_listener(
+        &self,
+        listener: TcpListener,
+        shutdown: CancellationToken,
+    ) -> Result<(), IngestError> {
         loop {
             tokio::select! {
                 result = listener.accept() => {

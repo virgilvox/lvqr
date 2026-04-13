@@ -1,0 +1,21 @@
+[package]
+name = "lvqr-fragment"
+description = "Unified Fragment Model for LVQR. Fragment is the root media type; every ingest produces it and every egress projects from it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["streaming", "cmaf", "moq", "fragment", "video"]
+categories = ["multimedia"]
+
+[dependencies]
+lvqr-moq = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
