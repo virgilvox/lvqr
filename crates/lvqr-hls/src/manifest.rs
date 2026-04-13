@@ -1,0 +1,437 @@
+//! HLS / LL-HLS manifest types and text renderer.
+//!
+//! The types in this module model an RFC 8216 media playlist plus the
+//! LL-HLS extensions from Apple's 2020 draft. The renderer emits a
+//! UTF-8 playlist compatible with `hls.js` 1.5+, Safari, and (when
+//! the conformance slot is wired in) Apple's `mediastreamvalidator`.
+
+use std::fmt::Write;
+use std::time::Duration;
+
+use lvqr_cmaf::CmafChunk;
+
+/// Errors produced by the playlist builder.
+#[derive(Debug, thiserror::Error)]
+pub enum HlsError {
+    /// A chunk arrived with a DTS earlier than the last chunk the
+    /// builder has already consumed. HLS playlists are strictly
+    /// monotonic in media sequence; going backwards is not
+    /// recoverable without a discontinuity, which the day-one
+    /// scaffold does not support.
+    #[error("non-monotonic DTS: chunk dts {chunk_dts} < last dts {last_dts}")]
+    NonMonotonic { last_dts: u64, chunk_dts: u64 },
+    /// A chunk arrived with zero duration. HLS requires positive
+    /// durations on every part and segment; a zero-duration chunk
+    /// is either a producer bug or an end-of-stream marker, and
+    /// either way the builder refuses to publish it.
+    #[error("chunk has zero duration")]
+    ZeroDuration,
+}
+
+/// One segment in a media playlist.
+///
+/// A segment is a fully closed DASH-sized boundary (by default 2 s).
+/// It contains one or more [`Part`] entries; the last part in a
+/// segment carries `independent = true` iff it starts with a
+/// keyframe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    /// Media sequence number. Starts at `PlaylistBuilderConfig::starting_sequence`
+    /// and increments by 1 for every closed segment.
+    pub sequence: u64,
+    /// URI of the segment file relative to the playlist.
+    pub uri: String,
+    /// Total duration of all parts inside this segment, in
+    /// timescale ticks. Rendered as seconds at `render_manifest`
+    /// time.
+    pub duration_ticks: u64,
+    /// Parts that make up this segment, in DTS order.
+    pub parts: Vec<Part>,
+}
+
+/// One partial segment (LL-HLS `#EXT-X-PART` entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Part {
+    /// URI of the partial file relative to the playlist.
+    pub uri: String,
+    /// Duration of the partial in timescale ticks.
+    pub duration_ticks: u64,
+    /// True if a decoder can start decoding at this part without
+    /// any prior part. HLS uses this to serve a low-latency
+    /// subscriber a cold start without waiting for the next
+    /// segment boundary.
+    pub independent: bool,
+}
+
+/// `#EXT-X-SERVER-CONTROL` tag values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerControl {
+    /// `CAN-BLOCK-RELOAD=YES`. Required for a server to claim LL-HLS.
+    pub can_block_reload: bool,
+    /// `PART-HOLD-BACK` seconds. The client will not play back
+    /// closer to the live edge than this.
+    pub part_hold_back: Duration,
+    /// `HOLD-BACK` seconds. Maximum distance from the live edge
+    /// that a non-LL client will play.
+    pub hold_back: Duration,
+}
+
+impl Default for ServerControl {
+    fn default() -> Self {
+        // Apple's LL-HLS draft recommends PART-HOLD-BACK >= 3 *
+        // target part duration and HOLD-BACK >= 3 * target segment
+        // duration. With the default 200 ms part / 2 s segment
+        // policy from lvqr-cmaf, that's 0.6 s and 6 s respectively.
+        Self {
+            can_block_reload: true,
+            part_hold_back: Duration::from_millis(600),
+            hold_back: Duration::from_secs(6),
+        }
+    }
+}
+
+/// A complete in-memory HLS / LL-HLS media playlist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Manifest {
+    /// `#EXT-X-VERSION`. LL-HLS requires 9.
+    pub version: u8,
+    /// Track timescale. Used to convert tick durations to the
+    /// seconds values HLS expects.
+    pub timescale: u32,
+    /// `#EXT-X-TARGETDURATION`. In seconds; HLS rounds up.
+    pub target_duration_secs: u32,
+    /// `#EXT-X-PART-INF:PART-TARGET`. In seconds as a float.
+    pub part_target_secs: f32,
+    /// `#EXT-X-SERVER-CONTROL` values.
+    pub server_control: ServerControl,
+    /// Media init segment URI emitted via `#EXT-X-MAP`.
+    pub map_uri: String,
+    /// Closed segments, oldest first.
+    pub segments: Vec<Segment>,
+    /// Partials that belong to the next not-yet-closed segment. The
+    /// last entry is rendered as `#EXT-X-PRELOAD-HINT` iff it is the
+    /// trailing partial that the client should fetch next.
+    pub preliminary_parts: Vec<Part>,
+}
+
+impl Manifest {
+    /// Render the playlist as UTF-8 text. Returns a `String` that is
+    /// ready to serve as an `application/vnd.apple.mpegurl` response
+    /// body.
+    pub fn render(&self) -> String {
+        let mut out = String::with_capacity(512 + self.segments.len() * 128);
+        let _ = writeln!(out, "#EXTM3U");
+        let _ = writeln!(out, "#EXT-X-VERSION:{}", self.version);
+        let _ = writeln!(out, "#EXT-X-TARGETDURATION:{}", self.target_duration_secs);
+        let _ = writeln!(
+            out,
+            "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD={},PART-HOLD-BACK={:.3},HOLD-BACK={:.3}",
+            if self.server_control.can_block_reload {
+                "YES"
+            } else {
+                "NO"
+            },
+            self.server_control.part_hold_back.as_secs_f32(),
+            self.server_control.hold_back.as_secs_f32(),
+        );
+        let _ = writeln!(out, "#EXT-X-PART-INF:PART-TARGET={:.3}", self.part_target_secs);
+        let _ = writeln!(out, "#EXT-X-MAP:URI=\"{}\"", self.map_uri);
+        if let Some(first) = self.segments.first() {
+            let _ = writeln!(out, "#EXT-X-MEDIA-SEQUENCE:{}", first.sequence);
+        }
+        for seg in &self.segments {
+            for part in &seg.parts {
+                let _ = writeln!(
+                    out,
+                    "#EXT-X-PART:DURATION={:.6},URI=\"{}\"{}",
+                    ticks_to_secs(part.duration_ticks, self.timescale),
+                    part.uri,
+                    if part.independent { ",INDEPENDENT=YES" } else { "" },
+                );
+            }
+            let _ = writeln!(
+                out,
+                "#EXTINF:{:.6},\n{}",
+                ticks_to_secs(seg.duration_ticks, self.timescale),
+                seg.uri
+            );
+        }
+        // Preliminary parts (the open segment): rendered after the
+        // closed segments so a client walking the playlist top-down
+        // encounters them in wall-clock order.
+        for part in &self.preliminary_parts {
+            let _ = writeln!(
+                out,
+                "#EXT-X-PART:DURATION={:.6},URI=\"{}\"{}",
+                ticks_to_secs(part.duration_ticks, self.timescale),
+                part.uri,
+                if part.independent { ",INDEPENDENT=YES" } else { "" },
+            );
+        }
+        out
+    }
+}
+
+/// Free-standing version of [`Manifest::render`] so callers that
+/// want to inspect or mutate the rendered string do not need a
+/// full `Manifest` value in a local.
+pub fn render_manifest(manifest: &Manifest) -> String {
+    manifest.render()
+}
+
+/// Configuration for [`PlaylistBuilder`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistBuilderConfig {
+    /// Track timescale. Must match the `CmafChunk::dts` timescale.
+    pub timescale: u32,
+    /// Starting media sequence number. Bump past zero if the
+    /// playlist needs to pick up where a previous LVQR instance
+    /// left off (e.g. after a hot restart).
+    pub starting_sequence: u64,
+    /// Init segment URI for `#EXT-X-MAP`.
+    pub map_uri: String,
+    /// Prefix for segment / partial URIs. Segments are named
+    /// `{prefix}seg-{sequence}.m4s`; partials are named
+    /// `{prefix}part-{sequence}-{part_index}.m4s`.
+    pub uri_prefix: String,
+    /// `#EXT-X-TARGETDURATION` in seconds. Must be >= the longest
+    /// segment the builder is allowed to emit.
+    pub target_duration_secs: u32,
+    /// `#EXT-X-PART-INF:PART-TARGET` in seconds.
+    pub part_target_secs: f32,
+}
+
+impl Default for PlaylistBuilderConfig {
+    fn default() -> Self {
+        Self {
+            timescale: 90_000,
+            starting_sequence: 0,
+            map_uri: "init.mp4".into(),
+            uri_prefix: String::new(),
+            target_duration_secs: 2,
+            part_target_secs: 0.2,
+        }
+    }
+}
+
+/// Pure state machine that consumes [`CmafChunk`] values in DTS
+/// order and produces an updated [`Manifest`] after every push.
+///
+/// The builder holds the authoritative view of the playlist and is
+/// the type the axum router will wrap in an `Arc<Mutex<...>>` when
+/// it lands. Today callers can drive it directly from tests.
+#[derive(Debug)]
+pub struct PlaylistBuilder {
+    config: PlaylistBuilderConfig,
+    manifest: Manifest,
+    /// Parts belonging to the segment currently being built but not
+    /// yet closed. When the next `Segment`-kind chunk arrives, the
+    /// builder converts these into a closed [`Segment`] entry and
+    /// appends it to `manifest.segments`.
+    pending_parts: Vec<Part>,
+    pending_duration_ticks: u64,
+    /// Media sequence number the next closed segment will carry.
+    next_sequence: u64,
+    /// Last-seen DTS, used for monotonicity enforcement.
+    last_dts: Option<u64>,
+    /// Part index inside the currently-open segment, used to build
+    /// unique partial URIs.
+    part_index: u32,
+}
+
+impl PlaylistBuilder {
+    pub fn new(config: PlaylistBuilderConfig) -> Self {
+        let manifest = Manifest {
+            version: 9,
+            timescale: config.timescale,
+            target_duration_secs: config.target_duration_secs,
+            part_target_secs: config.part_target_secs,
+            server_control: ServerControl::default(),
+            map_uri: config.map_uri.clone(),
+            segments: Vec::new(),
+            preliminary_parts: Vec::new(),
+        };
+        let next_sequence = config.starting_sequence;
+        Self {
+            config,
+            manifest,
+            pending_parts: Vec::new(),
+            pending_duration_ticks: 0,
+            next_sequence,
+            last_dts: None,
+            part_index: 0,
+        }
+    }
+
+    /// Push one chunk. Returns the updated manifest view on every
+    /// call so the axum router can re-serialize without an extra
+    /// borrow.
+    pub fn push(&mut self, chunk: &CmafChunk) -> Result<&Manifest, HlsError> {
+        if chunk.duration == 0 {
+            return Err(HlsError::ZeroDuration);
+        }
+        if let Some(last) = self.last_dts
+            && chunk.dts < last
+        {
+            return Err(HlsError::NonMonotonic {
+                last_dts: last,
+                chunk_dts: chunk.dts,
+            });
+        }
+        self.last_dts = Some(chunk.dts);
+
+        let part = Part {
+            uri: format!(
+                "{}part-{}-{}.m4s",
+                self.config.uri_prefix, self.next_sequence, self.part_index
+            ),
+            duration_ticks: chunk.duration,
+            independent: chunk.kind.is_independent(),
+        };
+        self.part_index += 1;
+
+        // Segment-kind chunks close the PREVIOUS segment and start a
+        // new one. Partial-kind chunks append to the current open
+        // segment. Everything is a partial under LL-HLS; the
+        // difference is which boundary the chunk falls on.
+        if chunk.kind.is_segment_start() && !self.pending_parts.is_empty() {
+            self.close_pending_segment();
+        }
+        self.pending_parts.push(part);
+        self.pending_duration_ticks += chunk.duration;
+
+        // Refresh the manifest's view of the preliminary parts so
+        // any renderer run after this call sees the latest state.
+        self.manifest.preliminary_parts = self.pending_parts.clone();
+
+        Ok(&self.manifest)
+    }
+
+    /// Borrow the current manifest without pushing anything new.
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    /// Force-close the currently open segment. Useful at
+    /// end-of-stream and at hot-restart time; normal operation
+    /// closes segments automatically when the next `Segment` chunk
+    /// arrives.
+    pub fn close_pending_segment(&mut self) {
+        if self.pending_parts.is_empty() {
+            return;
+        }
+        let sequence = self.next_sequence;
+        let uri = format!("{}seg-{}.m4s", self.config.uri_prefix, sequence);
+        let seg = Segment {
+            sequence,
+            uri,
+            duration_ticks: self.pending_duration_ticks,
+            parts: std::mem::take(&mut self.pending_parts),
+        };
+        self.manifest.segments.push(seg);
+        self.pending_duration_ticks = 0;
+        self.next_sequence += 1;
+        self.part_index = 0;
+        self.manifest.preliminary_parts.clear();
+    }
+}
+
+/// Convert a tick count in the playlist's timescale to fractional
+/// seconds for `#EXTINF` / `#EXT-X-PART:DURATION`.
+fn ticks_to_secs(ticks: u64, timescale: u32) -> f64 {
+    if timescale == 0 {
+        return 0.0;
+    }
+    ticks as f64 / timescale as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use lvqr_cmaf::{CmafChunk, CmafChunkKind};
+
+    fn mk_chunk(dts: u64, duration: u64, kind: CmafChunkKind) -> CmafChunk {
+        CmafChunk {
+            track_id: "0.mp4".into(),
+            payload: Bytes::from_static(b""),
+            dts,
+            duration,
+            kind,
+        }
+    }
+
+    #[test]
+    fn builder_closes_segment_on_next_segment_chunk() {
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        // First chunk is always a Segment-kind (new stream).
+        b.push(&mk_chunk(0, 30_000, CmafChunkKind::Segment)).unwrap();
+        b.push(&mk_chunk(30_000, 30_000, CmafChunkKind::Partial)).unwrap();
+        b.push(&mk_chunk(60_000, 30_000, CmafChunkKind::Partial)).unwrap();
+        // Second Segment-kind closes the prior segment.
+        b.push(&mk_chunk(90_000, 30_000, CmafChunkKind::Segment)).unwrap();
+
+        let m = b.manifest();
+        assert_eq!(m.segments.len(), 1);
+        assert_eq!(m.segments[0].sequence, 0);
+        assert_eq!(m.segments[0].parts.len(), 3);
+        assert!(m.segments[0].parts[0].independent, "first part is a keyframe");
+        assert_eq!(m.preliminary_parts.len(), 1, "one pending part in the open segment");
+    }
+
+    #[test]
+    fn builder_rejects_zero_duration() {
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        assert!(matches!(
+            b.push(&mk_chunk(0, 0, CmafChunkKind::Segment)),
+            Err(HlsError::ZeroDuration)
+        ));
+    }
+
+    #[test]
+    fn builder_rejects_non_monotonic_dts() {
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        b.push(&mk_chunk(100, 10, CmafChunkKind::Segment)).unwrap();
+        match b.push(&mk_chunk(50, 10, CmafChunkKind::Partial)) {
+            Err(HlsError::NonMonotonic {
+                last_dts: 100,
+                chunk_dts: 50,
+            }) => {}
+            other => panic!("expected NonMonotonic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_emits_required_tags() {
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        b.push(&mk_chunk(0, 180_000, CmafChunkKind::Segment)).unwrap();
+        b.push(&mk_chunk(180_000, 180_000, CmafChunkKind::Segment)).unwrap();
+        let text = b.manifest().render();
+        assert!(text.starts_with("#EXTM3U"));
+        assert!(text.contains("#EXT-X-VERSION:9"));
+        assert!(text.contains("#EXT-X-TARGETDURATION:2"));
+        assert!(text.contains("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES"));
+        assert!(text.contains("#EXT-X-PART-INF:PART-TARGET=0.200"));
+        assert!(text.contains("#EXT-X-MAP:URI=\"init.mp4\""));
+        assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:0"));
+        assert!(text.contains("#EXTINF:"));
+        assert!(text.contains("seg-0.m4s"));
+    }
+
+    #[test]
+    fn render_emits_independent_flag_only_on_keyframes() {
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        b.push(&mk_chunk(0, 30_000, CmafChunkKind::Segment)).unwrap();
+        b.push(&mk_chunk(30_000, 30_000, CmafChunkKind::Partial)).unwrap();
+        b.push(&mk_chunk(60_000, 30_000, CmafChunkKind::PartialIndependent))
+            .unwrap();
+        // Close the segment so the parts appear in the rendered
+        // output.
+        b.close_pending_segment();
+        let text = b.manifest().render();
+        // The first and third parts carry INDEPENDENT=YES; the
+        // middle one does not.
+        let indep_count = text.matches(",INDEPENDENT=YES").count();
+        assert_eq!(indep_count, 2);
+    }
+}

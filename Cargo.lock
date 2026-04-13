@@ -1489,6 +1489,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lvqr-hls"
+version = "0.3.1"
+dependencies = [
+ "bytes",
+ "lvqr-cmaf",
+ "lvqr-core",
+ "proptest",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "lvqr-ingest"
 version = "0.3.1"
 dependencies = [

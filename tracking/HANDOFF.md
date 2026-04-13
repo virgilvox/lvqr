@@ -1,13 +1,13 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.3 AVC parity gate + multi-sub-layer HEVC coverage
+## Project Status: v0.4-dev -- Tier 2.3 AVC parity, kvazaar HEVC, lvqr-hls scaffold
 
 **Last Updated**: 2026-04-13 (session 7)
-**Tests**: 52 test binaries across the workspace, 213 individual
-tests (plus ~5700 generated proptest cases per run across the
-ingest, fragment, hevc, aac, and cmaf-policy harnesses), all green.
-cargo clippy --workspace --all-targets -- -D warnings is clean.
-cargo fmt --check is clean.
+**Tests**: 55 test binaries across the workspace, 224 individual
+tests (plus ~6300 generated proptest cases per run across the
+ingest, fragment, hevc, aac, cmaf-policy, and hls-manifest
+harnesses), all green. cargo clippy --workspace --all-targets --
+-D warnings is clean. cargo fmt --check is clean.
 
 ## Session 7 additions (2026-04-13)
 
@@ -80,13 +80,41 @@ deferred; every other session-7 priority landed.
    note travels with the code it describes and does not rot in
    isolation.
 
+4. **`lvqr-hls` crate scaffold**. First egress protocol to land on
+   top of `lvqr-cmaf::CmafChunk`. Pure-library day-one scope:
+   * `Manifest` + `Segment` + `Part` + `ServerControl` types
+     modelling an RFC 8216 media playlist plus the LL-HLS draft
+     extensions.
+   * `PlaylistBuilder` pure state machine that consumes `CmafChunk`
+     values, enforces strict DTS monotonicity and non-zero
+     duration, and produces an updated `Manifest` on every push.
+   * `Manifest::render` text renderer emitting `#EXTM3U`,
+     `#EXT-X-VERSION:9`, `#EXT-X-TARGETDURATION`,
+     `#EXT-X-SERVER-CONTROL` (with `CAN-BLOCK-RELOAD=YES`,
+     `PART-HOLD-BACK`, `HOLD-BACK`), `#EXT-X-PART-INF`,
+     `#EXT-X-MAP`, `#EXT-X-MEDIA-SEQUENCE`, per-segment `#EXTINF`,
+     and per-part `#EXT-X-PART` with `INDEPENDENT=YES` on
+     keyframes.
+   * Day-one 2-of-5 contract slots: 5 unit tests, 2 integration
+     tests (`tests/integration_builder.rs`), 3 proptest properties
+     (`tests/proptest_manifest.rs` -- never-panic, well-formed
+     output, strictly monotonic media sequences). Fuzz, E2E, and
+     conformance slots are open and land with the axum router +
+     Apple `mediastreamvalidator` wrapper in a later session.
+   * No axum router yet. The router lands when a real HTTP
+     consumer (browser, `hls.js`, `mediastreamvalidator`) arrives.
+     Day-one scope is the manifest library only.
+   * Explicitly out of scope for now: multivariant master
+     playlists, byte-range delivery, encryption, discontinuity
+     handling, rendition groups, byte-level `mediastreamvalidator`
+     conformance.
+
 ### What session 7 did NOT land
 
-* **`lvqr-hls` scaffold**. Deferred because the three items above
-  consumed the session budget. Still the next-highest-leverage item
-  for session 8. Per the competitive audit, LL-HLS is the loudest
-  v1.0 gap (every evaluator asks "can it serve HLS?") and it slots
-  in cleanly on top of the CmafChunk type that already exists.
+Nothing from the session 7 work list carried over. Session 8 picks
+up the remaining Tier 2.3 items (raw-sample coalescer implementation,
+lvqr-hls axum router, retiring the hand-rolled fmp4 writer behind a
+feature flag).
 
 ### Contract slot status as of session 7
 
@@ -95,13 +123,14 @@ deferred; every other session-7 priority landed.
 | lvqr-ingest | y | y | y | y | y |
 | lvqr-codec | y | y | y | via rtmp_ws_e2e | y (multi-sublayer now covered) |
 | lvqr-cmaf | y | open (no parser surface) | y | via rtmp_ws_e2e | y (AVC + HEVC + AAC) |
+| lvqr-hls | y | open (no parser surface) | y | open (axum router pending) | open (mediastreamvalidator pending) |
 | lvqr-record | y | open | y | workspace e2e | y |
 | lvqr-moq | y | open | y | via rtmp_ws_e2e | n/a (pure value type) |
 | lvqr-fragment | y | open | y | via rtmp_ws_e2e | n/a (pure value type) |
 
-No contract slot changes from session 6; the multi-sub-layer fixture
-strengthens the existing `lvqr-codec` conformance slot without
-adding a new one.
+`lvqr-hls` joins the table at 2-of-5 on day one. The multi-sub-layer
+fixture strengthens the existing `lvqr-codec` conformance slot
+without adding a new slot.
 
 ## Session 6 additions (2026-04-13): HEVC + AAC init segment writers
 
@@ -794,23 +823,23 @@ should be aware of so nothing is discovered twice.
 
 ## Recommended Tier 2.3 entry point (session 8)
 
-Session 7 closed three of the four session-7 work list items (AVC
-parity gate, multi-sub-layer HEVC fixture, segmenter design note).
-Session 8 picks up the deferred item plus the two follow-ups the
-design note surfaced.
+Session 7 closed every session-7 work list item plus the session-8
+`lvqr-hls` scaffold. Session 8 picks up the two follow-ups the
+segmenter design note surfaced plus the axum router and the
+hand-rolled writer retirement.
 
-1. **Start `lvqr-hls`**. Per the competitive audit, LL-HLS is the
-   loudest v1.0 gap. Day-one scaffold needs `CmafChunk` -> HLS
-   partial manifest generation plus a tiny axum router. No actual
-   LL-HLS client testing yet. Day-one 5-artifact coverage lands with
-   the scaffold: proptest on manifest generation, integration via
-   `lvqr-test-utils::TestServer`, conformance via Apple
-   `mediastreamvalidator` behind a soft-skip when it is not
-   available on PATH (same pattern as `ffprobe_bytes`). Wait on the
-   raw-sample coalescer: the pass-through `CmafSegmenter` already
-   emits `CmafChunk` values for the `rtmp_ws_e2e` path, so
-   `lvqr-hls` can consume them immediately without blocking on the
-   full Tier 2.3 migration.
+1. **Wire up the `lvqr-hls` axum router**. The manifest library
+   landed in session 7; session 8 adds the actual HTTP surface:
+   `GET /playlist.m3u8` (blocking reload per `_HLS_msn=` /
+   `_HLS_part=` query params), `GET /init.mp4`, `GET /seg-*.m4s`,
+   `GET /part-*.m4s`. Back it with an `Arc<RwLock<PlaylistBuilder>>`
+   and a separate `Arc<DashMap<String, Bytes>>` for the segment
+   cache. Day-one 5-artifact coverage for this: E2E via
+   `lvqr-test-utils::TestServer` running the router against a
+   real `hls.js` handshake (or at minimum a curl-driven blocking
+   reload), conformance via a new
+   `lvqr-test-utils::mediastreamvalidator_bytes` helper that
+   follows the same soft-skip pattern as `ffprobe_bytes`.
 2. **Implement the raw-sample coalescer** per the design note in
    `crates/lvqr-cmaf/src/segmenter.rs`. Session 7 pinned the spec;
    session 8 lands:

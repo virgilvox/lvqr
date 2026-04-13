@@ -1,0 +1,22 @@
+[package]
+name = "lvqr-hls"
+description = "HTTP Live Streaming (HLS) egress for LVQR -- LL-HLS manifest generator built on CmafChunk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["streaming", "hls", "ll-hls", "cmaf", "moq"]
+categories = ["multimedia", "multimedia::video"]
+
+[dependencies]
+lvqr-core = { workspace = true }
+lvqr-cmaf = { workspace = true }
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+proptest = "1"
