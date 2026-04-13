@@ -1444,6 +1444,7 @@ name = "lvqr-codec"
 version = "0.3.1"
 dependencies = [
  "bytes",
+ "lvqr-conformance",
  "proptest",
  "thiserror 2.0.18",
  "tracing",
@@ -1454,7 +1455,9 @@ name = "lvqr-conformance"
 version = "0.3.1"
 dependencies = [
  "bytes",
+ "serde",
  "tokio",
+ "toml",
 ]
 
 [[package]]

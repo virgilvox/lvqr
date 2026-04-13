@@ -2,12 +2,67 @@
 
 ## Project Status: v0.4-dev -- Tier 2.2 Closed, Tier 2.3 Scaffold Landed
 
-**Last Updated**: 2026-04-13 (session 5)
-**Tests**: 50 test binaries across the workspace, 203 individual
+**Last Updated**: 2026-04-13 (session 5, part 2)
+**Tests**: 51 test binaries across the workspace, 206 individual
 tests (plus ~5700 generated proptest cases per run across the
 ingest, fragment, hevc, aac, and cmaf-policy harnesses), all green.
 cargo clippy --workspace --all-targets -- -D warnings is clean.
 cargo fmt --check is clean.
+
+## Session 5 part 2 additions (2026-04-13)
+
+Directly after the part-1 commit landed and pushed, two follow-ups
+from the "Recommended Tier 2.3 entry point" work list in this file
+closed in the same session:
+
+1. **`lvqr-conformance` fixture corpus bootstrapped**. The session-3
+   Tier 1 item that had been BLOCKED since session 3 on "no ffmpeg
+   in the dev env" unblocked as soon as ffmpeg 8.1 was installed.
+   Captured:
+   - `fixtures/codec/hevc-sps-x265-main-320x240.{bin,toml}` -- the
+     real x265 SPS already pinned in the parser's unit test, now
+     sitting in the corpus with a sidecar naming every expected
+     decoded field including `general_level_idc = 60` (HEVC level
+     2.0, which x265 picks for 320x240 at 30 fps).
+   - `fixtures/codec/aac-asc-aaclc-{44100,48}khz-stereo.{bin,toml}`
+     -- the two canonical AAC-LC ASC byte blobs LVQR already relies
+     on elsewhere, pinned with their decoded values.
+   - `fixtures/fmp4/cmaf-h264-baseline-360p-1s.{mp4,toml}` -- a 1 s
+     fragmented CMAF H.264 Baseline 3.1 capture from ffmpeg, seed
+     for future lvqr-ingest and lvqr-cmaf consumer tests.
+   - `fixtures/rtmp/h264_aac_1s.{flv,toml}` -- a 1 s H.264 + AAC-LC
+     FLV, first real RTMP test vector in the repo.
+
+   `lvqr-conformance::codec::{list, load, CodecFixture,
+   CodecFixtureMeta, HevcSpsExpected, AacAscExpected}` exposes a
+   typed loader: consumers call `list()` to iterate every fixture
+   on disk, and each fixture comes with parsed sidecar metadata so
+   adding a new byte blob + TOML pair automatically extends
+   coverage without touching test code. Sidecar parsing runs
+   through `toml` + `serde`, already in the workspace dep set.
+
+2. **Conformance slot closed for `lvqr-codec`**. New
+   `crates/lvqr-codec/tests/conformance_codec.rs` iterates the
+   codec corpus via `lvqr_conformance::codec::list()` and asserts
+   `parse_sps` / `parse_asc` decode every blob to the expected
+   values from the sidecar. **The contract mechanism paid for
+   itself on its first run**: my initial hand-computed sidecar
+   guessed `general_level_idc = 93` for the 320x240 x265 SPS
+   (copying the value from the synthetic `codec_string_format` unit
+   test), and the conformance test failed loudly on the first run
+   because the real encoder output is level 60. The fixture sidecar
+   and the hand-rolled x265 unit test are now both pinned to the
+   real value. This is exactly the "catches silent drift between
+   hand-written synthetic tests and real encoder output" story the
+   5-artifact contract exists for.
+
+   `lvqr-codec` is now the second crate (after `lvqr-ingest`) to
+   hit **5/5 contract slots**. The only remaining open slots
+   workspace-wide are the fuzz slots on `lvqr-record`, `lvqr-moq`,
+   `lvqr-fragment`, `lvqr-cmaf` (all low-marginal-value per prior
+   session decisions) and the conformance slots on `lvqr-moq` and
+   `lvqr-fragment` (pure value types with no external validator
+   target).
 
 ## Session 5 additions (2026-04-13): Tier 2.2 closure + Tier 2.3 scaffold
 

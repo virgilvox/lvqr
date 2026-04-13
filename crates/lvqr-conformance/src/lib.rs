@@ -27,6 +27,7 @@
 //! crates.io; it is an internal test dependency.
 
 use bytes::Bytes;
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 /// Root directory for reference fixtures. Paths are resolved relative to
@@ -39,7 +40,7 @@ pub fn fixtures_dir() -> PathBuf {
 ///
 /// The `name` argument is a slash-delimited path relative to `fixtures/`,
 /// e.g. `"rtmp/obs-30-macos-h264-aac.flv"` or
-/// `"fmp4/init-h264-baseline-720p.mp4"`.
+/// `"fmp4/cmaf-h264-baseline-360p-1s.mp4"`.
 pub fn load_fixture(name: &str) -> std::io::Result<Bytes> {
     let path = fixtures_dir().join(name);
     let bytes = std::fs::read(&path)?;
@@ -49,6 +50,125 @@ pub fn load_fixture(name: &str) -> std::io::Result<Bytes> {
 /// Return the absolute path for a named fixture without reading it.
 pub fn fixture_path(name: &str) -> PathBuf {
     fixtures_dir().join(name)
+}
+
+pub mod codec {
+    //! Typed access to the codec-parser fixture corpus.
+    //!
+    //! Every file under `fixtures/codec/` pairs a raw parser-input
+    //! byte blob with a `.toml` sidecar that names the expected
+    //! decoded values. Parser conformance tests in `lvqr-codec`
+    //! iterate this corpus via [`list`] and [`load`] so adding a new
+    //! fixture + sidecar automatically extends coverage without
+    //! touching test code.
+
+    use super::*;
+
+    /// Sidecar metadata for a codec fixture.
+    ///
+    /// Only the fields relevant to parser conformance are modeled.
+    /// Free-form TOML keys like `source`, `container`, `license` are
+    /// accepted at the top level but not surfaced because the tests
+    /// do not assert on them.
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct CodecFixtureMeta {
+        /// Human-readable codec string, e.g. `"hev1.1.60000000.L93.B0"`.
+        pub codec: String,
+        /// Expected decoded values for an HEVC SPS fixture. Present
+        /// iff the fixture is an HEVC SPS byte blob.
+        pub expected: Expected,
+    }
+
+    /// Parser-specific expectation discriminators. Only one branch is
+    /// present per fixture; the TOML `[expected.hevc_sps]` vs
+    /// `[expected.aac_asc]` section names select which.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Expected {
+        pub hevc_sps: Option<HevcSpsExpected>,
+        pub aac_asc: Option<AacAscExpected>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct HevcSpsExpected {
+        pub general_profile_space: u8,
+        pub general_tier_flag: bool,
+        pub general_profile_idc: u8,
+        pub general_profile_compatibility_flags: u32,
+        pub general_level_idc: u8,
+        pub chroma_format_idc: u32,
+        pub pic_width_in_luma_samples: u32,
+        pub pic_height_in_luma_samples: u32,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct AacAscExpected {
+        pub object_type: u8,
+        pub sample_rate: u32,
+        pub channel_config: u8,
+        pub sbr_present: bool,
+        pub ps_present: bool,
+    }
+
+    /// One loaded codec fixture: the byte blob plus its parsed metadata.
+    #[derive(Debug, Clone)]
+    pub struct CodecFixture {
+        /// File stem (no extension), e.g. `hevc-sps-x265-main-320x240`.
+        pub name: String,
+        /// Raw parser-input bytes.
+        pub bytes: Bytes,
+        /// Parsed sidecar metadata.
+        pub meta: CodecFixtureMeta,
+    }
+
+    /// List every codec fixture on disk. Returns the fixtures sorted
+    /// by file name so iteration order is deterministic across
+    /// platforms and filesystems.
+    pub fn list() -> std::io::Result<Vec<CodecFixture>> {
+        let dir = super::fixtures_dir().join("codec");
+        let mut out = Vec::new();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(it) => it,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("bin") {
+                continue;
+            }
+            let name = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let bytes = std::fs::read(&path)?;
+            let toml_path = path.with_extension("toml");
+            let toml_text = std::fs::read_to_string(&toml_path)
+                .map_err(|e| std::io::Error::other(format!("missing sidecar {}: {e}", toml_path.display())))?;
+            let meta: CodecFixtureMeta = toml::from_str(&toml_text).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("malformed sidecar {}: {e}", toml_path.display()),
+                )
+            })?;
+            out.push(CodecFixture {
+                name,
+                bytes: Bytes::from(bytes),
+                meta,
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// Load a single codec fixture by its file stem.
+    pub fn load(name: &str) -> std::io::Result<CodecFixture> {
+        let list = list()?;
+        list.into_iter()
+            .find(|f| f.name == name)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("no codec fixture {name}")))
+    }
 }
 
 /// Outcome of running an external validator.
@@ -119,6 +239,27 @@ mod tests {
     fn fixtures_dir_is_under_crate_manifest() {
         let dir = fixtures_dir();
         assert!(dir.ends_with("fixtures"));
+    }
+
+    #[test]
+    fn codec_fixture_list_loads_bundled_blobs() {
+        let list = codec::list().expect("list codec fixtures");
+        assert!(
+            !list.is_empty(),
+            "codec fixture corpus should not be empty after session 5 bootstrap"
+        );
+        // Every fixture's sidecar must name exactly one parser
+        // expectation (hevc_sps XOR aac_asc). Catches a malformed
+        // sidecar before any downstream test loads it.
+        for f in &list {
+            let has_hevc = f.meta.expected.hevc_sps.is_some();
+            let has_aac = f.meta.expected.aac_asc.is_some();
+            assert!(
+                has_hevc ^ has_aac,
+                "fixture {} must name exactly one of hevc_sps / aac_asc",
+                f.name
+            );
+        }
     }
 
     #[test]

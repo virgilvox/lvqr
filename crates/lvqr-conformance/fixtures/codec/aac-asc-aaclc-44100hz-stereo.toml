@@ -1,0 +1,11 @@
+source = "legacy lvqr-ingest hard-coded ASC for AAC-LC 44100 Hz stereo; pinned here so the fmp4 esds test and the codec conformance test share a single source of truth"
+codec = "mp4a.40.2"
+container = "raw AAC AudioSpecificConfig bytes"
+license = "CC0"
+
+[expected.aac_asc]
+object_type = 2
+sample_rate = 44100
+channel_config = 2
+sbr_present = false
+ps_present = false

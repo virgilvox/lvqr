@@ -1,0 +1,13 @@
+source = "ffmpeg 8.1; -f lavfi -i testsrc2=320x240:rate=30 -f lavfi -i sine=440Hz:44100 -t 1 -c:v libx264 ultrafast baseline 3.1 -c:a aac 128k stereo 44.1 kHz -f flv"
+codec = "avc1.42c01f + mp4a.40.2"
+container = "FLV"
+duration_ms = 1000
+notes = "Reference RTMP publish payload: H.264 Baseline 3.1 + AAC-LC 44.1 kHz stereo. First test vector for lvqr-ingest FLV demux regression tests."
+license = "CC0; synthesized from lavfi testsrc2 + sine wave"
+
+[expected]
+video_codec = "avc1.42c01f"
+audio_codec = "mp4a.40.2"
+video_resolution = [320, 240]
+audio_sample_rate = 44100
+audio_channels = 2

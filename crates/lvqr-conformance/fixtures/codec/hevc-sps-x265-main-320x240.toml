@@ -1,0 +1,15 @@
+source = "ffmpeg 8.1 libx265 ultrafast; -f lavfi -i testsrc2=320x240:rate=30 -t 1 -x265-params temporal-layers=1:bframes=0"
+codec = "hev1.1.60000000.L60.B0"
+container = "raw HEVC SPS NAL payload (no 2-byte NAL header prefix)"
+license = "CC0; synthesized from lavfi testsrc2 by maintainer"
+notes = "x265 picks HEVC level 2.0 (general_level_idc = 60, i.e. level * 30 = 60) for 320x240 at 30 fps because it is the smallest level that fits the stream. Larger resolutions bump this higher."
+
+[expected.hevc_sps]
+general_profile_space = 0
+general_tier_flag = false
+general_profile_idc = 1
+general_profile_compatibility_flags = 0x60000000
+general_level_idc = 60
+chroma_format_idc = 1
+pic_width_in_luma_samples = 320
+pic_height_in_luma_samples = 240

@@ -497,15 +497,22 @@ mod tests {
 
     #[test]
     fn parse_sps_decodes_real_x265_single_sublayer() {
-        // Real SPS captured from `ffmpeg -c:v libx265 -preset ultrafast`
-        // encoding a testsrc2 320x240 1s clip via ffmpeg 8.1. This is a
-        // genuine encoder payload, not a synthetic fixture, and pins
-        // the parser's behavior against a bit layout produced by an
-        // independent codec implementation. Single sub-layer because
-        // x265's default temporal-layers mode does not flip
-        // sps_max_sub_layers_minus1 even with b-pyramid enabled; the
-        // multi-sub-layer positive coverage lives in the synthetic
-        // tests above.
+        // Real SPS captured from `ffmpeg 8.1 -c:v libx265 -preset ultrafast`
+        // encoding a 320x240 testsrc2 clip. Level 60 = HEVC level 2.0
+        // is what x265 picks as the smallest level that fits this
+        // resolution + frame rate. Single sub-layer because x265's
+        // default temporal-layers mode does not flip
+        // sps_max_sub_layers_minus1; the multi-sub-layer positive
+        // coverage lives in the synthetic tests above.
+        //
+        // The same byte blob lives in the conformance fixture corpus
+        // at `lvqr-conformance/fixtures/codec/hevc-sps-x265-main-320x240.bin`
+        // with a sidecar TOML naming the full expected decoded
+        // values. `lvqr-codec/tests/conformance_codec.rs` asserts
+        // every field of the parser output matches the sidecar;
+        // this unit test is a smaller, faster redundant check that
+        // fails loudly if the hand-rolled parser's general PTL path
+        // regresses, without needing the conformance dev-dep.
         let hex = "0101600000030090000003000003003ca00a080f165ba4a4c2f0168080000003008000000f0400";
         let sps_bytes: Vec<u8> = (0..hex.len())
             .step_by(2)
@@ -513,9 +520,11 @@ mod tests {
             .collect();
         let sps = parse_sps(&sps_bytes).expect("real x265 SPS should parse");
         assert_eq!(sps.general_profile_idc, 1); // Main
+        assert_eq!(sps.general_level_idc, 60); // HEVC level 2.0
         assert_eq!(sps.chroma_format_idc, 1); // 4:2:0
         assert_eq!(sps.pic_width_in_luma_samples, 320);
         assert_eq!(sps.pic_height_in_luma_samples, 240);
+        assert_eq!(sps.codec_string(), "hev1.1.60000000.L60.B0");
     }
 
     #[test]

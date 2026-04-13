@@ -11,6 +11,10 @@ publish = false
 
 [dependencies]
 bytes = { workspace = true }
+# Sidecar metadata parser for fixture .toml files. Small, already in
+# the workspace dep set (lvqr-cli serve config, etc.), so no net weight.
+toml = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }

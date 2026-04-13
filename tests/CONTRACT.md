@@ -32,22 +32,20 @@ list) and their 5-artifact status as of 2026-04-13:
 | lvqr-record | yes (`tests/proptest_recorder.rs`) | no | yes (`tests/record_integration.rs`) | workspace `tests/e2e/` | yes (`tests/record_conformance.rs`, ffprobe against recorded init segment) |
 | lvqr-moq | yes (`tests/proptest_facade.rs`) | no | yes (`tests/integration_facade.rs`) | via `rtmp_ws_e2e` | no |
 | lvqr-fragment | yes (`tests/proptest_fragment.rs`) | no | yes (`tests/integration_moq_sink.rs`) | via `rtmp_ws_e2e` | no |
-| lvqr-codec | yes (`tests/proptest_{hevc,aac}.rs`) | yes (`fuzz/fuzz_targets/{parse_hevc_sps,parse_aac_asc,read_ue_v}.rs`) | yes (`tests/integration_codec.rs`) | via `rtmp_ws_e2e` | no |
+| lvqr-codec | yes (`tests/proptest_{hevc,aac}.rs`) | yes (`fuzz/fuzz_targets/{parse_hevc_sps,parse_aac_asc,read_ue_v}.rs`) | yes (`tests/integration_codec.rs`) | via `rtmp_ws_e2e` | yes (`tests/conformance_codec.rs`, iterates `lvqr-conformance` corpus) |
 | lvqr-cmaf | yes (`tests/proptest_policy.rs`) | no | yes (`tests/integration_segmenter.rs`) | via `rtmp_ws_e2e` | yes (`tests/conformance_init.rs`, ffprobe against mp4-atom init segment) |
 
 Gaps relative to the contract are tracked in the Tier 1/2 work list.
 The immediate priorities are:
 
-1. Fixture corpus bootstrap for `lvqr-conformance/fixtures/{rtmp,fmp4,hls}/`.
-   `ffmpeg` is now available locally as of session 5 and should be
-   captured in the next session.
-2. `mediastreamvalidator` wrapper for LL-HLS output once Tier 2.5 is
+1. `mediastreamvalidator` wrapper for LL-HLS output once Tier 2.5 is
    underway, wired through `lvqr-conformance::ValidatorResult`.
-3. Codec-level conformance slot for `lvqr-codec`: pin a handful of
-   real encoder-produced HEVC SPS and AAC ASC byte blobs with
-   expected decoded values, reusing the x265 SPS captured in
-   `crates/lvqr-codec/src/hevc.rs::tests::parse_sps_decodes_real_x265_single_sublayer`
-   as the seed fixture.
+2. HEVC fMP4 fixture capture (kvazaar or nvenc; x265 does not emit
+   `sps_max_sub_layers_minus1 > 0` SPSes, so the multi-sub-layer
+   parser path is still synthetic-only).
+3. Audio media-segment fixture for `lvqr-ingest` esds conformance
+   tests to exercise >127-byte AudioSpecificConfig payloads through
+   the full ffprobe round-trip.
 
 ## Enforcement
 

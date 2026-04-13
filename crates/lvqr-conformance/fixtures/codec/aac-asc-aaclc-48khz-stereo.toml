@@ -1,0 +1,11 @@
+source = "hand-packed by maintainer per ISO/IEC 14496-3 section 1.6.2.1"
+codec = "mp4a.40.2"
+container = "raw AAC AudioSpecificConfig bytes"
+license = "CC0"
+
+[expected.aac_asc]
+object_type = 2
+sample_rate = 48000
+channel_config = 2
+sbr_present = false
+ps_present = false

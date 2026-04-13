@@ -1,0 +1,12 @@
+source = "ffmpeg 8.1 libx264 ultrafast -profile:v baseline -level 3.1; -f lavfi -i testsrc2=640x360:rate=30 -t 1; movflags=empty_moov+cmaf+frag_keyframe+default_base_moof"
+codec = "avc1.42c01f"
+container = "fMP4 (CMAF low-latency fragmented)"
+duration_ms = 1000
+notes = "Single CMAF track, 30 fragments at 30 fps, 640x360. First test vector for lvqr-ingest fMP4 consumers and lvqr-cmaf segmenter regression tests."
+license = "CC0; synthesized from lavfi testsrc2"
+
+[expected]
+width = 640
+height = 360
+profile = "Constrained Baseline"
+level = 31
