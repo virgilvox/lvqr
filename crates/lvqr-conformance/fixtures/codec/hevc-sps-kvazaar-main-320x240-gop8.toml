@@ -1,0 +1,15 @@
+source = "kvazaar 2.3.2 main profile; ffmpeg 8.1 -f lavfi -i testsrc2=320x240:rate=30 -t 1 -pix_fmt yuv420p -f yuv4mpegpipe | kvazaar --input - --input-res 320x240 --input-fps 30 --gop 8"
+codec = "hev1.1.60000000.L186.B0"
+container = "raw HEVC SPS NAL payload (no 2-byte NAL header prefix)"
+license = "CC0; synthesized from lavfi testsrc2 by maintainer"
+notes = "First real multi-sub-layer HEVC SPS in the corpus. --gop 8 flips kvazaar from low-delay-P mode into a real temporal-scalability GOP structure, which in turn raises sps_max_sub_layers_minus1 from 0 to 1. This exercises the parse_ptl_sublayers code path with real encoder output rather than the synthetic bit-writer fixtures in the parser unit tests. general_level_idc = 186 encodes HEVC level 6.2 (186 / 30 = 6.2), which kvazaar picks as a safe ceiling for every resolution because it does not run level inference by default."
+
+[expected.hevc_sps]
+general_profile_space = 0
+general_tier_flag = false
+general_profile_idc = 1
+general_profile_compatibility_flags = 0x60000000
+general_level_idc = 186
+chroma_format_idc = 1
+pic_width_in_luma_samples = 320
+pic_height_in_luma_samples = 240

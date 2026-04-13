@@ -17,6 +17,158 @@
 //! mdat` via `mp4-atom`. Keeping the scaffold thin today means that
 //! migration is additive: new sample-coalescer code, zero changes to
 //! the public surface.
+//!
+//! ## Raw-sample coalescer design note (session 7)
+//!
+//! Before the sample coalescer lands, we need to agree on how raw
+//! samples enter the pipeline, how per-track timing is tracked, and
+//! how the HLS partial / DASH segment / MoQ group boundaries interact
+//! with the keyframe cadence. This section is the scope document.
+//! Treat it as a living spec that the first implementation PR is
+//! allowed to rewrite.
+//!
+//! ### Input shape
+//!
+//! The coalescer consumes a stream of `RawSample` values. A
+//! `RawSample` is a minimal value type carrying:
+//!
+//! ```text
+//! RawSample {
+//!     track_id: u32,
+//!     dts: u64,          // per-track timescale ticks
+//!     cts_offset: i32,   // composition offset, usually zero for audio
+//!     duration: u32,     // per-sample duration in timescale ticks
+//!     payload: Bytes,    // AVCC length-prefixed for video,
+//!                        // raw AU for AAC (no ADTS header)
+//!     flags: SampleFlags,// { keyframe, depends_on, is_depended_on }
+//! }
+//! ```
+//!
+//! The producer is authoritative for timing. The coalescer never
+//! re-derives DTS from PTS or vice versa and never re-parses the
+//! payload to infer keyframe status; every bit of metadata the
+//! coalescer needs is in the struct. This is the opposite of the SRS
+//! "parse the RTMP tag inside the core type" design and the same as
+//! the OvenMediaEngine `Provider/Publisher/Stream` split.
+//!
+//! ### State per track
+//!
+//! One `TrackCoalescer` per track. Each owns:
+//!
+//! * A `CmafPolicyState` (already implemented).
+//! * A `pending_samples: Vec<RawSample>` buffer holding the samples
+//!   that have not yet been flushed into a chunk.
+//! * A `next_sequence_number: u32` counter for the `mfhd` box.
+//! * An `init_segment: Bytes` produced once by the HEVC / AVC / AAC
+//!   init writers from `crate::init` the moment the coalescer sees
+//!   the first sample and knows enough to build an init.
+//!
+//! The multi-track surface is a `HashMap<u32, TrackCoalescer>` keyed
+//! by track id. The segmenter emits one `CmafChunk` per track per
+//! flush; the HLS / DASH egress crates are responsible for aligning
+//! the per-track outputs into a single playlist.
+//!
+//! ### Boundary decision
+//!
+//! For each incoming sample the coalescer runs the policy state
+//! machine. The decision is:
+//!
+//! 1. **Append**: the sample stays in the pending buffer, no chunk
+//!    emitted.
+//! 2. **Flush as partial**: emit a chunk built from the pending
+//!    samples, kind = `Partial` or `PartialIndependent`.
+//! 3. **Flush as segment**: emit a chunk built from the pending
+//!    samples, kind = `Segment`. This is always the start of a new
+//!    HLS segment, a new DASH segment, and a new MoQ group.
+//!
+//! The "flush as partial" decision fires when the pending duration
+//! hits `CmafPolicy::partial_duration`. The "flush as segment"
+//! decision fires when a keyframe arrives after the pending duration
+//! has already passed `CmafPolicy::segment_duration`. Edge case: a
+//! keyframe that arrives before the segment duration closes ends the
+//! current segment early iff the policy sets `honor_keyframe_cadence`
+//! (not yet in the policy, add with the coalescer).
+//!
+//! ### `moof + mdat` construction
+//!
+//! Build the `moof` via `mp4_atom::Moof` + `mp4_atom::Traf` +
+//! `mp4_atom::Tfhd` + `mp4_atom::Tfdt` + `mp4_atom::Trun`, then append
+//! an `mp4_atom::Mdat` carrying the concatenated sample payloads.
+//! `Trun` must set the `data_offset_present` flag and carry a
+//! placeholder offset that is patched after the `moof` is encoded but
+//! before the `mdat` is written (mp4-atom does not offer a
+//! `patch_data_offset` helper today; the coalescer will either pass a
+//! post-encode offset patcher or precompute the moof size). The
+//! hand-rolled `lvqr-ingest` writer at `remux/fmp4.rs:528` is the
+//! reference implementation; the coalescer should produce the same
+//! byte layout modulo the harmless differences already cataloged in
+//! `crates/lvqr-cmaf/tests/parity_avc_init.rs`.
+//!
+//! Per-sample fields inside the `Trun`:
+//!
+//! * `sample_duration`: from `RawSample::duration`.
+//! * `sample_size`: `payload.len()`.
+//! * `sample_flags`: built from `RawSample::flags` per the ISO BMFF
+//!   `sample_flags` layout (6 bits of `is_leading` + `depends_on` +
+//!   `is_depended_on` + `has_redundancy`, plus the 16-bit degradation
+//!   priority and the 1-bit `is_non_sync_sample`).
+//! * `sample_composition_time_offset`: `cts_offset`, present only
+//!   when any sample in the chunk has a non-zero offset (saves bytes
+//!   on audio tracks that never need CTS).
+//!
+//! ### Init segment lifecycle
+//!
+//! The first sample on a given track triggers init segment
+//! construction. For video, the producer supplies SPS / PPS / VPS /
+//! dimensions + parsed HEVC or AVC sample entries as part of the
+//! `RawSample` sidecar (or a separate `TrackInit` message that
+//! precedes the first `RawSample`). The coalescer passes those into
+//! `write_avc_init_segment` / `write_hevc_init_segment` and caches
+//! the result as `TrackCoalescer::init_segment`.
+//!
+//! The `CmafSegmenter` public surface grows one method:
+//!
+//! ```text
+//! pub fn init_segment(&self, track_id: u32) -> Option<&Bytes>;
+//! ```
+//!
+//! Egress crates call it the moment they need to prepend an init
+//! segment to a new subscriber's stream. Returns `None` until the
+//! first sample on that track has been seen.
+//!
+//! ### Interaction with the existing passthrough path
+//!
+//! The sample coalescer is strictly additive. The existing
+//! `FragmentStream` -> pre-muxed `moof + mdat` passthrough stays in
+//! place for the `rtmp_ws_e2e` path because retiring it requires a
+//! full rewrite of the RTMP bridge to stop emitting pre-muxed
+//! fragments. The coalescer enters via a new constructor
+//! `CmafSegmenter::from_sample_stream(sample_stream, ...)` and lives
+//! alongside the existing `CmafSegmenter::new(fragment_stream, ...)`
+//! during the transition.
+//!
+//! ### Session 7 deliverable
+//!
+//! Session 7 should land:
+//!
+//! 1. A `RawSample` + `SampleStream` trait pair in `lvqr-fragment` or
+//!    a new `lvqr-cmaf::sample` module. Pick the location based on
+//!    which crate ends up owning the producer side (ingest will
+//!    eventually emit `RawSample` directly, so `lvqr-fragment` is the
+//!    better long-term home).
+//! 2. A `TrackCoalescer` struct with a `push(sample) -> Option<CmafChunk>`
+//!    method. Pure state machine, no I/O, trivially proptest-able.
+//! 3. A thin `CmafSegmenter::from_sample_stream` constructor wrapping
+//!    a `HashMap<TrackId, TrackCoalescer>` and pulling samples via
+//!    the new trait.
+//! 4. A round-trip test that drives a scripted sample stream through
+//!    the coalescer and asserts the output chunks are structurally
+//!    equivalent to what `lvqr-ingest::remux::fmp4::video_segment`
+//!    produces for the same input.
+//!
+//! Items 1 and 2 are load-bearing. Items 3 and 4 can be split into
+//! session 7.5 if the trait design turns out to require more
+//! negotiation with the lvqr-ingest side than anticipated.
 
 use crate::chunk::CmafChunk;
 use crate::policy::{CmafPolicy, CmafPolicyState};

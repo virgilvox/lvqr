@@ -1432,6 +1432,7 @@ dependencies = [
  "lvqr-conformance",
  "lvqr-core",
  "lvqr-fragment",
+ "lvqr-ingest",
  "lvqr-test-utils",
  "mp4-atom",
  "proptest",

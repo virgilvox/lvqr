@@ -1,13 +1,107 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.3 lvqr-cmaf grows HEVC + AAC init writers
+## Project Status: v0.4-dev -- Tier 2.3 AVC parity gate + multi-sub-layer HEVC coverage
 
-**Last Updated**: 2026-04-13 (session 6)
-**Tests**: 51 test binaries across the workspace, 211 individual
+**Last Updated**: 2026-04-13 (session 7)
+**Tests**: 52 test binaries across the workspace, 213 individual
 tests (plus ~5700 generated proptest cases per run across the
 ingest, fragment, hevc, aac, and cmaf-policy harnesses), all green.
 cargo clippy --workspace --all-targets -- -D warnings is clean.
 cargo fmt --check is clean.
+
+## Session 7 additions (2026-04-13)
+
+Session 7 closed three of the four follow-up items from the session-6
+HANDOFF work list in a single run. Only the `lvqr-hls` scaffold is
+deferred; every other session-7 priority landed.
+
+1. **AVC init parity gate** (`crates/lvqr-cmaf/tests/parity_avc_init.rs`).
+   New test that runs both writers on the same SPS / PPS / dimensions
+   triple and structurally compares the decoded Moov trees via
+   `mp4_atom::Moov::decode`. The assertion set is the playback
+   contract: ftyp brands, mvhd timescale + next_track_id, trak count
+   and track_id, mdhd timescale, hdlr type, stsd codec kind, Avc1
+   width / height / depth, avcC length_size, avcC SPS and PPS byte
+   sequences, mvex.trex track_id + default_sample_description_index.
+   Every one of those fields matches across writers. The total byte
+   length differs (cmaf=698, ingest=662, delta=+36 bytes) because the
+   two writers pick different defaults for fields that do not affect
+   playback (creation timestamps, default volume, matrix values,
+   stsz/stsc/stco table shapes, stts entry counts, hdlr name
+   strings). A second test (`avc_init_parity_byte_equality_is_not_required`)
+   pins the intentional-non-equality invariant so a future session
+   cannot accidentally replace the structural-match test with a
+   byte-equality assertion. Dev-dep cycle check: `lvqr-ingest` is now
+   a dev-dep of `lvqr-cmaf` (test-only); no normal-dep cycle because
+   `lvqr-ingest` does not depend on `lvqr-cmaf` in any direction.
+   This is the first byte-level proof the mp4-atom writer is a
+   drop-in replacement for the hand-rolled path. When the Tier 2.3
+   migration retires the hand-rolled writer, the parity test becomes
+   the migration gate.
+
+2. **Real multi-sub-layer HEVC fixture via kvazaar**
+   (`crates/lvqr-conformance/fixtures/codec/hevc-sps-kvazaar-main-320x240-gop8.{bin,toml}`).
+   `brew install kvazaar` (kvazaar 2.3.2) plus a `ffmpeg 8.1 -f lavfi
+   -i testsrc2=320x240:rate=30 -t 1 -f yuv4mpegpipe | kvazaar --input
+   - --input-res 320x240 --input-fps 30 --gop 8` pipeline produces an
+   HEVC Annex-B bytestream whose SPS has
+   `sps_max_sub_layers_minus1 = 1`. x265 refused to emit this under
+   every session-5 configuration tried; kvazaar's `--gop 8` flag
+   flips it from the low-delay-P default into a real
+   temporal-scalability GOP, which is what the multi-sub-layer SPS
+   path is for.
+
+   The SPS NAL payload (no 2-byte header) is pinned in the codec
+   fixture corpus with a sidecar carrying every decoded field
+   (profile_idc = 1 Main, level_idc = 186 i.e. HEVC level 6.2,
+   compat flags 0x60000000, chroma 4:2:0, 320x240). The existing
+   `lvqr-codec::tests::conformance_codec.rs` harness picked it up
+   with zero code changes the first time it ran, validating the
+   session-5 "drop a .bin + .toml in and coverage extends
+   automatically" design choice. **The multi-sub-layer HEVC parser
+   path now has real-encoder coverage** on top of the synthetic
+   bit-writer fixtures that were the session-5 canonical truth. The
+   session-5 HANDOFF note "If no maintained encoder on homebrew
+   emits multi-sublayer SPSes, document that in HANDOFF and leave
+   the synthetic coverage as the canonical truth" is now obsolete.
+
+3. **CmafSegmenter raw-sample coalescer design note**
+   (`crates/lvqr-cmaf/src/segmenter.rs` crate doc comment). Extended
+   the existing segmenter-module doc with a nine-section design note
+   covering: `RawSample` input shape, per-track state
+   (`TrackCoalescer`), boundary decision flow (Append / FlushPartial
+   / FlushSegment), `moof + mdat` construction via `mp4-atom`,
+   init-segment lifecycle with a new `CmafSegmenter::init_segment`
+   public method, interaction with the existing pass-through path
+   during the transition, and a concrete session-7-or-7.5
+   deliverable list. Treat the note as a living spec that the first
+   implementation PR is allowed to rewrite. Pinning it in the
+   segmenter source rather than a separate markdown file means the
+   note travels with the code it describes and does not rot in
+   isolation.
+
+### What session 7 did NOT land
+
+* **`lvqr-hls` scaffold**. Deferred because the three items above
+  consumed the session budget. Still the next-highest-leverage item
+  for session 8. Per the competitive audit, LL-HLS is the loudest
+  v1.0 gap (every evaluator asks "can it serve HLS?") and it slots
+  in cleanly on top of the CmafChunk type that already exists.
+
+### Contract slot status as of session 7
+
+| Crate | proptest | fuzz | integration | E2E | conformance |
+|---|---|---|---|---|---|
+| lvqr-ingest | y | y | y | y | y |
+| lvqr-codec | y | y | y | via rtmp_ws_e2e | y (multi-sublayer now covered) |
+| lvqr-cmaf | y | open (no parser surface) | y | via rtmp_ws_e2e | y (AVC + HEVC + AAC) |
+| lvqr-record | y | open | y | workspace e2e | y |
+| lvqr-moq | y | open | y | via rtmp_ws_e2e | n/a (pure value type) |
+| lvqr-fragment | y | open | y | via rtmp_ws_e2e | n/a (pure value type) |
+
+No contract slot changes from session 6; the multi-sub-layer fixture
+strengthens the existing `lvqr-codec` conformance slot without
+adding a new one.
 
 ## Session 6 additions (2026-04-13): HEVC + AAC init segment writers
 
@@ -698,60 +792,55 @@ should be aware of so nothing is discovered twice.
   reusing the x265 fixture already in
   `parse_sps_decodes_real_x265_single_sublayer` as the seed.
 
-## Recommended Tier 2.3 entry point (session 7)
+## Recommended Tier 2.3 entry point (session 8)
 
-Session 6 closed priority item 1 from the prior list (grow `lvqr-cmaf`
-beyond AVC). The remaining priorities carry forward unchanged:
+Session 7 closed three of the four session-7 work list items (AVC
+parity gate, multi-sub-layer HEVC fixture, segmenter design note).
+Session 8 picks up the deferred item plus the two follow-ups the
+design note surfaced.
 
-1. **Wire `lvqr-cmaf::write_avc_init_segment` into `rtmp_ws_e2e`** in
-   parallel with the hand-rolled
-   `lvqr-ingest::remux::fmp4::video_init_segment` and byte-diff the
-   two outputs. This is the first byte-level proof the `mp4-atom`
-   path is a drop-in replacement for the hand-rolled writer. If the
-   bytes differ, document the differences here and pick a
-   source-of-truth side. Start with a standalone parity test
-   (`crates/lvqr-cmaf/tests/parity_avc_init.rs`) that imports
-   `lvqr-ingest` as a dev-dep, runs both writers on the same SPS /
-   PPS / dimensions triple, and dumps the diff structurally through
-   `mp4_atom::Moov::decode`. Expect the outputs to differ in
-   compressor name, default volume, and possibly `stsd` count
-   handling; everything else should match.
-2. **Capture a multi-sub-layer HEVC fixture**. x265 will not produce
-   `sps_max_sub_layers_minus1 > 0` in any configuration tried in
-   session 5. Try `brew install kvazaar` and
-   `kvazaar --temporal-layers 2`, or capture an HEVC SPS from a
-   publicly licensed sample (Apple bipbop advanced, Big Buck Bunny
-   HEVC rendition). Pin the bytes in
-   `crates/lvqr-conformance/fixtures/codec/` with a sidecar; the
-   existing `conformance_codec.rs` harness will pick them up
-   automatically. If no maintained encoder on homebrew emits a
-   multi-sub-layer SPS, document it here and leave the synthetic
-   coverage as the canonical truth.
-3. **Scope the CmafSegmenter raw-sample coalescer**. The current
-   segmenter is a pass-through over pre-muxed fragments. The
-   Tier 2.3 load-bearing piece is a sample coalescer that consumes
-   raw samples and builds its own `moof + mdat` via `mp4-atom`.
-   Session 7 should start with a design note in
-   `crates/lvqr-cmaf/docs/segmenter-design.md` (or an expanded doc
-   comment on `CmafSegmenter`) rather than implementing half. The
-   note should cover: how raw samples enter the pipeline, how
-   timing is tracked per-track, how the HLS partial boundary and
-   DASH segment boundary interact with the keyframe cadence, and
-   how the HEVC / AAC init writers from session 6 slot into the
-   first-segment path.
-4. **Only then start `lvqr-hls`**. Per the competitive audit, LL-HLS
-   is the loudest v1.0 gap. Day-one scaffold needs CmafChunk ->
-   HLS partial manifest generation plus a tiny axum router. No
-   actual LL-HLS client testing yet. Day-one 5-artifact coverage
-   lands with the scaffold: proptest on manifest generation,
-   integration via `lvqr-test-utils::TestServer`, conformance via
-   Apple `mediastreamvalidator` behind a soft-skip when it is not
-   available on PATH (same pattern as `ffprobe_bytes`).
+1. **Start `lvqr-hls`**. Per the competitive audit, LL-HLS is the
+   loudest v1.0 gap. Day-one scaffold needs `CmafChunk` -> HLS
+   partial manifest generation plus a tiny axum router. No actual
+   LL-HLS client testing yet. Day-one 5-artifact coverage lands with
+   the scaffold: proptest on manifest generation, integration via
+   `lvqr-test-utils::TestServer`, conformance via Apple
+   `mediastreamvalidator` behind a soft-skip when it is not
+   available on PATH (same pattern as `ffprobe_bytes`). Wait on the
+   raw-sample coalescer: the pass-through `CmafSegmenter` already
+   emits `CmafChunk` values for the `rtmp_ws_e2e` path, so
+   `lvqr-hls` can consume them immediately without blocking on the
+   full Tier 2.3 migration.
+2. **Implement the raw-sample coalescer** per the design note in
+   `crates/lvqr-cmaf/src/segmenter.rs`. Session 7 pinned the spec;
+   session 8 lands:
+   * A `RawSample` + `SampleStream` trait pair in
+     `lvqr-fragment` (or `lvqr-cmaf::sample`; pick based on which
+     crate ends up owning the producer side long-term).
+   * A `TrackCoalescer` struct with `push(sample) -> Option<CmafChunk>`.
+   * `CmafSegmenter::from_sample_stream` constructor wrapping a
+     `HashMap<TrackId, TrackCoalescer>`.
+   * A round-trip test that drives a scripted sample stream through
+     the coalescer and asserts structural equivalence with
+     `lvqr-ingest::remux::fmp4::video_segment` output. The session-7
+     `parity_avc_init.rs` test is the template for the assertion
+     style.
+3. **Wire `lvqr-cmaf::write_avc_init_segment` into `rtmp_ws_e2e`**.
+   The session-7 parity gate proved the writers are structurally
+   equivalent; now the hand-rolled path at
+   `lvqr-ingest::remux::fmp4::video_init_segment` can be retired
+   behind a feature flag and eventually removed. Migration order:
+   (a) add a `#[cfg(feature = "cmaf-init")]` code path in the RTMP
+   bridge that calls `lvqr_cmaf::write_avc_init_segment` when the
+   feature is on, (b) flip the feature on in CI and verify
+   `rtmp_ws_e2e` is still green, (c) flip the default-on, (d) a
+   later session removes the hand-rolled path and the feature
+   flag.
 
-All four items are gated on the Tier 2.3 CmafSegmenter raw-sample
-coalescer being at least scoped. Do NOT start `lvqr-dash`,
-`lvqr-whip`, `lvqr-whep`, `lvqr-srt`, `lvqr-rtsp`, or `lvqr-archive`
-before then.
+Do NOT start `lvqr-dash`, `lvqr-whip`, `lvqr-whep`, `lvqr-srt`,
+`lvqr-rtsp`, or `lvqr-archive` before the raw-sample coalescer lands.
+Every egress beyond LL-HLS needs the coalescer to produce chunks
+from arbitrary sample sources, not just the RTMP pre-muxed path.
 
 ## Recommended Tier 2.3 entry point (session 6, closed)
 
