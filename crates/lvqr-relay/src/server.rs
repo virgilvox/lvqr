@@ -136,10 +136,22 @@ impl RelayServer {
                     self.metrics.connections_total.fetch_add(1, Ordering::Relaxed);
                     metrics::counter!("lvqr_moq_connections_total").increment(1);
 
+                    // Reject obviously malformed broadcast paths before the
+                    // auth check so we never pass attacker-shaped input to
+                    // downstream providers, loggers, or recorder hooks.
+                    let (token, broadcast) = parse_url_token(request.url());
+                    if !is_valid_broadcast_name(&broadcast) {
+                        warn!(conn = conn_id, broadcast = %broadcast, "rejecting session with invalid broadcast path");
+                        metrics::counter!("lvqr_auth_failures_total", "entry" => "moq").increment(1);
+                        if let Err(e) = request.close(400).await {
+                            debug!(error = %e, "request close failed");
+                        }
+                        continue;
+                    }
+
                     // Authentication: inspect the requested URL for a token query
                     // parameter and ask the auth provider whether to allow the
                     // session. Reject early via Request::close before the handshake.
-                    let (token, broadcast) = parse_url_token(request.url());
                     let auth_decision = self.auth.check(&AuthContext::Subscribe {
                         token: token.clone(),
                         broadcast: broadcast.clone(),
@@ -215,6 +227,86 @@ fn parse_url_token(url: Option<&url::Url>) -> (Option<String>, String) {
         .find(|(k, _)| k == "token")
         .map(|(_, v)| v.into_owned());
     (token, broadcast)
+}
+
+/// Reject broadcast paths that contain control characters, directory
+/// traversal components, backslashes, or that exceed 255 bytes. LVQR uses
+/// broadcast names as opaque keys into moq-lite's Origin, but the same
+/// strings end up in log lines, metric labels, auth provider decisions,
+/// and (via the event bus) disk recording paths. Hardening the validator
+/// at the first entry point is the cheapest way to keep attacker-shaped
+/// names from leaking into any of those subsystems.
+///
+/// The allowed set is `[A-Za-z0-9._/-]` plus a length cap.
+///
+/// Empty broadcast names are **permitted** because MoQ sessions routinely
+/// connect to the relay root URL and pick broadcasts later via SUBSCRIBE
+/// protocol messages; the URL path is not always the broadcast name.
+/// Non-empty names must pass the strict format check.
+#[cfg(feature = "quinn-transport")]
+fn is_valid_broadcast_name(s: &str) -> bool {
+    if s.is_empty() {
+        return true;
+    }
+    if s.len() > 255 {
+        return false;
+    }
+    if s.starts_with('/') || s.ends_with('/') {
+        return false;
+    }
+    if s.contains("..") {
+        return false;
+    }
+    s.bytes()
+        .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/'))
+}
+
+#[cfg(all(test, feature = "quinn-transport"))]
+mod broadcast_name_tests {
+    use super::is_valid_broadcast_name;
+
+    #[test]
+    fn accepts_typical_broadcast_paths() {
+        assert!(is_valid_broadcast_name("live/test"));
+        assert!(is_valid_broadcast_name("live/my-stream.v2"));
+        assert!(is_valid_broadcast_name("app_name/room123"));
+        assert!(is_valid_broadcast_name("single"));
+    }
+
+    #[test]
+    fn accepts_empty_for_session_root() {
+        // MoQ sessions legitimately connect to https://host:port/ and pick
+        // broadcasts via SUBSCRIBE. Empty must pass.
+        assert!(is_valid_broadcast_name(""));
+    }
+
+    #[test]
+    fn rejects_too_long() {
+        let long = "a".repeat(256);
+        assert!(!is_valid_broadcast_name(&long));
+    }
+
+    #[test]
+    fn rejects_directory_traversal() {
+        assert!(!is_valid_broadcast_name("../etc/passwd"));
+        assert!(!is_valid_broadcast_name("live/../admin"));
+        assert!(!is_valid_broadcast_name(".."));
+    }
+
+    #[test]
+    fn rejects_leading_or_trailing_slash() {
+        assert!(!is_valid_broadcast_name("/live/test"));
+        assert!(!is_valid_broadcast_name("live/test/"));
+    }
+
+    #[test]
+    fn rejects_control_chars_and_backslash() {
+        assert!(!is_valid_broadcast_name("live/\ntest"));
+        assert!(!is_valid_broadcast_name("live/\0test"));
+        assert!(!is_valid_broadcast_name("live\\test"));
+        assert!(!is_valid_broadcast_name("live test"));
+        assert!(!is_valid_broadcast_name("live/test?token=x"));
+    }
 }
 
 /// Stub server when quinn-transport feature is disabled.

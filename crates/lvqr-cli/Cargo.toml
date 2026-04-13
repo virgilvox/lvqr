@@ -28,7 +28,7 @@ lvqr-mesh = { workspace = true }
 lvqr-ingest = { workspace = true }
 lvqr-signal = { workspace = true }
 lvqr-admin = { workspace = true }
-lvqr-auth = { workspace = true }
+lvqr-auth = { workspace = true, features = ["jwt"] }
 lvqr-record = { workspace = true }
 
 axum = { workspace = true }

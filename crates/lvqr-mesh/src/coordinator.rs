@@ -162,7 +162,18 @@ impl MeshCoordinator {
         orphans
     }
 
-    /// Reassign an orphaned peer to a new parent.
+    /// Reassign a peer to a new parent.
+    ///
+    /// Used both for orphan reassignment (after the old parent was removed)
+    /// and for live rebalance (moving a peer from an overloaded parent to
+    /// an underloaded one without going through `remove_peer` first). The
+    /// implementation handles both: it saves the peer's current parent
+    /// before overwriting it and, if the current parent still exists,
+    /// removes the stale child reference from its children list.
+    ///
+    /// Without the stale-child cleanup, live rebalance would leave every
+    /// reassigned peer in its old parent's children vec, inflating
+    /// `child_count()` and breaking `find_best_parent` load balancing.
     pub fn reassign_peer(&self, id: &str) -> Result<PeerAssignment, MeshError> {
         // Verify the peer exists
         if !self.peers.contains_key(id) {
@@ -173,22 +184,37 @@ impl MeshCoordinator {
         let parent = self.find_best_parent()?;
         let parent_depth = self.peers.get(&parent).map(|p| p.depth).unwrap_or(0);
 
-        // Now update the peer
-        let assignment = {
+        // Capture the old parent before we overwrite it, and rewrite the
+        // peer's own parent/depth fields in one short-lived entry borrow.
+        // The old parent lookup happens after the entry is dropped so we do
+        // not hold two DashMap references at once.
+        let (assignment, old_parent) = {
             let Some(mut entry) = self.peers.get_mut(id) else {
                 return Err(MeshError::PeerNotFound(id.to_string()));
             };
 
+            let old_parent = entry.parent.clone();
             entry.parent = Some(parent.clone());
             entry.depth = parent_depth + 1;
 
-            PeerAssignment {
+            let assignment = PeerAssignment {
                 peer_id: id.to_string(),
                 role: entry.role,
                 parent: Some(parent.clone()),
                 depth: entry.depth,
-            }
+            };
+            (assignment, old_parent)
         };
+
+        // Remove the stale child entry from the old parent's children list,
+        // if the old parent is still in the mesh. No-op for the orphan case
+        // because `remove_peer` already deleted the old parent entirely.
+        if let Some(old_parent_id) = old_parent
+            && old_parent_id != parent
+            && let Some(mut old_parent_entry) = self.peers.get_mut(&old_parent_id)
+        {
+            old_parent_entry.children.retain(|c| c != id);
+        }
 
         // Add as child of new parent (entry already dropped)
         if let Some(mut parent_entry) = self.peers.get_mut(&parent) {
@@ -481,25 +507,100 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_and_dead_peer_detection() {
+    fn heartbeat_keeps_peer_alive() {
+        // 1-second timeout so we can observe the full lifecycle within a
+        // single test without relying on sub-second granularity that
+        // `heartbeat_timeout_secs` does not support.
         let coord = MeshCoordinator::new(MeshConfig {
             max_children: 3,
             root_peer_count: 2,
             max_depth: 4,
-            heartbeat_timeout_secs: 0, // instant timeout for testing
+            heartbeat_timeout_secs: 1,
         });
 
         coord.add_peer("peer-1".into(), "live/test".into()).unwrap();
 
-        // With 0s timeout, the peer should immediately be "dead"
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        // PeerInfo::new stamps last_heartbeat at construction time, so a
+        // freshly registered peer is alive until the timeout elapses.
         let dead = coord.find_dead_peers();
-        assert!(dead.contains(&"peer-1".to_string()));
+        assert!(
+            !dead.contains(&"peer-1".to_string()),
+            "freshly registered peer should be alive"
+        );
 
-        // After heartbeat, no longer dead (if we increase timeout)
+        // Sleep past the timeout. The peer should now be considered dead.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let dead = coord.find_dead_peers();
+        assert!(
+            dead.contains(&"peer-1".to_string()),
+            "peer with stale heartbeat should be dead after timeout"
+        );
+
+        // Heartbeat resets the liveness clock. The peer is alive again.
         coord.heartbeat("peer-1");
-        // But with 0s timeout it's still dead immediately... so this test
-        // really just validates the mechanism works
+        let dead = coord.find_dead_peers();
+        assert!(
+            !dead.contains(&"peer-1".to_string()),
+            "heartbeat should reset the liveness clock"
+        );
+    }
+
+    /// Regression test for the v0.4 audit finding: `reassign_peer` must
+    /// remove the stale child reference from the old parent's children list
+    /// when called on a live (not-yet-orphaned) peer. The orphan-reassign
+    /// path already worked because `remove_peer` had deleted the old parent
+    /// entirely; this tests the live rebalance case.
+    #[test]
+    fn reassign_live_peer_removes_stale_child_from_old_parent() {
+        let coord = MeshCoordinator::new(MeshConfig {
+            max_children: 10, // room for everyone so the test stays deterministic
+            root_peer_count: 2,
+            max_depth: 4,
+            heartbeat_timeout_secs: 10,
+        });
+
+        // Two roots and one child attached to one of them.
+        coord.add_peer("root-A".into(), "live/test".into()).unwrap();
+        coord.add_peer("root-B".into(), "live/test".into()).unwrap();
+        coord.add_peer("child".into(), "live/test".into()).unwrap();
+
+        let child = coord.get_peer("child").unwrap();
+        let original_parent = child.parent.clone().unwrap();
+
+        // Sanity: the child is in the original parent's children list.
+        let parent = coord.get_peer(&original_parent).unwrap();
+        assert!(parent.children.contains(&"child".to_string()));
+
+        // Reassign without removing. find_best_parent will pick whichever
+        // root has fewer children, which may or may not be the same as
+        // original_parent. If it picks the same parent, we cannot prove
+        // the bug, so retry until we get a real move.
+        //
+        // In practice with two roots and one child, the new parent is
+        // guaranteed to be the *other* root because find_best_parent
+        // prefers fewer children first (the other root has 0, the
+        // original parent has 1).
+        coord.reassign_peer("child").unwrap();
+        let reassigned = coord.get_peer("child").unwrap();
+        let new_parent = reassigned.parent.clone().unwrap();
+        assert_ne!(
+            new_parent, original_parent,
+            "reassign_peer should move the child to the less-loaded root"
+        );
+
+        // The old parent must no longer have the stale child reference.
+        let old_parent_after = coord.get_peer(&original_parent).unwrap();
+        assert!(
+            !old_parent_after.children.contains(&"child".to_string()),
+            "old parent still has stale child reference after live reassign"
+        );
+
+        // The new parent must own the child.
+        let new_parent_after = coord.get_peer(&new_parent).unwrap();
+        assert!(
+            new_parent_after.children.contains(&"child".to_string()),
+            "new parent missing the reassigned child"
+        );
     }
 
     #[test]

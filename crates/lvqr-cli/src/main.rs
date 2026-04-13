@@ -6,7 +6,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
 use clap::Parser;
-use lvqr_auth::{AuthContext, AuthDecision, NoopAuthProvider, SharedAuth, StaticAuthConfig, StaticAuthProvider};
+use lvqr_auth::{
+    AuthContext, AuthDecision, JwtAuthConfig, JwtAuthProvider, NoopAuthProvider, SharedAuth, StaticAuthConfig,
+    StaticAuthProvider,
+};
 use lvqr_core::{EventBus, RelayEvent};
 use moq_lite::Track;
 use std::collections::HashMap;
@@ -71,6 +74,22 @@ struct ServeArgs {
     /// Directory to record broadcasts into. Omit to disable recording.
     #[arg(long, env = "LVQR_RECORD_DIR")]
     record_dir: Option<String>,
+
+    /// HS256 shared secret enabling JWT authentication. When set, the JWT
+    /// provider replaces the static-token provider and all auth surfaces
+    /// validate bearer tokens as signed JWTs.
+    #[arg(long, env = "LVQR_JWT_SECRET")]
+    jwt_secret: Option<String>,
+
+    /// Expected `iss` claim for JWT validation. When unset, issuer is not
+    /// checked. Only meaningful with `--jwt-secret`.
+    #[arg(long, env = "LVQR_JWT_ISSUER")]
+    jwt_issuer: Option<String>,
+
+    /// Expected `aud` claim for JWT validation. When unset, audience is not
+    /// checked. Only meaningful with `--jwt-secret`.
+    #[arg(long, env = "LVQR_JWT_AUDIENCE")]
+    jwt_audience: Option<String>,
 }
 
 #[tokio::main]
@@ -126,24 +145,43 @@ async fn serve(args: ServeArgs) -> Result<()> {
         }
     });
 
-    // Build authentication provider from CLI/env. If no tokens are configured,
-    // use NoopAuthProvider (open access, backward compatible).
-    let auth_config = StaticAuthConfig {
-        admin_token: args.admin_token.clone(),
-        publish_key: args.publish_key.clone(),
-        subscribe_token: args.subscribe_token.clone(),
-    };
-    let auth: SharedAuth = if auth_config.has_any() {
+    // Build authentication provider from CLI/env. JWT takes precedence when
+    // `--jwt-secret` is set: every auth surface then validates bearer tokens
+    // as HS256-signed JWTs with the configured issuer and audience. Otherwise
+    // fall back to the static-token provider when any individual token is
+    // configured, and finally to `NoopAuthProvider` (open access) when nothing
+    // is set so v0.3.1 deployments continue working with no config changes.
+    let auth: SharedAuth = if let Some(secret) = args.jwt_secret.clone() {
         tracing::info!(
-            admin = auth_config.admin_token.is_some(),
-            publish = auth_config.publish_key.is_some(),
-            subscribe = auth_config.subscribe_token.is_some(),
-            "auth: static-token provider enabled"
+            issuer = args.jwt_issuer.is_some(),
+            audience = args.jwt_audience.is_some(),
+            "auth: JWT provider enabled"
         );
-        Arc::new(StaticAuthProvider::new(auth_config))
+        let provider = JwtAuthProvider::new(JwtAuthConfig {
+            secret,
+            issuer: args.jwt_issuer.clone(),
+            audience: args.jwt_audience.clone(),
+        })
+        .map_err(|e| anyhow::anyhow!("failed to init JWT auth provider: {e}"))?;
+        Arc::new(provider)
     } else {
-        tracing::info!("auth: open access (no tokens configured)");
-        Arc::new(NoopAuthProvider)
+        let auth_config = StaticAuthConfig {
+            admin_token: args.admin_token.clone(),
+            publish_key: args.publish_key.clone(),
+            subscribe_token: args.subscribe_token.clone(),
+        };
+        if auth_config.has_any() {
+            tracing::info!(
+                admin = auth_config.admin_token.is_some(),
+                publish = auth_config.publish_key.is_some(),
+                subscribe = auth_config.subscribe_token.is_some(),
+                "auth: static-token provider enabled"
+            );
+            Arc::new(StaticAuthProvider::new(auth_config)) as SharedAuth
+        } else {
+            tracing::info!("auth: open access (no tokens configured)");
+            Arc::new(NoopAuthProvider) as SharedAuth
+        }
     };
 
     // Single process-wide event bus: lifecycle events (broadcast started/stopped,
