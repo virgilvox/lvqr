@@ -1,9 +1,11 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 0 Closed
+## Project Status: v0.4-dev -- Tier 0 Closed, Tier 1 Kickoff Underway
 
 **Last Updated**: 2026-04-13
-**Tests**: 110 Rust passing (cargo test --workspace), clippy + fmt clean
+**Tests**: 28 test binaries across the workspace, all green. cargo clippy
+--workspace --all-targets -- -D warnings is clean. cargo fmt --check is
+clean.
 **E2E Verified**: real RTMP publish -> RtmpMoqBridge -> MoQ origin -> axum WS
 relay -> tungstenite WebSocket client, with fMP4 init (ftyp) and media (moof)
 segments verified byte-by-byte. See `crates/lvqr-cli/tests/rtmp_ws_e2e.rs`.
@@ -80,6 +82,82 @@ The audit reorders two Tier 1 items:
 2. `lvqr-conformance` and the proptest/cargo-fuzz harnesses ship before
    `lvqr-chaos`. Chaos testing is valuable but does not block Tier 2
    the way the conformance corpus does.
+
+## Tier 1 Progress as of 2026-04-13
+
+Landed in this session:
+
+1. **`lvqr-conformance` crate skeleton** (`publish = false`). Directory
+   layout for fixtures under `fixtures/{rtmp,fmp4,hls,dash,moq,edge-cases}/`,
+   `ValidatorResult` type with soft-skip semantics, README documenting
+   the provenance metadata every fixture must ship with.
+2. **Proptest harness** for `lvqr-ingest` parsers and fMP4 writer at
+   `crates/lvqr-ingest/tests/proptest_parsers.rs`. `parse_video_tag` and
+   `parse_audio_tag` tested to never panic across 1024 cases each;
+   `video_init_segment_with_size` and `video_segment` tested to produce
+   structurally well-formed ISO BMFF buffers across 256 cases each
+   (2560 generated cases total, all green).
+3. **Golden-file regression** for the fMP4 writer at
+   `crates/lvqr-ingest/tests/golden_fmp4.rs` with two fixtures under
+   `crates/lvqr-ingest/tests/fixtures/golden/`. `BLESS=1` regenerates
+   both after intentional format changes.
+4. **`ffprobe_bytes` helper** in `lvqr-test-utils` with
+   `FfprobeResult::{Ok, Skipped, Failed}`. Tests soft-skip when ffprobe
+   is not on PATH so contributor laptops without ffmpeg do not break CI.
+5. **ffprobe wired into the golden fMP4 test** via a new
+   `ffprobe_accepts_concatenated_cmaf` case that feeds the init segment
+   plus a keyframe media segment into ffprobe and asserts acceptance.
+6. **cargo-fuzz scaffold** for the FLV parsers at
+   `crates/lvqr-ingest/fuzz/`, excluded from the main workspace so
+   stable builds do not pull libfuzzer-sys. Two targets:
+   `parse_video_tag` and `parse_audio_tag`. Nightly-only; runs via
+   `cargo +nightly fuzz run <target>`.
+7. **5-artifact test contract** documented at `tests/CONTRACT.md` with
+   a table tracking each in-scope crate's current coverage of the
+   five required artifacts (proptest, fuzz, integration, E2E,
+   conformance). Educational during Tier 1; hard CI gate from Tier 2.
+
+After this session, `lvqr-ingest` has four of the five artifacts for
+its parsers and writers: proptest (new), cargo-fuzz (new, nightly),
+integration (existing RTMP bridge test), and conformance (new golden
+plus ffprobe). The fifth slot (browser E2E) is covered transitively
+by the `lvqr-cli` rtmp_ws_e2e test. No other crate has full coverage yet.
+
+## Tier 1 Remaining Work
+
+Big-ticket items still to build:
+
+- `TestServer` in `lvqr-test-utils` that spawns a full LVQR binary (or
+  calls `lvqr_cli::serve` directly once the CLI crate exposes a lib)
+  with ephemeral ports and cleanup. Replaces ad-hoc server setup in
+  every test file.
+- testcontainers fixtures for MinIO (S3-compatible object storage),
+  needed for the Tier 2.4 archive crate.
+- `tests/e2e/` playwright suite that drives a real Chrome against the
+  test app to exercise ingest plus playback. Trace recording on
+  failure. Gating for the audio A/V drift soak test the audit calls
+  out.
+- ffprobe-backed validation of every fMP4 output in every test,
+  swapping hand-rolled structural assertions for the external
+  validator where practical.
+- `mediastreamvalidator` wrapper in `lvqr-conformance` that runs Apple's
+  HLS validator against generated playlists. Blocks on Tier 2.5 existing.
+- Cross-implementation comparison harness: same RTMP into LVQR and
+  MediaMTX, structural diff of HLS playlists. Blocks on Tier 2.5.
+- 24-hour soak rig that runs synthetic publisher plus subscribers and
+  asserts no memory growth, no FD leaks, no gauge drift.
+- `lvqr-loadgen` crate for Rust-native data-plane load generation.
+- `lvqr-chaos` crate for fault injection. Lowest priority per the audit.
+- CI enforcement script for the 5-artifact contract. Educational PR
+  comments in Tier 1, hard fail in Tier 2.
+
+The `lvqr-fragment` and `lvqr-moq` crates from Tier 2.1 remain the
+load-bearing architectural call. Do not ship new protocol code before
+those two land. Read `tracking/AUDIT-2026-04-13.md` for the full
+competitor comparison and the five strategic bets before arguing about
+priority.
+
+## End-to-End Pipeline (Proven Working)
 
 ## End-to-End Pipeline (Proven Working)
 

@@ -43,3 +43,4 @@ moq-lite = { workspace = true }
 rml_rtmp = { workspace = true }
 tracing-subscriber = { workspace = true }
 proptest = "1"
+lvqr-test-utils = { workspace = true }

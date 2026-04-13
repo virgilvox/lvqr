@@ -1,5 +1,9 @@
 [workspace]
 resolver = "2"
+# crates/lvqr-ingest/fuzz is intentionally excluded; libfuzzer-sys requires
+# nightly rustc and sanitizer instrumentation. Run with:
+#   cargo +nightly fuzz run parse_video_tag
+exclude = ["crates/lvqr-ingest/fuzz"]
 members = [
     "crates/lvqr-core",
     "crates/lvqr-relay",

@@ -1560,6 +1560,7 @@ dependencies = [
  "h264-reader",
  "lvqr-auth",
  "lvqr-core",
+ "lvqr-test-utils",
  "metrics",
  "moq-lite",
  "proptest",

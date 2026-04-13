@@ -1,0 +1,42 @@
+[package]
+name = "lvqr-ingest-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+# Excluded from the main workspace because libfuzzer-sys requires nightly
+# rustc and sanitizer instrumentation that the stable workspace builds
+# cannot produce. Run with:
+#
+#   cargo +nightly fuzz run parse_video_tag
+#   cargo +nightly fuzz run parse_audio_tag
+#
+# Seeds for each target live under fuzz/corpus/<target>/ and are populated
+# progressively from the lvqr-conformance fixture corpus plus regression
+# samples from past crashes.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+lvqr-ingest = { path = ".." }
+
+[[bin]]
+name = "parse_video_tag"
+path = "fuzz_targets/parse_video_tag.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_audio_tag"
+path = "fuzz_targets/parse_audio_tag.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true
