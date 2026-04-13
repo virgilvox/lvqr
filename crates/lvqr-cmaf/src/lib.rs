@@ -58,6 +58,9 @@ pub mod policy;
 pub mod segmenter;
 
 pub use chunk::{CmafChunk, CmafChunkKind};
-pub use init::{InitSegmentError, VideoInitParams, write_avc_init_segment};
+pub use init::{
+    AudioInitParams, HevcInitParams, InitSegmentError, VideoInitParams, write_aac_init_segment, write_avc_init_segment,
+    write_hevc_init_segment,
+};
 pub use policy::{CmafPolicy, PolicyDecision};
 pub use segmenter::{CmafSegmenter, SegmenterError};

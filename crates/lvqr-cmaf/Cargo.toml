@@ -31,3 +31,4 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 proptest = "1"
 lvqr-test-utils = { workspace = true }
+lvqr-conformance = { workspace = true }

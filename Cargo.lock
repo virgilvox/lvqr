@@ -1429,6 +1429,7 @@ version = "0.3.1"
 dependencies = [
  "bytes",
  "lvqr-codec",
+ "lvqr-conformance",
  "lvqr-core",
  "lvqr-fragment",
  "lvqr-test-utils",

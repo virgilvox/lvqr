@@ -1,13 +1,137 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.2 Closed, Tier 2.3 Scaffold Landed
+## Project Status: v0.4-dev -- Tier 2.3 lvqr-cmaf grows HEVC + AAC init writers
 
-**Last Updated**: 2026-04-13 (session 5, part 2)
-**Tests**: 51 test binaries across the workspace, 206 individual
+**Last Updated**: 2026-04-13 (session 6)
+**Tests**: 51 test binaries across the workspace, 211 individual
 tests (plus ~5700 generated proptest cases per run across the
 ingest, fragment, hevc, aac, and cmaf-policy harnesses), all green.
 cargo clippy --workspace --all-targets -- -D warnings is clean.
 cargo fmt --check is clean.
+
+## Session 6 additions (2026-04-13): HEVC + AAC init segment writers
+
+Session 6 tackled priority item 1 from the "Recommended Tier 2.3 entry
+point" work list: grow `lvqr-cmaf` beyond AVC. The AVC-only
+`write_avc_init_segment` from session 5 is now joined by HEVC and AAC
+siblings, both built on `mp4-atom` and both covered by the same
+ffprobe conformance harness.
+
+1. **`write_hevc_init_segment` + `HevcInitParams`**. New public API in
+   `crates/lvqr-cmaf/src/init.rs`. Takes VPS / SPS / PPS NAL unit byte
+   blobs (each including the 2-byte HEVC NAL header so they can be
+   written verbatim into the `hvcC` arrays) plus a decoded
+   `lvqr_codec::hevc::HevcSps` view used to populate the `hvcC`
+   header (profile, tier, level, chroma format) and the `tkhd` /
+   `visual` dimensions. `general_constraint_indicator_flags` ships
+   zeroed because the SPS parser does not surface them yet; that is
+   fine for the 8-bit Main profile streams LVQR supports today but
+   becomes a real gap the moment a Main10 or an HDR stream enters the
+   picture. Comment at the call site flags the limitation.
+
+2. **`write_aac_init_segment` + `AudioInitParams`**. Feeds raw
+   `AudioSpecificConfig` bytes through `lvqr_codec::aac::parse_asc`
+   and builds an `mp4a` sample entry plus an `esds` box using
+   `mp4-atom`'s descriptor writer. mp4-atom's `DecoderSpecific` only
+   supports the 4-bit `sampling_frequency_index` encoding and the
+   compact (<32) AOT form, so the writer refuses:
+   * sample rates that do not map to one of the 13 indexable
+     frequencies in ISO/IEC 14496-3 Table 1.16
+     (`InitSegmentError::UnsupportedAacSampleRate`),
+   * AOT >= 32 / escape-encoded object types
+     (`InitSegmentError::InvalidAsc` wrapping a `CodecError::MalformedAsc`
+     with a descriptive message).
+
+   Both errors are proptest-friendly and exercised by a new unit test
+   using a hand-built explicit-frequency ASC. This is tighter than
+   the existing hand-rolled `lvqr-ingest::remux::fmp4::esds` path,
+   which silently produced malformed descriptors for ASCs longer than
+   127 bytes pre-session-5.
+
+3. **Real x265 HEVC NAL units captured**. Session 5 bootstrapped the
+   fixture corpus with a real x265 SPS (post-NAL-header payload) but
+   not VPS / PPS. Session 6 captured a full VPS + SPS + PPS triple
+   from a `ffmpeg 8.1 -c:v libx265 -preset ultrafast` encode of a 1 s
+   320x240 testsrc2 clip and pinned the bytes inline in the new
+   lvqr-cmaf unit and conformance tests. The capture was a one-shot
+   Python walker over the hvcC box; adding it to the corpus proper as
+   a named fixture is deferred until the fixture loader grows a
+   multi-NAL-per-fixture variant.
+
+4. **ffprobe conformance expanded to HEVC and AAC**. New tests in
+   `crates/lvqr-cmaf/tests/conformance_init.rs`:
+   * `ffprobe_accepts_hevc_init_segment`: loads the
+     `hevc-sps-x265-main-320x240` conformance-corpus fixture,
+     constructs an `HevcSps` view from the sidecar metadata (so a
+     drift between `parse_sps` output and the sidecar would fail
+     `lvqr-codec`'s `conformance_codec.rs` harness first), builds an
+     HEVC init segment using the captured x265 VPS / SPS NAL / PPS
+     blobs, and feeds the result to ffprobe 8.1. **ffprobe accepts
+     the output.** This is the first proof in the repo that the
+     `mp4-atom`-backed HEVC writer produces bytes a real validator
+     will take.
+   * `ffprobe_accepts_aac_init_segment`: loads the
+     `aac-asc-aaclc-44100hz-stereo` fixture, feeds the raw ASC
+     through the new `write_aac_init_segment`, and asserts ffprobe
+     accepts the resulting init segment. Same story for AAC.
+
+5. **Unit-level round trips**. Three new lib-level tests cover the
+   new writers without the conformance corpus dev-dep:
+   * `hevc_init_segment_starts_with_ftyp_and_contains_moov`
+   * `hevc_init_segment_round_trips_through_mp4_atom` (asserts the
+     three `HvcCArray` entries match the input VPS / SPS / PPS
+     byte-for-byte after mp4-atom decode)
+   * `aac_init_segment_round_trips_through_mp4_atom` (asserts
+     channel_count, sample_size, AOT, freq_index, chan_conf)
+   * `aac_init_rejects_non_indexable_sample_rate` (explicit-frequency
+     11468 Hz ASC must be refused with the typed error variant)
+
+6. **Public API surface grew**. `lvqr_cmaf::{HevcInitParams,
+   AudioInitParams, write_hevc_init_segment, write_aac_init_segment}`
+   are now re-exported from the crate root. `InitSegmentError` gained
+   two variants (`InvalidAsc`, `UnsupportedAacSampleRate`) so callers
+   can distinguish a parse failure from a sample-rate-out-of-table
+   rejection. Existing `VideoInitParams` / `write_avc_init_segment`
+   signatures are unchanged; this is purely additive.
+
+### What session 6 did NOT land (deferred to session 7)
+
+The "Recommended Tier 2.3 entry point" work list named four follow-ups
+after the HEVC / AAC writers. Only item 1 closed this session. The
+remaining three are still open:
+
+1. **`rtmp_ws_e2e` migration and AVC byte-diff** (priority 2 in the
+   prior handoff). Wiring `lvqr-cmaf::write_avc_init_segment` into
+   `rtmp_ws_e2e` alongside the hand-rolled
+   `lvqr-ingest::remux::fmp4::video_init_segment` and diffing the
+   byte outputs is the first real drop-in-replacement proof. Not
+   landed this session; the HEVC / AAC writers were the higher
+   leverage item because they unblock every future egress crate that
+   needs non-AVC codec support.
+2. **Multi-sub-layer HEVC fixture capture** (priority 3). Still not
+   attempted; x265 will not produce `max_sub_layers_minus1 > 0` in
+   any configuration tried so far, and kvazaar has not been
+   installed. Synthetic-only coverage remains the canonical truth.
+3. **CmafSegmenter raw-sample coalescer** (priority 4). Not started.
+   The segmenter remains a pass-through that annotates pre-muxed
+   fragments; the load-bearing raw-sample coalescer is a design-note
+   item for the next session, not an implementation item.
+
+### Contract slot status as of session 6
+
+| Crate | proptest | fuzz | integration | E2E | conformance |
+|---|---|---|---|---|---|
+| lvqr-ingest | y | y | y | y | y |
+| lvqr-codec | y | y | y | via rtmp_ws_e2e | y |
+| lvqr-cmaf | y | open (no parser surface) | y | via rtmp_ws_e2e | y (AVC + HEVC + AAC) |
+| lvqr-record | y | open | y | workspace e2e | y |
+| lvqr-moq | y | open | y | via rtmp_ws_e2e | n/a (pure value type) |
+| lvqr-fragment | y | open | y | via rtmp_ws_e2e | n/a (pure value type) |
+
+`lvqr-cmaf`'s conformance coverage is now AVC + HEVC + AAC against
+ffprobe 8.1. Fuzz remains intentionally open for the same reason as
+the prior sessions: the crate consumes `Bytes` from trusted producers
+and writes mp4-atom structures, so there is no parser attack surface.
 
 ## Session 5 part 2 additions (2026-04-13)
 
@@ -574,11 +698,67 @@ should be aware of so nothing is discovered twice.
   reusing the x265 fixture already in
   `parse_sps_decodes_real_x265_single_sublayer` as the seed.
 
-## Recommended Tier 2.3 entry point (session 6)
+## Recommended Tier 2.3 entry point (session 7)
 
-With Tier 2.2 closed (HEVC multi-sub-layer + esds migration) and
-the `lvqr-cmaf` scaffold landed on top of `mp4-atom`, session 6 can
-tackle any of the following in priority order:
+Session 6 closed priority item 1 from the prior list (grow `lvqr-cmaf`
+beyond AVC). The remaining priorities carry forward unchanged:
+
+1. **Wire `lvqr-cmaf::write_avc_init_segment` into `rtmp_ws_e2e`** in
+   parallel with the hand-rolled
+   `lvqr-ingest::remux::fmp4::video_init_segment` and byte-diff the
+   two outputs. This is the first byte-level proof the `mp4-atom`
+   path is a drop-in replacement for the hand-rolled writer. If the
+   bytes differ, document the differences here and pick a
+   source-of-truth side. Start with a standalone parity test
+   (`crates/lvqr-cmaf/tests/parity_avc_init.rs`) that imports
+   `lvqr-ingest` as a dev-dep, runs both writers on the same SPS /
+   PPS / dimensions triple, and dumps the diff structurally through
+   `mp4_atom::Moov::decode`. Expect the outputs to differ in
+   compressor name, default volume, and possibly `stsd` count
+   handling; everything else should match.
+2. **Capture a multi-sub-layer HEVC fixture**. x265 will not produce
+   `sps_max_sub_layers_minus1 > 0` in any configuration tried in
+   session 5. Try `brew install kvazaar` and
+   `kvazaar --temporal-layers 2`, or capture an HEVC SPS from a
+   publicly licensed sample (Apple bipbop advanced, Big Buck Bunny
+   HEVC rendition). Pin the bytes in
+   `crates/lvqr-conformance/fixtures/codec/` with a sidecar; the
+   existing `conformance_codec.rs` harness will pick them up
+   automatically. If no maintained encoder on homebrew emits a
+   multi-sub-layer SPS, document it here and leave the synthetic
+   coverage as the canonical truth.
+3. **Scope the CmafSegmenter raw-sample coalescer**. The current
+   segmenter is a pass-through over pre-muxed fragments. The
+   Tier 2.3 load-bearing piece is a sample coalescer that consumes
+   raw samples and builds its own `moof + mdat` via `mp4-atom`.
+   Session 7 should start with a design note in
+   `crates/lvqr-cmaf/docs/segmenter-design.md` (or an expanded doc
+   comment on `CmafSegmenter`) rather than implementing half. The
+   note should cover: how raw samples enter the pipeline, how
+   timing is tracked per-track, how the HLS partial boundary and
+   DASH segment boundary interact with the keyframe cadence, and
+   how the HEVC / AAC init writers from session 6 slot into the
+   first-segment path.
+4. **Only then start `lvqr-hls`**. Per the competitive audit, LL-HLS
+   is the loudest v1.0 gap. Day-one scaffold needs CmafChunk ->
+   HLS partial manifest generation plus a tiny axum router. No
+   actual LL-HLS client testing yet. Day-one 5-artifact coverage
+   lands with the scaffold: proptest on manifest generation,
+   integration via `lvqr-test-utils::TestServer`, conformance via
+   Apple `mediastreamvalidator` behind a soft-skip when it is not
+   available on PATH (same pattern as `ffprobe_bytes`).
+
+All four items are gated on the Tier 2.3 CmafSegmenter raw-sample
+coalescer being at least scoped. Do NOT start `lvqr-dash`,
+`lvqr-whip`, `lvqr-whep`, `lvqr-srt`, `lvqr-rtsp`, or `lvqr-archive`
+before then.
+
+## Recommended Tier 2.3 entry point (session 6, closed)
+
+Session 6 closed item 3 from this list (grow `lvqr-cmaf` beyond AVC,
+with the same ffprobe conformance harness extended to HEVC and AAC).
+Items 1, 2, and 4 are now deferred to session 7 per the list above.
+The original item text is preserved here for historical reference:
 
 1. **Bootstrap the `lvqr-conformance` fixture corpus** now that
    ffmpeg is available locally. This has been BLOCKED since
