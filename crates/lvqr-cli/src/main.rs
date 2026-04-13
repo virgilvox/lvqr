@@ -55,10 +55,10 @@ struct ServeArgs {
     #[arg(long, env = "LVQR_TLS_KEY")]
     tls_key: Option<String>,
 
-    /// Path to TOML config file.
-    #[arg(long, short, env = "LVQR_CONFIG")]
-    config: Option<String>,
-
+    // NOTE: a `--config <PATH>` flag used to live here and was declared in
+    // ServeArgs but was never read from. Removed as dead surface per the
+    // 2026-04-13 readiness audit. Real config file loading lands alongside
+    // the Tier 3 hot-config reload work (notify-rs + SIGHUP).
     /// Bearer token required for /api/v1/* admin endpoints. Leave unset for open access.
     #[arg(long, env = "LVQR_ADMIN_TOKEN")]
     admin_token: Option<String>,

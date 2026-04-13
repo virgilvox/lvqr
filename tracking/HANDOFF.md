@@ -12,7 +12,7 @@ segments verified byte-by-byte. See `crates/lvqr-cli/tests/rtmp_ws_e2e.rs`.
 
 The roadmap at `tracking/ROADMAP.md` is the authoritative plan for the next
 18-24 months of work; read it alongside CLAUDE.md before starting anything.
-Two audits sit next to it:
+Three audits sit next to it:
 
 - `tracking/AUDIT-2026-04-13.md` (external) compares LVQR's current
   surface area against MediaMTX, LiveKit, OvenMediaEngine, SRS, Ant
@@ -22,6 +22,11 @@ Two audits sit next to it:
   latent-bug, and security-hardening audit of LVQR itself. Every
   critical claim was manually verified before landing. Five fixes
   shipped the same session.
+- `tracking/AUDIT-READINESS-2026-04-13.md` (readiness) audits CI
+  wiring, supply-chain, documentation drift, unwired CLI surface,
+  and Tier 0/1 progress against the roadmap. Five fixes landed:
+  README refresh, ffmpeg installed in CI, `--config` dead flag
+  removed, plus this document.
 
 ## What Tier 0 Closed (2026-04-13)
 
@@ -173,6 +178,49 @@ Plus a new Tier 1 test that closes one of the audit's deferred items:
    a timeout. Before this test, `record_track` had zero integration
    coverage; only the pure helpers (`looks_like_init`, `track_prefix`,
    `sanitize_name`) were tested.
+
+## Readiness Audit Fixes (2026-04-13)
+
+A third audit pass focused on readiness: what a new contributor or
+future session encounters when they sit down to work. Five fixes
+landed in the same commit as `tracking/AUDIT-READINESS-2026-04-13.md`:
+
+1. **README refreshed** to v0.4-dev. Removed the stale "83 Rust
+   tests, no auth, no recording" claims. Added current crate list
+   including `lvqr-auth`, `lvqr-record`, `lvqr-conformance`. Added
+   a pointer at the three audit documents and the roadmap.
+2. **ffmpeg installed in CI** on both the Linux and macOS legs of
+   the test matrix via apt and brew respectively. Before this
+   change, the `ffprobe_accepts_concatenated_cmaf` test landed in
+   Tier 1 kickoff silently soft-skipped on every CI run because
+   ffprobe was not on PATH.
+3. **`cargo test --workspace`** used on both matrix legs (previously
+   split into `--lib` and `--test '*'` which skipped doc tests).
+   Doctests in `lvqr-auth` and `lvqr-ingest::protocol` now run.
+4. **Verify-ffprobe step** added to CI so if the ffmpeg install
+   silently succeeds but ffprobe is not on PATH we fail fast with
+   a loud error instead of silently skipping the conformance
+   check.
+5. **Dead `--config` CLI flag removed** from `lvqr-cli::ServeArgs`.
+   The flag was declared but never read, leaking into `--help`,
+   the README, the quickstart, and CONTRIBUTING as a capability
+   lie. Will be re-added with a real loader alongside the Tier 3
+   hot config reload work.
+
+Tracked by the audit for later (not fixed this commit):
+
+- `docs/architecture.md` still says `tokio::select!` for the CLI
+  server composition. The Tier 0 fix was `tokio::join!`. Dedicated
+  docs pass in Tier 5.
+- `docs/quickstart.md` references a `/watch/my-stream` endpoint
+  that does not exist.
+- `CONTRIBUTING.md` crate list missing `lvqr-auth`, `lvqr-record`,
+  `lvqr-conformance`, and references a `docker/docker-compose.test.yml`
+  that does not exist.
+- No cargo-audit job in CI. Supply-chain CVE scan deferred.
+- No nightly cargo-fuzz runner wired up. The fuzz targets exist and
+  compile under nightly but nothing runs them on a schedule.
+- No playwright E2E suite. No 5-artifact CI enforcement script.
 
 ## Tier 1 Remaining Work
 
