@@ -1,0 +1,48 @@
+[package]
+name = "lvqr-codec-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+# Excluded from the main workspace because libfuzzer-sys requires nightly
+# rustc and sanitizer instrumentation that the stable workspace builds
+# cannot produce. Run with:
+#
+#   cargo +nightly fuzz run parse_hevc_sps
+#   cargo +nightly fuzz run parse_aac_asc
+#   cargo +nightly fuzz run read_ue_v
+#
+# Seeds for each target live under fuzz/corpus/<target>/ and are populated
+# from real encoder captures plus regression samples from past crashes.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lvqr-codec = { path = ".." }
+
+[[bin]]
+name = "parse_hevc_sps"
+path = "fuzz_targets/parse_hevc_sps.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_aac_asc"
+path = "fuzz_targets/parse_aac_asc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_ue_v"
+path = "fuzz_targets/read_ue_v.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true

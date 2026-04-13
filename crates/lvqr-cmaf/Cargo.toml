@@ -1,0 +1,33 @@
+[package]
+name = "lvqr-cmaf"
+description = "CMAF segmenter for LVQR -- produces chunks aligned for HLS partials, DASH segments, and MoQ groups"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["streaming", "cmaf", "hls", "dash", "moq"]
+categories = ["multimedia", "multimedia::video"]
+
+[dependencies]
+lvqr-core = { workspace = true }
+lvqr-codec = { workspace = true }
+lvqr-fragment = { workspace = true }
+
+# fMP4 / ISO BMFF box writer. Actively maintained by kixelated (the MoQ
+# reference author), pure Rust, MIT OR Apache-2.0, covers HEVC (hev1/hvc1)
+# and AV1 (av01) sample entries which the hand-rolled writer in
+# lvqr-ingest::remux::fmp4 does not. Replaces the hand-rolled path for
+# every codec except the one case where lvqr-ingest still drives the
+# existing rtmp_ws_e2e test until the Tier 2.3 migration completes.
+mp4-atom = { version = "0.10", features = ["bytes"] }
+
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+proptest = "1"
+lvqr-test-utils = { workspace = true }

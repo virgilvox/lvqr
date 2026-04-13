@@ -140,10 +140,13 @@ impl HevcSps {
 /// function strips emulation-prevention bytes internally.
 ///
 /// Scope: extracts profile / tier / level / chroma format / resolution.
-/// Currently only supports `sps_max_sub_layers_minus1 == 0` (single
-/// sub-layer streams, which is every consumer HEVC stream LVQR has seen
-/// in practice). Multi-sub-layer streams return
-/// [`CodecError::Unsupported`]; add support when a user reports it.
+/// Handles `sps_max_sub_layers_minus1` values in `0..=6` (the full HEVC
+/// range), including the sub-layer profile/level present flag loop, the
+/// reserved-zero-2-bits padding for layers `max_sub_layers_minus1..8`,
+/// and the per-sub-layer PTL body skip. LVQR does not expose the
+/// per-sub-layer PTL data because it only needs the general PTL to emit
+/// a codec string; the sub-layer bits are parsed for completeness and
+/// discarded.
 pub fn parse_sps(payload: &[u8]) -> Result<HevcSps, CodecError> {
     let rbsp = rbsp_from_ebsp(payload);
     let mut r = BitReader::new(&rbsp);
@@ -160,15 +163,7 @@ pub fn parse_sps(payload: &[u8]) -> Result<HevcSps, CodecError> {
 
     // profile_tier_level( 1, sps_max_sub_layers_minus1 )
     let sps = parse_ptl_general(&mut r)?;
-
-    // Skip sub-layer profile/level flags if any. Each sub-layer contributes
-    // a profile_present_flag + level_present_flag (2 bits) plus reserved
-    // padding and optional sub-layer PTL bodies. Full support is out of
-    // scope for LVQR; bail early with Unsupported on any multi-layer
-    // stream so callers know to plug in a more complete parser.
-    if max_sub_layers_minus1 > 0 {
-        return Err(CodecError::Unsupported("HEVC SPS with sps_max_sub_layers_minus1 > 0"));
-    }
+    parse_ptl_sublayers(&mut r, max_sub_layers_minus1)?;
 
     // sps_seq_parameter_set_id ue(v)
     let _sps_id = r.read_ue_v()?;
@@ -251,9 +246,175 @@ fn parse_ptl_general(r: &mut BitReader<'_>) -> Result<PtlGeneral, CodecError> {
     })
 }
 
+/// Parse the sub-layer portion of profile_tier_level for the SPS.
+///
+/// Per HEVC spec (T-REC-H.265 §7.3.3) with `profilePresentFlag == 1`:
+///
+/// ```text
+///   for( i = 0; i < maxNumSubLayersMinus1; i++ ) {
+///     sub_layer_profile_present_flag[i] u(1)
+///     sub_layer_level_present_flag[i]   u(1)
+///   }
+///   if( maxNumSubLayersMinus1 > 0 )
+///     for( i = maxNumSubLayersMinus1; i < 8; i++ )
+///       reserved_zero_2bits[i] u(2)
+///   for( i = 0; i < maxNumSubLayersMinus1; i++ ) {
+///     if( sub_layer_profile_present_flag[i] ) <88 bits of PTL body>
+///     if( sub_layer_level_present_flag[i] )   u(8) level_idc
+///   }
+/// ```
+///
+/// The sub-layer PTL body has the same 88-bit layout as the general
+/// PTL minus the trailing `general_level_idc` byte: profile_space(2) +
+/// tier_flag(1) + profile_idc(5) + compat_flags(32) + source_flags(4) +
+/// constraint_flags(43) + inbld(1) = 88. LVQR does not surface per-
+/// sub-layer data; the bits are consumed so the bit cursor ends up in
+/// the right place for the SPS fields that follow.
+fn parse_ptl_sublayers(r: &mut BitReader<'_>, max_sub_layers_minus1: u8) -> Result<(), CodecError> {
+    if max_sub_layers_minus1 == 0 {
+        return Ok(());
+    }
+    let n = max_sub_layers_minus1 as usize;
+    // Collect presence flags for the per-sub-layer pass below. Capacity
+    // is at most 6 entries (max_sub_layers_minus1 is bounded to 6 by the
+    // caller) so a small fixed array avoids any heap traffic.
+    let mut profile_present = [false; 6];
+    let mut level_present = [false; 6];
+    for i in 0..n {
+        profile_present[i] = r.read_bit()? == 1;
+        level_present[i] = r.read_bit()? == 1;
+    }
+    // Reserved padding: layers [max_sub_layers_minus1, 8) each contribute
+    // a reserved_zero_2bits field. Total padding width is
+    // 2 * (8 - max_sub_layers_minus1) bits.
+    let padding_bits = 2 * (8 - n);
+    r.skip_bits(padding_bits)?;
+    for i in 0..n {
+        if profile_present[i] {
+            // 88-bit sub-layer PTL body. Split into two skip calls to
+            // stay within the 32-bit read_bits budget if we ever wanted
+            // to inspect them; skip_bits takes a usize so a single call
+            // is fine.
+            r.skip_bits(88)?;
+        }
+        if level_present[i] {
+            r.skip_bits(8)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal MSB-first bit writer used only by the synthetic-SPS
+    /// fixture builder below. Kept inside the test module because it
+    /// has no production consumers and should not grow one.
+    struct BitWriter {
+        bytes: Vec<u8>,
+        bit_pos: usize,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                bit_pos: 0,
+            }
+        }
+
+        fn write_bit(&mut self, b: u32) {
+            if self.bit_pos % 8 == 0 {
+                self.bytes.push(0);
+            }
+            let byte_idx = self.bit_pos / 8;
+            let shift = 7 - (self.bit_pos % 8);
+            self.bytes[byte_idx] |= ((b & 1) as u8) << shift;
+            self.bit_pos += 1;
+        }
+
+        fn write_bits(&mut self, value: u32, n: u8) {
+            for i in (0..n).rev() {
+                self.write_bit((value >> i) & 1);
+            }
+        }
+
+        fn write_ue(&mut self, value: u32) {
+            // value v encoded as k zeros, 1 bit, k-bit suffix where
+            //   (1 << k) - 1 + suffix = v. Equivalently, write (v+1) as
+            //   a minimal-width binary code prefixed by enough leading
+            //   zeros to pad it out.
+            let code = (value as u64) + 1;
+            let mut k = 0u8;
+            while (1u64 << (k + 1)) <= code {
+                k += 1;
+            }
+            for _ in 0..k {
+                self.write_bit(0);
+            }
+            self.write_bits(code as u32, k + 1);
+        }
+
+        fn into_bytes(self) -> Vec<u8> {
+            self.bytes
+        }
+    }
+
+    /// Build a synthetic HEVC SPS with the given `max_sub_layers_minus1`
+    /// and a full general PTL body. Used by the positive decode tests.
+    fn build_synthetic_sps(max_sub_layers_minus1: u8) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        // sps_video_parameter_set_id u(4)
+        w.write_bits(0, 4);
+        // sps_max_sub_layers_minus1 u(3)
+        w.write_bits(max_sub_layers_minus1 as u32, 3);
+        // sps_temporal_id_nesting_flag u(1)
+        w.write_bit(1);
+        // general PTL: 96 bits
+        w.write_bits(0, 2); // profile_space
+        w.write_bit(0); // tier_flag
+        w.write_bits(1, 5); // profile_idc = 1 (Main)
+        w.write_bits(0x60000000, 32); // compat flags
+        // 4 source flags
+        w.write_bit(0);
+        w.write_bit(0);
+        w.write_bit(0);
+        w.write_bit(0);
+        // 44 constraint + inbld bits
+        for _ in 0..44 {
+            w.write_bit(0);
+        }
+        w.write_bits(93, 8); // general_level_idc = 93
+        // sub_layer_profile_present / level_present flags
+        for _ in 0..max_sub_layers_minus1 {
+            w.write_bit(1); // profile_present
+            w.write_bit(1); // level_present
+        }
+        if max_sub_layers_minus1 > 0 {
+            let padding = 2 * (8 - max_sub_layers_minus1 as usize);
+            for _ in 0..padding {
+                w.write_bit(0);
+            }
+        }
+        // Per-sub-layer PTL body (88 bits) + level_idc (8 bits) since
+        // both flags are set above.
+        for _ in 0..max_sub_layers_minus1 {
+            for _ in 0..88 {
+                w.write_bit(0);
+            }
+            w.write_bits(60, 8); // sub_layer_level_idc = 60
+        }
+        // sps_seq_parameter_set_id ue(v) = 0
+        w.write_ue(0);
+        // chroma_format_idc ue(v) = 1 (4:2:0)
+        w.write_ue(1);
+        // pic_width_in_luma_samples ue(v) = 1920
+        w.write_ue(1920);
+        // pic_height_in_luma_samples ue(v) = 1080
+        w.write_ue(1080);
+        w.into_bytes()
+    }
 
     #[test]
     fn nal_type_round_trip() {
@@ -292,6 +453,69 @@ mod tests {
         // panic".
         let zeros = vec![0u8; 64];
         assert!(parse_sps(&zeros).is_err());
+    }
+
+    #[test]
+    fn parse_sps_decodes_synthetic_single_sublayer() {
+        let sps_bytes = build_synthetic_sps(0);
+        let sps = parse_sps(&sps_bytes).expect("single-sublayer SPS should parse");
+        assert_eq!(sps.general_profile_idc, 1);
+        assert_eq!(sps.general_profile_compatibility_flags, 0x60000000);
+        assert_eq!(sps.general_level_idc, 93);
+        assert_eq!(sps.chroma_format_idc, 1);
+        assert_eq!(sps.pic_width_in_luma_samples, 1920);
+        assert_eq!(sps.pic_height_in_luma_samples, 1080);
+        assert_eq!(sps.codec_string(), "hev1.1.60000000.L93.B0");
+    }
+
+    #[test]
+    fn parse_sps_decodes_two_sublayer_stream() {
+        // Exercises the sub-layer profile/level present flag loop, the
+        // reserved-zero-2-bits padding, and the per-sub-layer PTL body
+        // skip. A two-sublayer SPS is the common case for any HEVC
+        // stream that ships temporal scalability; the single-sublayer
+        // path above stays as the common-case regression guard.
+        let sps_bytes = build_synthetic_sps(1);
+        let sps = parse_sps(&sps_bytes).expect("two-sublayer SPS should parse");
+        assert_eq!(sps.general_profile_idc, 1);
+        assert_eq!(sps.general_level_idc, 93);
+        assert_eq!(sps.pic_width_in_luma_samples, 1920);
+        assert_eq!(sps.pic_height_in_luma_samples, 1080);
+    }
+
+    #[test]
+    fn parse_sps_decodes_max_sublayer_stream() {
+        // Boundary: max_sub_layers_minus1 = 6 is the spec ceiling (7 sub
+        // layers). Padding shrinks to 2 * (8 - 6) = 4 bits. Every sub-
+        // layer sets both presence flags, producing 6 * (88 + 8) = 576
+        // bits of sub-layer PTL body to skip.
+        let sps_bytes = build_synthetic_sps(6);
+        let sps = parse_sps(&sps_bytes).expect("max-sublayer SPS should parse");
+        assert_eq!(sps.pic_width_in_luma_samples, 1920);
+        assert_eq!(sps.pic_height_in_luma_samples, 1080);
+    }
+
+    #[test]
+    fn parse_sps_decodes_real_x265_single_sublayer() {
+        // Real SPS captured from `ffmpeg -c:v libx265 -preset ultrafast`
+        // encoding a testsrc2 320x240 1s clip via ffmpeg 8.1. This is a
+        // genuine encoder payload, not a synthetic fixture, and pins
+        // the parser's behavior against a bit layout produced by an
+        // independent codec implementation. Single sub-layer because
+        // x265's default temporal-layers mode does not flip
+        // sps_max_sub_layers_minus1 even with b-pyramid enabled; the
+        // multi-sub-layer positive coverage lives in the synthetic
+        // tests above.
+        let hex = "0101600000030090000003000003003ca00a080f165ba4a4c2f0168080000003008000000f0400";
+        let sps_bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let sps = parse_sps(&sps_bytes).expect("real x265 SPS should parse");
+        assert_eq!(sps.general_profile_idc, 1); // Main
+        assert_eq!(sps.chroma_format_idc, 1); // 4:2:0
+        assert_eq!(sps.pic_width_in_luma_samples, 320);
+        assert_eq!(sps.pic_height_in_luma_samples, 240);
     }
 
     #[test]

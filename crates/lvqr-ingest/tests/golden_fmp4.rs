@@ -22,7 +22,10 @@
 //! the fMP4 writer.
 
 use bytes::Bytes;
-use lvqr_ingest::remux::{VideoConfig, VideoSample, video_init_segment_with_size, video_segment};
+use lvqr_ingest::remux::{
+    AudioConfig, VideoConfig, VideoSample, audio_init_segment, audio_segment, video_init_segment_with_size,
+    video_segment,
+};
 use lvqr_test_utils::ffprobe_bytes;
 use std::path::{Path, PathBuf};
 
@@ -131,6 +134,35 @@ fn ffprobe_accepts_concatenated_cmaf() {
         keyframe: true,
     };
     let seg = video_segment(1, 0, std::slice::from_ref(&sample));
+
+    let mut buf = Vec::with_capacity(init.len() + seg.len());
+    buf.extend_from_slice(&init);
+    buf.extend_from_slice(&seg);
+
+    ffprobe_bytes(&buf).assert_accepted();
+}
+
+/// Conformance slot for the audio branch of the fMP4 writer. Builds an
+/// AAC-LC init segment plus a one-frame audio media segment and feeds
+/// the concatenation to ffprobe. This is the real validation for the
+/// `esds` MPEG-4 descriptor length encoding introduced when
+/// `parse_audio_specific_config` migrated to the hardened
+/// `lvqr_codec::aac::parse_asc`: if the descriptor size fields are off
+/// by a byte, ffprobe rejects the stream.
+#[test]
+fn ffprobe_accepts_audio_init_and_frame() {
+    let config = AudioConfig {
+        asc: vec![0x12, 0x10], // AAC-LC, 44100 Hz, stereo (same ASC as the unit tests)
+        sample_rate: 44100,
+        channels: 2,
+        object_type: 2,
+    };
+    let init = audio_init_segment(&config);
+    // A single zeroed AAC frame is enough payload for ffprobe to walk
+    // the container structure; we are validating the esds descriptor
+    // lengths, not the codec payload.
+    let frame = Bytes::from(vec![0u8; 64]);
+    let seg = audio_segment(1, 0, 1024, &frame);
 
     let mut buf = Vec::with_capacity(init.len() + seg.len());
     buf.extend_from_slice(&init);

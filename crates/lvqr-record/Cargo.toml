@@ -23,3 +23,5 @@ tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros", "fs"] }
 proptest = "1"
 bytes = { workspace = true }
+lvqr-cmaf = { workspace = true }
+lvqr-test-utils = { workspace = true }

@@ -23,26 +23,31 @@ validator is wired in.
 
 The contract applies to every crate under `crates/lvqr-{ingest,whip,whep,hls,dash,srt,rtsp,codec,cmaf,archive,moq,fragment,record}`. Pure library crates without a wire format or parser are exempt.
 
-Crates currently in scope and their 5-artifact status as of 2026-04-13:
+Crates currently in scope (per `scripts/check_test_contract.sh` IN_SCOPE
+list) and their 5-artifact status as of 2026-04-13:
 
 | Crate | proptest | fuzz | integration | E2E | conformance |
 |---|---|---|---|---|---|
-| lvqr-ingest (FLV, fMP4, RTMP) | yes (`tests/proptest_parsers.rs`, 9 tests, ~4100 generated cases per run) | yes (`fuzz/fuzz_targets/{parse_video_tag,parse_audio_tag}.rs`, nightly via `.github/workflows/fuzz.yml`) | yes (`tests/rtmp_bridge_integration.rs`) | yes (`../lvqr-cli/tests/rtmp_ws_e2e.rs` plus `tests/e2e/test-app.spec.ts`) | golden + ffprobe (`tests/golden_fmp4.rs`, `ffprobe_accepts_concatenated_cmaf`) |
-| lvqr-relay | no | no | yes (`tests/relay_integration.rs`) | partial (via lvqr-cli) | no |
-| lvqr-core | partial (ringbuf, gop) | no | no | n/a | n/a |
-| lvqr-auth | no | no | no | n/a | n/a |
-| lvqr-signal | no | no | yes (`tests/signal_integration.rs`, 5 tests, real TestServer+tokio-tungstenite) | workspace `tests/e2e/` | no |
-| lvqr-record | yes (`tests/proptest_recorder.rs`) | no | yes (`tests/record_integration.rs`) | workspace `tests/e2e/` | no |
+| lvqr-ingest (FLV, fMP4, RTMP) | yes (`tests/proptest_parsers.rs`, ~4100 cases per run) | yes (`fuzz/fuzz_targets/{parse_video_tag,parse_audio_tag}.rs`) | yes (`tests/rtmp_bridge_integration.rs`) | yes (`../lvqr-cli/tests/rtmp_ws_e2e.rs` plus `tests/e2e/test-app.spec.ts`) | golden + ffprobe (`tests/golden_fmp4.rs`, `ffprobe_accepts_concatenated_cmaf`, `ffprobe_accepts_audio_init_and_frame`) |
+| lvqr-record | yes (`tests/proptest_recorder.rs`) | no | yes (`tests/record_integration.rs`) | workspace `tests/e2e/` | yes (`tests/record_conformance.rs`, ffprobe against recorded init segment) |
+| lvqr-moq | yes (`tests/proptest_facade.rs`) | no | yes (`tests/integration_facade.rs`) | via `rtmp_ws_e2e` | no |
+| lvqr-fragment | yes (`tests/proptest_fragment.rs`) | no | yes (`tests/integration_moq_sink.rs`) | via `rtmp_ws_e2e` | no |
+| lvqr-codec | yes (`tests/proptest_{hevc,aac}.rs`) | yes (`fuzz/fuzz_targets/{parse_hevc_sps,parse_aac_asc,read_ue_v}.rs`) | yes (`tests/integration_codec.rs`) | via `rtmp_ws_e2e` | no |
+| lvqr-cmaf | yes (`tests/proptest_policy.rs`) | no | yes (`tests/integration_segmenter.rs`) | via `rtmp_ws_e2e` | yes (`tests/conformance_init.rs`, ffprobe against mp4-atom init segment) |
 
-Gaps relative to the contract are tracked in the Tier 1 work list. The
-immediate priorities are:
+Gaps relative to the contract are tracked in the Tier 1/2 work list.
+The immediate priorities are:
 
 1. Fixture corpus bootstrap for `lvqr-conformance/fixtures/{rtmp,fmp4,hls}/`.
-   Blocked in the current dev env on `ffmpeg` availability.
+   `ffmpeg` is now available locally as of session 5 and should be
+   captured in the next session.
 2. `mediastreamvalidator` wrapper for LL-HLS output once Tier 2.5 is
    underway, wired through `lvqr-conformance::ValidatorResult`.
-3. ffprobe-backed conformance slot for `lvqr-record`: run `ffprobe_bytes`
-   against recorded segments in a follow-up test.
+3. Codec-level conformance slot for `lvqr-codec`: pin a handful of
+   real encoder-produced HEVC SPS and AAC ASC byte blobs with
+   expected decoded values, reusing the x265 SPS captured in
+   `crates/lvqr-codec/src/hevc.rs::tests::parse_sps_decodes_real_x265_single_sublayer`
+   as the seed fixture.
 
 ## Enforcement
 

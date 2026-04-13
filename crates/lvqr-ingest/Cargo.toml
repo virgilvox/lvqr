@@ -17,6 +17,7 @@ rtmp = ["dep:rml_rtmp"]
 [dependencies]
 lvqr-core = { workspace = true }
 lvqr-auth = { workspace = true }
+lvqr-codec = { workspace = true }
 lvqr-moq = { workspace = true }
 lvqr-fragment = { workspace = true }
 moq-lite = { workspace = true }

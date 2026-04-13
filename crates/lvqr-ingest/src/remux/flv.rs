@@ -262,36 +262,20 @@ pub fn parse_audio_tag(data: &Bytes) -> FlvAudioTag {
     }
 }
 
-/// Sampling frequency index table from ISO 14496-3.
-const AAC_SAMPLE_RATES: [u32; 13] = [
-    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
-];
-
 /// Parse an AudioSpecificConfig (ISO 14496-3 section 1.6.2.1).
+///
+/// Delegates to `lvqr_codec::aac::parse_asc`, the hardened parser that
+/// handles the 5-bit + 6-bit object-type escape, the 15-index explicit-
+/// frequency form, and HE-AAC (SBR) / HE-AAC v2 (PS) extension
+/// signalling. The raw ASC bytes are stored verbatim because the `esds`
+/// writer copies them directly into `DecoderSpecificInfo`.
 fn parse_audio_specific_config(asc: &[u8]) -> Option<AudioConfig> {
-    if asc.len() < 2 {
-        return None;
-    }
-
-    // AudioSpecificConfig is bit-packed:
-    // bits 0-4: audioObjectType (5 bits)
-    // bits 5-8: samplingFrequencyIndex (4 bits)
-    // bits 9-12: channelConfiguration (4 bits)
-    let object_type = asc[0] >> 3;
-    let freq_index = (((asc[0] & 0x07) << 1) | (asc[1] >> 7)) as usize;
-    let channels = (asc[1] >> 3) & 0x0F;
-
-    let sample_rate = if freq_index < AAC_SAMPLE_RATES.len() {
-        AAC_SAMPLE_RATES[freq_index]
-    } else {
-        return None;
-    };
-
+    let parsed = lvqr_codec::aac::parse_asc(asc).ok()?;
     Some(AudioConfig {
         asc: asc.to_vec(),
-        sample_rate,
-        channels,
-        object_type,
+        sample_rate: parsed.sample_rate,
+        channels: parsed.channel_config,
+        object_type: parsed.object_type,
     })
 }
 

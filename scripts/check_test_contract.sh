@@ -32,6 +32,7 @@ IN_SCOPE=(
     lvqr-moq
     lvqr-fragment
     lvqr-codec
+    lvqr-cmaf
     # Tier 2 crates below will be enabled as they land:
     # lvqr-whip
     # lvqr-whep
@@ -39,7 +40,6 @@ IN_SCOPE=(
     # lvqr-dash
     # lvqr-srt
     # lvqr-rtsp
-    # lvqr-cmaf
     # lvqr-archive
 )
 

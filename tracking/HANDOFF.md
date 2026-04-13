@@ -1,13 +1,144 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.1 Landed, Tier 2.2 Scaffold In Progress
+## Project Status: v0.4-dev -- Tier 2.2 Closed, Tier 2.3 Scaffold Landed
 
-**Last Updated**: 2026-04-13 (session 4, part 2)
-**Tests**: 48 test binaries across the workspace, 179 individual tests
-(plus ~4700 generated proptest cases per run across the ingest,
-fragment, hevc, and aac harnesses), all green. cargo clippy
---workspace --all-targets -- -D warnings is clean. cargo fmt --check
-is clean.
+**Last Updated**: 2026-04-13 (session 5)
+**Tests**: 50 test binaries across the workspace, 203 individual
+tests (plus ~5700 generated proptest cases per run across the
+ingest, fragment, hevc, aac, and cmaf-policy harnesses), all green.
+cargo clippy --workspace --all-targets -- -D warnings is clean.
+cargo fmt --check is clean.
+
+## Session 5 additions (2026-04-13): Tier 2.2 closure + Tier 2.3 scaffold
+
+Five work items landed in a single session, closing Tier 2.2 and
+opening Tier 2.3 on top of the `mp4-atom` box writer.
+
+1. **HEVC SPS parser now handles multi-sub-layer streams**. Replaced
+   the session-4 `Unsupported` bail at `sps_max_sub_layers_minus1 > 0`
+   with a real `parse_ptl_sublayers` helper that walks the sub-layer
+   profile/level present flag loop (2 bits per sub-layer), the
+   reserved-zero-2-bits padding for layers in `max_sub_layers_minus1..8`,
+   and the per-sub-layer 88-bit PTL body plus optional 8-bit level_idc.
+   LVQR does not surface per-sub-layer data; the bits are consumed so
+   the reader ends up at the right position for the SPS fields that
+   follow. Three positive decode tests land alongside: synthetic
+   single-sub-layer, synthetic two-sub-layer, and synthetic
+   max-sub-layer (`max_sub_layers_minus1 = 6`), all built via a tiny
+   test-only bit writer.
+
+   Plus a **real encoder fixture**: an SPS captured from
+   `ffmpeg -c:v libx265` encoding a 320x240 testsrc2 clip, pinned in
+   `parse_sps_decodes_real_x265_single_sublayer`. This is the first
+   time the parser is pinned against an independent encoder's bit
+   layout rather than the LVQR test writer. Multi-sub-layer *real*
+   fixtures are deferred: neither x265's `--temporal-layers` nor
+   b-pyramid modes produced a `max_sub_layers_minus1 > 0` SPS in any
+   configuration tried, so the multi-sub-layer path is currently
+   synthetic-only. Not ideal; honest.
+
+2. **`lvqr-ingest::remux::fmp4::esds` migrated to
+   `lvqr_codec::aac::parse_asc`**. Closes the internal audit finding
+   "fMP4 esds descriptor uses single-byte length encoding". The
+   hand-rolled `parse_audio_specific_config` in `flv.rs` now
+   delegates to the hardened parser, so every FLV AAC sequence
+   header benefits from the 5-bit + 6-bit object-type escape, the
+   15-index explicit-frequency escape, and HE-AAC SBR/PS signalling
+   that the v0.3 writer silently truncated. The descriptor length
+   encoding in the `esds` box is now a new `write_mpeg4_descriptor`
+   helper that always emits the 4-byte MPEG-4 variable-length form
+   (tag byte + 4 length bytes, MSB continuation), replacing the
+   previous single-byte prefix that would malform on any
+   DecoderSpecificInfo larger than 127 bytes. The hardened path is
+   exercised by a new conformance test
+   `ffprobe_accepts_audio_init_and_frame` in `golden_fmp4.rs` which
+   feeds the AAC init segment plus a one-frame media segment to
+   ffprobe 8.1, and by a new unit test
+   `mpeg4_descriptor_length_encoding_round_trips_large_payloads` that
+   writes a 200-byte payload through `write_mpeg4_descriptor` and
+   asserts every byte of the emitted length field.
+
+3. **`lvqr-cmaf` crate scaffolded, built on `mp4-atom` 0.10.1**. New
+   workspace member opening Tier 2.3. Four modules:
+
+   * `chunk.rs`: `CmafChunk` (wire-ready `moof+mdat` bytes, DTS,
+     duration, track id) plus `CmafChunkKind`
+     (`Partial` / `PartialIndependent` / `Segment`) so egress crates
+     get HLS/DASH/MoQ boundary classification in one enum.
+   * `policy.rs`: `CmafPolicy` tuning (partial + segment durations)
+     and `CmafPolicyState`, a pure state machine that classifies
+     each fragment by keyframe flag + DTS. Defaults land for 90-kHz
+     video (200 ms partial, 2 s segment) and 48-kHz audio. Pure, no
+     I/O, no async, trivially proptest-able.
+   * `init.rs`: working `write_avc_init_segment` using `mp4-atom`'s
+     `Ftyp`, `Moov`, `Mvhd`, `Trak`, `Tkhd`, `Mdia`, `Mdhd`, `Hdlr`,
+     `Minf`, `Vmhd`, `Dinf`, `Dref`, `Stbl`, `Stsd`, `Codec::Avc1`,
+     `Avcc`, `Visual`, `Mvex`, `Trex`. Encodes directly into a
+     `BytesMut` via the crate's `bytes` feature. Round-trips through
+     `mp4-atom` decode and is accepted by ffprobe 8.1.
+   * `segmenter.rs`: `CmafSegmenter<S: FragmentStream>` with pull-
+     based `next_chunk()`. Thin today because every `Fragment` from
+     the RTMP bridge is already a pre-muxed `moof+mdat`; the
+     segmenter annotates with boundary info and passes through. The
+     real sample-coalescer grows additively when ingest begins
+     emitting raw samples instead of pre-muxed fragments.
+
+   4-of-5 contract slots on day one: proptest (`tests/proptest_policy.rs`,
+   4 properties x 200 cases), integration (`tests/integration_segmenter.rs`,
+   3 scenarios driving a scripted `FragmentStream`), conformance
+   (`tests/conformance_init.rs`, ffprobe accepting the mp4-atom init
+   segment), e2e via the workspace `rtmp_ws_e2e` path. Fuzz slot
+   intentionally open: the segmenter has no parser attack surface.
+
+4. **cargo-fuzz targets for `lvqr-codec`**. New `crates/lvqr-codec/fuzz/`
+   with three targets: `parse_hevc_sps`, `parse_aac_asc`, and
+   `read_ue_v` (which uses the input's first byte as a bit offset so
+   the exp-Golomb decoder is fuzzed across every starting alignment,
+   bounded to 64 iterations per input so libfuzzer terminates).
+   Excluded from the workspace members list because `libfuzzer-sys`
+   needs nightly. `.github/workflows/fuzz.yml` migrated from a single
+   `target` matrix axis to an `include`-style matrix carrying
+   `(target, fuzz_dir)` pairs so the ingest and codec fuzz crates
+   share one job definition. Closes the fuzz slot for `lvqr-codec`.
+
+5. **Conformance slot for `lvqr-record`**. New
+   `tests/record_conformance.rs` builds a real AVC init segment via
+   `lvqr_cmaf::write_avc_init_segment`, drives it through a MoQ
+   origin + broadcast + track + group publisher, records it with
+   `BroadcastRecorder::record_broadcast`, reads the init file back
+   from disk, runs it through `ffprobe_bytes`, and asserts
+   byte-for-byte equality with the bytes fed to the publisher. This
+   is the first test in the repo that exercises `lvqr-cmaf` from a
+   different crate, and the first that chains mp4-atom -> MoQ ->
+   recorder -> disk -> ffprobe end-to-end. Closes the last open
+   contract slot on `lvqr-record` (fuzz stays open per the session-3
+   decision that pure helpers are already proptest-covered and fuzz
+   is low-marginal-value).
+
+### Library research decision (session 5)
+
+Before writing any new codec parser code this session, verified that
+the Rust ecosystem still has no maintained, pure-Rust, MIT/Apache
+alternative for the narrow "codec string + sample-entry fields"
+niche that `lvqr-codec` owns:
+
+* No `h265-reader` / `h26x-reader` crates exist.
+* `hevc-parser` (quietvoid) is a Dolby-Vision-focused tool,
+  self-described "incomplete", pulls `nom 8` + `bitvec_helpers` +
+  `matroska-demuxer` + `regex-lite`. Not a drop-in.
+* Mozilla `mp4parse` is MPL-2.0, read-only, last release May 2023.
+* `symphonia`'s AAC ASC parser is private behind MPL-2.0 and not
+  exposed as a standalone API.
+* `bitstream-io` (Matt Brubeck) is actively maintained but does not
+  ship exp-Golomb, so replacing LVQR's ~250-line BitReader would
+  save <200 lines and still require Golomb on top.
+* `mp4-atom` 0.10.1 (kixelated, MIT/Apache, pure Rust, actively
+  maintained) is the right call for `lvqr-cmaf` and already wired
+  in.
+
+Decision: keep `lvqr-codec` hand-rolled, build `lvqr-cmaf` on
+`mp4-atom`. Revisit when a maintained pure-Rust HEVC/ASC parser
+appears or symphonia factors its ASC code out.
 
 ## Session 4 part 2 additions (2026-04-13): Tier 2.2 `lvqr-codec` scaffold
 
@@ -375,41 +506,60 @@ should be aware of so nothing is discovered twice.
   pass if they remain unused.
 - **`lvqr-wasm`**: entire crate is self-deprecated. Scheduled for
   removal in v0.5. CI still builds it.
-- **Still-open 5-artifact slots (educational mode, not blocking)**:
-  fuzz for `lvqr-record`, `lvqr-moq`, `lvqr-fragment`; conformance
-  for `lvqr-record`, `lvqr-moq`, `lvqr-fragment`. Fuzz is
-  low-marginal-value for the facade + fragment types (they are
-  pure value types with no parser attack surface); the real target
-  for day-one fuzz is `lvqr-codec` when it lands. Conformance for
-  `lvqr-fragment` will come via the codec crates' golden fixtures.
+- **Still-open 5-artifact slots after session 5 (educational mode,
+  not blocking)**: fuzz for `lvqr-record`, `lvqr-moq`,
+  `lvqr-fragment`, `lvqr-cmaf`; conformance for `lvqr-moq`,
+  `lvqr-fragment`, `lvqr-codec`. `lvqr-ingest` is 5/5; `lvqr-record`,
+  `lvqr-codec`, and `lvqr-cmaf` are 4/5. Fuzz is low-marginal-value
+  for the facade + fragment + cmaf types (they are pure value
+  types or stateful shims with no parser attack surface).
+  Conformance for `lvqr-codec` is the single most obvious next
+  slot to close: pin a handful of real encoder-captured HEVC SPS
+  and AAC ASC byte blobs plus their expected decoded values,
+  reusing the x265 fixture already in
+  `parse_sps_decodes_real_x265_single_sublayer` as the seed.
 
-## Recommended Tier 2.2 entry point (session 5)
+## Recommended Tier 2.3 entry point (session 6)
 
-With Tier 2.1 landed, the next load-bearing item is Tier 2.2
-`lvqr-codec`: hand-rolled bit readers for HEVC, VP9, AV1, Opus, and
-AAC, producing `FragmentMeta` and the init-segment bytes that
-`MoqTrackSink` expects. The crate should ship:
+With Tier 2.2 closed (HEVC multi-sub-layer + esds migration) and
+the `lvqr-cmaf` scaffold landed on top of `mp4-atom`, session 6 can
+tackle any of the following in priority order:
 
-1. HEVC VPS/SPS/PPS parsing plus codec-string generation in the
-   form `hev1.<profile>.<tier>.<level>`, resolution extraction.
-2. AAC AudioSpecificConfig parsing hardened against malformed
-   descriptors (variable-length MPEG-4 descriptor lengths, HE-AAC
-   SBR+PS, xHE-AAC) to replace the single-byte descriptor assumption
-   in the current `lvqr-ingest::remux::fmp4::esds` writer.
-3. Day-one 5-artifact coverage: proptest on each parser (no panic
-   on arbitrary input), a real cargo-fuzz target per codec seeded
-   from `lvqr-conformance` fixtures, integration test that parses
-   real encoder output, conformance via `ffprobe -show_streams`
-   diff against reference encoders.
+1. **Bootstrap the `lvqr-conformance` fixture corpus** now that
+   ffmpeg is available locally. This has been BLOCKED since
+   session 3 and unblocks codec conformance, HLS comparison
+   harnesses, and the DASH path when those land. Capture a small
+   matrix of FLV, fMP4, H.264, HEVC, and AAC bytes under
+   `crates/lvqr-conformance/fixtures/` via `ffmpeg -f lavfi` and
+   pin them into the corpus with a per-fixture `metadata.toml`
+   stating the expected parser outputs.
+2. **Add a codec conformance slot to `lvqr-codec`** using the new
+   fixture corpus. Parser outputs (profile, level, resolution,
+   sample rate, channel count) should match the corpus metadata
+   exactly. This closes the last educational warning on
+   `lvqr-codec` per `scripts/check_test_contract.sh`.
+3. **Grow `lvqr-cmaf` beyond AVC**: add `write_hevc_init_segment`
+   and `write_aac_init_segment` using `mp4-atom`'s `Hev1` / `Hvcc`
+   / `Mp4a` / `Esds` types plus the new `lvqr_codec::hevc` and
+   `lvqr_codec::aac` decoded values. Wire the cmaf init writer
+   into `rtmp_ws_e2e` in parallel with the hand-rolled writer
+   and diff the bytes as the first byte-level proof that
+   `mp4-atom` output is a drop-in replacement for the current
+   writer.
+4. **Multi-sub-layer HEVC fixture capture**: try `kvazaar` or an
+   nvenc-based HEVC encoder rather than x265 to get a real
+   `sps_max_sub_layers_minus1 > 0` SPS on disk. If none of the
+   available encoders produce one, capture an HEVC SPS from a
+   publicly licensed sample (Apple bipbop? Big Buck Bunny HEVC
+   rendition?) and pin the bytes.
 
-Do NOT start any Tier 2 protocol crate (`lvqr-whip`, `lvqr-whep`,
-`lvqr-hls`, `lvqr-dash`, `lvqr-srt`, `lvqr-rtsp`, `lvqr-cmaf`,
-`lvqr-archive`) until `lvqr-codec` has at least HEVC SPS parsing
-working. `lvqr-cmaf` in particular depends on `lvqr-codec` for
-sample-entry construction, and every egress protocol crate consumes
-`lvqr-cmaf`. Get `lvqr-codec` right and every subsequent
-Tier 2 crate becomes mechanical; get it wrong and every Tier 2
-crate becomes a rewrite.
+Do NOT start any Tier 2 egress protocol crate (`lvqr-whip`,
+`lvqr-whep`, `lvqr-hls`, `lvqr-dash`, `lvqr-srt`, `lvqr-rtsp`,
+`lvqr-archive`) until `lvqr-cmaf` has a working segmenter that
+emits real `moof + mdat` bytes from raw samples. The scaffold
+landed in session 5 is a pass-through that annotates pre-muxed
+fragments; the sample-coalescer is the actual Tier 2.3 load-bearing
+piece.
 
 ---
 **E2E Verified**: real RTMP publish -> RtmpMoqBridge -> MoQ origin -> axum WS

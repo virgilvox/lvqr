@@ -44,6 +44,29 @@ fn write_full_box(buf: &mut BytesMut, box_type: &[u8; 4], version: u8, flags: u3
     });
 }
 
+/// Write an MPEG-4 descriptor (`ISO/IEC 14496-1` §8.3.3) with a variable-length
+/// size prefix.
+///
+/// The size is encoded as 1-4 bytes, each holding 7 payload bits with the
+/// MSB set on every byte except the last. Fixed 4-byte form is used here
+/// rather than minimal encoding so the descriptor header width is the same
+/// regardless of payload size, which keeps `patch`-style callers simple.
+/// The 4-byte form supports payloads up to 2^28 - 1 bytes, which is far
+/// more than any realistic AudioSpecificConfig or DecoderConfigDescriptor.
+fn write_mpeg4_descriptor(buf: &mut BytesMut, tag: u8, f: impl FnOnce(&mut BytesMut)) {
+    buf.put_u8(tag);
+    let size_pos = buf.len();
+    buf.put_bytes(0, 4); // 4-byte placeholder for the length field
+    let payload_start = buf.len();
+    f(buf);
+    let size = buf.len() - payload_start;
+    assert!(size < (1 << 28), "MPEG-4 descriptor payload exceeds 28-bit size field");
+    buf[size_pos] = 0x80 | ((size >> 21) & 0x7F) as u8;
+    buf[size_pos + 1] = 0x80 | ((size >> 14) & 0x7F) as u8;
+    buf[size_pos + 2] = 0x80 | ((size >> 7) & 0x7F) as u8;
+    buf[size_pos + 3] = (size & 0x7F) as u8;
+}
+
 // --- Init segment generation ---
 
 /// Generate a video init segment (ftyp + moov) for H.264/AVC.
@@ -310,36 +333,41 @@ pub fn audio_init_segment(config: &AudioConfig) -> Bytes {
                                 buf.put_u16(0); // reserved
                                 buf.put_u32(config.sample_rate << 16); // sampleRate (fixed-point 16.16)
 
-                                // esds box
+                                // esds box (ISO/IEC 14496-1 §8). The ASC bytes in
+                                // `config.asc` are the DecoderSpecificInfo payload; they
+                                // were validated up front by
+                                // `lvqr_codec::aac::parse_asc` when the FLV AAC sequence
+                                // header arrived, so any bit layout supported by the
+                                // hardened parser (xHE-AAC, HE-AAC SBR/PS, explicit-
+                                // frequency escape, >127-byte ASC) now round-trips
+                                // through the writer without the previous single-byte
+                                // descriptor-length footgun.
                                 write_full_box(buf, b"esds", 0, 0, |buf| {
-                                    // ES_Descriptor
-                                    buf.put_u8(0x03); // ES_DescrTag
-                                    let asc_len = config.asc.len();
-                                    let decoder_config_len = 13 + 2 + asc_len;
-                                    let es_desc_len = 3 + 2 + decoder_config_len + 3;
-                                    buf.put_u8(es_desc_len as u8); // length
-                                    buf.put_u16(1); // ES_ID
-                                    buf.put_u8(0); // streamDependenceFlag, URL_Flag, OCRstreamFlag, streamPriority
+                                    write_mpeg4_descriptor(buf, 0x03, |buf| {
+                                        // ES_ID + flags
+                                        buf.put_u16(1);
+                                        buf.put_u8(0);
 
-                                    // DecoderConfigDescriptor
-                                    buf.put_u8(0x04); // DecoderConfigDescrTag
-                                    buf.put_u8(decoder_config_len as u8);
-                                    buf.put_u8(0x40); // objectTypeIndication = Audio ISO/IEC 14496-3
-                                    buf.put_u8(0x15); // streamType=5 (audio) | upStream=0 | reserved=1
-                                    buf.put_u8(0); // bufferSizeDB (24 bits)
-                                    buf.put_u16(0);
-                                    buf.put_u32(0); // maxBitrate
-                                    buf.put_u32(0); // avgBitrate
+                                        // DecoderConfigDescriptor
+                                        write_mpeg4_descriptor(buf, 0x04, |buf| {
+                                            buf.put_u8(0x40); // objectTypeIndication = Audio ISO/IEC 14496-3
+                                            buf.put_u8(0x15); // streamType=5 (audio) | upStream=0 | reserved=1
+                                            buf.put_u8(0); // bufferSizeDB (24 bits)
+                                            buf.put_u16(0);
+                                            buf.put_u32(0); // maxBitrate
+                                            buf.put_u32(0); // avgBitrate
 
-                                    // DecoderSpecificInfo
-                                    buf.put_u8(0x05); // DecoderSpecificInfoTag
-                                    buf.put_u8(asc_len as u8);
-                                    buf.put_slice(&config.asc);
+                                            // DecoderSpecificInfo wraps the ASC bytes.
+                                            write_mpeg4_descriptor(buf, 0x05, |buf| {
+                                                buf.put_slice(&config.asc);
+                                            });
+                                        });
 
-                                    // SLConfigDescriptor
-                                    buf.put_u8(0x06); // SLConfigDescrTag
-                                    buf.put_u8(1); // length
-                                    buf.put_u8(0x02); // predefined = MP4
+                                        // SLConfigDescriptor
+                                        write_mpeg4_descriptor(buf, 0x06, |buf| {
+                                            buf.put_u8(0x02); // predefined = MP4
+                                        });
+                                    });
                                 });
                             });
                         });
@@ -621,6 +649,40 @@ mod tests {
         let init_bytes = &init[..];
         let esds_pos = init_bytes.windows(4).position(|w| w == b"esds");
         assert!(esds_pos.is_some(), "esds box not found in audio init");
+    }
+
+    #[test]
+    fn mpeg4_descriptor_length_encoding_round_trips_large_payloads() {
+        // The esds writer migration swapped a single-byte descriptor
+        // length prefix for the full 4-byte MPEG-4 variable-length
+        // form. The unit tests above only exercise the 2-byte ASC
+        // case (payload well under 127 bytes). This test verifies
+        // that payloads >= 128 bytes round-trip through the length
+        // encoding without corruption, which is the whole reason the
+        // migration exists.
+        //
+        // The payload is 200 bytes of a non-zero pattern so every
+        // byte position is distinguishable from the padding a buggy
+        // length field might introduce.
+        let payload: Vec<u8> = (0..200u8).collect();
+        let mut buf = BytesMut::new();
+        write_mpeg4_descriptor(&mut buf, 0x05, |inner| {
+            inner.put_slice(&payload);
+        });
+
+        // Tag byte + 4 length bytes + 200 payload bytes = 205 total.
+        assert_eq!(buf.len(), 1 + 4 + payload.len());
+        assert_eq!(buf[0], 0x05, "tag byte");
+        // Expected encoding for size 200 = 0xC8:
+        //   byte 0: 0x80 | ((200 >> 21) & 0x7F) = 0x80
+        //   byte 1: 0x80 | ((200 >> 14) & 0x7F) = 0x80
+        //   byte 2: 0x80 | ((200 >>  7) & 0x7F) = 0x81
+        //   byte 3:         200 & 0x7F          = 0x48
+        assert_eq!(buf[1], 0x80);
+        assert_eq!(buf[2], 0x80);
+        assert_eq!(buf[3], 0x81);
+        assert_eq!(buf[4], 0x48);
+        assert_eq!(&buf[5..], payload.as_slice());
     }
 
     #[test]

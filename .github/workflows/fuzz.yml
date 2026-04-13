@@ -1,7 +1,12 @@
 name: Fuzz
 
-# cargo-fuzz targets for the RTMP ingest parsers
-# (crates/lvqr-ingest/fuzz). Two cadences:
+# cargo-fuzz targets for the LVQR parser crates:
+#
+#   - crates/lvqr-ingest/fuzz: RTMP/FLV parsers.
+#   - crates/lvqr-codec/fuzz: HEVC SPS + AAC AudioSpecificConfig
+#     parsers plus the shared BitReader exp-Golomb decoder.
+#
+# Two cadences:
 #
 #   - Every PR runs each target for 60 seconds. This is educational
 #     during Tier 1 per tests/CONTRACT.md: the job is set to
@@ -22,6 +27,8 @@ on:
     paths:
       - "crates/lvqr-ingest/src/**"
       - "crates/lvqr-ingest/fuzz/**"
+      - "crates/lvqr-codec/src/**"
+      - "crates/lvqr-codec/fuzz/**"
       - ".github/workflows/fuzz.yml"
   schedule:
     # 07:00 UTC daily. Low-contention window for Linux runners.
@@ -42,9 +49,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - parse_video_tag
-          - parse_audio_tag
+        include:
+          - target: parse_video_tag
+            fuzz_dir: crates/lvqr-ingest/fuzz
+          - target: parse_audio_tag
+            fuzz_dir: crates/lvqr-ingest/fuzz
+          - target: parse_hevc_sps
+            fuzz_dir: crates/lvqr-codec/fuzz
+          - target: parse_aac_asc
+            fuzz_dir: crates/lvqr-codec/fuzz
+          - target: read_ue_v
+            fuzz_dir: crates/lvqr-codec/fuzz
     steps:
       - uses: actions/checkout@v4
 
@@ -54,7 +69,7 @@ jobs:
       - name: Cache cargo registry and fuzz build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/lvqr-ingest/fuzz -> target
+          workspaces: ${{ matrix.fuzz_dir }} -> target
           # Separate key namespace so the nightly fuzz cache does not
           # collide with the stable workspace cache from ci.yml.
           prefix-key: fuzz-v1
@@ -72,7 +87,7 @@ jobs:
           fi
 
       - name: Run ${{ matrix.target }} for ${{ steps.duration.outputs.seconds }}s
-        working-directory: crates/lvqr-ingest/fuzz
+        working-directory: ${{ matrix.fuzz_dir }}
         run: |
           cargo +nightly fuzz run ${{ matrix.target }} -- \
             -max_total_time=${{ steps.duration.outputs.seconds }} \
@@ -84,7 +99,7 @@ jobs:
         with:
           name: fuzz-artifacts-${{ matrix.target }}-${{ github.run_id }}
           path: |
-            crates/lvqr-ingest/fuzz/artifacts/${{ matrix.target }}/**
-            crates/lvqr-ingest/fuzz/corpus/${{ matrix.target }}/**
+            ${{ matrix.fuzz_dir }}/artifacts/${{ matrix.target }}/**
+            ${{ matrix.fuzz_dir }}/corpus/${{ matrix.target }}/**
           if-no-files-found: ignore
           retention-days: 30
