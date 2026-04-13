@@ -84,6 +84,8 @@ impl MeshCoordinator {
                 depth: 0,
             };
             self.peers.insert(id, peer);
+            metrics::gauge!("lvqr_mesh_peers").increment(1.0);
+            metrics::gauge!("lvqr_mesh_offload_percentage").set(self.offload_percentage());
             debug!(peer = %assignment.peer_id, "assigned as root peer");
             return Ok(assignment);
         }
@@ -116,6 +118,8 @@ impl MeshCoordinator {
             parent_entry.children.push(id);
         }
 
+        metrics::gauge!("lvqr_mesh_peers").increment(1.0);
+        metrics::gauge!("lvqr_mesh_offload_percentage").set(self.offload_percentage());
         debug!(
             peer = %assignment.peer_id,
             parent = ?assignment.parent,
@@ -153,6 +157,8 @@ impl MeshCoordinator {
             info!(peer = id, orphans = orphans.len(), "peer removed, children orphaned");
         }
 
+        metrics::gauge!("lvqr_mesh_peers").decrement(1.0);
+        metrics::gauge!("lvqr_mesh_offload_percentage").set(self.offload_percentage());
         orphans
     }
 

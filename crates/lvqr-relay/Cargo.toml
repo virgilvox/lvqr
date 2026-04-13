@@ -16,7 +16,9 @@ quinn-transport = ["dep:quinn", "dep:web-transport-quinn", "dep:rustls", "dep:mo
 
 [dependencies]
 lvqr-core = { workspace = true }
+lvqr-auth = { workspace = true }
 moq-lite = { workspace = true }
+url = { workspace = true }
 
 # Transport (optional backends)
 quinn = { workspace = true, optional = true }
@@ -27,16 +29,19 @@ rcgen = { workspace = true, optional = true }
 
 # Async
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 futures = { workspace = true }
 
 # Utils
 bytes = { workspace = true }
 tracing = { workspace = true }
+metrics = { workspace = true }
 thiserror = { workspace = true }
 dashmap = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio-util = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }

@@ -10,10 +10,4 @@ pub enum CoreError {
 
     #[error("channel closed")]
     ChannelClosed,
-
-    #[error("ring buffer full (capacity: {capacity})")]
-    RingBufferFull { capacity: usize },
-
-    #[error("GOP cache miss: no complete GOP available")]
-    GopCacheMiss,
 }

@@ -1,8 +1,8 @@
 /**
  * @lvqr/player - Drop-in video player Web Component
  *
- * Connects to an LVQR relay via MoQ-Lite over WebTransport and renders
- * live video using MSE (MediaSource Extensions).
+ * Connects to an LVQR relay via MoQ-Lite over WebTransport (or WebSocket
+ * fallback) and renders live video + audio using MSE (MediaSource Extensions).
  *
  * @example
  * ```html
@@ -15,14 +15,21 @@
 
 import { LvqrClient } from '@lvqr/core';
 
+interface TrackBuffer {
+  sourceBuffer: SourceBuffer | null;
+  pending: Uint8Array[];
+  initReceived: boolean;
+}
+
 /**
- * `<lvqr-player>` Web Component for live video playback.
+ * `<lvqr-player>` Web Component for live video + audio playback.
  *
  * Attributes:
  * - `src`: Relay URL with stream path (required)
  * - `autoplay`: Start playback automatically
  * - `muted`: Start muted
  * - `fingerprint`: TLS cert fingerprint for development
+ * - `token`: Optional viewer token for relays that require auth
  */
 export class LvqrPlayerElement extends HTMLElement {
   private client: LvqrClient | null = null;
@@ -30,12 +37,13 @@ export class LvqrPlayerElement extends HTMLElement {
   private statusEl: HTMLDivElement;
   private shadow: ShadowRoot;
   private mediaSource: MediaSource | null = null;
-  private sourceBuffer: SourceBuffer | null = null;
-  private pendingBuffers: Uint8Array[] = [];
-  private initReceived = false;
+
+  // One buffer per track. Track names match the LVQR convention:
+  //   "0.mp4" -> video, "1.mp4" -> audio
+  private buffers: Map<string, TrackBuffer> = new Map();
 
   static get observedAttributes(): string[] {
-    return ['src', 'autoplay', 'muted', 'fingerprint'];
+    return ['src', 'autoplay', 'muted', 'fingerprint', 'token'];
   }
 
   constructor() {
@@ -71,7 +79,7 @@ export class LvqrPlayerElement extends HTMLElement {
           display: none;
         }
       </style>
-      <video part="video"></video>
+      <video part="video" playsinline></video>
       <div class="status" part="status"></div>
     `;
 
@@ -115,10 +123,11 @@ export class LvqrPlayerElement extends HTMLElement {
     try {
       this.client = new LvqrClient(relayUrl, {
         fingerprint: this.getAttribute('fingerprint') ?? undefined,
+        token: this.getAttribute('token') ?? undefined,
       });
 
       this.client.on('connected', () => {
-        this.setStatus('connected, waiting for video...');
+        this.setStatus('connected, waiting for media...');
       });
 
       this.client.on('error', (err) => {
@@ -129,17 +138,18 @@ export class LvqrPlayerElement extends HTMLElement {
         this.setStatus(reason ? `disconnected: ${reason}` : 'disconnected');
       });
 
-      // Set up MSE (SourceBuffer is created lazily when first init segment arrives)
+      // Set up MSE. SourceBuffers are added lazily as init segments arrive.
       this.mediaSource = new MediaSource();
       this.videoEl.src = URL.createObjectURL(this.mediaSource);
 
       await this.client.connect();
 
-      this.client.on('frame', (data: Uint8Array, _track: string) => {
-        this.handleFrame(data);
+      this.client.on('frame', (data: Uint8Array, track: string) => {
+        this.handleFrame(data, track);
       });
 
-      await this.client.subscribe(broadcast);
+      // Subscribe to both video and audio tracks.
+      await this.client.subscribe(broadcast, ['0.mp4', '1.mp4']);
     } catch (err) {
       this.setStatus(`failed: ${err}`);
     }
@@ -158,91 +168,97 @@ export class LvqrPlayerElement extends HTMLElement {
       }
     }
     this.mediaSource = null;
-    this.sourceBuffer = null;
-    this.pendingBuffers = [];
-    this.initReceived = false;
+    this.buffers.clear();
     this.setStatus('');
   }
 
-  /** Handle an incoming fMP4 frame. Detect init segment and create SourceBuffer. */
-  private handleFrame(data: Uint8Array): void {
-    // Detect fMP4 init segment by checking for 'ftyp' box
-    if (!this.initReceived && data.length > 8 && isInitSegment(data)) {
-      this.initReceived = true;
+  /** Handle an incoming fMP4 frame for a specific track. */
+  private handleFrame(data: Uint8Array, track: string): void {
+    let buf = this.buffers.get(track);
+    if (!buf) {
+      buf = { sourceBuffer: null, pending: [], initReceived: false };
+      this.buffers.set(track, buf);
+    }
 
-      // Extract codec from avcC box in the init segment
-      const codec = extractCodecFromInit(data);
-      const mimeType = `video/mp4; codecs="${codec}"`;
+    // Detect init segment by checking for the 'ftyp' box.
+    if (!buf.initReceived && data.length > 8 && isInitSegment(data)) {
+      buf.initReceived = true;
 
+      const mimeType = mimeForTrack(track, data);
+      const setupBuffer = () => this.createSourceBuffer(track, mimeType);
       if (this.mediaSource?.readyState === 'open') {
-        this.createSourceBuffer(mimeType);
+        setupBuffer();
       } else {
-        this.mediaSource?.addEventListener('sourceopen', () => {
-          this.createSourceBuffer(mimeType);
-        });
+        this.mediaSource?.addEventListener('sourceopen', setupBuffer, { once: true });
       }
     }
 
-    this.pendingBuffers.push(data);
-    this.flushPending();
+    buf.pending.push(data);
+    this.flushPending(track);
   }
 
-  private createSourceBuffer(mimeType: string): void {
-    if (!this.mediaSource || this.sourceBuffer) return;
+  private createSourceBuffer(track: string, mimeType: string): void {
+    const buf = this.buffers.get(track);
+    if (!this.mediaSource || !buf || buf.sourceBuffer) return;
 
     try {
-      this.sourceBuffer = this.mediaSource.addSourceBuffer(mimeType);
-      this.sourceBuffer.mode = 'sequence';
-
-      this.sourceBuffer.addEventListener('updateend', () => {
-        this.flushPending();
-      });
-
-      this.sourceBuffer.addEventListener('error', () => {
-        this.setStatus('buffer error');
-      });
-
-      this.flushPending();
+      const sb = this.mediaSource.addSourceBuffer(mimeType);
+      // Video tolerates non-monotonic DTS from browser encoders in `sequence`
+      // mode, which stamps frames by append order. Audio MUST stay in the
+      // default `segments` mode so that MSE honors the fMP4 baseMediaDecodeTime
+      // and keeps A/V lock; forcing audio into `sequence` drifts the two tracks
+      // apart over time (audit finding, 2026-04-10).
+      if (track === '0.mp4') {
+        sb.mode = 'sequence';
+      }
+      sb.addEventListener('updateend', () => this.flushPending(track));
+      sb.addEventListener('error', () => this.setStatus(`buffer error (${track})`));
+      buf.sourceBuffer = sb;
+      this.flushPending(track);
     } catch (e) {
-      this.setStatus(`MSE error: ${e}`);
+      this.setStatus(`MSE error (${track}): ${e}`);
     }
   }
 
-  private flushPending(): void {
-    if (!this.sourceBuffer || this.sourceBuffer.updating || this.pendingBuffers.length === 0) {
+  private flushPending(track: string): void {
+    const buf = this.buffers.get(track);
+    if (!buf || !buf.sourceBuffer || buf.sourceBuffer.updating || buf.pending.length === 0) {
       return;
     }
-
-    const data = this.pendingBuffers.shift()!;
+    const data = buf.pending.shift()!;
     try {
-      this.sourceBuffer.appendBuffer(new Uint8Array(data) as unknown as ArrayBuffer);
-
-      if (this.videoEl.paused && this.videoEl.readyState >= 2) {
-        this.videoEl.play().catch(() => {});
-        this.setStatus('');
-      }
+      buf.sourceBuffer.appendBuffer(new Uint8Array(data) as unknown as ArrayBuffer);
+      this.maybeStartPlayback();
     } catch (e) {
       if (e instanceof DOMException && e.name === 'QuotaExceededError') {
-        this.trimBuffer();
-        this.pendingBuffers.unshift(data);
+        this.trimAllBuffers();
+        buf.pending.unshift(data);
       }
     }
   }
 
-  private trimBuffer(): void {
-    if (!this.sourceBuffer || this.sourceBuffer.updating) return;
-
-    const buffered = this.sourceBuffer.buffered;
-    if (buffered.length > 0) {
-      const start = buffered.start(0);
-      const end = buffered.end(buffered.length - 1);
-      if (end - start > 10) {
-        try {
-          this.sourceBuffer.remove(start, end - 10);
-        } catch {
-          // ignore
+  private trimAllBuffers(): void {
+    for (const buf of this.buffers.values()) {
+      if (!buf.sourceBuffer || buf.sourceBuffer.updating) continue;
+      const buffered = buf.sourceBuffer.buffered;
+      if (buffered.length > 0) {
+        const start = buffered.start(0);
+        const end = buffered.end(buffered.length - 1);
+        if (end - start > 10) {
+          try {
+            buf.sourceBuffer.remove(start, end - 10);
+          } catch {
+            // ignore
+          }
         }
       }
+    }
+  }
+
+  private maybeStartPlayback(): void {
+    if (this.videoEl.paused && this.videoEl.readyState >= 2) {
+      this.videoEl.play().catch(() => {});
+      this.setStatus('');
     }
   }
 
@@ -254,6 +270,17 @@ export class LvqrPlayerElement extends HTMLElement {
 /** Check if data starts with an ftyp box (fMP4 init segment). */
 function isInitSegment(data: Uint8Array): boolean {
   return data[4] === 0x66 && data[5] === 0x74 && data[6] === 0x79 && data[7] === 0x70; // "ftyp"
+}
+
+/** Pick the right MSE MIME type for a track based on its name and init data. */
+function mimeForTrack(track: string, initData: Uint8Array): string {
+  if (track === '1.mp4') {
+    // Audio: AAC-LC by convention. Could be parsed from esds, but LVQR
+    // currently only emits AAC-LC.
+    return 'audio/mp4; codecs="mp4a.40.2"';
+  }
+  // Default: video
+  return `video/mp4; codecs="${extractCodecFromInit(initData)}"`;
 }
 
 /**
@@ -275,7 +302,6 @@ function extractCodecFromInit(data: Uint8Array): string {
       }
     }
   }
-
   // Fallback: High profile, level 3.1
   return 'avc1.64001F';
 }

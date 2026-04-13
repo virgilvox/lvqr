@@ -1,8 +1,10 @@
 use crate::error::RelayError;
+use lvqr_auth::{AuthContext, AuthDecision, NoopAuthProvider, SharedAuth};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{error, info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 /// Configuration for the relay server.
 #[derive(Debug, Clone)]
@@ -53,6 +55,7 @@ pub struct RelayServer {
     origin: moq_lite::OriginProducer,
     metrics: Arc<RelayMetrics>,
     on_connection: Option<ConnectionCallback>,
+    auth: SharedAuth,
 }
 
 #[cfg(feature = "quinn-transport")]
@@ -63,7 +66,13 @@ impl RelayServer {
             origin: moq_lite::OriginProducer::new(),
             metrics: Arc::new(RelayMetrics::default()),
             on_connection: None,
+            auth: Arc::new(NoopAuthProvider),
         }
+    }
+
+    /// Install an authentication provider. By default `NoopAuthProvider` is used.
+    pub fn set_auth_provider(&mut self, auth: SharedAuth) {
+        self.auth = auth;
     }
 
     /// Set a callback for connection lifecycle events.
@@ -103,59 +112,109 @@ impl RelayServer {
         Ok((server, local_addr))
     }
 
-    /// Run the relay server. Blocks until shutdown.
-    pub async fn run(&self) -> Result<(), RelayError> {
+    /// Run the relay server. Blocks until the cancellation token fires.
+    pub async fn run(&self, shutdown: CancellationToken) -> Result<(), RelayError> {
         let (mut server, local_addr) = self.init_server()?;
         info!(addr = %local_addr, "relay listening");
 
-        self.accept_loop(&mut server).await
+        self.accept_loop(&mut server, shutdown).await
     }
 
-    /// Run the relay on a pre-initialized server.
-    pub async fn accept_loop(&self, server: &mut moq_native::Server) -> Result<(), RelayError> {
+    /// Run the relay on a pre-initialized server until cancellation.
+    pub async fn accept_loop(
+        &self,
+        server: &mut moq_native::Server,
+        shutdown: CancellationToken,
+    ) -> Result<(), RelayError> {
         let mut conn_id: u64 = 0;
 
-        while let Some(request) = server.accept().await {
-            conn_id += 1;
-            self.metrics.connections_total.fetch_add(1, Ordering::Relaxed);
-            self.metrics.connections_active.fetch_add(1, Ordering::Relaxed);
+        loop {
+            tokio::select! {
+                request = server.accept() => {
+                    let Some(request) = request else { break };
+                    conn_id += 1;
+                    self.metrics.connections_total.fetch_add(1, Ordering::Relaxed);
+                    metrics::counter!("lvqr_moq_connections_total").increment(1);
 
-            let origin = self.origin.clone();
-            let metrics = self.metrics.clone();
-            let id = conn_id;
-            let on_conn = self.on_connection.clone();
-
-            if let Some(ref cb) = on_conn {
-                cb(id, true);
-            }
-
-            tokio::spawn(async move {
-                info!(conn = id, transport = request.transport(), "new connection");
-
-                let session_result = request.with_publish(origin.consume()).with_consume(origin).ok().await;
-
-                match session_result {
-                    Ok(session) => {
-                        if let Err(e) = session.closed().await {
-                            warn!(conn = id, error = %e, "session closed with error");
-                        } else {
-                            info!(conn = id, "session closed");
+                    // Authentication: inspect the requested URL for a token query
+                    // parameter and ask the auth provider whether to allow the
+                    // session. Reject early via Request::close before the handshake.
+                    let (token, broadcast) = parse_url_token(request.url());
+                    let auth_decision = self.auth.check(&AuthContext::Subscribe {
+                        token: token.clone(),
+                        broadcast: broadcast.clone(),
+                    });
+                    if let AuthDecision::Deny { reason } = auth_decision {
+                        warn!(conn = conn_id, reason = %reason, "rejecting unauthenticated session");
+                        metrics::counter!("lvqr_auth_failures_total", "entry" => "moq").increment(1);
+                        if let Err(e) = request.close(401).await {
+                            debug!(error = %e, "request close failed");
                         }
+                        continue;
                     }
-                    Err(e) => {
-                        error!(conn = id, error = %e, "failed to accept session");
-                    }
-                }
 
-                metrics.connections_active.fetch_sub(1, Ordering::Relaxed);
-                if let Some(ref cb) = on_conn {
-                    cb(id, false);
+                    self.metrics.connections_active.fetch_add(1, Ordering::Relaxed);
+                    metrics::gauge!("lvqr_active_moq_sessions").increment(1.0);
+                    let origin = self.origin.clone();
+                    let metrics = self.metrics.clone();
+                    let id = conn_id;
+                    let on_conn = self.on_connection.clone();
+
+                    if let Some(ref cb) = on_conn {
+                        cb(id, true);
+                    }
+
+                    tokio::spawn(async move {
+                        info!(conn = id, transport = request.transport(), "new connection");
+
+                        let session_result = request.with_publish(origin.consume()).with_consume(origin).ok().await;
+
+                        match session_result {
+                            Ok(session) => {
+                                if let Err(e) = session.closed().await {
+                                    warn!(conn = id, error = %e, "session closed with error");
+                                } else {
+                                    info!(conn = id, "session closed");
+                                }
+                            }
+                            Err(e) => {
+                                error!(conn = id, error = %e, "failed to accept session");
+                            }
+                        }
+
+                        metrics.connections_active.fetch_sub(1, Ordering::Relaxed);
+                        ::metrics::gauge!("lvqr_active_moq_sessions").decrement(1.0);
+                        if let Some(ref cb) = on_conn {
+                            cb(id, false);
+                        }
+                    });
                 }
-            });
+                _ = shutdown.cancelled() => {
+                    info!("relay shutdown signal received, draining connections");
+                    server.close().await;
+                    break;
+                }
+            }
         }
 
         Ok(())
     }
+}
+
+/// Extract the optional `token` query parameter and broadcast path from the
+/// MoQ session URL. The MoQ session URL is typically of the form
+/// `https://host:port/<broadcast>?token=<token>`.
+#[cfg(feature = "quinn-transport")]
+fn parse_url_token(url: Option<&url::Url>) -> (Option<String>, String) {
+    let Some(url) = url else {
+        return (None, String::new());
+    };
+    let broadcast = url.path().trim_start_matches('/').to_string();
+    let token = url
+        .query_pairs()
+        .find(|(k, _)| k == "token")
+        .map(|(_, v)| v.into_owned());
+    (token, broadcast)
 }
 
 /// Stub server when quinn-transport feature is disabled.
@@ -167,10 +226,11 @@ pub struct RelayServer {
 #[cfg(not(feature = "quinn-transport"))]
 impl RelayServer {
     pub fn new(config: RelayConfig) -> Self {
+        let _ = config;
         Self { config }
     }
 
-    pub async fn run(&self) -> Result<(), RelayError> {
+    pub async fn run(&self, _shutdown: CancellationToken) -> Result<(), RelayError> {
         Err(RelayError::Transport(
             "no transport backend enabled (enable quinn-transport feature)".to_string(),
         ))

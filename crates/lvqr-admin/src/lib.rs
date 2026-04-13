@@ -1,6 +1,6 @@
 pub mod routes;
 
-pub use routes::{AdminState, MeshState, StreamInfo, build_router};
+pub use routes::{AdminError, AdminState, MeshState, MetricsRender, StreamInfo, build_router};
 
 /// Configuration for the admin HTTP server.
 #[derive(Debug, Clone)]

@@ -5,12 +5,17 @@ pub mod rtmp;
 pub mod bridge;
 
 pub mod error;
+pub mod protocol;
 pub mod remux;
 
 pub use error::IngestError;
+pub use protocol::IngestProtocol;
 
 #[cfg(feature = "rtmp")]
 pub use bridge::RtmpMoqBridge;
+
+#[cfg(feature = "rtmp")]
+pub use protocol::RtmpIngest;
 
 #[cfg(feature = "rtmp")]
 pub use rtmp::{RtmpConfig, RtmpServer};

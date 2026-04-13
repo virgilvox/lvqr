@@ -221,7 +221,7 @@ async fn rtmp_video_produces_cmaf() {
         bind_addr: ([127, 0, 0, 1], port).into(),
     };
     let rtmp_server = bridge.create_rtmp_server(rtmp_config);
-    let server_handle = tokio::spawn(async move { rtmp_server.run().await });
+    let server_handle = tokio::spawn(async move { rtmp_server.run(tokio_util::sync::CancellationToken::new()).await });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -354,7 +354,7 @@ async fn rtmp_audio_produces_cmaf() {
         bind_addr: ([127, 0, 0, 1], port).into(),
     };
     let rtmp_server = bridge.create_rtmp_server(rtmp_config);
-    let server_handle = tokio::spawn(async move { rtmp_server.run().await });
+    let server_handle = tokio::spawn(async move { rtmp_server.run(tokio_util::sync::CancellationToken::new()).await });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 

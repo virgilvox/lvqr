@@ -13,12 +13,14 @@
 //! If you're looking for the actual media data path, see `lvqr-relay` and `moq-lite`.
 
 pub mod error;
+pub mod events;
 pub mod gop;
 pub mod registry;
 pub mod ringbuf;
 pub mod types;
 
 pub use error::CoreError;
+pub use events::{DEFAULT_EVENT_CAPACITY, EventBus, RelayEvent};
 pub use gop::GopCache;
 pub use registry::{Registry, Subscription};
 pub use ringbuf::RingBuffer;

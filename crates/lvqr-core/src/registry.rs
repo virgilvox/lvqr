@@ -35,11 +35,23 @@ struct TrackState {
 }
 
 /// A subscription handle. Receives frames published to the track.
+///
+/// When dropped, the subscriber count is automatically decremented.
 #[derive(Debug)]
 pub struct Subscription {
     pub id: SubscriberId,
     pub track: TrackName,
     receiver: broadcast::Receiver<Frame>,
+    tracks: Arc<DashMap<TrackName, TrackState>>,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if let Some(mut entry) = self.tracks.get_mut(&self.track) {
+            entry.subscriber_count = entry.subscriber_count.saturating_sub(1);
+            debug!(subscriber = %self.id, track = %self.track, remaining = entry.subscriber_count, "subscription dropped");
+        }
+    }
 }
 
 impl Subscription {
@@ -141,6 +153,7 @@ impl Registry {
             id,
             track: track.clone(),
             receiver,
+            tracks: self.tracks.clone(),
         }
     }
 
@@ -340,5 +353,37 @@ mod tests {
         let mut names: Vec<String> = registry.track_names().iter().map(|t| t.as_str().to_string()).collect();
         names.sort();
         assert_eq!(names, vec!["live/a", "live/b", "live/c"]);
+    }
+
+    #[test]
+    fn subscriber_count_decrements_on_drop() {
+        let registry = Registry::new();
+        let track = TrackName::new("live/drop");
+
+        let sub = registry.subscribe(&track);
+        assert_eq!(registry.subscriber_count(&track), 1);
+
+        drop(sub);
+        assert_eq!(registry.subscriber_count(&track), 0);
+    }
+
+    #[test]
+    fn multiple_subscribers_drop_independently() {
+        let registry = Registry::new();
+        let track = TrackName::new("live/multi_drop");
+
+        let sub1 = registry.subscribe(&track);
+        let sub2 = registry.subscribe(&track);
+        let sub3 = registry.subscribe(&track);
+        assert_eq!(registry.subscriber_count(&track), 3);
+
+        drop(sub1);
+        assert_eq!(registry.subscriber_count(&track), 2);
+
+        drop(sub2);
+        assert_eq!(registry.subscriber_count(&track), 1);
+
+        drop(sub3);
+        assert_eq!(registry.subscriber_count(&track), 0);
     }
 }

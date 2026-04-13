@@ -1,13 +1,18 @@
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, State, WebSocketUpgrade};
-use axum::response::IntoResponse;
+use axum::extract::{Path, Query, State, WebSocketUpgrade};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
 use clap::Parser;
+use lvqr_auth::{AuthContext, AuthDecision, NoopAuthProvider, SharedAuth, StaticAuthConfig, StaticAuthProvider};
+use lvqr_core::{EventBus, RelayEvent};
 use moq_lite::Track;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
 #[derive(Parser, Debug)]
@@ -50,6 +55,22 @@ struct ServeArgs {
     /// Path to TOML config file.
     #[arg(long, short, env = "LVQR_CONFIG")]
     config: Option<String>,
+
+    /// Bearer token required for /api/v1/* admin endpoints. Leave unset for open access.
+    #[arg(long, env = "LVQR_ADMIN_TOKEN")]
+    admin_token: Option<String>,
+
+    /// Required publish key (RTMP stream key, WS ingest ?token=). Leave unset for open access.
+    #[arg(long, env = "LVQR_PUBLISH_KEY")]
+    publish_key: Option<String>,
+
+    /// Required viewer token (WS relay/MoQ subscribe ?token=). Leave unset for open access.
+    #[arg(long, env = "LVQR_SUBSCRIBE_TOKEN")]
+    subscribe_token: Option<String>,
+
+    /// Directory to record broadcasts into. Omit to disable recording.
+    #[arg(long, env = "LVQR_RECORD_DIR")]
+    record_dir: Option<String>,
 }
 
 #[tokio::main]
@@ -73,6 +94,11 @@ struct WsRelayState {
     origin: moq_lite::OriginProducer,
     /// Stored init segments per broadcast, so viewers get them immediately on connect.
     init_segments: Arc<dashmap::DashMap<String, Bytes>>,
+    /// Authentication provider applied to WS subscribe and ingest sessions.
+    auth: SharedAuth,
+    /// Event bus so ingest sessions can publish lifecycle events that the
+    /// recorder (and future hooks) consume.
+    events: EventBus,
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
@@ -84,18 +110,78 @@ async fn serve(args: ServeArgs) -> Result<()> {
         "starting LVQR relay"
     );
 
+    // Install Prometheus exporter recorder so all `metrics::*` macro calls
+    // throughout the workspace are captured for the /metrics endpoint.
+    let prom_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .map_err(|e| anyhow::anyhow!("failed to install Prometheus recorder: {e}"))?;
+
+    // Cancellation token used to coordinate graceful shutdown across all subsystems.
+    let shutdown = CancellationToken::new();
+    let shutdown_signal = shutdown.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("ctrl-c received, initiating graceful shutdown");
+            shutdown_signal.cancel();
+        }
+    });
+
+    // Build authentication provider from CLI/env. If no tokens are configured,
+    // use NoopAuthProvider (open access, backward compatible).
+    let auth_config = StaticAuthConfig {
+        admin_token: args.admin_token.clone(),
+        publish_key: args.publish_key.clone(),
+        subscribe_token: args.subscribe_token.clone(),
+    };
+    let auth: SharedAuth = if auth_config.has_any() {
+        tracing::info!(
+            admin = auth_config.admin_token.is_some(),
+            publish = auth_config.publish_key.is_some(),
+            subscribe = auth_config.subscribe_token.is_some(),
+            "auth: static-token provider enabled"
+        );
+        Arc::new(StaticAuthProvider::new(auth_config))
+    } else {
+        tracing::info!("auth: open access (no tokens configured)");
+        Arc::new(NoopAuthProvider)
+    };
+
+    // Single process-wide event bus: lifecycle events (broadcast started/stopped,
+    // viewer joined/left) are broadcast on this, and any hook (recorder,
+    // webhook dispatcher, future webhook/ops tools) subscribes to it.
+    let events = EventBus::default();
+
     // MoQ relay
     let relay_config = lvqr_relay::RelayConfig::new(([0, 0, 0, 0], args.port).into());
     let mut relay = lvqr_relay::RelayServer::new(relay_config);
+    relay.set_auth_provider(auth.clone());
     let (mut moq_server, relay_addr) = relay.init_server()?;
     tracing::info!(addr = %relay_addr, "MoQ relay listening");
 
-    // RTMP ingest bridged to MoQ
-    let bridge = Arc::new(lvqr_ingest::RtmpMoqBridge::new(relay.origin().clone()));
+    // RTMP ingest bridged to MoQ. The bridge emits BroadcastStarted/Stopped
+    // on the shared EventBus so the recorder does not have to poll.
+    let bridge = Arc::new(
+        lvqr_ingest::RtmpMoqBridge::with_auth(relay.origin().clone(), auth.clone()).with_events(events.clone()),
+    );
     let rtmp_config = lvqr_ingest::RtmpConfig {
         bind_addr: ([0, 0, 0, 0], args.rtmp_port).into(),
     };
     let rtmp_server = bridge.create_rtmp_server(rtmp_config);
+
+    // Optional disk recorder. When --record-dir is set, every broadcast is
+    // recorded asynchronously by an extra MoQ subscriber. The recorder
+    // listens to lifecycle events rather than polling the RTMP bridge, so
+    // WS-ingested broadcasts are recorded too.
+    if let Some(ref dir) = args.record_dir {
+        let recorder = lvqr_record::BroadcastRecorder::new(dir);
+        let origin = relay.origin().clone();
+        let event_rx = events.subscribe();
+        let record_shutdown = shutdown.clone();
+        tracing::info!(dir = %dir, "recording enabled");
+        tokio::spawn(async move {
+            spawn_recordings(recorder, origin, event_rx, record_shutdown).await;
+        });
+    }
 
     // Admin HTTP API wired to real relay metrics and bridge state
     let metrics = relay.metrics().clone();
@@ -121,7 +207,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
                 .map(|name| lvqr_admin::StreamInfo { name, subscribers: 0 })
                 .collect()
         },
-    );
+    )
+    .with_auth(auth.clone())
+    .with_metrics(Arc::new(move || prom_handle.render()));
 
     let admin_addr: std::net::SocketAddr = ([0, 0, 0, 0], args.admin_port).into();
 
@@ -129,6 +217,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let ws_state = WsRelayState {
         origin: relay.origin().clone(),
         init_segments: Arc::new(dashmap::DashMap::new()),
+        auth: auth.clone(),
+        events: events.clone(),
     };
     let ws_router = axum::Router::new()
         .route("/ws/{*broadcast}", get(ws_relay_handler))
@@ -167,16 +257,24 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
             // Background dead peer detection
             let mesh_for_reaper = mesh.clone();
+            let reaper_shutdown = shutdown.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {
-                    interval.tick().await;
-                    let dead = mesh_for_reaper.find_dead_peers();
-                    for peer_id in dead {
-                        tracing::info!(peer = %peer_id, "mesh: removing dead peer");
-                        let orphans = mesh_for_reaper.remove_peer(&peer_id);
-                        for orphan in orphans {
-                            let _ = mesh_for_reaper.reassign_peer(&orphan);
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let dead = mesh_for_reaper.find_dead_peers();
+                            for peer_id in dead {
+                                tracing::info!(peer = %peer_id, "mesh: removing dead peer");
+                                let orphans = mesh_for_reaper.remove_peer(&peer_id);
+                                for orphan in orphans {
+                                    let _ = mesh_for_reaper.reassign_peer(&orphan);
+                                }
+                            }
+                        }
+                        _ = reaper_shutdown.cancelled() => {
+                            tracing::debug!("mesh reaper shutting down");
+                            break;
                         }
                     }
                 }
@@ -235,31 +333,59 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     tracing::info!(addr = %admin_addr, "admin API listening");
 
-    // Run all servers concurrently
-    tokio::select! {
-        result = relay.accept_loop(&mut moq_server) => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "relay server error");
-            }
-        }
-        result = rtmp_server.run() => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "RTMP server error");
-            }
-        }
-        result = async {
-            let listener = tokio::net::TcpListener::bind(admin_addr).await?;
-            axum::serve(listener, combined_router).await
-        } => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "admin server error");
-            }
-        }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutting down");
-        }
-    }
+    // Run all servers concurrently and wait for every subsystem to drain.
+    //
+    // Each subsystem respects the shared cancellation token, so ctrl-c (which
+    // cancels the token from the signal task above) triggers orderly shutdown
+    // in every subsystem at once. If any subsystem exits on its own (error or
+    // natural completion), its wrapper fires the token so the others also
+    // stop. Using `tokio::join!` instead of `tokio::select!` guarantees we
+    // wait for all three to finish rather than racing cancellation against
+    // in-flight work, which previously truncated the final GOP on ctrl-c.
+    let relay_shutdown = shutdown.clone();
+    let rtmp_shutdown = shutdown.clone();
+    let admin_shutdown = shutdown.clone();
 
+    let shutdown_on_exit_relay = shutdown.clone();
+    let relay_fut = async move {
+        let result = relay.accept_loop(&mut moq_server, relay_shutdown).await;
+        if let Err(e) = &result {
+            tracing::error!(error = %e, "relay server error");
+        }
+        shutdown_on_exit_relay.cancel();
+        result
+    };
+
+    let shutdown_on_exit_rtmp = shutdown.clone();
+    let rtmp_fut = async move {
+        let result = rtmp_server.run(rtmp_shutdown).await;
+        if let Err(e) = &result {
+            tracing::error!(error = %e, "RTMP server error");
+        }
+        shutdown_on_exit_rtmp.cancel();
+        result
+    };
+
+    let shutdown_on_exit_admin = shutdown.clone();
+    let admin_fut = async move {
+        let result: Result<()> = async {
+            let listener = tokio::net::TcpListener::bind(admin_addr).await?;
+            axum::serve(listener, combined_router)
+                .with_graceful_shutdown(async move { admin_shutdown.cancelled().await })
+                .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = &result {
+            tracing::error!(error = %e, "admin server error");
+        }
+        shutdown_on_exit_admin.cancel();
+        result
+    };
+
+    let _ = tokio::join!(relay_fut, rtmp_fut, admin_fut);
+
+    tracing::info!("shutdown complete");
     Ok(())
 }
 
@@ -269,12 +395,37 @@ async fn ws_relay_handler(
     ws: WebSocketUpgrade,
     State(state): State<WsRelayState>,
     Path(broadcast): Path<String>,
-) -> impl IntoResponse {
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
     tracing::info!(broadcast = %broadcast, "WebSocket relay request");
+    let resolved = resolve_ws_token(&headers, &params, "ws_subscribe");
+    let decision = state.auth.check(&AuthContext::Subscribe {
+        token: resolved.token,
+        broadcast: broadcast.clone(),
+    });
+    if let AuthDecision::Deny { reason } = decision {
+        tracing::warn!(broadcast = %broadcast, reason = %reason, "WS relay denied");
+        metrics::counter!("lvqr_auth_failures_total", "entry" => "ws").increment(1);
+        return (StatusCode::UNAUTHORIZED, reason).into_response();
+    }
+    metrics::counter!("lvqr_ws_connections_total", "direction" => "subscribe").increment(1);
+    let ws = match resolved.offered_subprotocol {
+        Some(ref p) => ws.protocols(std::iter::once(p.clone())),
+        None => ws,
+    };
     ws.on_upgrade(move |socket| ws_relay_session(socket, state, broadcast))
+        .into_response()
 }
 
 /// Handle a single WebSocket relay session.
+///
+/// Wire format: `[u8 track_id][fMP4 payload]`
+///   - track_id 0 = video (0.mp4)
+///   - track_id 1 = audio (1.mp4)
+///
+/// Both tracks are multiplexed onto the single WebSocket via an internal mpsc
+/// channel. This is a breaking change vs. the v0.3.x raw-binary protocol.
 async fn ws_relay_session(mut socket: WebSocket, state: WsRelayState, broadcast: String) {
     let consumer = state.origin.consume();
     let Some(bc) = consumer.consume_broadcast(&broadcast) else {
@@ -290,52 +441,94 @@ async fn ws_relay_session(mut socket: WebSocket, state: WsRelayState, broadcast:
 
     tracing::info!(broadcast = %broadcast, "WS relay session started");
 
-    // Subscribe to video track
-    let video_track = match bc.subscribe_track(&Track::new("0.mp4")) {
-        Ok(t) => Some(t),
-        Err(e) => {
-            tracing::debug!(error = ?e, "no video track available");
-            None
-        }
-    };
+    // Subscribe to video and audio tracks. Both are optional.
+    let video_track = bc.subscribe_track(&Track::new("0.mp4")).ok();
+    let audio_track = bc.subscribe_track(&Track::new("1.mp4")).ok();
 
-    // Forward video frames over WebSocket
-    if let Some(mut track) = video_track {
-        loop {
-            let group = match track.next_group().await {
-                Ok(Some(g)) => g,
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::debug!(error = ?e, "video track error");
-                    break;
-                }
-            };
-
-            if let Err(e) = forward_group(&mut socket, group).await {
-                tracing::debug!(error = ?e, "WS send error");
-                break;
-            }
-        }
+    if video_track.is_none() && audio_track.is_none() {
+        tracing::warn!(broadcast = %broadcast, "no playable tracks for WS relay");
+        return;
     }
 
+    // mpsc channel multiplexes (track_id, payload) from track readers to the socket writer.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(u8, Bytes)>(64);
+
+    let cancel = CancellationToken::new();
+
+    if let Some(track) = video_track {
+        let tx = tx.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            relay_track(track, 0u8, tx, cancel).await;
+        });
+    }
+    if let Some(track) = audio_track {
+        let tx = tx.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            relay_track(track, 1u8, tx, cancel).await;
+        });
+    }
+    drop(tx);
+
+    while let Some((track_id, payload)) = rx.recv().await {
+        let mut framed = Vec::with_capacity(1 + payload.len());
+        framed.push(track_id);
+        framed.extend_from_slice(&payload);
+        let len = framed.len() as u64;
+        if let Err(e) = socket.send(Message::Binary(framed.into())).await {
+            tracing::debug!(error = ?e, "WS send error");
+            break;
+        }
+        metrics::counter!("lvqr_frames_relayed_total", "transport" => "ws").increment(1);
+        metrics::counter!("lvqr_bytes_relayed_total", "transport" => "ws").increment(len);
+    }
+
+    cancel.cancel();
     tracing::info!(broadcast = %broadcast, "WS relay session ended");
 }
 
-/// Forward all frames from a MoQ group as binary WebSocket messages.
-async fn forward_group(socket: &mut WebSocket, mut group: moq_lite::GroupConsumer) -> Result<(), axum::Error> {
+/// Read groups+frames from a MoQ track and forward each frame to the mpsc
+/// channel tagged with the supplied track_id. Stops when the track ends, the
+/// receiver is dropped, or `cancel` fires.
+async fn relay_track(
+    mut track: moq_lite::TrackConsumer,
+    track_id: u8,
+    tx: tokio::sync::mpsc::Sender<(u8, Bytes)>,
+    cancel: CancellationToken,
+) {
     loop {
-        match group.read_frame().await {
-            Ok(Some(frame)) => {
-                socket.send(Message::Binary(frame.to_vec().into())).await?;
-            }
-            Ok(None) => break,
+        let group = tokio::select! {
+            res = track.next_group() => res,
+            _ = cancel.cancelled() => return,
+        };
+        let mut group = match group {
+            Ok(Some(g)) => g,
+            Ok(None) => return,
             Err(e) => {
-                tracing::debug!(error = ?e, "group read error");
-                break;
+                tracing::debug!(track_id, error = ?e, "track error");
+                return;
+            }
+        };
+        loop {
+            let frame = tokio::select! {
+                res = group.read_frame() => res,
+                _ = cancel.cancelled() => return,
+            };
+            match frame {
+                Ok(Some(bytes)) => {
+                    if tx.send((track_id, bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::debug!(track_id, error = ?e, "group read error");
+                    return;
+                }
             }
         }
     }
-    Ok(())
 }
 
 // =====================================================================
@@ -355,9 +548,78 @@ async fn ws_ingest_handler(
     ws: WebSocketUpgrade,
     State(state): State<WsRelayState>,
     Path(broadcast): Path<String>,
-) -> impl IntoResponse {
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
     tracing::info!(broadcast = %broadcast, "WebSocket ingest request");
+    let resolved = resolve_ws_token(&headers, &params, "ws_ingest");
+    let decision = state.auth.check(&AuthContext::Publish {
+        app: "ws".to_string(),
+        key: resolved.token.clone().unwrap_or_default(),
+    });
+    if let AuthDecision::Deny { reason } = decision {
+        tracing::warn!(broadcast = %broadcast, reason = %reason, "WS ingest denied");
+        metrics::counter!("lvqr_auth_failures_total", "entry" => "ws_ingest").increment(1);
+        return (StatusCode::UNAUTHORIZED, reason).into_response();
+    }
+    metrics::counter!("lvqr_ws_connections_total", "direction" => "publish").increment(1);
+    let ws = match resolved.offered_subprotocol {
+        Some(ref p) => ws.protocols(std::iter::once(p.clone())),
+        None => ws,
+    };
     ws.on_upgrade(move |socket| ws_ingest_session(socket, state, broadcast))
+        .into_response()
+}
+
+/// Result of extracting a bearer token from a WebSocket upgrade request.
+///
+/// The preferred transport is the `Sec-WebSocket-Protocol` header with a value
+/// of `lvqr.bearer.<token>`. When the client offers that, the matching
+/// subprotocol string is echoed back so axum's upgrade handshake accepts it.
+/// The legacy `?token=` query parameter is still accepted as a fallback, but
+/// logs a deprecation warning so operators can migrate clients.
+struct WsTokenResolution {
+    token: Option<String>,
+    offered_subprotocol: Option<String>,
+}
+
+fn resolve_ws_token(headers: &HeaderMap, params: &HashMap<String, String>, entry: &'static str) -> WsTokenResolution {
+    // Sec-WebSocket-Protocol is a comma-separated list. Find any entry
+    // starting with the `lvqr.bearer.` prefix, strip it, and echo it back
+    // verbatim so the upgrade response picks a valid subprotocol.
+    if let Some(hv) = headers.get("sec-websocket-protocol")
+        && let Ok(raw) = hv.to_str()
+    {
+        for item in raw.split(',') {
+            let proto = item.trim();
+            if let Some(tok) = proto.strip_prefix("lvqr.bearer.")
+                && !tok.is_empty()
+            {
+                return WsTokenResolution {
+                    token: Some(tok.to_string()),
+                    offered_subprotocol: Some(proto.to_string()),
+                };
+            }
+        }
+    }
+
+    // Legacy: ?token=... in the query string. Keep accepting it to avoid
+    // hard-breaking v0.3.1 clients mid-upgrade, but warn so logs flag it.
+    if let Some(tok) = params.get("token").filter(|t| !t.is_empty()) {
+        tracing::warn!(
+            entry = entry,
+            "deprecated: ?token= query parameter; migrate to Sec-WebSocket-Protocol: lvqr.bearer.<token>"
+        );
+        return WsTokenResolution {
+            token: Some(tok.clone()),
+            offered_subprotocol: None,
+        };
+    }
+
+    WsTokenResolution {
+        token: None,
+        offered_subprotocol: None,
+    }
 }
 
 async fn ws_ingest_session(mut socket: WebSocket, state: WsRelayState, broadcast: String) {
@@ -377,6 +639,12 @@ async fn ws_ingest_session(mut socket: WebSocket, state: WsRelayState, broadcast
         return;
     };
 
+    // Announce this broadcast on the event bus so the recorder and other
+    // subscribers can wire up before the first media frame arrives.
+    state.events.emit(RelayEvent::BroadcastStarted {
+        name: broadcast.clone(),
+    });
+
     let Ok(mut video_track) = bc.create_track(Track::new("0.mp4")) else {
         tracing::warn!("failed to create video track");
         return;
@@ -390,8 +658,6 @@ async fn ws_ingest_session(mut socket: WebSocket, state: WsRelayState, broadcast
     let mut video_init: Option<Bytes> = None;
     let mut video_group: Option<moq_lite::GroupProducer> = None;
     let mut video_seq: u32 = 0;
-    let mut catalog_written = false;
-
     // Confirm to the browser that ingest is ready
     let _ = socket.send(Message::Text(r#"{"status":"ready"}"#.into())).await;
 
@@ -438,13 +704,10 @@ async fn ws_ingest_session(mut socket: WebSocket, state: WsRelayState, broadcast
                         video_init = Some(init.clone());
                         state.init_segments.insert(broadcast.clone(), init);
 
-                        if !catalog_written {
-                            let json = remux::generate_catalog(Some(&config), None);
-                            if let Ok(mut group) = catalog_track.append_group() {
-                                let _ = group.write_frame(Bytes::from(json));
-                                let _ = group.finish();
-                                catalog_written = true;
-                            }
+                        let json = remux::generate_catalog(Some(&config), None);
+                        if let Ok(mut group) = catalog_track.append_group() {
+                            let _ = group.write_frame(Bytes::from(json));
+                            let _ = group.finish();
                         }
                     }
                     None => {
@@ -505,7 +768,68 @@ async fn ws_ingest_session(mut socket: WebSocket, state: WsRelayState, broadcast
     if let Some(mut g) = video_group.take() {
         let _ = g.finish();
     }
+    state.events.emit(RelayEvent::BroadcastStopped {
+        name: broadcast.clone(),
+    });
     tracing::info!(broadcast = %broadcast, "WS ingest session ended");
+}
+
+/// Background task that listens on the event bus for new broadcasts and
+/// starts a recorder for each one. The recorder runs as a regular MoQ
+/// subscriber, so it never affects the live data path. Recordings stop on
+/// shutdown.
+///
+/// This is event-driven rather than polling the RTMP bridge, so WS-ingested
+/// broadcasts (which never touch the RTMP bridge) are recorded identically.
+async fn spawn_recordings(
+    recorder: lvqr_record::BroadcastRecorder,
+    origin: moq_lite::OriginProducer,
+    mut events: tokio::sync::broadcast::Receiver<RelayEvent>,
+    shutdown: CancellationToken,
+) {
+    let mut active: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let event = tokio::select! {
+            res = events.recv() => res,
+            _ = shutdown.cancelled() => return,
+        };
+        let event = match event {
+            Ok(e) => e,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(missed = n, "recorder event stream lagged");
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        match event {
+            RelayEvent::BroadcastStarted { name } => {
+                if !active.insert(name.clone()) {
+                    continue;
+                }
+                let consumer = origin.consume();
+                let Some(broadcast) = consumer.consume_broadcast(&name) else {
+                    tracing::warn!(broadcast = %name, "recorder: broadcast not resolvable yet");
+                    active.remove(&name);
+                    continue;
+                };
+                let recorder = recorder.clone();
+                let cancel = shutdown.clone();
+                tracing::info!(broadcast = %name, "starting recording");
+                let name_clone = name.clone();
+                tokio::spawn(async move {
+                    let _ = recorder
+                        .record_broadcast(&name_clone, broadcast, lvqr_record::RecordOptions::default(), cancel)
+                        .await;
+                });
+            }
+            RelayEvent::BroadcastStopped { name } => {
+                active.remove(&name);
+                // The per-broadcast recorder task observes the track ending
+                // on its own and exits, so no explicit cancellation needed.
+            }
+            RelayEvent::ViewerJoined { .. } | RelayEvent::ViewerLeft { .. } => {}
+        }
+    }
 }
 
 /// Parse an AVCDecoderConfigurationRecord (from VideoEncoder's decoderConfig.description).
@@ -520,7 +844,7 @@ fn parse_avcc_record(data: &[u8]) -> Option<lvqr_ingest::remux::VideoConfig> {
 
     let num_sps = (data[5] & 0x1F) as usize;
     let mut offset = 6;
-    let mut sps = Vec::new();
+    let mut sps_list = Vec::with_capacity(num_sps);
     for _ in 0..num_sps {
         if offset + 2 > data.len() {
             return None;
@@ -530,7 +854,7 @@ fn parse_avcc_record(data: &[u8]) -> Option<lvqr_ingest::remux::VideoConfig> {
         if offset + len > data.len() {
             return None;
         }
-        sps = data[offset..offset + len].to_vec();
+        sps_list.push(data[offset..offset + len].to_vec());
         offset += len;
     }
 
@@ -539,7 +863,7 @@ fn parse_avcc_record(data: &[u8]) -> Option<lvqr_ingest::remux::VideoConfig> {
     }
     let num_pps = data[offset] as usize;
     offset += 1;
-    let mut pps = Vec::new();
+    let mut pps_list = Vec::with_capacity(num_pps);
     for _ in 0..num_pps {
         if offset + 2 > data.len() {
             return None;
@@ -549,17 +873,17 @@ fn parse_avcc_record(data: &[u8]) -> Option<lvqr_ingest::remux::VideoConfig> {
         if offset + len > data.len() {
             return None;
         }
-        pps = data[offset..offset + len].to_vec();
+        pps_list.push(data[offset..offset + len].to_vec());
         offset += len;
     }
 
-    if sps.is_empty() || pps.is_empty() {
+    if sps_list.is_empty() || pps_list.is_empty() {
         return None;
     }
 
     Some(lvqr_ingest::remux::VideoConfig {
-        sps,
-        pps,
+        sps_list,
+        pps_list,
         profile,
         compat,
         level,

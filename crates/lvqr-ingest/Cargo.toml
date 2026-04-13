@@ -16,6 +16,7 @@ rtmp = ["dep:rml_rtmp"]
 
 [dependencies]
 lvqr-core = { workspace = true }
+lvqr-auth = { workspace = true }
 moq-lite = { workspace = true }
 
 # RTMP
@@ -23,12 +24,17 @@ rml_rtmp = { workspace = true, optional = true }
 
 # Async
 tokio = { workspace = true, features = ["net", "io-util"] }
+tokio-util = { workspace = true }
 futures = { workspace = true }
+
+# H.264 SPS parsing
+h264-reader = { workspace = true }
 
 # Utils
 bytes = { workspace = true }
 dashmap = { workspace = true }
 tracing = { workspace = true }
+metrics = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

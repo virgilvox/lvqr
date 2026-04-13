@@ -172,12 +172,16 @@ pub fn video_init_segment_with_size(config: &VideoConfig, width: u16, height: u1
                                     buf.put_u8(config.compat);
                                     buf.put_u8(config.level);
                                     buf.put_u8(0xFF); // lengthSizeMinusOne=3 | reserved
-                                    buf.put_u8(0xE1); // numSPS=1 | reserved
-                                    buf.put_u16(config.sps.len() as u16);
-                                    buf.put_slice(&config.sps);
-                                    buf.put_u8(1); // numPPS
-                                    buf.put_u16(config.pps.len() as u16);
-                                    buf.put_slice(&config.pps);
+                                    buf.put_u8(0xE0 | (config.sps_list.len() as u8)); // numSPS | reserved
+                                    for sps in &config.sps_list {
+                                        buf.put_u16(sps.len() as u16);
+                                        buf.put_slice(sps);
+                                    }
+                                    buf.put_u8(config.pps_list.len() as u8); // numPPS
+                                    for pps in &config.pps_list {
+                                        buf.put_u16(pps.len() as u16);
+                                        buf.put_slice(pps);
+                                    }
                                 });
                             });
                         });
@@ -553,8 +557,8 @@ mod tests {
 
     fn test_video_config() -> flv::VideoConfig {
         flv::VideoConfig {
-            sps: vec![0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9],
-            pps: vec![0x68, 0xEE, 0x3C, 0x80],
+            sps_list: vec![vec![0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9]],
+            pps_list: vec![vec![0x68, 0xEE, 0x3C, 0x80]],
             profile: 0x64,
             compat: 0x00,
             level: 0x1F,

@@ -12,6 +12,7 @@ categories = ["multimedia", "network-programming"]
 
 [dependencies]
 lvqr-core = { workspace = true }
+lvqr-auth = { workspace = true }
 
 axum = { workspace = true }
 tower = { workspace = true }

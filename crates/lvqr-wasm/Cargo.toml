@@ -1,6 +1,6 @@
 [package]
 name = "lvqr-wasm"
-description = "LVQR WebAssembly bindings for browser playback"
+description = "DEPRECATED: prefer @lvqr/core (npm). LVQR WebAssembly bindings stub for browser playback"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

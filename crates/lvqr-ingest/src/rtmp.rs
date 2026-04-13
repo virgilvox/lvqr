@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 /// Configuration for the RTMP ingest server.
@@ -33,6 +34,9 @@ pub type MediaCallback = Arc<dyn Fn(&str, &str, Bytes, u32) + Send + Sync>;
 /// Callback for publish/unpublish events: (app_name, stream_key).
 pub type StreamCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
+/// Authentication callback: (app, stream_key) -> bool. Returns true to accept.
+pub type AuthCallback = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
 /// RTMP ingest server that translates RTMP streams to MoQ tracks.
 pub struct RtmpServer {
     config: RtmpConfig,
@@ -40,6 +44,9 @@ pub struct RtmpServer {
     on_audio: MediaCallback,
     on_publish: StreamCallback,
     on_unpublish: StreamCallback,
+    /// Optional authentication: returns true to accept the publish stream key.
+    /// `None` means open access.
+    validate_publish: Option<AuthCallback>,
 }
 
 impl RtmpServer {
@@ -62,6 +69,7 @@ impl RtmpServer {
             on_audio: Arc::new(on_audio),
             on_publish: Arc::new(on_publish),
             on_unpublish: Arc::new(on_unpublish),
+            validate_publish: None,
         }
     }
 
@@ -79,33 +87,62 @@ impl RtmpServer {
             on_audio,
             on_publish,
             on_unpublish,
+            validate_publish: None,
         }
+    }
+
+    /// Install an optional callback that validates publish requests by stream
+    /// key. When the callback returns `false`, the publish is rejected and the
+    /// connection is closed.
+    pub fn set_validate_publish(&mut self, validate: AuthCallback) {
+        self.validate_publish = Some(validate);
     }
 
     pub fn config(&self) -> &RtmpConfig {
         &self.config
     }
 
-    /// Run the RTMP ingest server. Blocks until shutdown.
-    pub async fn run(&self) -> Result<(), IngestError> {
+    /// Run the RTMP ingest server. Blocks until the cancellation token fires.
+    pub async fn run(&self, shutdown: CancellationToken) -> Result<(), IngestError> {
         let listener = TcpListener::bind(self.config.bind_addr).await?;
         info!(addr = %self.config.bind_addr, "RTMP ingest listening");
 
         loop {
-            let (stream, peer_addr) = listener.accept().await?;
-            info!(%peer_addr, "RTMP connection accepted");
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, peer_addr) = result?;
+                    info!(%peer_addr, "RTMP connection accepted");
+                    metrics::counter!("lvqr_rtmp_connections_total").increment(1);
 
-            let on_video = self.on_video.clone();
-            let on_audio = self.on_audio.clone();
-            let on_publish = self.on_publish.clone();
-            let on_unpublish = self.on_unpublish.clone();
+                    let on_video = self.on_video.clone();
+                    let on_audio = self.on_audio.clone();
+                    let on_publish = self.on_publish.clone();
+                    let on_unpublish = self.on_unpublish.clone();
+                    let validate_publish = self.validate_publish.clone();
 
-            tokio::spawn(async move {
-                if let Err(e) = handle_rtmp_connection(stream, on_video, on_audio, on_publish, on_unpublish).await {
-                    error!(%peer_addr, error = %e, "RTMP session error");
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_rtmp_connection(
+                            stream,
+                            on_video,
+                            on_audio,
+                            on_publish,
+                            on_unpublish,
+                            validate_publish,
+                        )
+                        .await
+                        {
+                            error!(%peer_addr, error = %e, "RTMP session error");
+                        }
+                    });
                 }
-            });
+                _ = shutdown.cancelled() => {
+                    info!("RTMP shutdown signal received");
+                    break;
+                }
+            }
         }
+
+        Ok(())
     }
 }
 
@@ -116,6 +153,7 @@ async fn handle_rtmp_connection(
     on_audio: MediaCallback,
     on_publish: StreamCallback,
     on_unpublish: StreamCallback,
+    validate_publish: Option<AuthCallback>,
 ) -> Result<(), IngestError> {
     // Phase 1: RTMP Handshake
     let mut handshake = Handshake::new(PeerType::Server);
@@ -153,8 +191,16 @@ async fn handle_rtmp_connection(
                 debug!("RTMP handshake complete");
 
                 // Phase 2: RTMP Session
-                return handle_rtmp_session(stream, remaining_bytes, on_video, on_audio, on_publish, on_unpublish)
-                    .await;
+                return handle_rtmp_session(
+                    stream,
+                    remaining_bytes,
+                    on_video,
+                    on_audio,
+                    on_publish,
+                    on_unpublish,
+                    validate_publish,
+                )
+                .await;
             }
         }
     }
@@ -168,6 +214,7 @@ async fn handle_rtmp_session(
     on_audio: MediaCallback,
     on_publish: StreamCallback,
     on_unpublish: StreamCallback,
+    validate_publish: Option<AuthCallback>,
 ) -> Result<(), IngestError> {
     let config = ServerSessionConfig::new();
     let (mut session, initial_results) =
@@ -241,6 +288,17 @@ async fn handle_rtmp_session(
                         ..
                     } => {
                         info!(app = %app_name, key = %stream_key, "RTMP publish requested");
+                        // Authenticate publish stream key.
+                        if let Some(ref validate) = validate_publish {
+                            if !(validate)(app_name, stream_key) {
+                                info!(
+                                    app = %app_name,
+                                    "RTMP publish rejected by auth provider"
+                                );
+                                metrics::counter!("lvqr_auth_failures_total", "entry" => "rtmp").increment(1);
+                                return Ok(());
+                            }
+                        }
                         current_key = stream_key.clone();
                         let accept_results = session
                             .accept_request(*request_id)

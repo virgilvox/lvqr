@@ -1,10 +1,24 @@
 //! LVQR WebAssembly bindings for browser playback.
 //!
-//! Provides a WebTransport-based client that runs in the browser.
-//! Falls back to WebSocket when WebTransport is unavailable.
+//! # DEPRECATED
 //!
-//! This crate must be compiled with `--target wasm32-unknown-unknown`.
-//! Building for native targets provides only version/utility exports.
+//! This crate is **deprecated** and is no longer the recommended browser
+//! client. Use the TypeScript packages instead:
+//!
+//! - [`@lvqr/core`](https://www.npmjs.com/package/@lvqr/core) -- full MoQ-Lite
+//!   subscriber over WebTransport with automatic WebSocket fMP4 fallback
+//! - [`@lvqr/player`](https://www.npmjs.com/package/@lvqr/player) -- drop-in
+//!   `<lvqr-player>` Web Component built on top of `@lvqr/core`
+//!
+//! The TypeScript client implements the full MoQ-Lite protocol (this WASM
+//! crate only exposed raw WebTransport stream helpers and never wired up the
+//! data callbacks). Switching is straightforward because the JS package has
+//! the same public surface that the WASM bindings tried to provide.
+//!
+//! This crate will continue to compile for the existing version range but
+//! receives no further development.
+
+#![allow(deprecated)]
 
 #[cfg(target_arch = "wasm32")]
 mod transport;
@@ -51,6 +65,14 @@ pub fn is_webtransport_supported() -> bool {
 /// await client.connect();
 /// client.onFrame((data) => { /* process frame bytes */ });
 /// ```
+///
+/// **Deprecated:** prefer the `@lvqr/core` npm package, which implements the
+/// full MoQ-Lite protocol and the WebSocket fMP4 fallback. This struct only
+/// exposes raw WebTransport stream helpers and never wires `onFrame`.
+#[deprecated(
+    since = "0.3.2",
+    note = "Use @lvqr/core (npm) for browser clients; this WASM stub is no longer maintained."
+)]
 #[wasm_bindgen]
 pub struct LvqrSubscriber {
     url: String,

@@ -6,15 +6,18 @@
 /// and the MoQ ecosystem (moq-js).
 use bytes::Bytes;
 use dashmap::DashMap;
+use lvqr_auth::{AuthContext, NoopAuthProvider, SharedAuth};
+use lvqr_core::{EventBus, RelayEvent};
 use moq_lite::Track;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::remux::{
     AudioConfig, FlvAudioTag, FlvVideoTag, VideoConfig, VideoSample, audio_init_segment, audio_segment,
-    generate_catalog, parse_audio_tag, parse_video_tag, video_init_segment, video_segment,
+    extract_resolution, generate_catalog, parse_audio_tag, parse_video_tag, video_init_segment_with_size,
+    video_segment,
 };
-use crate::rtmp::{MediaCallback, RtmpConfig, RtmpServer, StreamCallback};
+use crate::rtmp::{AuthCallback, MediaCallback, RtmpConfig, RtmpServer, StreamCallback};
 
 /// State for a single active RTMP stream being bridged to MoQ.
 struct ActiveStream {
@@ -28,7 +31,6 @@ struct ActiveStream {
     audio_config: Option<AudioConfig>,
     video_init: Option<Bytes>,
     audio_init: Option<Bytes>,
-    catalog_written: bool,
     // Segment sequencing
     video_seq: u32,
     audio_seq: u32,
@@ -43,6 +45,8 @@ struct ActiveStream {
 pub struct RtmpMoqBridge {
     origin: moq_lite::OriginProducer,
     streams: Arc<DashMap<String, ActiveStream>>,
+    auth: SharedAuth,
+    events: Option<EventBus>,
 }
 
 impl RtmpMoqBridge {
@@ -50,7 +54,38 @@ impl RtmpMoqBridge {
         Self {
             origin,
             streams: Arc::new(DashMap::new()),
+            auth: Arc::new(NoopAuthProvider),
+            events: None,
         }
+    }
+
+    /// Construct with a specific auth provider.
+    pub fn with_auth(origin: moq_lite::OriginProducer, auth: SharedAuth) -> Self {
+        Self {
+            origin,
+            streams: Arc::new(DashMap::new()),
+            auth,
+            events: None,
+        }
+    }
+
+    /// Replace the auth provider after construction.
+    pub fn set_auth(&mut self, auth: SharedAuth) {
+        self.auth = auth;
+    }
+
+    /// Attach an `EventBus` so the bridge emits `BroadcastStarted` and
+    /// `BroadcastStopped` events whenever an RTMP publisher connects or
+    /// disconnects. Subscribers on the bus (e.g. the recorder) can react
+    /// without polling `stream_names()`.
+    pub fn with_events(mut self, events: EventBus) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// Attach or replace the event bus after construction.
+    pub fn set_event_bus(&mut self, events: EventBus) {
+        self.events = Some(events);
     }
 
     /// Create an RTMP server wired to this bridge.
@@ -60,6 +95,8 @@ impl RtmpMoqBridge {
         let streams_unpublish = self.streams.clone();
         let streams_video = self.streams.clone();
         let streams_audio = self.streams.clone();
+        let events_publish = self.events.clone();
+        let events_unpublish = self.events.clone();
 
         let on_publish: StreamCallback = Arc::new(move |app: &str, key: &str| {
             let stream_name = format!("{app}/{key}");
@@ -95,6 +132,12 @@ impl RtmpMoqBridge {
                 }
             };
 
+            metrics::gauge!("lvqr_active_streams").increment(1.0);
+            if let Some(bus) = &events_publish {
+                bus.emit(RelayEvent::BroadcastStarted {
+                    name: stream_name.clone(),
+                });
+            }
             streams_publish.insert(
                 stream_name,
                 ActiveStream {
@@ -107,7 +150,6 @@ impl RtmpMoqBridge {
                     audio_config: None,
                     video_init: None,
                     audio_init: None,
-                    catalog_written: false,
                     video_seq: 0,
                     audio_seq: 0,
                     last_video_ts: None,
@@ -120,6 +162,12 @@ impl RtmpMoqBridge {
             if let Some((_, mut stream)) = streams_unpublish.remove(&stream_name) {
                 if let Some(mut group) = stream.video_group.take() {
                     let _ = group.finish();
+                }
+                metrics::gauge!("lvqr_active_streams").decrement(1.0);
+                if let Some(bus) = &events_unpublish {
+                    bus.emit(RelayEvent::BroadcastStopped {
+                        name: stream_name.clone(),
+                    });
                 }
                 info!(stream = %stream_name, "removed MoQ broadcast");
             }
@@ -134,8 +182,18 @@ impl RtmpMoqBridge {
 
             match parse_video_tag(&data) {
                 FlvVideoTag::SequenceHeader(config) => {
-                    debug!(stream = %stream_name, codec = %config.codec_string(), "video sequence header");
-                    let init = video_init_segment(&config);
+                    let (width, height) = config
+                        .sps_list
+                        .first()
+                        .and_then(|sps| extract_resolution(sps))
+                        .unwrap_or((0, 0));
+                    debug!(
+                        stream = %stream_name,
+                        codec = %config.codec_string(),
+                        width, height,
+                        "video sequence header"
+                    );
+                    let init = video_init_segment_with_size(&config, width as u16, height as u16);
                     stream.video_config = Some(config);
                     stream.video_init = Some(init);
                     maybe_write_catalog(stream, &stream_name);
@@ -151,6 +209,9 @@ impl RtmpMoqBridge {
                     let Some(ref init) = stream.video_init else {
                         return;
                     };
+
+                    metrics::counter!("lvqr_frames_published_total", "type" => "video").increment(1);
+                    metrics::counter!("lvqr_bytes_ingested_total", "type" => "video").increment(nalu_data.len() as u64);
 
                     // Compute duration from timestamp delta (default 33ms = ~30fps)
                     let duration_ms = match stream.last_video_ts {
@@ -234,6 +295,9 @@ impl RtmpMoqBridge {
                         return;
                     };
 
+                    metrics::counter!("lvqr_frames_published_total", "type" => "audio").increment(1);
+                    metrics::counter!("lvqr_bytes_ingested_total", "type" => "audio").increment(aac_data.len() as u64);
+
                     stream.audio_seq += 1;
                     // AAC-LC uses 1024 samples per frame at the audio sample rate
                     let duration = 1024;
@@ -260,7 +324,19 @@ impl RtmpMoqBridge {
             }
         });
 
-        RtmpServer::from_callbacks(config, on_video, on_audio, on_publish, on_unpublish)
+        let mut server = RtmpServer::from_callbacks(config, on_video, on_audio, on_publish, on_unpublish);
+
+        // Wire the bridge's auth provider into RTMP publish validation.
+        let auth = self.auth.clone();
+        let validate: AuthCallback = Arc::new(move |app: &str, key: &str| {
+            auth.check(&AuthContext::Publish {
+                app: app.to_string(),
+                key: key.to_string(),
+            })
+            .is_allow()
+        });
+        server.set_validate_publish(validate);
+        server
     }
 
     /// Number of active RTMP streams being bridged.
@@ -274,13 +350,12 @@ impl RtmpMoqBridge {
     }
 }
 
-/// Write the catalog track once both video and audio configs are available
-/// (or when the first config arrives if the other won't come).
+/// Write the catalog track whenever codec configuration changes.
+///
+/// Each call creates a new MoQ group, so late-joining subscribers always
+/// get the latest catalog. This handles the case where audio config arrives
+/// after video config -- the catalog is rewritten with both tracks.
 fn maybe_write_catalog(stream: &mut ActiveStream, stream_name: &str) {
-    if stream.catalog_written {
-        return;
-    }
-    // Write catalog once we have at least one config
     if stream.video_config.is_none() && stream.audio_config.is_none() {
         return;
     }
@@ -294,8 +369,12 @@ fn maybe_write_catalog(stream: &mut ActiveStream, stream_name: &str) {
                 return;
             }
             let _ = group.finish();
-            stream.catalog_written = true;
-            info!(stream = %stream_name, "catalog published");
+            info!(
+                stream = %stream_name,
+                has_video = stream.video_config.is_some(),
+                has_audio = stream.audio_config.is_some(),
+                "catalog published"
+            );
         }
         Err(e) => {
             debug!(error = ?e, "failed to append catalog group");

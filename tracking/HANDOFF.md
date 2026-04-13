@@ -1,11 +1,87 @@
 # LVQR Handoff Document
 
-## Project Status: v0.3.1 -- Browser Playback Working
+## Project Status: v0.4-dev -- Tier 0 Closed
 
-**Last Updated**: 2026-04-11
-**Tests**: 83 Rust + 8 Python = 91 total (passing)
-**CI**: All 5 jobs green (Format+Lint, Test ubuntu, Test macos, WASM Build, Docker Build)
-**E2E Verified**: Browser webcam -> WS ingest -> fMP4 remux -> MoQ -> WS relay -> MSE playback
+**Last Updated**: 2026-04-13
+**Tests**: 110 Rust passing (cargo test --workspace), clippy + fmt clean
+**E2E Verified**: real RTMP publish -> RtmpMoqBridge -> MoQ origin -> axum WS
+relay -> tungstenite WebSocket client, with fMP4 init (ftyp) and media (moof)
+segments verified byte-by-byte. See `crates/lvqr-cli/tests/rtmp_ws_e2e.rs`.
+
+The roadmap at `tracking/ROADMAP.md` is the authoritative plan for the next
+18-24 months of work; read it alongside CLAUDE.md before starting anything.
+The competitive audit at `tracking/AUDIT-2026-04-13.md` compares LVQR's
+current surface area against MediaMTX, LiveKit, OvenMediaEngine, SRS, Ant
+Media, AWS Kinesis Video Streams, Janus, and Jitsi, and calibrates the
+strategic bets. Read it before arguing about feature priority.
+
+## What Tier 0 Closed (2026-04-13)
+
+The v0.4 audit found real bugs hiding behind v0.3.1's "green CI" claim. Tier 0
+addressed each of them; the state today is:
+
+1. **Graceful shutdown race fixed.** `crates/lvqr-cli/src/main.rs` now runs
+   the relay, RTMP, and admin subsystems via `tokio::join!` with per-subsystem
+   wrappers that cancel the shared token on exit. The outer `select!` arm
+   that pre-empted draining subsystems on ctrl-c is gone.
+2. **EventBus wired end-to-end.** `lvqr_core::EventBus` is created once in
+   the CLI and handed to `RtmpMoqBridge::with_events`. The RTMP bridge emits
+   `BroadcastStarted/Stopped` on publish/unpublish; the WS ingest handler
+   emits the same events around its session; `spawn_recordings` subscribes
+   to the bus instead of polling `bridge.stream_names()`, so WS-ingested
+   broadcasts are recorded identically to RTMP-ingested ones.
+3. **Player audio SourceBuffer fix.** Both `@lvqr/player` and the test app's
+   watch tab now set `sb.mode = 'sequence'` only for video (`0.mp4`); audio
+   stays in the default `segments` mode so fMP4 `baseMediaDecodeTime` is
+   honored and A/V stays in lock.
+4. **Tokens out of query strings.** WebSocket auth now travels in
+   `Sec-WebSocket-Protocol: lvqr.bearer.<token>`. The new `resolve_ws_token`
+   helper in `lvqr-cli` parses the header and echoes the exact subprotocol
+   back so axum's upgrade handshake completes. `?token=` is still accepted
+   during the transition but logs a deprecation warning per upgrade. The
+   JS client (`bindings/js/packages/core/src/client.ts`) and the test app
+   construct their WebSockets with the subprotocol array when a token is
+   set, and the test app grew token inputs on both Watch and Stream tabs.
+5. **Pluggable protocol scaffolding and auth crate.** `lvqr-auth` is a new
+   crate with `AuthProvider`, `StaticAuthProvider`, `NoopAuthProvider`, and
+   an optional `JwtAuthProvider` behind the `jwt` feature. `lvqr-ingest`
+   gained `IngestProtocol` + an `RtmpIngest` adapter. `lvqr-relay` gained
+   a mirror `RelayProtocol` trait. The object-safety mock test that the
+   audit flagged as theatrical is gone.
+6. **Real RTMP to WS E2E test.** `crates/lvqr-cli/tests/rtmp_ws_e2e.rs`
+   drives a real rml_rtmp publisher through the bridge, subscribes via a
+   real tokio-tungstenite WebSocket client, and asserts both an init
+   segment (`ftyp`) and a media segment (`moof`) arrive over the wire.
+   Zero mocks, zero helper-in-isolation assertions.
+
+## Breaking Changes vs 0.3.1
+
+- **WS auth transport**: prefer `Sec-WebSocket-Protocol: lvqr.bearer.<token>`
+  over `?token=`. The query-string form still works but logs a deprecation
+  warning and is scheduled for removal in a future release.
+- **Recorder eligibility**: anything ingested over WebSocket is now recorded
+  when `--record-dir` is set; previously only RTMP-ingested streams were.
+
+## Next Up: Tier 1 (Test Infrastructure)
+
+Per the roadmap, Tier 0 unblocks Tier 1: build the reference fixture corpus,
+proptest harnesses, cargo-fuzz targets, testcontainers fixtures, playwright
+E2E, ffprobe validation in CI, and the MediaMTX comparison harness. The
+load-bearing architectural call after that (Tier 2) is the Unified Fragment
+Model in `crates/lvqr-fragment/` and the `lvqr-moq` facade crate -- do NOT
+add new protocol code before those two land.
+
+The audit reorders two Tier 1 items:
+
+1. The MediaMTX cross-implementation comparison harness graduates to a
+   first-day CI requirement for Tier 2.5 (LL-HLS) rather than a late
+   Tier 1 add-on. Bake it into `lvqr-conformance` during Tier 1 so
+   Tier 2.5 does not have to build it later.
+2. `lvqr-conformance` and the proptest/cargo-fuzz harnesses ship before
+   `lvqr-chaos`. Chaos testing is valuable but does not block Tier 2
+   the way the conformance corpus does.
+
+## End-to-End Pipeline (Proven Working)
 
 ## End-to-End Pipeline (Proven Working)
 

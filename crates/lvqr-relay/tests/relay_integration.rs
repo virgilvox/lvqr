@@ -23,7 +23,11 @@ async fn publish_subscribe_single_track() {
 
     // Run the relay in the background
     let relay_origin = relay.origin().clone();
-    let relay_handle = tokio::spawn(async move { relay.accept_loop(&mut server).await });
+    let relay_handle = tokio::spawn(async move {
+        relay
+            .accept_loop(&mut server, tokio_util::sync::CancellationToken::new())
+            .await
+    });
 
     // -- Publisher side --
     // Create a broadcast with a video track and write data to it
@@ -118,7 +122,11 @@ async fn fanout_multiple_subscribers() {
     let (mut server, relay_addr) = relay.init_server().expect("failed to init relay server");
 
     let relay_origin = relay.origin().clone();
-    let relay_handle = tokio::spawn(async move { relay.accept_loop(&mut server).await });
+    let relay_handle = tokio::spawn(async move {
+        relay
+            .accept_loop(&mut server, tokio_util::sync::CancellationToken::new())
+            .await
+    });
 
     // Publish a broadcast with known data
     let mut broadcast = relay_origin
@@ -208,7 +216,11 @@ async fn relay_metrics() {
 
     assert_eq!(metrics.connections_total.load(std::sync::atomic::Ordering::Relaxed), 0);
 
-    let relay_handle = tokio::spawn(async move { relay.accept_loop(&mut server).await });
+    let relay_handle = tokio::spawn(async move {
+        relay
+            .accept_loop(&mut server, tokio_util::sync::CancellationToken::new())
+            .await
+    });
 
     // Connect a client
     let sub_origin = Origin::produce();
@@ -265,7 +277,11 @@ async fn connection_callback() {
         }
     }));
 
-    let relay_handle = tokio::spawn(async move { relay.accept_loop(&mut server).await });
+    let relay_handle = tokio::spawn(async move {
+        relay
+            .accept_loop(&mut server, tokio_util::sync::CancellationToken::new())
+            .await
+    });
 
     // Connect a client
     let sub_origin = Origin::produce();
@@ -290,4 +306,32 @@ async fn connection_callback() {
     assert_eq!(disconnects.load(std::sync::atomic::Ordering::Relaxed), 1);
 
     relay_handle.abort();
+}
+
+/// Verify that cancelling the shutdown token causes accept_loop to return cleanly.
+#[tokio::test]
+async fn shutdown_token_stops_accept_loop() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("lvqr=debug")
+        .with_test_writer()
+        .try_init();
+
+    let relay_config = lvqr_relay::RelayConfig::new("[::]:0".parse().unwrap());
+    let relay = lvqr_relay::RelayServer::new(relay_config);
+    let (mut server, _addr) = relay.init_server().expect("failed to init relay server");
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+    let relay_handle = tokio::spawn(async move { relay.accept_loop(&mut server, shutdown_clone).await });
+
+    // Let it start
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Cancel and expect the loop to return promptly
+    shutdown.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), relay_handle)
+        .await
+        .expect("relay did not shut down within 2 seconds");
+    assert!(result.is_ok(), "relay task panicked");
+    assert!(result.unwrap().is_ok(), "accept_loop returned error");
 }

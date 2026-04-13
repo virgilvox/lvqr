@@ -8,8 +8,10 @@ use bytes::Bytes;
 /// H.264 codec configuration extracted from an FLV AVC sequence header.
 #[derive(Debug, Clone)]
 pub struct VideoConfig {
-    pub sps: Vec<u8>,
-    pub pps: Vec<u8>,
+    /// All SPS NALUs from the AVCC record. Typically one entry.
+    pub sps_list: Vec<Vec<u8>>,
+    /// All PPS NALUs from the AVCC record. Typically one entry.
+    pub pps_list: Vec<Vec<u8>>,
     pub profile: u8,
     pub compat: u8,
     pub level: u8,
@@ -18,6 +20,16 @@ pub struct VideoConfig {
 }
 
 impl VideoConfig {
+    /// Primary SPS (first entry, used for codec detection and resolution).
+    pub fn sps(&self) -> &[u8] {
+        &self.sps_list[0]
+    }
+
+    /// Primary PPS (first entry).
+    pub fn pps(&self) -> &[u8] {
+        &self.pps_list[0]
+    }
+
     /// Generate the codec string for MSE (e.g. "avc1.64001F").
     pub fn codec_string(&self) -> String {
         format!("avc1.{:02X}{:02X}{:02X}", self.profile, self.compat, self.level)
@@ -69,6 +81,28 @@ pub enum FlvAudioTag {
     RawAac(Bytes),
     /// Non-AAC codec or unrecognized data.
     Unknown,
+}
+
+/// Extract pixel dimensions from an SPS NALU using h264-reader.
+///
+/// The SPS bytes should include the NAL header byte (typically 0x67).
+/// Returns (width, height) or None if parsing fails.
+pub fn extract_resolution(sps_nalu: &[u8]) -> Option<(u32, u32)> {
+    if sps_nalu.len() < 2 {
+        return None;
+    }
+    // SPS NALU from AVCC: first byte is NAL header (0x67), rest is SPS RBSP.
+    // Try decode_nal first (handles RBSP escape sequences), fall back to raw slice.
+    let rbsp_data;
+    let rbsp: &[u8] = match h264_reader::rbsp::decode_nal(sps_nalu) {
+        Ok(cow) => {
+            rbsp_data = cow;
+            &rbsp_data
+        }
+        Err(_) => &sps_nalu[1..], // skip NAL header, use raw bytes
+    };
+    let sps = h264_reader::nal::sps::SeqParameterSet::from_bits(h264_reader::rbsp::BitReader::new(rbsp)).ok()?;
+    sps.pixel_dimensions().ok()
 }
 
 /// Parse an FLV video tag body.
@@ -138,7 +172,7 @@ fn parse_avcc_record(data: &[u8]) -> Option<VideoConfig> {
     let num_sps = (data[5] & 0x1F) as usize; // lower 5 bits
     let mut offset = 6;
 
-    let mut sps = Vec::new();
+    let mut sps_list = Vec::with_capacity(num_sps);
     for _ in 0..num_sps {
         if offset + 2 > data.len() {
             return None;
@@ -148,7 +182,7 @@ fn parse_avcc_record(data: &[u8]) -> Option<VideoConfig> {
         if offset + sps_len > data.len() {
             return None;
         }
-        sps = data[offset..offset + sps_len].to_vec();
+        sps_list.push(data[offset..offset + sps_len].to_vec());
         offset += sps_len;
     }
 
@@ -158,7 +192,7 @@ fn parse_avcc_record(data: &[u8]) -> Option<VideoConfig> {
     let num_pps = data[offset] as usize;
     offset += 1;
 
-    let mut pps = Vec::new();
+    let mut pps_list = Vec::with_capacity(num_pps);
     for _ in 0..num_pps {
         if offset + 2 > data.len() {
             return None;
@@ -168,17 +202,17 @@ fn parse_avcc_record(data: &[u8]) -> Option<VideoConfig> {
         if offset + pps_len > data.len() {
             return None;
         }
-        pps = data[offset..offset + pps_len].to_vec();
+        pps_list.push(data[offset..offset + pps_len].to_vec());
         offset += pps_len;
     }
 
-    if sps.is_empty() || pps.is_empty() {
+    if sps_list.is_empty() || pps_list.is_empty() {
         return None;
     }
 
     Some(VideoConfig {
-        sps,
-        pps,
+        sps_list,
+        pps_list,
         profile,
         compat,
         level,
@@ -327,8 +361,8 @@ mod tests {
                 assert_eq!(config.compat, 0x00);
                 assert_eq!(config.level, 0x1F);
                 assert_eq!(config.nalu_length_size, 4);
-                assert_eq!(config.sps, sps);
-                assert_eq!(config.pps, pps);
+                assert_eq!(config.sps(), sps);
+                assert_eq!(config.pps(), pps);
                 assert_eq!(config.codec_string(), "avc1.64001F");
             }
             other => panic!("expected SequenceHeader, got {other:?}"),
@@ -462,5 +496,23 @@ mod tests {
             }
             other => panic!("expected Nalu, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn extract_resolution_from_known_sps() {
+        // SPS NALU for 64x64 (from h264-reader test suite)
+        // NAL header 0x67 (type 7 = SPS), then SPS RBSP data
+        let sps = vec![
+            0x67, 0x64, 0x00, 0x0A, 0xAC, 0x72, 0x84, 0x44, 0x26, 0x84, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0xCA,
+            0x3C, 0x48, 0x96, 0x11, 0x80,
+        ];
+        let dims = extract_resolution(&sps);
+        assert_eq!(dims, Some((64, 64)));
+    }
+
+    #[test]
+    fn extract_resolution_returns_none_for_garbage() {
+        assert_eq!(extract_resolution(&[]), None);
+        assert_eq!(extract_resolution(&[0xFF, 0x00]), None);
     }
 }

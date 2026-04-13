@@ -13,6 +13,8 @@ export interface LvqrClientOptions {
   transport?: TransportType;
   /** SHA-256 fingerprint for self-signed certs (development). */
   fingerprint?: string;
+  /** Optional viewer token for relays that require authentication. */
+  token?: string;
 }
 
 export interface LvqrEvents {
@@ -116,26 +118,25 @@ export class LvqrClient {
       throw new Error('Not connected. Call connect() first.');
     }
 
-    if (this.moqSubscriber) {
-      // Default to video only. Audio requires a separate SourceBuffer in the player
-      // which isn't implemented yet. Pass ['0.mp4', '1.mp4'] to subscribe to both.
-      const trackNames = tracks ?? ['0.mp4'];
+    // Default: subscribe to video AND audio tracks. Pass an explicit list to
+    // override (e.g. ['0.mp4'] for video only).
+    const trackNames = tracks ?? ['0.mp4', '1.mp4'];
 
+    if (this.moqSubscriber) {
       for (const trackName of trackNames) {
         await this.moqSubscriber.subscribe(broadcast, trackName, (data) => {
           this.emit('frame', data, trackName);
         });
       }
     } else if (this.transport instanceof WebSocket) {
-      // WebSocket fallback: reconnect to the broadcast-specific WS endpoint
-      // The server's /ws/{broadcast} endpoint sends fMP4 frames as binary messages
+      // WebSocket fallback: reconnect to the broadcast-specific WS endpoint.
+      // The server's /ws/{broadcast} endpoint sends fMP4 frames as binary
+      // messages prefixed with a 1-byte track ID (0=video, 1=audio).
       const ws = this.transport;
       ws.close(); // close the generic connection
 
-      const wsUrl = this.url
-        .replace(/^https:/, 'wss:')
-        .replace(/^http:/, 'ws:');
-      await this.connectWebSocketBroadcast(`${wsUrl}/ws/${broadcast}`);
+      const wsBase = this.url.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:');
+      await this.connectWebSocketBroadcast(`${wsBase}/ws/${broadcast}`);
     }
   }
 
@@ -209,17 +210,34 @@ export class LvqrClient {
       };
 
       ws.onmessage = (event) => {
-        if (event.data instanceof ArrayBuffer) {
-          this.emit('frame', new Uint8Array(event.data), '0.mp4');
+        if (event.data instanceof ArrayBuffer && event.data.byteLength > 0) {
+          const view = new Uint8Array(event.data);
+          const trackId = view[0];
+          const payload = view.subarray(1);
+          const trackName = trackId === 1 ? '1.mp4' : '0.mp4';
+          this.emit('frame', payload, trackName);
         }
       };
     });
   }
 
-  /** Connect to a broadcast-specific WS endpoint that streams fMP4 frames. */
+  /** Connect to a broadcast-specific WS endpoint that streams fMP4 frames.
+   *
+   * Wire format: each binary message is `[u8 track_id][fMP4 payload]`,
+   * where track_id 0 is video (0.mp4) and track_id 1 is audio (1.mp4).
+   *
+   * If a token is configured, it is sent as a `Sec-WebSocket-Protocol`
+   * subprotocol in the form `lvqr.bearer.<token>`. The server parses the
+   * header, strips the prefix, and echoes the exact subprotocol back so the
+   * upgrade handshake completes. This keeps tokens out of request URLs and
+   * access logs.
+   */
   private async connectWebSocketBroadcast(url: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(url);
+      const protocols = this.options.token
+        ? [`lvqr.bearer.${this.options.token}`]
+        : undefined;
+      const ws = protocols ? new WebSocket(url, protocols) : new WebSocket(url);
       ws.binaryType = 'arraybuffer';
 
       ws.onopen = () => {
@@ -237,8 +255,12 @@ export class LvqrClient {
       };
 
       ws.onmessage = (event) => {
-        if (event.data instanceof ArrayBuffer) {
-          this.emit('frame', new Uint8Array(event.data), '0.mp4');
+        if (event.data instanceof ArrayBuffer && event.data.byteLength > 0) {
+          const view = new Uint8Array(event.data);
+          const trackId = view[0];
+          const payload = view.subarray(1);
+          const trackName = trackId === 1 ? '1.mp4' : '0.mp4';
+          this.emit('frame', payload, trackName);
         }
       };
     });

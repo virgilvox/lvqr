@@ -139,7 +139,7 @@
 
 <header>
   <h1>LVQR Test</h1>
-  <span id="version">v0.3.1</span>
+  <span id="version">v0.4-dev</span>
 </header>
 
 <nav>
@@ -161,6 +161,11 @@
       <label>Broadcast</label>
       <input id="watch-broadcast" value="live/webcam" placeholder="live/webcam">
     </div>
+  </div>
+
+  <div class="field">
+    <label>Subscribe Token (optional)</label>
+    <input id="watch-token" value="" placeholder="sent as Sec-WebSocket-Protocol: lvqr.bearer.TOKEN">
   </div>
 
   <div style="margin-bottom: 16px; display: flex; gap: 8px;">
@@ -188,6 +193,11 @@
       <label>Broadcast Name</label>
       <input id="stream-key" value="live/webcam" placeholder="live/webcam">
     </div>
+  </div>
+
+  <div class="field">
+    <label>Publish Token (optional)</label>
+    <input id="stream-token" value="" placeholder="sent as Sec-WebSocket-Protocol: lvqr.bearer.TOKEN">
   </div>
 
   <div class="row" style="margin-bottom: 16px;">
@@ -276,16 +286,21 @@ function setStatus(id, cls, msg) {
 }
 
 // =====================
-// WATCH (WebSocket fMP4)
+// WATCH (WebSocket fMP4, dual-track video+audio)
+//
+// Wire format: each binary message is `[u8 track_id][fMP4 payload]`,
+// where track_id 0 is video and track_id 1 is audio. Each track gets its own
+// MSE SourceBuffer.
 // =====================
 let watchWs = null;
 let watchMs = null;
-let watchSb = null;
-let watchQueue = [];
+// trackId -> { sourceBuffer, queue, initReceived }
+let watchBuffers = new Map();
 
 function startWatch() {
   const server = document.getElementById('watch-server').value;
   const broadcast = document.getElementById('watch-broadcast').value;
+  const token = document.getElementById('watch-token').value.trim();
   const url = server.replace(/^http/, 'ws') + '/ws/' + broadcast;
 
   stopWatch();
@@ -295,64 +310,74 @@ function startWatch() {
   const video = document.getElementById('watch-video');
   watchMs = new MediaSource();
   video.src = URL.createObjectURL(watchMs);
-  watchSb = null;
-  watchQueue = [];
+  watchBuffers = new Map();
 
   watchMs.addEventListener('sourceopen', () => {
     log('watch-log', 'MediaSource open');
   });
 
-  watchWs = new WebSocket(url);
+  // Tokens are sent via Sec-WebSocket-Protocol: lvqr.bearer.<token>
+  // so they never appear in access logs or referer headers.
+  const protocols = token ? ['lvqr.bearer.' + token] : undefined;
+  watchWs = protocols ? new WebSocket(url, protocols) : new WebSocket(url);
   watchWs.binaryType = 'arraybuffer';
 
   watchWs.onopen = () => {
-    setStatus('watch-status', 'ok', 'Connected. Waiting for video...');
+    setStatus('watch-status', 'ok', 'Connected. Waiting for media...');
     log('watch-log', 'WebSocket connected');
     document.getElementById('btn-watch').disabled = true;
     document.getElementById('btn-stop-watch').disabled = false;
   };
 
   watchWs.onmessage = (e) => {
-    const data = new Uint8Array(e.data);
-    const boxType = data.length > 8 ? String.fromCharCode(data[4], data[5], data[6], data[7]) : '??';
-    const hex = Array.from(data.slice(0, 16)).map(b => b.toString(16).padStart(2,'0')).join(' ');
-    if (boxType === 'ftyp') {
-      log('watch-log', '>>> INIT SEGMENT: ' + data.length + 'B [ftyp] ' + hex);
-    } else if (watchQueue.length < 5 || watchQueue.length % 30 === 0) {
-      log('watch-log', '#' + watchQueue.length + ' ' + data.length + 'B [' + boxType + '] ' + hex);
+    if (!(e.data instanceof ArrayBuffer) || e.data.byteLength < 1) return;
+    const view = new Uint8Array(e.data);
+    const trackId = view[0];
+    const data = view.subarray(1);
+
+    let buf = watchBuffers.get(trackId);
+    if (!buf) {
+      buf = { sourceBuffer: null, queue: [], initReceived: false };
+      watchBuffers.set(trackId, buf);
     }
 
-    // Detect init segment
-    if (!watchSb && data.length > 8 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
-      const codec = extractCodec(data);
-      const mime = `video/mp4; codecs="${codec}"`;
-      log('watch-log', 'init segment received, codec: ' + codec);
+    // Detect fMP4 init segment.
+    const isInit = data.length > 8 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70;
+    if (isInit && !buf.initReceived) {
+      buf.initReceived = true;
+      const mime = trackId === 1
+        ? 'audio/mp4; codecs="mp4a.40.2"'
+        : 'video/mp4; codecs="' + extractCodec(data) + '"';
+      log('watch-log', 'init segment track=' + trackId + ' (' + data.length + 'B) -> ' + mime);
+
+      const setup = () => {
+        try {
+          const sb = watchMs.addSourceBuffer(mime);
+          // Video tolerates non-monotonic DTS from browser encoders in
+          // `sequence` mode; audio MUST stay in default `segments` mode so
+          // the fMP4 baseMediaDecodeTime is honored and A/V stays in sync.
+          if (trackId === 0) {
+            sb.mode = 'sequence';
+          }
+          sb.addEventListener('updateend', () => flushWatchTrack(trackId));
+          sb.addEventListener('error', (ev) => log('watch-log', 'SourceBuffer error track=' + trackId + ': ' + ev));
+          buf.sourceBuffer = sb;
+          flushWatchTrack(trackId);
+        } catch (err) {
+          log('watch-log', 'addSourceBuffer failed track=' + trackId + ': ' + err);
+          setStatus('watch-status', 'err', 'MSE error: ' + err.message);
+        }
+      };
 
       if (watchMs.readyState === 'open') {
-        try {
-          log('watch-log', 'creating SourceBuffer: ' + mime);
-          watchSb = watchMs.addSourceBuffer(mime);
-          watchSb.mode = 'sequence';
-          watchSb.addEventListener('updateend', () => {
-            if (!watchSb) return;
-            log('watch-log', 'appendBuffer OK, buffered: ' + (watchSb.buffered.length > 0 ? watchSb.buffered.end(0).toFixed(2) + 's' : '0s'));
-            flushWatch();
-          });
-          watchSb.addEventListener('error', (e) => log('watch-log', 'SourceBuffer error event: ' + e));
-        } catch(err) {
-          log('watch-log', 'addSourceBuffer failed: ' + err);
-          setStatus('watch-status', 'err', 'MSE error: ' + err.message);
-          return;
-        }
+        setup();
+      } else {
+        watchMs.addEventListener('sourceopen', setup, { once: true });
       }
     }
 
-    if (data.length > 8 && data[4]===0x6D && data[5]===0x6F && data[6]===0x6F && data[7]===0x66) {
-      // moof - media segment, don't log every one
-    }
-
-    watchQueue.push(data);
-    flushWatch();
+    buf.queue.push(data);
+    flushWatchTrack(trackId);
   };
 
   watchWs.onerror = () => {
@@ -368,47 +393,48 @@ function startWatch() {
   };
 }
 
-function flushWatch() {
-  if (!watchSb || watchSb.updating || watchQueue.length === 0) return;
-  const data = watchQueue.shift();
+function flushWatchTrack(trackId) {
+  const buf = watchBuffers.get(trackId);
+  if (!buf || !buf.sourceBuffer || buf.sourceBuffer.updating || buf.queue.length === 0) return;
+  const data = buf.queue.shift();
   try {
-    watchSb.appendBuffer(data);
+    buf.sourceBuffer.appendBuffer(data);
     const video = document.getElementById('watch-video');
     if (video.paused && video.readyState >= 2) {
       video.play().catch(() => {});
       setStatus('watch-status', 'ok', 'Playing');
-      log('watch-log', 'playback started');
     }
-    // Chase the live edge: if we fall behind, jump forward
-    if (watchSb && watchSb.buffered.length > 0) {
-      const end = watchSb.buffered.end(watchSb.buffered.length - 1);
+    // Chase the live edge based on the video buffer (track 0).
+    if (trackId === 0 && buf.sourceBuffer.buffered.length > 0) {
+      const end = buf.sourceBuffer.buffered.end(buf.sourceBuffer.buffered.length - 1);
       if (end - video.currentTime > 0.5) {
         video.currentTime = end - 0.1;
       }
     }
-  } catch(e) {
-    if (e.name === 'QuotaExceededError') {
-      trimWatch();
-      watchQueue.unshift(data);
+  } catch (err) {
+    if (err.name === 'QuotaExceededError') {
+      trimWatchAll();
+      buf.queue.unshift(data);
     } else {
-      log('watch-log', 'appendBuffer error: ' + e);
+      log('watch-log', 'appendBuffer error track=' + trackId + ': ' + err);
     }
   }
 }
 
-function trimWatch() {
-  if (!watchSb || watchSb.updating) return;
-  const b = watchSb.buffered;
-  if (b.length > 0 && b.end(b.length-1) - b.start(0) > 10) {
-    try { watchSb.remove(b.start(0), b.end(b.length-1) - 10); } catch {}
+function trimWatchAll() {
+  for (const buf of watchBuffers.values()) {
+    if (!buf.sourceBuffer || buf.sourceBuffer.updating) continue;
+    const b = buf.sourceBuffer.buffered;
+    if (b.length > 0 && b.end(b.length-1) - b.start(0) > 10) {
+      try { buf.sourceBuffer.remove(b.start(0), b.end(b.length-1) - 10); } catch {}
+    }
   }
 }
 
 function stopWatch() {
   if (watchWs) { watchWs.close(); watchWs = null; }
   if (watchMs && watchMs.readyState === 'open') { try { watchMs.endOfStream(); } catch {} }
-  watchSb = null;
-  watchQueue = [];
+  watchBuffers = new Map();
   document.getElementById('btn-watch').disabled = false;
   document.getElementById('btn-stop-watch').disabled = true;
 }
@@ -482,14 +508,16 @@ async function startStream() {
 
   const server = document.getElementById('stream-server').value;
   const broadcast = document.getElementById('stream-key').value;
+  const token = document.getElementById('stream-token').value.trim();
   const wsUrl = server.replace(/^http/, 'ws') + '/ingest/' + broadcast;
   const [w, h] = document.getElementById('stream-res').value.split('x').map(Number);
 
   setStatus('stream-status', 'info', 'Connecting to ' + wsUrl);
   log('stream-log', 'connecting: ' + wsUrl);
 
-  // Open WebSocket to ingest endpoint
-  streamWs = new WebSocket(wsUrl);
+  // Token (if set) is sent as Sec-WebSocket-Protocol: lvqr.bearer.<token>.
+  const protocols = token ? ['lvqr.bearer.' + token] : undefined;
+  streamWs = protocols ? new WebSocket(wsUrl, protocols) : new WebSocket(wsUrl);
   streamWs.binaryType = 'arraybuffer';
 
   streamWs.onopen = () => {

@@ -34,8 +34,8 @@ mod tests {
     #[test]
     fn catalog_with_video_and_audio() {
         let video = VideoConfig {
-            sps: vec![0x67],
-            pps: vec![0x68],
+            sps_list: vec![vec![0x67]],
+            pps_list: vec![vec![0x68]],
             profile: 0x64,
             compat: 0x00,
             level: 0x1F,
@@ -58,8 +58,8 @@ mod tests {
     #[test]
     fn catalog_video_only() {
         let video = VideoConfig {
-            sps: vec![0x67],
-            pps: vec![0x68],
+            sps_list: vec![vec![0x67]],
+            pps_list: vec![vec![0x68]],
             profile: 0x42,
             compat: 0xC0,
             level: 0x1E,
