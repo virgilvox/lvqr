@@ -1,14 +1,74 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- WHEP video egress honest end-to-end
+## Project Status: v0.4-dev -- WHEP video E2E + Tier 2.4 archive index open
 
-**Last Updated**: 2026-04-14 (session 22 close)
+**Last Updated**: 2026-04-14 (session 23 close)
 **Tests**: `cargo test --workspace` green under the default feature
-set: 70 test binaries, 276+ individual tests passing, 1 doctest
+set: 72 test binaries, 296+ individual tests passing, 1 doctest
 marked `ignore` (a non-runnable doc example in
 `lvqr-fragment/src/moq_sink.rs:39`), 0 failures. `cargo clippy
 --workspace --all-targets -- -D warnings` clean. `cargo fmt --all
 --check` clean.
+
+## Session 23 (2026-04-14): Tier 2.4 start -- lvqr-archive segment index
+
+One commit on top of session 22's baseline. Opened Tier 2.4 by
+landing the load-bearing primitive every DVR feature will build
+on: a redb-backed segment index that answers "give me every
+segment for (broadcast, track) whose decode extent overlaps
+[query_start, query_end)" in sorted order.
+
+### Commit
+
+* **c0d474f** -- New `crates/lvqr-archive/` crate. `SegmentRef`
+  value type (broadcast, track, segment_seq, start_dts, end_dts,
+  timescale, keyframe_start, byte_offset, length, path).
+  `SegmentIndex` trait with `record`, `find_range`, `latest`.
+  `RedbSegmentIndex` impl using redb 2.6 with a hand-rolled
+  compound key layout ([broadcast_len u16_be][broadcast]
+  [track_len u16_be][track][start_dts u64_be]) so byte order
+  equals numeric order within a (broadcast, track) prefix and
+  range scans hit a single contiguous sweep. Value body is a
+  hand-rolled binary format to avoid pulling bincode or postcard
+  into the workspace. 20 unit tests covering round-trip
+  encoding, rejection of corrupt / truncated / oversized inputs,
+  key ordering within and across streams, range lookup with
+  leading-segment inclusion when the query window starts inside
+  a segment, track/broadcast boundary isolation, database reopen
+  persistence, and duplicate-key idempotent overwrite.
+
+### Scope deliberately kept out of this session
+
+* **Writer integration**. `lvqr-record` still writes segments
+  without populating the index. The next session wires the
+  `FragmentObserver::on_fragment` hook on the bridge to emit
+  `SegmentRef` rows alongside the existing segment writes.
+* **HTTP playback endpoint**. The `GET /playback/{broadcast}?
+  from=&to=` surface is a follow-up once the writer integration
+  has populated real rows.
+* **Rotation / compaction / S3 upload / cross-node replication**.
+  All follow-ups once the data model survives the writer
+  integration.
+
+### Recommended entry point (session 24)
+
+1. **Writer integration**: extend `lvqr-record` or add an
+   `IndexingFragmentObserver` in `lvqr-cli` that reads
+   `FragmentObserver::on_fragment` and calls
+   `RedbSegmentIndex::record` with the segment's filesystem path,
+   dts range, and keyframe status. Load-bearing question: does
+   `lvqr_fragment::Fragment` already carry the start_dts +
+   end_dts of its samples, or does the coalescer need to surface
+   them on the observer API? Budget: one session.
+2. **HTTP playback endpoint** landing on the existing admin
+   axum router: `GET /playback/{broadcast}?from={dts}&to={dts}`
+   returning JSON `[SegmentRef, ...]` or an LL-HLS playlist
+   window over the matched segments. Budget: one session.
+3. Continue with the remaining three highest-leverage items from
+   the session-22 maturity report: HEVC+Opus end-to-end through
+   the bridge, WHIP ingest, and DASH egress.
+
+
 
 ## Session 22 (2026-04-14): str0m-backed WHEP end-to-end
 
