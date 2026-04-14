@@ -291,24 +291,34 @@ async fn handle_uri(
 }
 
 // =====================================================================
-// MultiHlsServer: per-broadcast LL-HLS fan-out.
+// MultiHlsServer: per-broadcast, per-track LL-HLS fan-out.
 // =====================================================================
 
-/// Multi-broadcast LL-HLS server.
+/// Multi-broadcast LL-HLS server with per-broadcast video + audio
+/// renditions.
 ///
-/// Wraps a map of broadcast name -> [`HlsServer`] so that a single axum
-/// router can serve `/hls/{broadcast}/playlist.m3u8` for many parallel
+/// Wraps a map of broadcast name -> [`BroadcastEntry`] so that a single
+/// axum router can serve `/hls/{broadcast}/playlist.m3u8` (video),
+/// `/hls/{broadcast}/audio.m3u8` (audio, when present), and a
+/// synthesized `/hls/{broadcast}/master.m3u8` for many parallel
 /// broadcasts. The producer side creates per-broadcast state on demand
-/// via [`MultiHlsServer::ensure_broadcast`]; the consumer side looks up
-/// existing state via [`MultiHlsServer::get_broadcast`] and returns
-/// `404` for broadcasts that have not published anything yet.
+/// via [`MultiHlsServer::ensure_video`] and [`MultiHlsServer::ensure_audio`];
+/// the consumer side looks up existing state via
+/// [`MultiHlsServer::video`] / [`MultiHlsServer::audio`] and returns
+/// `404` for broadcasts or renditions that have not published anything
+/// yet.
+///
+/// Session 13 scope: one video and (optionally) one audio rendition
+/// per broadcast. Multi-variant video ladders land when a real
+/// transcoder is wired in; for now the master playlist declares one
+/// video variant with an optional audio rendition group reference.
 ///
 /// The routed path is a single catch-all (`/hls/{*path}`) because
 /// broadcast names legitimately contain slashes today -- the RTMP
 /// bridge names broadcasts `{app}/{key}` (for example `live/test`) --
 /// so a simple `/hls/{broadcast}/...` pattern would not capture them.
-/// The handler splits the tail off and treats the remainder as the
-/// broadcast key.
+/// The handler splits the tail off and matches on the filename to
+/// dispatch between video and audio renditions.
 #[derive(Debug, Clone)]
 pub struct MultiHlsServer {
     inner: Arc<MultiHlsState>,
@@ -317,13 +327,27 @@ pub struct MultiHlsServer {
 #[derive(Debug)]
 struct MultiHlsState {
     config: PlaylistBuilderConfig,
-    broadcasts: std::sync::Mutex<HashMap<String, HlsServer>>,
+    broadcasts: std::sync::Mutex<HashMap<String, BroadcastEntry>>,
+}
+
+/// Per-broadcast state tracked by [`MultiHlsServer`].
+///
+/// Video is always present (broadcasts are created on the first
+/// `ensure_video` call); audio is optional and appears once
+/// `ensure_audio` is called for the same broadcast name.
+#[derive(Debug, Clone)]
+struct BroadcastEntry {
+    video: HlsServer,
+    audio: Option<HlsServer>,
 }
 
 impl MultiHlsServer {
     /// Build a new multi-broadcast server. `config` is used as the
-    /// template `PlaylistBuilderConfig` for every broadcast created
-    /// on the fly by [`Self::ensure_broadcast`].
+    /// template `PlaylistBuilderConfig` for every video rendition
+    /// created on the fly by [`Self::ensure_video`]. The audio
+    /// renditions use a derived config with a different `map_uri`
+    /// and `uri_prefix` so video and audio chunks never collide in
+    /// the cache.
     pub fn new(config: PlaylistBuilderConfig) -> Self {
         Self {
             inner: Arc::new(MultiHlsState {
@@ -333,37 +357,77 @@ impl MultiHlsServer {
         }
     }
 
-    /// Producer-side entry point. Returns a cheap clone of the
-    /// per-broadcast [`HlsServer`], creating one if this is the first
-    /// time `broadcast` has been seen.
-    pub fn ensure_broadcast(&self, broadcast: &str) -> HlsServer {
+    /// Producer-side entry point for the video rendition of
+    /// `broadcast`. Returns a cheap clone of the per-broadcast
+    /// video [`HlsServer`], creating the broadcast entry if this is
+    /// the first time it has been seen.
+    pub fn ensure_video(&self, broadcast: &str) -> HlsServer {
         let mut map = self
             .inner
             .broadcasts
             .lock()
             .expect("multi hls broadcasts mutex poisoned");
         if let Some(existing) = map.get(broadcast) {
-            return existing.clone();
+            return existing.video.clone();
         }
-        let server = HlsServer::new(self.inner.config.clone());
-        map.insert(broadcast.to_string(), server.clone());
-        server
+        let entry = BroadcastEntry {
+            video: HlsServer::new(self.inner.config.clone()),
+            audio: None,
+        };
+        let video = entry.video.clone();
+        map.insert(broadcast.to_string(), entry);
+        video
     }
 
-    /// Consumer-side lookup. Returns `None` when the broadcast has
-    /// never been announced by a producer. Used by HTTP handlers so
-    /// an unknown broadcast becomes a 404 instead of an empty-playlist
-    /// 200.
-    pub fn get_broadcast(&self, broadcast: &str) -> Option<HlsServer> {
+    /// Producer-side entry point for the audio rendition of
+    /// `broadcast`. Returns a cheap clone of the per-broadcast
+    /// audio [`HlsServer`], creating both the broadcast entry and
+    /// the audio rendition if either does not yet exist. Audio
+    /// renditions are configured with a distinct init-segment URI
+    /// (`audio-init.mp4`) and chunk URI prefix (`audio-`) so they
+    /// never collide with the video rendition's cache.
+    pub fn ensure_audio(&self, broadcast: &str) -> HlsServer {
+        let mut map = self
+            .inner
+            .broadcasts
+            .lock()
+            .expect("multi hls broadcasts mutex poisoned");
+        let entry = map.entry(broadcast.to_string()).or_insert_with(|| BroadcastEntry {
+            video: HlsServer::new(self.inner.config.clone()),
+            audio: None,
+        });
+        if entry.audio.is_none() {
+            entry.audio = Some(HlsServer::new(audio_config_from(&self.inner.config)));
+        }
+        entry.audio.clone().expect("audio just assigned")
+    }
+
+    /// Consumer-side lookup for the video rendition of `broadcast`.
+    /// Returns `None` when the broadcast has never been announced.
+    pub fn video(&self, broadcast: &str) -> Option<HlsServer> {
         self.inner
             .broadcasts
             .lock()
             .expect("multi hls broadcasts mutex poisoned")
             .get(broadcast)
-            .cloned()
+            .map(|e| e.video.clone())
     }
 
-    /// Number of broadcasts currently tracked. Test-oriented.
+    /// Consumer-side lookup for the audio rendition of `broadcast`.
+    /// Returns `None` when the broadcast has no audio rendition
+    /// (either the broadcast is unknown or only video has been
+    /// published so far).
+    pub fn audio(&self, broadcast: &str) -> Option<HlsServer> {
+        self.inner
+            .broadcasts
+            .lock()
+            .expect("multi hls broadcasts mutex poisoned")
+            .get(broadcast)
+            .and_then(|e| e.audio.clone())
+    }
+
+    /// Number of broadcasts currently tracked (regardless of how
+    /// many renditions each broadcast has). Test-oriented.
     pub fn broadcast_count(&self) -> usize {
         self.inner
             .broadcasts
@@ -373,8 +437,20 @@ impl MultiHlsServer {
     }
 
     /// Build an `axum::Router` that serves every tracked broadcast
-    /// under `/hls/{broadcast}/...`. The router has no middleware and
-    /// no auth; both are the responsibility of the composing binary.
+    /// under `/hls/{broadcast}/...`. Routes:
+    ///
+    /// * `/hls/{broadcast}/master.m3u8` -- synthesized master
+    ///   playlist; 404 if the broadcast has no video yet, audio
+    ///   rendition is included only when the broadcast has called
+    ///   `ensure_audio`.
+    /// * `/hls/{broadcast}/playlist.m3u8` -- video media playlist.
+    /// * `/hls/{broadcast}/init.mp4` -- video init segment.
+    /// * `/hls/{broadcast}/audio.m3u8` -- audio media playlist.
+    /// * `/hls/{broadcast}/audio-init.mp4` -- audio init segment.
+    /// * `/hls/{broadcast}/audio-<uri>` -- audio chunk (matched by
+    ///   the `audio-` prefix that `audio_config_from` installs on
+    ///   the audio [`PlaylistBuilderConfig`]).
+    /// * `/hls/{broadcast}/<uri>` -- video chunk (everything else).
     pub fn router(&self) -> Router {
         Router::new()
             .route(&format!("{MULTI_HLS_PREFIX}/{{*path}}"), get(handle_multi_get))
@@ -382,10 +458,27 @@ impl MultiHlsServer {
     }
 }
 
+/// Derive an audio-rendition [`PlaylistBuilderConfig`] from the
+/// video template. Uses the video template's timing parameters but
+/// swaps the `map_uri`, `uri_prefix`, and timescale to values
+/// appropriate for a 48 kHz AAC track. Session 13 hardcodes 48 kHz;
+/// later sessions will read the real sample rate from the
+/// producer-supplied [`lvqr_cmaf::RawSample`] metadata.
+fn audio_config_from(video: &PlaylistBuilderConfig) -> PlaylistBuilderConfig {
+    PlaylistBuilderConfig {
+        timescale: 48_000,
+        starting_sequence: video.starting_sequence,
+        map_uri: "audio-init.mp4".into(),
+        uri_prefix: "audio-".into(),
+        target_duration_secs: video.target_duration_secs,
+        part_target_secs: video.part_target_secs,
+    }
+}
+
 /// Split an `/hls/{broadcast}/<tail>` catch-all capture into
-/// `(broadcast, tail)` where `tail` is one of `playlist.m3u8`,
-/// `init.mp4`, or a chunk URI. The broadcast is everything before the
-/// final `/`.
+/// `(broadcast, tail)` where `tail` is one of `master.m3u8`,
+/// `playlist.m3u8`, `init.mp4`, `audio.m3u8`, `audio-init.mp4`, or
+/// a chunk URI. The broadcast is everything before the final `/`.
 fn split_broadcast_path(path: &str) -> Option<(&str, &str)> {
     let idx = path.rfind('/')?;
     if idx == 0 {
@@ -407,15 +500,64 @@ async fn handle_multi_get(
     let Some((broadcast, tail)) = split_broadcast_path(&path) else {
         return (StatusCode::NOT_FOUND, "malformed hls path").into_response();
     };
-    let Some(server) = multi.get_broadcast(broadcast) else {
-        return (StatusCode::NOT_FOUND, format!("unknown broadcast {broadcast}")).into_response();
+    if tail == "master.m3u8" {
+        return handle_master_playlist(&multi, broadcast).await;
+    }
+    let video = multi.video(broadcast);
+    let audio = multi.audio(broadcast);
+    let (server_opt, video_uri): (Option<HlsServer>, bool) = match tail {
+        "playlist.m3u8" | "init.mp4" => (video, true),
+        "audio.m3u8" | "audio-init.mp4" => (audio, false),
+        other if other.starts_with("audio-") => (audio, false),
+        _ => (video, true),
+    };
+    let Some(server) = server_opt else {
+        let which = if video_uri { "video" } else { "audio" };
+        return (
+            StatusCode::NOT_FOUND,
+            format!("unknown {which} rendition for broadcast {broadcast}"),
+        )
+            .into_response();
     };
     let state = server.state.clone();
     match tail {
-        "playlist.m3u8" => render_playlist(&state, q.hls_msn, q.hls_part).await,
-        "init.mp4" => render_init(&state).await,
+        "playlist.m3u8" | "audio.m3u8" => render_playlist(&state, q.hls_msn, q.hls_part).await,
+        "init.mp4" | "audio-init.mp4" => render_init(&state).await,
         other => render_uri(&state, other).await,
     }
+}
+
+async fn handle_master_playlist(multi: &MultiHlsServer, broadcast: &str) -> Response {
+    if multi.video(broadcast).is_none() {
+        return (StatusCode::NOT_FOUND, format!("unknown broadcast {broadcast}")).into_response();
+    }
+    let mut master = crate::master::MasterPlaylist::default();
+    let audio_group_id = "audio";
+    if multi.audio(broadcast).is_some() {
+        master.renditions.push(crate::master::MediaRendition {
+            rendition_type: crate::master::MediaRenditionType::Audio,
+            group_id: audio_group_id.into(),
+            name: "default".into(),
+            uri: "audio.m3u8".into(),
+            default: true,
+            autoselect: true,
+            language: None,
+        });
+    }
+    master.variants.push(crate::master::VariantStream {
+        // Session 13 ships no real bandwidth / codecs estimation;
+        // emit a plausible H.264 baseline + AAC-LC string plus a
+        // conservative bitrate so a player can pick the variant up
+        // without complaining. Real values will come from the
+        // producer-side catalog once the codec parsers land.
+        bandwidth_bps: 2_500_000,
+        codecs: "avc1.640020,mp4a.40.2".into(),
+        resolution: None,
+        audio_group: multi.audio(broadcast).is_some().then(|| audio_group_id.to_string()),
+        uri: "playlist.m3u8".into(),
+    });
+    let body = master.render();
+    ([(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")], body).into_response()
 }
 
 #[cfg(test)]

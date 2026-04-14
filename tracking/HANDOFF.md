@@ -1,10 +1,10 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.3 multi-broadcast LL-HLS + cmaf-writer default
+## Project Status: v0.4-dev -- Tier 2.3 audio rendition group in LL-HLS
 
-**Last Updated**: 2026-04-13 (session 12.2 close)
-**Tests**: workspace-wide `cargo test --workspace` green under the
-new default (cmaf-writer on): 66 test binaries, 0 failures.
+**Last Updated**: 2026-04-13 (session 13 close)
+**Tests**: `cargo test --workspace` green under the cmaf-writer
+default: 67 test binaries, 251 individual tests, 0 failures.
 `cargo test -p lvqr-cli --no-default-features --features
 rtmp,quinn-transport --test rtmp_hls_e2e --test rtmp_ws_e2e`
 green on the legacy hand-rolled fMP4 writer path.
@@ -12,6 +12,155 @@ green on the legacy hand-rolled fMP4 writer path.
 both the default and the `--no-default-features --features
 rtmp,quinn-transport` legacy configuration.
 `cargo fmt --all --check` clean.
+
+## Session 13 (2026-04-13): audio rendition group + master playlist
+
+Session 13 closed item 2 from the session-11 work list: audio
+rendition group in HLS, including the master-playlist generation
+that was its prerequisite. Five files touched (one new):
+
+1. **`crates/lvqr-hls/src/master.rs`** (new). Pure-library
+   `MasterPlaylist` + `VariantStream` + `MediaRendition` +
+   `MediaRenditionType` types and a `render()` method that emits a
+   minimal HLS multivariant playlist: `#EXTM3U`, `#EXT-X-VERSION:9`,
+   `#EXT-X-INDEPENDENT-SEGMENTS`, one `#EXT-X-MEDIA` per rendition,
+   and one `#EXT-X-STREAM-INF` (with optional `RESOLUTION` and
+   `AUDIO=` attributes) followed by the variant URI per variant.
+   Six unit tests cover the empty case, the single-rendition audio
+   case, language attribute presence/absence, and variant lines
+   without an audio group or a resolution. Exported from
+   `lvqr_hls::lib` alongside the existing media-playlist exports.
+
+2. **`crates/lvqr-hls/src/server.rs`**. `MultiHlsServer` was
+   single-rendition per broadcast (one `HlsServer` per broadcast
+   key); session 13 turned the inner map into `HashMap<String,
+   BroadcastEntry>` where `BroadcastEntry { video: HlsServer,
+   audio: Option<HlsServer> }`. The session-12 `ensure_broadcast` /
+   `get_broadcast` API renamed to `ensure_video` / `video`; new
+   `ensure_audio` / `audio` accessors create the audio rendition on
+   demand using a derived `audio_config_from(template)` that swaps
+   the timescale to 48 kHz, the `map_uri` to `audio-init.mp4`, and
+   the `uri_prefix` to `audio-` so audio chunks never collide with
+   video chunks in either the cache or the wire. The
+   `/hls/{*path}` catch-all dispatch now matches `master.m3u8`
+   (synthesizes a master playlist, including the audio rendition
+   declaration when the broadcast has called `ensure_audio`),
+   `audio.m3u8` and `audio-init.mp4` (audio HlsServer's playlist
+   and init), URIs prefixed `audio-` (audio HlsServer's chunk
+   cache), and falls through to the video HlsServer for everything
+   else. The session-12 video routes (`playlist.m3u8`, `init.mp4`,
+   chunk URIs) are unchanged. Unknown broadcasts and unknown audio
+   renditions return 404 instead of empty 200s. The session-12
+   `rtmp_hls_e2e.rs` test still passes against the renamed API.
+
+3. **`crates/lvqr-cli/src/hls.rs`**. `HlsFragmentBridge` now keeps
+   two policy state maps (video keyed by broadcast, audio keyed by
+   broadcast) and dispatches fragments by track id: video samples
+   (`0.mp4`) go to `multi.ensure_video(broadcast)` with the
+   `VIDEO_90KHZ_DEFAULT` policy, audio samples (`1.mp4`) go to
+   `multi.ensure_audio(broadcast)` with the `AUDIO_48KHZ_DEFAULT`
+   policy. Tracks other than `0.mp4` and `1.mp4` are still
+   ignored. The `dispatch_init` / `dispatch_chunk` /
+   `classify` / `reset` helpers are factored out so the video and
+   audio code paths share the same Tokio task-spawning shape.
+
+4. **`crates/lvqr-hls/tests/integration_master.rs`** (new). Three
+   integration tests driving `MultiHlsServer::router` via
+   `tower::ServiceExt::oneshot`:
+
+   * `master_playlist_includes_audio_rendition_when_both_tracks_present`:
+     pushes a video init + segment chunk and an audio init +
+     segment chunk into a `live/test` broadcast, fetches
+     `/hls/live/test/master.m3u8` and asserts it contains the
+     audio `EXT-X-MEDIA` line, an `EXT-X-STREAM-INF` line with
+     `AUDIO="audio"`, and the variant URI on the next line. Also
+     fetches `/hls/live/test/playlist.m3u8`, `/hls/live/test/audio.m3u8`,
+     `/hls/live/test/init.mp4`, and `/hls/live/test/audio-init.mp4`
+     and asserts each is served correctly with the right body and
+     `Content-Type`.
+   * `master_playlist_omits_audio_when_only_video_has_published`:
+     same flow but only video is published. Master playlist must
+     not contain `EXT-X-MEDIA` or `AUDIO=`. The audio playlist
+     and audio init both 404.
+   * `master_playlist_returns_404_for_unknown_broadcast`: the
+     happy-path 404 case for a broadcast that has no renditions
+     at all.
+
+5. **`crates/lvqr-hls/src/lib.rs`**. New `master` module exported
+   alongside the existing `manifest` and `server` modules.
+
+### Verification run
+
+* `cargo test --workspace` -- 67 binaries, 251 individual tests,
+  0 failures. The new binary is `integration_master` (3 tests);
+  the other 6 new tests are the `master::tests` unit tests in
+  `lvqr-hls`'s lib binary.
+* `cargo test -p lvqr-cli --no-default-features --features
+  rtmp,quinn-transport --test rtmp_hls_e2e --test rtmp_ws_e2e` --
+  both legacy-path E2E tests still green.
+* `cargo clippy --workspace --all-targets -- -D warnings` clean
+  under default.
+* `cargo clippy -p lvqr-cli --no-default-features --features
+  rtmp,quinn-transport --all-targets -- -D warnings` clean under
+  the legacy fMP4 path.
+* `cargo fmt --all --check` clean.
+
+### What session 13 did NOT land
+
+* **Audio in the RTMP-driven E2E test**. The
+  `rtmp_hls_e2e.rs` test still publishes video only. Extending
+  it to publish FLV audio requires AAC sequence-header plumbing
+  and an audio-aware FLV fixture. The audio bridge code path is
+  exercised by the new `integration_master.rs` test through the
+  `MultiHlsServer` API directly. A full RTMP-publish-with-audio
+  E2E lands in a later session, ideally bundled with the
+  `rtmp_ws_e2e.rs` audio extension that the WS handler already
+  expects.
+* **Real bandwidth and resolution in the master playlist**.
+  Session 13 emits a hardcoded `BANDWIDTH=2500000`,
+  `CODECS="avc1.640020,mp4a.40.2"`, no `RESOLUTION`. Real values
+  will come from the producer-side catalog once the codec
+  parsers feed back into the bridge -- tracked as part of the
+  Tier 2.2 codec wiring.
+* **Per-rendition mediastreamvalidator coverage**. The
+  `lvqr-hls` conformance slot still soft-skips when Apple's
+  `mediastreamvalidator` is not on PATH. Adding a master-playlist
+  conformance test is a follow-up once the validator is
+  installed in CI.
+* **Deletion of the hand-rolled fMP4 writer**. Session 12.2 set
+  the `legacy-fmp4` marker and flipped the default; deletion is
+  still a session 14 candidate (the cmaf-writer matrix has now
+  been green on main for one session of additions on top, which
+  is the soonest a "release cycle" can be argued).
+
+### Recommended entry point (session 14)
+
+The session-11 work list is now closed apart from item 3 (WHEP).
+The natural session-14 picks:
+
+1. **Delete the hand-rolled fMP4 writer behind `legacy-fmp4`**.
+   Removes `lvqr_ingest::remux::fmp4::video_segment` plus its
+   unit tests, the golden tests at `tests/golden_fmp4.rs` that
+   reference it, the proptest target at
+   `tests/proptest_parsers.rs::video_segment_is_well_formed`,
+   the parity tests at `tests/parity_avc_segment.rs` +
+   `tests/parity_avc_init.rs`, the `legacy-fmp4` feature on
+   `lvqr-ingest/Cargo.toml`, and the `test-legacy-fmp4-path`
+   CI job. Mechanical, half-session.
+2. **Begin `lvqr-whep` implementation** (was item 3). Needs a
+   `RawSampleObserver` hook on `RtmpMoqBridge` plus answers to
+   the four open questions in
+   `crates/lvqr-whep/docs/design.md`. Full session by itself.
+3. **Real RTMP-publish-with-audio E2E**. Extend
+   `rtmp_hls_e2e.rs` and `rtmp_ws_e2e.rs` to publish FLV audio
+   alongside the existing video sequence so the audio path
+   through the bridge gets covered end-to-end. Half-session
+   bundled with item 1.
+
+My recommendation: pair **(1) deletion + (3) audio E2E**. Both
+are mechanical, both compound the session 12 + 12.2 + 13 work
+into a coherent "Tier 2.3 closed" milestone. Item 2 (WHEP) is
+the right pick for session 15 once Tier 2.3 is fully closed.
 
 ## Session 12.2 (2026-04-13): `cmaf-writer` default-on + `legacy-fmp4` marker
 

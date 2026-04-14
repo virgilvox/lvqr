@@ -3,19 +3,17 @@
 //! This is the consumer side of the [`lvqr_ingest::FragmentObserver`]
 //! hook. The bridge in `lvqr-ingest` already produces `Fragment` values
 //! out of every RTMP publisher; the [`HlsFragmentBridge`] here observes
-//! those fragments, walks them through a per-broadcast [`CmafPolicyState`]
-//! to classify each chunk as a partial / partial-independent / segment
-//! boundary, and pushes the resulting [`CmafChunk`] into a shared
-//! [`MultiHlsServer`].
+//! those fragments, walks them through a per-broadcast / per-track
+//! [`CmafPolicyState`] to classify each chunk as a partial /
+//! partial-independent / segment boundary, and pushes the resulting
+//! [`CmafChunk`] into a shared [`MultiHlsServer`].
 //!
-//! Session 12 (multi-broadcast routing): the bridge now maintains one
-//! `CmafPolicyState` per observed broadcast, keyed by the broadcast name
-//! the ingest layer reports. Every broadcast that publishes a video track
-//! gets its own per-broadcast [`HlsServer`] inside the shared
-//! `MultiHlsServer`, and the axum router serves them at
-//! `/hls/{broadcast}/playlist.m3u8`. Audio is still ignored here; audio
-//! rendition groups land separately when `lvqr-hls` grows master-playlist
-//! support.
+//! Session 12 added per-broadcast routing so multiple concurrent
+//! broadcasts each get their own LL-HLS surface. Session 13 extends
+//! that to per-track audio renditions: audio fragments (`1.mp4`) are
+//! routed through `MultiHlsServer::ensure_audio` and the master
+//! playlist generated under `/hls/{broadcast}/master.m3u8` declares
+//! the audio rendition group when both tracks are present.
 //!
 //! The observer is invoked synchronously from the `rml_rtmp` callback
 //! path, but [`HlsServer::push_chunk_bytes`] is async. Each on_init /
@@ -25,27 +23,33 @@
 use bytes::Bytes;
 use lvqr_cmaf::{CmafChunk, CmafPolicy, CmafPolicyState};
 use lvqr_fragment::Fragment;
-use lvqr_hls::MultiHlsServer;
+use lvqr_hls::{HlsServer, MultiHlsServer};
 use lvqr_ingest::FragmentObserver;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tokio::runtime::Handle;
 
-/// Fans bridge-emitted fragments into a multi-broadcast LL-HLS server.
+const VIDEO_TRACK: &str = "0.mp4";
+const AUDIO_TRACK: &str = "1.mp4";
+
+/// Fans bridge-emitted fragments into a multi-broadcast / multi-track
+/// LL-HLS server.
 ///
 /// Construct one per `lvqr-cli` instance, hand it to the bridge via
 /// `RtmpMoqBridge::with_observer`, and clone the underlying
 /// [`MultiHlsServer`] into the axum router that serves
-/// `/hls/{broadcast}/playlist.m3u8`.
+/// `/hls/{broadcast}/playlist.m3u8` and `/hls/{broadcast}/audio.m3u8`.
 pub(crate) struct HlsFragmentBridge {
     multi: MultiHlsServer,
     /// Per-broadcast video policy state machines. Keyed on the
-    /// broadcast name the ingest layer reports. A fresh entry is
-    /// installed the first time a broadcast publishes its init
-    /// segment; a new init on the same broadcast resets the entry so
-    /// a republish (e.g. mid-stream codec change or RTMP reconnect)
-    /// starts cleanly.
+    /// broadcast name. A fresh entry is installed the first time a
+    /// broadcast publishes its video init segment; a new init on
+    /// the same broadcast resets the entry so a republish (e.g.
+    /// mid-stream codec change or RTMP reconnect) starts cleanly.
     video_states: Mutex<HashMap<String, CmafPolicyState>>,
+    /// Per-broadcast audio policy state machines. Same structure as
+    /// `video_states` but keyed on the audio track id.
+    audio_states: Mutex<HashMap<String, CmafPolicyState>>,
 }
 
 impl HlsFragmentBridge {
@@ -53,40 +57,29 @@ impl HlsFragmentBridge {
         Self {
             multi,
             video_states: Mutex::new(HashMap::new()),
+            audio_states: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Return the chunk classification for the next video fragment on
-    /// `broadcast`, installing a fresh `CmafPolicyState` if this is
-    /// the first fragment observed for that broadcast.
-    fn classify_video(&self, broadcast: &str, fragment: &Fragment) -> lvqr_cmaf::CmafChunkKind {
-        let mut states = self.video_states.lock().expect("hls bridge mutex poisoned");
-        let state = states
+    fn classify(
+        states: &Mutex<HashMap<String, CmafPolicyState>>,
+        policy: CmafPolicy,
+        broadcast: &str,
+        fragment: &Fragment,
+    ) -> lvqr_cmaf::CmafChunkKind {
+        let mut map = states.lock().expect("hls bridge mutex poisoned");
+        let state = map
             .entry(broadcast.to_string())
-            .or_insert_with(|| CmafPolicyState::new(CmafPolicy::VIDEO_90KHZ_DEFAULT));
+            .or_insert_with(|| CmafPolicyState::new(policy));
         state.step(fragment.flags.keyframe, fragment.dts).kind
     }
 
-    /// Reset the policy state for `broadcast` to a fresh
-    /// `VIDEO_90KHZ_DEFAULT` baseline. Called whenever a new init
-    /// segment lands so that a mid-stream codec change starts from a
-    /// clean slate.
-    fn reset_video_state(&self, broadcast: &str) {
-        let mut states = self.video_states.lock().expect("hls bridge mutex poisoned");
-        states.insert(
-            broadcast.to_string(),
-            CmafPolicyState::new(CmafPolicy::VIDEO_90KHZ_DEFAULT),
-        );
+    fn reset(states: &Mutex<HashMap<String, CmafPolicyState>>, policy: CmafPolicy, broadcast: &str) {
+        let mut map = states.lock().expect("hls bridge mutex poisoned");
+        map.insert(broadcast.to_string(), CmafPolicyState::new(policy));
     }
-}
 
-impl FragmentObserver for HlsFragmentBridge {
-    fn on_init(&self, broadcast: &str, track: &str, init: Bytes) {
-        if track != "0.mp4" {
-            return;
-        }
-        self.reset_video_state(broadcast);
-        let server = self.multi.ensure_broadcast(broadcast);
+    fn dispatch_init(server: HlsServer, init: Bytes) {
         let Ok(handle) = Handle::try_current() else {
             tracing::warn!("HLS bridge on_init outside tokio runtime; dropping init");
             return;
@@ -96,19 +89,7 @@ impl FragmentObserver for HlsFragmentBridge {
         });
     }
 
-    fn on_fragment(&self, broadcast: &str, track: &str, fragment: &Fragment) {
-        if track != "0.mp4" {
-            return;
-        }
-        let kind = self.classify_video(broadcast, fragment);
-        let chunk = CmafChunk {
-            track_id: fragment.track_id.clone(),
-            payload: fragment.payload.clone(),
-            dts: fragment.dts,
-            duration: fragment.duration,
-            kind,
-        };
-        let server = self.multi.ensure_broadcast(broadcast);
+    fn dispatch_chunk(server: HlsServer, chunk: CmafChunk) {
         let Ok(handle) = Handle::try_current() else {
             tracing::warn!("HLS bridge on_fragment outside tokio runtime; dropping chunk");
             return;
@@ -119,5 +100,43 @@ impl FragmentObserver for HlsFragmentBridge {
                 tracing::debug!(error = ?e, "hls push_chunk_bytes rejected");
             }
         });
+    }
+}
+
+impl FragmentObserver for HlsFragmentBridge {
+    fn on_init(&self, broadcast: &str, track: &str, init: Bytes) {
+        match track {
+            VIDEO_TRACK => {
+                Self::reset(&self.video_states, CmafPolicy::VIDEO_90KHZ_DEFAULT, broadcast);
+                Self::dispatch_init(self.multi.ensure_video(broadcast), init);
+            }
+            AUDIO_TRACK => {
+                Self::reset(&self.audio_states, CmafPolicy::AUDIO_48KHZ_DEFAULT, broadcast);
+                Self::dispatch_init(self.multi.ensure_audio(broadcast), init);
+            }
+            _ => {}
+        }
+    }
+
+    fn on_fragment(&self, broadcast: &str, track: &str, fragment: &Fragment) {
+        let (server, kind) = match track {
+            VIDEO_TRACK => {
+                let kind = Self::classify(&self.video_states, CmafPolicy::VIDEO_90KHZ_DEFAULT, broadcast, fragment);
+                (self.multi.ensure_video(broadcast), kind)
+            }
+            AUDIO_TRACK => {
+                let kind = Self::classify(&self.audio_states, CmafPolicy::AUDIO_48KHZ_DEFAULT, broadcast, fragment);
+                (self.multi.ensure_audio(broadcast), kind)
+            }
+            _ => return,
+        };
+        let chunk = CmafChunk {
+            track_id: fragment.track_id.clone(),
+            payload: fragment.payload.clone(),
+            dts: fragment.dts,
+            duration: fragment.duration,
+            kind,
+        };
+        Self::dispatch_chunk(server, chunk);
     }
 }
