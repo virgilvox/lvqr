@@ -299,6 +299,35 @@ async fn rtmp_publish_populates_archive_index() {
     let resp = http_get(admin_addr, "/playback/latest/live/ghost").await;
     assert_eq!(resp.status, 404, "latest ghost GET status");
 
+    // --- GET /playback/file/{*rel}: raw fragment bytes ---
+    // Build the relative path the writer uses:
+    // `<broadcast>/<track>/<seq:08>.m4s`.
+    let first_seq = http_rows[0]["segment_seq"].as_u64().unwrap();
+    let file_url = format!("/playback/file/live/dvr/0.mp4/{first_seq:08}.m4s");
+    let resp = http_get(admin_addr, &file_url).await;
+    assert_eq!(resp.status, 200, "GET {file_url} status");
+    assert!(resp.body.len() >= 8, "file body too short: {} bytes", resp.body.len());
+    assert_eq!(
+        &resp.body[4..8],
+        b"moof",
+        "file body did not start with a `moof` box: {file_url}"
+    );
+
+    // Missing file must 404.
+    let resp = http_get(admin_addr, "/playback/file/live/dvr/0.mp4/99999999.m4s").await;
+    assert_eq!(resp.status, 404, "missing file GET status");
+
+    // Path traversal guard: `..` segments that escape the
+    // archive root must be rejected with 400, not leak bytes
+    // from outside the archive. `/etc/hosts` is picked because
+    // it exists on every unix host and is harmless to attempt.
+    let resp = http_get(admin_addr, "/playback/file/..%2F..%2F..%2F..%2F..%2F..%2Fetc%2Fhosts").await;
+    assert!(
+        resp.status == 400 || resp.status == 404,
+        "path traversal must 400 or 404, got {}",
+        resp.status
+    );
+
     // redb takes an exclusive file lock, so the running server
     // holds it. Shut down cleanly and then reopen the index from
     // this test for read-only inspection of the on-disk state.

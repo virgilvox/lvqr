@@ -19,8 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::extract::{FromRef, Path as AxumPath, Query, State};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use bytes::Bytes;
@@ -219,6 +220,23 @@ pub(crate) struct PlaybackQuery {
     pub to: Option<u64>,
 }
 
+/// Router state shared between the three `/playback/*` handlers.
+/// Carries a canonicalized copy of the archive directory so the
+/// `file` handler can reject path traversal in constant time
+/// without touching the filesystem twice on every request.
+#[derive(Clone)]
+pub(crate) struct ArchiveState {
+    pub dir: Arc<PathBuf>,
+    pub canonical_dir: Arc<PathBuf>,
+    pub index: Arc<RedbSegmentIndex>,
+}
+
+impl FromRef<ArchiveState> for Arc<RedbSegmentIndex> {
+    fn from_ref(state: &ArchiveState) -> Arc<RedbSegmentIndex> {
+        Arc::clone(&state.index)
+    }
+}
+
 async fn playback_handler(
     State(index): State<Arc<RedbSegmentIndex>>,
     AxumPath(broadcast): AxumPath<String>,
@@ -285,21 +303,83 @@ async fn latest_handler(
     }
 }
 
+/// Serve an archived fragment file by relative path, e.g.
+/// `GET /playback/file/live/dvr/0.mp4/00000001.m4s`. `rel` is
+/// joined onto the configured archive directory; the joined
+/// path is canonicalized and rejected if it escapes the archive
+/// root. Returns `application/octet-stream` bytes on success,
+/// `404` when the file is missing, and `400` when the path
+/// traversal guard trips.
+async fn file_handler(State(state): State<ArchiveState>, AxumPath(rel): AxumPath<String>) -> Response {
+    let joined = state.dir.join(&rel);
+    // Canonicalize and confirm the resolved path is still under
+    // the canonicalized archive root. `canonicalize` fails with
+    // `NotFound` when the file does not exist; treat that as a
+    // 404 rather than a 500.
+    let canonical = match std::fs::canonicalize(&joined) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::NOT_FOUND, format!("archive file not found: {rel}")).into_response();
+        }
+        Err(e) => {
+            tracing::warn!(path = %joined.display(), error = %e, "archive: canonicalize failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("canonicalize error: {e}")).into_response();
+        }
+    };
+    if !canonical.starts_with(state.canonical_dir.as_path()) {
+        tracing::warn!(
+            rel = %rel,
+            resolved = %canonical.display(),
+            "archive: file request escaped archive root"
+        );
+        return (StatusCode::BAD_REQUEST, "path escapes archive root").into_response();
+    }
+
+    let bytes = match tokio::fs::read(&canonical).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::NOT_FOUND, format!("archive file not found: {rel}")).into_response();
+        }
+        Err(e) => {
+            tracing::warn!(path = %canonical.display(), error = %e, "archive: read failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("read error: {e}")).into_response();
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .body(Body::from(bytes))
+        .expect("valid response")
+}
+
 /// Build the `/playback` router. Merged into the admin axum router
 /// in `lib.rs::start` when `ServeConfig::archive_dir` is set.
 ///
 /// Routes:
 /// * `GET /playback/latest/{*broadcast}` -- single most-recent
 ///   segment for the stream, or 404 if none.
+/// * `GET /playback/file/{*rel}` -- raw bytes of an archived
+///   fragment file under the archive directory, guarded against
+///   path traversal.
 /// * `GET /playback/{*broadcast}` -- every segment overlapping the
 ///   `[from, to)` window (defaults `[0, u64::MAX)`), ordered by
 ///   `start_dts`.
 ///
-/// The `latest` route is declared first so axum's more-specific
-/// match wins over the trailing catch-all on `{*broadcast}`.
-pub(crate) fn playback_router(index: Arc<RedbSegmentIndex>) -> Router {
+/// The `latest` and `file` routes are declared first so axum's
+/// more-specific match wins over the trailing catch-all on
+/// `{*broadcast}`.
+pub(crate) fn playback_router(dir: PathBuf, index: Arc<RedbSegmentIndex>) -> Router {
+    let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+    let state = ArchiveState {
+        dir: Arc::new(dir),
+        canonical_dir: Arc::new(canonical_dir),
+        index,
+    };
     Router::new()
         .route("/playback/latest/{*broadcast}", get(latest_handler))
+        .route("/playback/file/{*rel}", get(file_handler))
         .route("/playback/{*broadcast}", get(playback_handler))
-        .with_state(index)
+        .with_state(state)
 }
