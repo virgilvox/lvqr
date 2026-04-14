@@ -1,0 +1,19 @@
+[package]
+name = "lvqr-archive"
+description = "LVQR segment index for DVR scrub and time-range playback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["streaming", "archive", "dvr", "cmaf", "index"]
+categories = ["multimedia", "database"]
+
+[dependencies]
+redb = "2"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

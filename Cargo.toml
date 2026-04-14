@@ -15,6 +15,7 @@ members = [
     "crates/lvqr-mesh",
     "crates/lvqr-ingest",
     "crates/lvqr-whep",
+    "crates/lvqr-archive",
     "crates/lvqr-signal",
     "crates/lvqr-admin",
     "crates/lvqr-auth",
