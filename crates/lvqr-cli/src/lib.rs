@@ -524,7 +524,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
 
         let combined = admin_router.merge(ws_router);
         if let Some((ref dir, ref index)) = archive_index {
-            combined.merge(playback_router(dir.clone(), Arc::clone(index)))
+            combined.merge(playback_router(dir.clone(), Arc::clone(index), auth.clone()))
         } else {
             combined
         }

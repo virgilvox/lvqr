@@ -20,12 +20,13 @@ use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{FromRef, Path as AxumPath, Query, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{Path as AxumPath, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use bytes::Bytes;
 use lvqr_archive::{RedbSegmentIndex, SegmentIndex, SegmentRef};
+use lvqr_auth::{AuthContext, AuthDecision, SharedAuth};
 use lvqr_fragment::Fragment;
 use lvqr_ingest::{FragmentObserver, SharedFragmentObserver};
 use serde::{Deserialize, Serialize};
@@ -218,30 +219,75 @@ pub(crate) struct PlaybackQuery {
     pub from: Option<u64>,
     #[serde(default)]
     pub to: Option<u64>,
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 /// Router state shared between the three `/playback/*` handlers.
 /// Carries a canonicalized copy of the archive directory so the
-/// `file` handler can reject path traversal in constant time
-/// without touching the filesystem twice on every request.
+/// `file` handler can reject path traversal in constant time,
+/// the shared [`SharedAuth`] provider so every handler honors
+/// the same subscribe-token semantics the WS relay uses, and
+/// the shared `RedbSegmentIndex` handle so the sync scans do
+/// not race redb's exclusive-file lock against the writer.
 #[derive(Clone)]
 pub(crate) struct ArchiveState {
     pub dir: Arc<PathBuf>,
     pub canonical_dir: Arc<PathBuf>,
     pub index: Arc<RedbSegmentIndex>,
+    pub auth: SharedAuth,
 }
 
-impl FromRef<ArchiveState> for Arc<RedbSegmentIndex> {
-    fn from_ref(state: &ArchiveState) -> Arc<RedbSegmentIndex> {
-        Arc::clone(&state.index)
+/// Extract a bearer token from an incoming request. Two
+/// transports are honored, matching the WS relay's resolver:
+///
+/// 1. `Authorization: Bearer <token>` header -- the HTTP-native
+///    form that every `curl` / `reqwest` / browser can produce.
+/// 2. `?token=<token>` query parameter -- accepted as a fallback
+///    for clients that cannot set custom headers (e.g. a plain
+///    `<video src>` tag or a simple file URL), at the cost of
+///    leaking the token into access logs. The WS handlers log a
+///    deprecation warning on this path; the playback surface
+///    accepts it silently for now because it is much newer and
+///    the deprecation plan is tracked separately.
+fn extract_bearer(headers: &HeaderMap, token_query: &Option<String>) -> Option<String> {
+    if let Some(hv) = headers.get(header::AUTHORIZATION)
+        && let Ok(raw) = hv.to_str()
+        && let Some(tok) = raw.strip_prefix("Bearer ")
+        && !tok.is_empty()
+    {
+        return Some(tok.to_string());
     }
+    token_query.as_ref().filter(|t| !t.is_empty()).cloned()
+}
+
+/// Run the `SharedAuth` subscribe check for a playback request.
+/// Returns `None` on allow; returns `Some(Response)` with a 401
+/// body when the provider denies, so callers can `return` it
+/// directly.
+fn playback_auth_gate(auth: &SharedAuth, broadcast: &str, token: Option<String>) -> Option<Response> {
+    let decision = auth.check(&AuthContext::Subscribe {
+        token,
+        broadcast: broadcast.to_string(),
+    });
+    if let AuthDecision::Deny { reason } = decision {
+        metrics::counter!("lvqr_auth_failures_total", "entry" => "playback").increment(1);
+        return Some((StatusCode::UNAUTHORIZED, reason).into_response());
+    }
+    None
 }
 
 async fn playback_handler(
-    State(index): State<Arc<RedbSegmentIndex>>,
+    State(state): State<ArchiveState>,
+    headers: HeaderMap,
     AxumPath(broadcast): AxumPath<String>,
     Query(params): Query<PlaybackQuery>,
 ) -> Response {
+    let token = extract_bearer(&headers, &params.token);
+    if let Some(resp) = playback_auth_gate(&state.auth, &broadcast, token) {
+        return resp;
+    }
+
     let track = params.track.as_deref().unwrap_or("0.mp4");
     let from = params.from.unwrap_or(0);
     let to = params.to.unwrap_or(u64::MAX);
@@ -250,7 +296,7 @@ async fn playback_handler(
     // scan itself is fast but still blocks the current task.
     // `spawn_blocking` keeps the admin axum runtime responsive for
     // other requests while the scan runs.
-    let index = Arc::clone(&index);
+    let index = Arc::clone(&state.index);
     let broadcast_owned = broadcast.clone();
     let track_owned = track.to_string();
     let rows = tokio::task::spawn_blocking(move || index.find_range(&broadcast_owned, &track_owned, from, to)).await;
@@ -276,15 +322,23 @@ async fn playback_handler(
 pub(crate) struct LatestQuery {
     #[serde(default)]
     pub track: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 async fn latest_handler(
-    State(index): State<Arc<RedbSegmentIndex>>,
+    State(state): State<ArchiveState>,
+    headers: HeaderMap,
     AxumPath(broadcast): AxumPath<String>,
     Query(params): Query<LatestQuery>,
 ) -> Response {
+    let token = extract_bearer(&headers, &params.token);
+    if let Some(resp) = playback_auth_gate(&state.auth, &broadcast, token) {
+        return resp;
+    }
+
     let track = params.track.as_deref().unwrap_or("0.mp4").to_string();
-    let index = Arc::clone(&index);
+    let index = Arc::clone(&state.index);
     let broadcast_owned = broadcast.clone();
     let track_owned = track.clone();
     let row = tokio::task::spawn_blocking(move || index.latest(&broadcast_owned, &track_owned)).await;
@@ -303,6 +357,15 @@ async fn latest_handler(
     }
 }
 
+/// Query parameters for `GET /playback/file/{*rel}`. The only
+/// field today is the token fallback; `rel` itself is the URL
+/// path component.
+#[derive(Debug, Deserialize)]
+pub(crate) struct FileQuery {
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
 /// Serve an archived fragment file by relative path, e.g.
 /// `GET /playback/file/live/dvr/0.mp4/00000001.m4s`. `rel` is
 /// joined onto the configured archive directory; the joined
@@ -310,7 +373,28 @@ async fn latest_handler(
 /// root. Returns `application/octet-stream` bytes on success,
 /// `404` when the file is missing, and `400` when the path
 /// traversal guard trips.
-async fn file_handler(State(state): State<ArchiveState>, AxumPath(rel): AxumPath<String>) -> Response {
+///
+/// Auth: the "broadcast" the request authorizes against is the
+/// leading path component of `rel`. The writer's canonical
+/// layout is `<broadcast_components...>/<track>/<seq>.m4s`,
+/// where broadcasts typically contain exactly one slash
+/// (`live/dvr`). The auth check treats everything up to the
+/// track's `0.mp4` / `1.mp4` suffix as the broadcast; a JWT
+/// with `sub:live/dvr` therefore authorizes every segment file
+/// under that stream's archive subtree without authorizing
+/// sibling streams.
+async fn file_handler(
+    State(state): State<ArchiveState>,
+    headers: HeaderMap,
+    AxumPath(rel): AxumPath<String>,
+    Query(params): Query<FileQuery>,
+) -> Response {
+    let token = extract_bearer(&headers, &params.token);
+    let broadcast_for_auth = broadcast_from_rel(&rel);
+    if let Some(resp) = playback_auth_gate(&state.auth, broadcast_for_auth, token) {
+        return resp;
+    }
+
     let joined = state.dir.join(&rel);
     // Canonicalize and confirm the resolved path is still under
     // the canonicalized archive root. `canonicalize` fails with
@@ -354,6 +438,34 @@ async fn file_handler(State(state): State<ArchiveState>, AxumPath(rel): AxumPath
         .expect("valid response")
 }
 
+/// Derive the broadcast key a `/playback/file/{*rel}` request
+/// should authorize against. The writer's canonical layout is
+/// `<broadcast>/<track>/<seq>.m4s` where `track` matches the
+/// `N.mp4` MoQ convention. We walk backward from the end of
+/// `rel`, drop the file segment and the track segment, and hand
+/// the remaining prefix to `auth.check`. If the layout does not
+/// match (only one component, or the track lookup fails), we
+/// fall back to the full `rel` so a misconfigured request still
+/// runs through the auth gate rather than slipping through.
+fn broadcast_from_rel(rel: &str) -> &str {
+    let trimmed = rel.trim_end_matches('/');
+    // Strip the trailing `.../<seq>.m4s` component.
+    let Some((head, _file)) = trimmed.rsplit_once('/') else {
+        return trimmed;
+    };
+    // Strip the trailing `.../<track>` component. Only accept
+    // `N.mp4`-shaped tracks so we do not over-trim a legitimate
+    // path whose layout happens not to match.
+    let Some((broadcast, track)) = head.rsplit_once('/') else {
+        return trimmed;
+    };
+    if track.ends_with(".mp4") && track.len() > 4 && track[..track.len() - 4].chars().all(|c| c.is_ascii_digit()) {
+        broadcast
+    } else {
+        trimmed
+    }
+}
+
 /// Build the `/playback` router. Merged into the admin axum router
 /// in `lib.rs::start` when `ServeConfig::archive_dir` is set.
 ///
@@ -370,12 +482,13 @@ async fn file_handler(State(state): State<ArchiveState>, AxumPath(rel): AxumPath
 /// The `latest` and `file` routes are declared first so axum's
 /// more-specific match wins over the trailing catch-all on
 /// `{*broadcast}`.
-pub(crate) fn playback_router(dir: PathBuf, index: Arc<RedbSegmentIndex>) -> Router {
+pub(crate) fn playback_router(dir: PathBuf, index: Arc<RedbSegmentIndex>, auth: SharedAuth) -> Router {
     let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
     let state = ArchiveState {
         dir: Arc::new(dir),
         canonical_dir: Arc::new(canonical_dir),
         index,
+        auth,
     };
     Router::new()
         .route("/playback/latest/{*broadcast}", get(latest_handler))

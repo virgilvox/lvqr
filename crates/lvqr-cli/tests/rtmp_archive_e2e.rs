@@ -14,6 +14,7 @@
 //! real on-disk writes, real redb queries.
 
 use lvqr_archive::{RedbSegmentIndex, SegmentIndex};
+use lvqr_auth::{SharedAuth, StaticAuthConfig, StaticAuthProvider};
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
@@ -21,6 +22,7 @@ use rml_rtmp::sessions::{
 };
 use rml_rtmp::time::RtmpTimestamp;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -58,11 +60,23 @@ struct HttpResponse {
 /// pulling `reqwest` / `hyper-util` in as a dev-dep for a handful
 /// of test reads. Mirrors the helper in `rtmp_hls_e2e.rs`.
 async fn http_get(addr: SocketAddr, path: &str) -> HttpResponse {
+    http_get_with_auth(addr, path, None).await
+}
+
+/// Variant of `http_get` that optionally sends an
+/// `Authorization: Bearer <token>` header. Used by the
+/// auth-gate test to exercise the header-based token path
+/// alongside the `?token=` query-string fallback.
+async fn http_get_with_auth(addr: SocketAddr, path: &str, bearer: Option<&str>) -> HttpResponse {
     let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
         .await
         .expect("http GET connect timed out")
         .expect("http GET connect failed");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let auth_header = match bearer {
+        Some(tok) => format!("Authorization: Bearer {tok}\r\n"),
+        None => String::new(),
+    };
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Connection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
     tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut buf))
@@ -399,4 +413,90 @@ async fn rtmp_publish_populates_archive_index() {
     let expected_last = rows.last().unwrap();
     assert_eq!(latest.start_dts, expected_last.start_dts);
     assert_eq!(latest.segment_seq, expected_last.segment_seq);
+}
+
+/// Playback surface honors `SharedAuth::check(AuthContext::
+/// Subscribe{..})` exactly the way the WS relay does. When
+/// `TestServerConfig::with_auth` installs a `StaticAuthProvider`
+/// whose `subscribe_token` is set, every `/playback/*` route
+/// must reject unauthenticated requests with 401 and accept
+/// authenticated requests whether the bearer arrives via
+/// `Authorization: Bearer` or `?token=`.
+#[tokio::test]
+async fn playback_surface_honors_shared_auth() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("lvqr=debug")
+        .with_test_writer()
+        .try_init();
+
+    let archive_tmp = TempDir::new().expect("tempdir");
+    let archive_path = archive_tmp.path().to_path_buf();
+
+    // Static-token provider with a subscribe gate; publish is
+    // left open so the RTMP publish below is not forced to
+    // authenticate.
+    let auth: SharedAuth = Arc::new(StaticAuthProvider::new(StaticAuthConfig {
+        admin_token: None,
+        publish_key: None,
+        subscribe_token: Some("s3cr3t".to_string()),
+    }));
+
+    let server = TestServer::start(
+        TestServerConfig::default()
+            .with_archive_dir(&archive_path)
+            .with_auth(auth),
+    )
+    .await
+    .expect("start TestServer");
+    let rtmp_addr = server.rtmp_addr();
+    let admin_addr = server.admin_addr();
+
+    let (_s, _sess) = publish_two_keyframes(rtmp_addr, "live", "dvr").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // --- Unauthenticated requests must be rejected with 401. ---
+    for path in [
+        "/playback/live/dvr",
+        "/playback/latest/live/dvr",
+        "/playback/file/live/dvr/0.mp4/00000001.m4s",
+    ] {
+        let resp = http_get(admin_addr, path).await;
+        assert_eq!(
+            resp.status, 401,
+            "unauthenticated {path} should 401, got {}",
+            resp.status
+        );
+    }
+
+    // --- Authenticated via Authorization: Bearer header. ---
+    let resp = http_get_with_auth(admin_addr, "/playback/live/dvr", Some("s3cr3t")).await;
+    assert_eq!(resp.status, 200, "header-auth range GET status");
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&resp.body).expect("header-auth body is JSON array");
+    assert!(!rows.is_empty(), "header-auth range returned empty");
+
+    let resp = http_get_with_auth(admin_addr, "/playback/latest/live/dvr", Some("s3cr3t")).await;
+    assert_eq!(resp.status, 200, "header-auth latest GET status");
+    let latest: serde_json::Value = serde_json::from_slice(&resp.body).expect("header-auth latest body is JSON");
+    assert_eq!(latest["broadcast"], "live/dvr");
+
+    let resp = http_get_with_auth(admin_addr, "/playback/file/live/dvr/0.mp4/00000001.m4s", Some("s3cr3t")).await;
+    assert_eq!(resp.status, 200, "header-auth file GET status");
+    assert!(resp.body.len() >= 8 && &resp.body[4..8] == b"moof");
+
+    // --- Authenticated via ?token= query fallback. ---
+    let resp = http_get(admin_addr, "/playback/live/dvr?token=s3cr3t").await;
+    assert_eq!(resp.status, 200, "query-auth range GET status");
+
+    let resp = http_get(admin_addr, "/playback/latest/live/dvr?token=s3cr3t").await;
+    assert_eq!(resp.status, 200, "query-auth latest GET status");
+
+    let resp = http_get(admin_addr, "/playback/file/live/dvr/0.mp4/00000001.m4s?token=s3cr3t").await;
+    assert_eq!(resp.status, 200, "query-auth file GET status");
+
+    // --- Wrong token must still 401, not slip through. ---
+    let resp = http_get_with_auth(admin_addr, "/playback/live/dvr", Some("not-the-token")).await;
+    assert_eq!(resp.status, 401, "wrong-token range GET status");
+
+    drop(_s);
+    server.shutdown().await.expect("shutdown");
 }
