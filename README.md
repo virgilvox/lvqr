@@ -19,14 +19,18 @@ three browser-facing egress paths lands from a single RTMP publish:
   RTMP broadcasts plus an RTMP publish with interleaved video and
   AAC audio, then reads back the master playlist, audio playlist,
   and audio init segment over a real TCP HTTP/1.1 client.
-- **WHEP signaling router** (`/whep/{broadcast}` POST / PATCH /
-  DELETE) with the full session lifecycle, content-type validation,
-  and a `RawSampleObserver` fanout that routes per-NAL / per-AAC
-  samples to every session subscribed to a given broadcast. The
-  `str0m` backend lands in a later session behind the existing
-  `SdpAnswerer` / `SessionHandle` trait boundary.
+- **WHEP video egress** (`/whep/{broadcast}` POST / PATCH / DELETE)
+  with a full `str0m` backend behind the `SdpAnswerer` trait: ICE,
+  DTLS, SRTP, and H.264 RTP packetization all complete against a
+  real browser. `--whep-port` (env `LVQR_WHEP_PORT`, default 0 =
+  disabled) attaches the `WhepServer` as a
+  `RawSampleObserver` on `RtmpMoqBridge`, and the in-process
+  loopback E2E test at `crates/lvqr-whep/tests/e2e_str0m_loopback.rs`
+  proves a client `Rtc` receives video frames from a publishing
+  `Str0mAnswerer` in ~0.15-0.18s of wall time. Audio (Opus) is out
+  of scope pending an AAC -> Opus transcoder.
 
-**Working and tested** (69 test binaries workspace-wide, 269
+**Working and tested** (70 test binaries workspace-wide, 276+
 individual tests, 0 failures under the default feature set,
 `cargo clippy --workspace --all-targets -- -D warnings` clean,
 `cargo fmt --all --check` clean):
@@ -52,13 +56,18 @@ individual tests, 0 failures under the default feature set,
   hardcoded into the audio policy; the bridge picks the real
   sample rate at init time so 44.1 kHz AAC reports the correct
   wall-clock `#EXT-X-PART:DURATION`.
-- **WHEP signaling router** via `lvqr-whep`: `WhepServer`,
-  `SdpAnswerer` / `SessionHandle` trait boundary, `H264Packetizer`
-  (RFC 6184 single-NAL + FU-A), and a 12-test integration slot
-  driving the axum router via `tower::ServiceExt::oneshot`. The
-  `RawSampleObserver` hook on `RtmpMoqBridge` is wired from the
-  ingest side; the `str0m` backend and the `--whep-addr` CLI flag
-  land in a later session.
+- **WHEP video egress** via `lvqr-whep`: `WhepServer`,
+  `SdpAnswerer` / `SessionHandle` trait boundary, `Str0mAnswerer`
+  running a per-session sans-IO poll loop over a loopback UDP
+  socket, video media write via `str0m::media::Writer` with an
+  AVCC -> Annex B boundary conversion (str0m's `H264Packetizer`
+  scans for Annex B start codes and silently drops AVCC input;
+  the converter is load-bearing), and a four-slot test spread
+  covering proptest (RFC 6184 round-trip + never-panic), fuzz
+  (`SdpOffer::from_sdp_string` under libFuzzer), integration
+  (12 tests against the axum router via `tower::ServiceExt::oneshot`),
+  and E2E (client `Rtc` + server `Str0mAnswerer` over loopback,
+  asserts decoded `Event::MediaData` on the client side).
 - **WebSocket browser ingest + egress** via the `@lvqr/core` and
   `@lvqr/player` TypeScript packages plus the bundled `test-app/`.
 - **MoQ relay** (QUIC / WebTransport fanout) via `lvqr-relay`
@@ -81,10 +90,17 @@ individual tests, 0 failures under the default feature set,
 
 **Known limitations:**
 
-- No `str0m` WebRTC backend yet. The WHEP router accepts offers
-  through the `SdpAnswerer` trait; the concrete `Str0mAnswerer`
-  impl (ICE / DTLS / SRTP + RTP packetization through the H.264
-  packetizer) is the next session's work.
+- WHEP audio is dropped. RTMP carries AAC, WHEP negotiates Opus,
+  no in-tree AAC -> Opus transcoder. The audio one-shot warns and
+  drops; video works end-to-end. See
+  `crates/lvqr-whep/docs/media-write.md` for the rationale.
+- WHEP trickle ICE ingestion logs once and returns success; WHEP
+  rarely needs trickle when the offer already embeds every host
+  candidate.
+- Real-browser WHEP E2E in CI is gated on packaging a reference
+  WHEP client binary (e.g. `simple-whep-client`) into the CI
+  image. The in-process loopback E2E covers every byte of the
+  server's send path.
 - No DASH, WHIP, SRT, or RTSP egress or ingest. Tracked in
   `tracking/ROADMAP.md` Tier 2.
 - WebRTC mesh is topology only; DataChannel media forwarding is
@@ -159,7 +175,7 @@ OBS/ffmpeg --RTMP--> lvqr-ingest --Fragment--+-> lvqr-cli WS relay --WebSocket f
                                              +-> lvqr-hls MultiHlsServer --HTTP LL-HLS--> Browser
                                              |   (master.m3u8 + audio rendition)
                                              |
-                                             +-> lvqr-whep router --HTTP + [str0m later]--> Browser (WebRTC)
+                                             +-> lvqr-whep Str0mAnswerer --WebRTC (ICE/DTLS/SRTP)--> Browser
 
 Supporting crates:
   lvqr-fragment  -- unified `Fragment` model every egress crate consumes
@@ -184,7 +200,7 @@ Supporting crates:
 | `lvqr-codec` | AVC / HEVC / AAC parsers (SPS, `AudioSpecificConfig`, `read_ue_v`) with proptest + fuzz coverage |
 | `lvqr-cmaf` | `RawSample`, `TrackCoalescer`, `CmafPolicy`, `build_moof_mdat`, AVC + HEVC + AAC init writers |
 | `lvqr-hls` | `PlaylistBuilder`, `HlsServer`, `MultiHlsServer` with master playlist and audio rendition group |
-| `lvqr-whep` | WHEP signaling router, `H264Packetizer` (RFC 6184), `SdpAnswerer` trait (str0m lands later) |
+| `lvqr-whep` | WHEP video egress: `WhepServer` axum router, `Str0mAnswerer` with sans-IO poll loop, `str0m::Writer`-driven media write with AVCC -> Annex B boundary conversion, proptest + fuzz + integration + loopback-E2E test coverage |
 | `lvqr-auth` | `AuthProvider` trait plus noop, static-token, and HS256 JWT providers |
 | `lvqr-relay` | MoQ relay wrapping `moq-lite` with auth, metrics, and connection callbacks |
 | `lvqr-ingest` | RTMP server, FLV parser, `RtmpMoqBridge`, `FragmentObserver` + `RawSampleObserver` hooks |

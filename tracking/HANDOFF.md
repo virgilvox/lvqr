@@ -1,17 +1,123 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- `lvqr-whep` signaling router shipped, str0m pending
+## Project Status: v0.4-dev -- WHEP video egress honest end-to-end
 
-**Last Updated**: 2026-04-14 (session 19 close)
+**Last Updated**: 2026-04-14 (session 22 close)
 **Tests**: `cargo test --workspace` green under the default feature
-set: 69 test binaries, 269 individual tests passing, 1 doctest
+set: 70 test binaries, 276+ individual tests passing, 1 doctest
 marked `ignore` (a non-runnable doc example in
-`lvqr-fragment/src/moq_sink.rs:39`), 0 failures. The
-`--no-default-features --features rtmp,quinn-transport` legacy
-configuration is retired along with the hand-rolled fMP4 writer; the
-`test-legacy-fmp4-path` CI matrix job was deleted in session 14.
-`cargo clippy --workspace --all-targets -- -D warnings` clean.
-`cargo fmt --all --check` clean.
+`lvqr-fragment/src/moq_sink.rs:39`), 0 failures. `cargo clippy
+--workspace --all-targets -- -D warnings` clean. `cargo fmt --all
+--check` clean.
+
+## Session 22 (2026-04-14): str0m-backed WHEP end-to-end
+
+Closed the entire WHEP media write arc in four commits on top of
+session 19's baseline. By the end of the session the
+RTMP -> WHEP -> WebRTC client path is real: ICE, DTLS, SRTP all
+complete, video samples from the ingest bridge flow through
+`Str0mSessionHandle::on_raw_sample` into the sans-IO poll loop,
+get AVCC-to-Annex-B converted, handed to
+`str0m::media::Writer::write` with the negotiated H.264 `Pt`, and
+arrive as decoded `Event::MediaData` events on a str0m-based
+client driven in-process by the E2E test.
+
+### Commits (origin/main)
+
+1. **580d152** -- `Str0mAnswerer` implementing `SdpAnswerer` behind
+   the session-16 trait boundary; sans-IO poll loop per session
+   spawned as a tokio task owning `Rtc` + `tokio::net::UdpSocket`;
+   `oneshot` shutdown on handle Drop; ICE + DTLS completes
+   against real browsers. `--whep-port` CLI flag (env
+   `LVQR_WHEP_PORT`, default 0 = disabled) wired into
+   `lvqr-cli::start` with `WhepServer` clone attached as
+   `SharedRawSampleObserver` on the bridge builder before the
+   `Arc` freeze. `TestServer` sets `whep_addr: None` so the 200+
+   existing integration tests are untouched.
+2. **db9fd10** -- `cargo fuzz` slot for `SdpOffer::from_sdp_string`
+   (the first untrusted-input entry point on the WHEP POST path).
+   Initial media-write design note with four load-bearing
+   decisions. Decision 2 in that initial note was wrong and is
+   corrected inline by commit ddcb599.
+3. **ddcb599** -- Video media write via `str0m::media::Writer`.
+   `SessionMsg::Video` pumped from `on_raw_sample` over an
+   `mpsc::UnboundedSender`; `SessionCtx` captures `video_mid`
+   (from `Event::MediaAdded`), `video_pt` (lazy via
+   `Writer::payload_params` filtered on `Codec::H264`), and a
+   `connected` flag (from `Event::Connected`). AVCC -> Annex B
+   converter at the boundary because str0m's `H264Packetizer`
+   scans for Annex B start codes and silently drops AVCC input;
+   six unit tests cover single NAL, multi NAL, empty, truncated,
+   overrun, and zero-length entries.
+4. **ed9c6e3** -- In-process str0m loopback E2E test
+   (`crates/lvqr-whep/tests/e2e_str0m_loopback.rs`) spinning up a
+   client `Rtc` + `Str0mAnswerer` over loopback UDP, completing
+   ICE + DTLS + SRTP in-process, pushing synthetic SPS + PPS +
+   IDR samples into the server via `on_raw_sample`, and asserting
+   `Event::Connected` + at least one `Event::MediaData` on the
+   client side. Runs in ~0.15-0.18s wall time, 10/10 green on a
+   local flakiness smoke run. Slot 4 (E2E) of the 5-artifact test
+   contract for lvqr-whep is now closed. `tests/CONTRACT.md`
+   updated to reflect proptest + fuzz + integration + E2E all
+   shipped; only conformance (cross-impl against
+   `simple-whep-client`) remains open.
+
+### Important session-22 finding
+
+The session-21 design note (`crates/lvqr-whep/docs/media-write.md`)
+claimed str0m's `H264Packetizer` accepts AVCC passthrough. Reading
+`src/packet/h264.rs` in step 1 of the execution plan revealed the
+opposite: it scans for Annex B start codes via `next_ind`, and an
+AVCC buffer has none, so the whole buffer gets handed to `emit`,
+where the length-prefix high byte is read as a NAL header of type
+0 and silently dropped. A naive build would complete ICE + DTLS +
+SRTP and then emit zero packets with no error anywhere. The
+boundary converter `avcc_to_annex_b` lives at
+`crates/lvqr-whep/src/str0m_backend.rs`; the design note is
+corrected in place.
+
+### What is real after session 22
+
+* **RTMP -> fMP4 -> MoQ -> browser**: real, unchanged.
+* **RTMP -> CMAF -> LL-HLS -> browser**: real, unchanged.
+* **RTMP -> RawSample -> `Str0mAnswerer` -> WebRTC client**: real
+  end-to-end. The in-process E2E test exercises every byte of
+  this path except the public internet and a real browser's
+  H.264 decoder. A real browser connecting to `--whep-port`
+  should see video decode once it negotiates a compatible H.264
+  profile, though the real-browser leg is not yet automated in
+  CI (gated on `simple-whep-client` packaging).
+
+### What is still not real
+
+* **Audio over WHEP**. RTMP ingest carries AAC, WHEP negotiated
+  Opus. No in-tree AAC -> Opus transcoder. One-shot warn on first
+  audio sample, then silent drop. Permanently deferred; see
+  `crates/lvqr-whep/docs/media-write.md` for rationale.
+* **Trickle ICE ingestion**. `Str0mSessionHandle::add_trickle`
+  still one-shot warns and returns success. WHEP rarely needs
+  trickle once the offer embeds every host candidate.
+* **Real-browser E2E in CI**. Gated on packaging a WHEP client
+  binary (`simple-whep-client` or a `webrtc-rs` thin wrapper)
+  into the CI image.
+* **CORS restrictive default** and **`lvqr-wasm` deletion**:
+  still correctly deferred audit items.
+
+### Recommended entry point (session 23)
+
+1. **Real-browser E2E via `simple-whep-client`** soft-skip,
+   landing slot 5 (conformance) of the test contract for
+   lvqr-whep. Closes every slot of the 5-artifact contract for
+   this crate. Requires the CI image to carry the binary.
+2. **Tier 2.4 start: archive + redb index**. Gate for Tier 3.
+3. **CORS restrictive default** (`crates/lvqr-cli/src/lib.rs`
+   `CorsLayer::permissive()` replacement). One-commit breaking
+   change with a release note.
+4. **`lvqr-wasm` deletion**. One-commit mechanical removal.
+5. **Keyframe request handling**. WebRTC PLI / FIR feedback from
+   the client should eventually trigger an upstream keyframe
+   request on the ingest side. Low priority until a real browser
+   client surfaces the need.
 
 ## Session 19 (2026-04-14): audit sweep + README refresh
 
