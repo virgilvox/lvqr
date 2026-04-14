@@ -11,6 +11,9 @@
 //! producer contract in full.
 
 use bytes::Bytes;
+use lvqr_fragment::FragmentMeta;
+use std::future::Future;
+use std::pin::Pin;
 
 /// One decoded or encoded sample on its way into the coalescer.
 ///
@@ -50,6 +53,32 @@ pub struct RawSample {
     /// HEVC, an IDR / CRA / BLA; for AAC, every sample is a
     /// keyframe so set this to `true` on every AAC sample.
     pub keyframe: bool,
+}
+
+/// Pull-based producer of [`RawSample`] values.
+///
+/// Mirrors [`lvqr_fragment::FragmentStream`] but at the sample
+/// level rather than the pre-muxed fragment level. Consumers
+/// typically wrap a `SampleStream` in a
+/// [`crate::coalescer::CmafSampleSegmenter`] which routes samples
+/// into the right [`crate::TrackCoalescer`] and yields the
+/// resulting [`crate::CmafChunk`] values.
+///
+/// The trait returns `Pin<Box<dyn Future>>` rather than using an
+/// `async fn` in trait because `async fn` in trait does not yet
+/// allow `Send` bounds without GATs plumbing that this crate does
+/// not need. A later refactor can flip to `async fn` once the
+/// producer side stabilises.
+pub trait SampleStream: Send {
+    /// Pull the next sample. Returns `None` when the source is
+    /// exhausted.
+    fn next_sample<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<RawSample>> + Send + 'a>>;
+
+    /// Producer-supplied metadata describing the stream
+    /// (codec string, timescale, init segment). Consumers use
+    /// this to build an init segment before the first chunk
+    /// arrives.
+    fn meta(&self) -> &FragmentMeta;
 }
 
 impl RawSample {

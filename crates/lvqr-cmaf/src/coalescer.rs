@@ -61,12 +61,15 @@
 //! total moof size is stable across the two encodes because every
 //! field is fixed-width.
 
+use std::collections::{HashMap, VecDeque};
+
 use bytes::{BufMut, Bytes, BytesMut};
+use lvqr_fragment::FragmentMeta;
 use mp4_atom::{Encode, Mfhd, Moof, Tfdt, Tfhd, Traf, Trun, TrunEntry};
 
 use crate::chunk::{CmafChunk, CmafChunkKind};
 use crate::policy::CmafPolicy;
-use crate::sample::RawSample;
+use crate::sample::{RawSample, SampleStream};
 
 /// Per-track sample coalescer. Construct one per track.
 #[derive(Debug)]
@@ -271,6 +274,81 @@ pub fn build_moof_mdat(sequence: u32, track_id: u32, base_dts: u64, samples: &[R
     }
 
     buf.freeze()
+}
+
+/// Pull-based segmenter driven by a [`SampleStream`].
+///
+/// Owns a [`TrackCoalescer`] per track id discovered in the
+/// stream. Samples are routed to their coalescer on arrival; the
+/// resulting [`CmafChunk`] values are queued into a ready buffer
+/// so consumers see them in emission order regardless of which
+/// track closed the boundary.
+pub struct CmafSampleSegmenter<S: SampleStream> {
+    stream: S,
+    default_policy: CmafPolicy,
+    coalescers: HashMap<u32, TrackCoalescer>,
+    ready: VecDeque<CmafChunk>,
+    /// True once the upstream `SampleStream` returned `None`. No
+    /// further samples will arrive; subsequent `next_chunk` calls
+    /// drain any remaining coalescer state.
+    drained: bool,
+}
+
+impl<S: SampleStream> CmafSampleSegmenter<S> {
+    /// Build a new segmenter with the given default policy. Every
+    /// track discovered in the stream will be coalesced with
+    /// this policy; multi-policy multi-track support (e.g. 90 kHz
+    /// video plus 48 kHz audio) lands when a producer needs it.
+    pub fn new(stream: S, default_policy: CmafPolicy) -> Self {
+        Self {
+            stream,
+            default_policy,
+            coalescers: HashMap::new(),
+            ready: VecDeque::new(),
+            drained: false,
+        }
+    }
+
+    /// Borrow the upstream [`FragmentMeta`] for callers that need
+    /// the codec string or init segment before the first chunk.
+    pub fn meta(&self) -> &FragmentMeta {
+        self.stream.meta()
+    }
+
+    /// Pull the next chunk. Returns `None` only when the upstream
+    /// stream is exhausted AND every coalescer has been flushed.
+    pub async fn next_chunk(&mut self) -> Option<CmafChunk> {
+        loop {
+            if let Some(chunk) = self.ready.pop_front() {
+                return Some(chunk);
+            }
+            if self.drained {
+                // Drain any coalescer state one last time. We do
+                // this after the upstream is exhausted so every
+                // pending batch surfaces as a final chunk before
+                // `None`.
+                for c in self.coalescers.values_mut() {
+                    if let Some(chunk) = c.flush() {
+                        self.ready.push_back(chunk);
+                    }
+                }
+                return self.ready.pop_front();
+            }
+            let Some(sample) = self.stream.next_sample().await else {
+                self.drained = true;
+                continue;
+            };
+            let track_id = sample.track_id;
+            let policy = self.default_policy;
+            let coalescer = self
+                .coalescers
+                .entry(track_id)
+                .or_insert_with(|| TrackCoalescer::new(track_id, policy));
+            if let Some(chunk) = coalescer.push(sample) {
+                self.ready.push_back(chunk);
+            }
+        }
+    }
 }
 
 /// ISO/IEC 14496-12 `sample_flags` for a video sample.
