@@ -16,7 +16,10 @@
 //! the reference.
 
 use bytes::{Bytes, BytesMut};
-use lvqr_cmaf::{CmafChunkKind, CmafPolicy, RawSample, TrackCoalescer, VideoInitParams, write_avc_init_segment};
+use lvqr_cmaf::{
+    AudioInitParams, CmafChunkKind, CmafPolicy, RawSample, TrackCoalescer, VideoInitParams, write_aac_init_segment,
+    write_avc_init_segment,
+};
 use lvqr_test_utils::ffprobe_bytes;
 
 /// Deterministic SPS + PPS from the AVC init segment's existing
@@ -103,6 +106,70 @@ fn ffprobe_accepts_init_plus_coalescer_segment() {
     // pair; stacking them back-to-back is how fMP4 live streams
     // are served.
     let init = init_segment_bytes();
+    let mut buf = Vec::with_capacity(init.len() + chunks.iter().map(|c| c.payload.len()).sum::<usize>());
+    buf.extend_from_slice(&init);
+    for chunk in &chunks {
+        buf.extend_from_slice(&chunk.payload);
+    }
+
+    ffprobe_bytes(&buf).assert_accepted();
+}
+
+#[test]
+fn ffprobe_accepts_init_plus_coalescer_aac_segment() {
+    // AAC-LC 44.1 kHz stereo. The same 2-byte
+    // AudioSpecificConfig lvqr-codec's conformance fixture pins
+    // (`aac-asc-aaclc-44100hz-stereo.bin`), hard-coded here so
+    // this test does not need the lvqr-conformance dev-dep.
+    let mut init = BytesMut::new();
+    write_aac_init_segment(
+        &mut init,
+        &AudioInitParams {
+            asc: vec![0x12, 0x10],
+            timescale: 44_100,
+        },
+    )
+    .expect("aac init encode");
+    let init = init.to_vec();
+
+    // Feed 20 AAC frames into a coalescer. AAC's frame size is
+    // fixed at 1024 samples per frame for AAC-LC, and every
+    // frame is independently decodable (every sample is a
+    // keyframe from the coalescer's point of view). With the
+    // default 48 kHz audio policy, the partial boundary fires
+    // every 9_600 ticks; 1024 frames * 20 frames = 20_480
+    // ticks, which straddles both the partial boundary (fires
+    // once) and is well below the 96_000 tick segment boundary.
+    //
+    // Side note: we use the 48 kHz audio defaults even though
+    // the ASC describes a 44.1 kHz stream because the policy is
+    // in track ticks, not Hz. The test only exercises the
+    // coalescer's state machine and the moof/mdat writer; the
+    // exact boundary value is not load-bearing.
+    let mut c = TrackCoalescer::new(1, CmafPolicy::AUDIO_48KHZ_DEFAULT);
+    let mut chunks = Vec::new();
+    let frame_ticks = 1024u32;
+    for i in 0..20 {
+        let dts = (i as u64) * frame_ticks as u64;
+        // 128 bytes of zero AAC payload per frame. ffprobe
+        // walks the container structure and emits decoder
+        // warnings about the AAC payload on stderr, but exits
+        // zero because the mp4a sample entry and the tfdt / trun
+        // structure are sound.
+        let payload = Bytes::from(vec![0u8; 128]);
+        if let Some(chunk) = c.push(RawSample::keyframe(1, dts, frame_ticks, payload)) {
+            chunks.push(chunk);
+        }
+    }
+    if let Some(chunk) = c.flush() {
+        chunks.push(chunk);
+    }
+    assert!(!chunks.is_empty());
+    // First chunk is always the segment head in a fresh
+    // coalescer.
+    assert_eq!(chunks[0].kind, CmafChunkKind::Segment);
+
+    // Concatenate init + chunks and feed to ffprobe.
     let mut buf = Vec::with_capacity(init.len() + chunks.iter().map(|c| c.payload.len()).sum::<usize>());
     buf.extend_from_slice(&init);
     for chunk in &chunks {
