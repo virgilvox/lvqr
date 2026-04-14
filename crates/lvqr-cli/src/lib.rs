@@ -64,6 +64,13 @@ pub struct ServeConfig {
     /// subscribed session. When `None`, no WHEP surface is exposed
     /// and no `str0m` state is constructed.
     pub whep_addr: Option<SocketAddr>,
+    /// Optional WHIP (WebRTC HTTP Ingest Protocol) HTTP bind
+    /// address. When `Some`, `start()` constructs a
+    /// `Str0mIngestAnswerer` and a `WhipMoqBridge`, attaches it
+    /// as an ingest sink, and spins up an axum router on this
+    /// address that accepts `POST /whip/{broadcast}` SDP offers.
+    /// When `None`, no WHIP surface is exposed.
+    pub whip_addr: Option<SocketAddr>,
     /// Enable the peer mesh coordinator and `/signal` endpoint.
     pub mesh_enabled: bool,
     /// Max children per mesh parent when `mesh_enabled`.
@@ -102,6 +109,7 @@ impl ServeConfig {
             admin_addr: (loopback, 0).into(),
             hls_addr: Some((loopback, 0).into()),
             whep_addr: None,
+            whip_addr: None,
             mesh_enabled: false,
             max_peers: 3,
             auth: None,
@@ -126,6 +134,7 @@ pub struct ServerHandle {
     admin_addr: SocketAddr,
     hls_addr: Option<SocketAddr>,
     whep_addr: Option<SocketAddr>,
+    whip_addr: Option<SocketAddr>,
     shutdown: CancellationToken,
     join: Option<tokio::task::JoinHandle<()>>,
 }
@@ -154,6 +163,11 @@ impl ServerHandle {
     /// Bound WHEP HTTP address, when WHEP egress is enabled.
     pub fn whep_addr(&self) -> Option<SocketAddr> {
         self.whep_addr
+    }
+
+    /// Bound WHIP HTTP address, when WHIP ingest is enabled.
+    pub fn whip_addr(&self) -> Option<SocketAddr> {
+        self.whip_addr
     }
 
     /// HTTP base URL for the admin / WS surface.
@@ -301,16 +315,13 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     if let Some((dir, index)) = archive_index.clone() {
         fragment_observers.push(Arc::new(IndexingFragmentObserver::new(dir, index)));
     }
-    match fragment_observers.len() {
-        0 => {}
-        1 => {
-            let observer = fragment_observers.into_iter().next().expect("len checked");
-            bridge_builder = bridge_builder.with_observer(observer);
-        }
-        _ => {
-            let tee: SharedFragmentObserver = Arc::new(TeeFragmentObserver::new(fragment_observers));
-            bridge_builder = bridge_builder.with_observer(tee);
-        }
+    let shared_fragment_observer: Option<SharedFragmentObserver> = match fragment_observers.len() {
+        0 => None,
+        1 => Some(fragment_observers.into_iter().next().expect("len checked")),
+        _ => Some(Arc::new(TeeFragmentObserver::new(fragment_observers)) as SharedFragmentObserver),
+    };
+    if let Some(ref obs) = shared_fragment_observer {
+        bridge_builder = bridge_builder.with_observer(obs.clone());
     }
 
     // Optional WHEP surface. Constructed before the bridge is
@@ -328,6 +339,33 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         Some(server)
     } else {
         None
+    };
+
+    // Optional WHIP ingest surface. The bridge side is a sibling
+    // of `RtmpMoqBridge`: it owns its own `BroadcastProducer`
+    // state but fans fragments through the exact same
+    // `SharedFragmentObserver` and `SharedRawSampleObserver`
+    // instances the RTMP bridge uses, so every existing egress
+    // (MoQ, LL-HLS, WHEP, disk record, DVR archive) picks up WHIP
+    // publishers with zero additional wiring.
+    let (whip_server, whip_bridge) = if let Some(addr) = config.whip_addr {
+        let mut whip_bridge = lvqr_whip::WhipMoqBridge::new(relay.origin().clone());
+        if let Some(ref obs) = shared_fragment_observer {
+            whip_bridge = whip_bridge.with_observer(obs.clone());
+        }
+        if let Some(ref server) = whep_server {
+            let raw_observer: lvqr_ingest::SharedRawSampleObserver = Arc::new(server.clone());
+            whip_bridge = whip_bridge.with_raw_sample_observer(raw_observer);
+        }
+        let whip_bridge_arc = Arc::new(whip_bridge);
+        let sink = whip_bridge_arc.clone() as Arc<dyn lvqr_whip::IngestSampleSink>;
+        let str0m_cfg = lvqr_whip::Str0mIngestConfig { host_ip: addr.ip() };
+        let answerer =
+            Arc::new(lvqr_whip::Str0mIngestAnswerer::new(str0m_cfg, sink)) as Arc<dyn lvqr_whip::SdpAnswerer>;
+        let server = lvqr_whip::WhipServer::new(answerer);
+        (Some(server), Some(whip_bridge_arc))
+    } else {
+        (None, None)
     };
 
     let bridge = Arc::new(bridge_builder);
@@ -363,6 +401,19 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
         tracing::info!(addr = %bound, "WHEP HTTP bound");
+        (Some(listener), Some(bound))
+    } else {
+        (None, None)
+    };
+
+    // WHIP listener: pre-bind for the same reason. Keeping the
+    // bridge arc alive for the lifetime of the server task is
+    // important: dropping it would tear down every active MoQ
+    // broadcast produced by a WHIP publisher.
+    let (whip_listener, whip_bound) = if let Some(addr) = config.whip_addr {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let bound = listener.local_addr()?;
+        tracing::info!(addr = %bound, "WHIP HTTP bound");
         (Some(listener), Some(bound))
     } else {
         (None, None)
@@ -538,11 +589,18 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let admin_shutdown = shutdown.clone();
     let hls_shutdown = shutdown.clone();
     let whep_shutdown = shutdown.clone();
+    let whip_shutdown = shutdown.clone();
     let bg_shutdown_for_task = shutdown.clone();
     let hls_router_pair =
         hls_listener.map(|listener| (listener, hls_server.expect("hls_server set when listener is set")));
     let whep_router_pair =
         whep_listener.map(|listener| (listener, whep_server.expect("whep_server set when listener is set")));
+    let whip_router_pair =
+        whip_listener.map(|listener| (listener, whip_server.expect("whip_server set when listener is set")));
+    // Moved into the spawned task below so it lives as long as
+    // the WHIP poll loops; see `drop(_whip_bridge_keepalive)` at
+    // the end of the join block.
+    let whip_bridge_keepalive = whip_bridge;
 
     let join = tokio::spawn(async move {
         let shutdown_on_exit_relay = bg_shutdown_for_task.clone();
@@ -603,7 +661,26 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             shutdown_on_exit_whep.cancel();
         };
 
-        let _ = tokio::join!(relay_fut, rtmp_fut, admin_fut, hls_fut, whep_fut);
+        let shutdown_on_exit_whip = bg_shutdown_for_task.clone();
+        let whip_fut = async move {
+            let Some((listener, server)) = whip_router_pair else {
+                return;
+            };
+            let router = lvqr_whip::router_for(server);
+            let result = axum::serve(listener, router)
+                .with_graceful_shutdown(async move { whip_shutdown.cancelled().await })
+                .await;
+            if let Err(e) = &result {
+                tracing::error!(error = %e, "WHIP server error");
+            }
+            shutdown_on_exit_whip.cancel();
+        };
+
+        let _ = tokio::join!(relay_fut, rtmp_fut, admin_fut, hls_fut, whep_fut, whip_fut);
+        // Keep the WHIP bridge Arc alive until every server has
+        // drained. Otherwise a late WHIP sample forwarded from an
+        // in-flight session could race an early drop.
+        drop(whip_bridge_keepalive);
         tracing::info!("shutdown complete");
     });
 
@@ -613,6 +690,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         admin_addr: admin_bound,
         hls_addr: hls_bound,
         whep_addr: whep_bound,
+        whip_addr: whip_bound,
         shutdown,
         join: Some(join),
     })

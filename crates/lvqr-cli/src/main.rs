@@ -44,6 +44,16 @@ struct ServeArgs {
     #[arg(long, default_value = "0", env = "LVQR_WHEP_PORT")]
     whep_port: u16,
 
+    /// WHIP HTTP listen port. Set to 0 to disable WHIP ingest. When
+    /// non-zero, `lvqr serve` binds a dedicated axum server on this
+    /// port exposing `POST/PATCH/DELETE /whip/{broadcast}` for
+    /// WebRTC publishers. The WHIP backend uses `str0m`, completes
+    /// ICE/DTLS, and converts inbound H.264 Annex B access units
+    /// into fragments that flow through every existing egress
+    /// (MoQ, LL-HLS, WHEP, disk record, DVR archive).
+    #[arg(long, default_value = "0", env = "LVQR_WHIP_PORT")]
+    whip_port: u16,
+
     /// Enable peer mesh relay.
     #[arg(long, env = "LVQR_MESH_ENABLED")]
     mesh_enabled: bool,
@@ -163,12 +173,19 @@ async fn serve_from_args(args: ServeArgs) -> Result<()> {
         Some(([0, 0, 0, 0], args.whep_port).into())
     };
 
+    let whip_addr = if args.whip_port == 0 {
+        None
+    } else {
+        Some(([0, 0, 0, 0], args.whip_port).into())
+    };
+
     let config = ServeConfig {
         relay_addr: ([0, 0, 0, 0], args.port).into(),
         rtmp_addr: ([0, 0, 0, 0], args.rtmp_port).into(),
         admin_addr: ([0, 0, 0, 0], args.admin_port).into(),
         hls_addr,
         whep_addr,
+        whip_addr,
         mesh_enabled: args.mesh_enabled,
         max_peers: args.max_peers,
         auth: Some(auth),

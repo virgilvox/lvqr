@@ -116,6 +116,7 @@ impl TestServer {
             admin_addr: ephemeral,
             hls_addr: if config.hls_disabled { None } else { Some(ephemeral) },
             whep_addr: None,
+            whip_addr: None,
             mesh_enabled: config.mesh_enabled,
             max_peers: config.max_peers.unwrap_or(3),
             auth: config.auth,

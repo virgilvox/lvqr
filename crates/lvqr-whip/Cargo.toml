@@ -1,0 +1,31 @@
+[package]
+name = "lvqr-whip"
+description = "WHIP (WebRTC HTTP Ingest Protocol) ingest for LVQR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["streaming", "webrtc", "whip", "rtp", "ingest"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+axum = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+h264-reader = { workspace = true }
+lvqr-cmaf = { workspace = true }
+lvqr-fragment = { workspace = true }
+lvqr-ingest = { workspace = true }
+lvqr-moq = { workspace = true }
+rand = { workspace = true }
+str0m = "0.18"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tower = { workspace = true }

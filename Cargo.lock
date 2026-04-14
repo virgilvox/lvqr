@@ -1526,6 +1526,7 @@ dependencies = [
  "lvqr-signal",
  "lvqr-test-utils",
  "lvqr-whep",
+ "lvqr-whip",
  "metrics",
  "metrics-exporter-prometheus",
  "moq-lite",
@@ -1784,6 +1785,27 @@ dependencies = [
  "dashmap",
  "lvqr-cmaf",
  "lvqr-ingest",
+ "proptest",
+ "rand 0.8.5",
+ "str0m",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "lvqr-whip"
+version = "0.3.1"
+dependencies = [
+ "axum",
+ "bytes",
+ "dashmap",
+ "h264-reader",
+ "lvqr-cmaf",
+ "lvqr-fragment",
+ "lvqr-ingest",
+ "lvqr-moq",
  "proptest",
  "rand 0.8.5",
  "str0m",
