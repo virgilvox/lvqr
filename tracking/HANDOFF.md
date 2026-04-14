@@ -2,7 +2,7 @@
 
 ## Project Status: v0.4-dev -- `lvqr-whep` signaling router shipped, str0m pending
 
-**Last Updated**: 2026-04-14 (session 17 close)
+**Last Updated**: 2026-04-14 (session 18 close)
 **Tests**: `cargo test --workspace` green under the default feature
 set: 69 test binaries, 269 individual tests, 0 failures. The
 `--no-default-features --features rtmp,quinn-transport` legacy
@@ -10,6 +10,92 @@ configuration is retired along with the hand-rolled fMP4 writer; the
 `test-legacy-fmp4-path` CI matrix job was deleted in session 14.
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 `cargo fmt --all --check` clean.
+
+## Session 18 (2026-04-14): fix LL-HLS audio partial duration reporting
+
+Session 18 is a one-commit session (3058ee3) closing the cosmetic
+follow-up that session 14 flagged: the LL-HLS audio playlist was
+rendering `#EXT-X-PART:DURATION` values scaled by
+48_000 / 44_100 ≈ 1.088 for 44.1 kHz AAC content because session
+13 hardcoded `audio_config_from` to `timescale: 48_000`. For a
+typical 1024-sample AAC-LC frame the playlist reported
+`DURATION=0.021333` (1024 / 48000) instead of the correct
+`DURATION=0.023220` (1024 / 44100). Routing and serving were
+always correct -- only the rendered duration was wrong.
+
+### What changed (six files touched)
+
+1. **`crates/lvqr-cmaf/src/policy.rs`**. New
+   `CmafPolicy::for_timescale(timescale: u32)` constructor that
+   builds a policy scaled to any timescale using the standard
+   LL-HLS targets (200 ms partials, 2 s segments).
+   `VIDEO_90KHZ_DEFAULT` and `AUDIO_48KHZ_DEFAULT` are the
+   specialised shapes this constructor returns for 90_000 Hz and
+   48_000 Hz respectively -- both constants kept for source-level
+   compatibility with the proptest / segmenter / coalescer test
+   suites that already name them.
+
+2. **`crates/lvqr-ingest/src/observer.rs`**. `FragmentObserver::on_init`
+   signature grows a `timescale: u32` parameter carrying the
+   track's native sample rate. Docstring explains why: downstream
+   consumers need the real denominator to render wall-clock
+   durations from tick counts. `NoopFragmentObserver` impl
+   updated.
+
+3. **`crates/lvqr-ingest/src/bridge.rs`**. Video on_init fire
+   passes `90_000` (hardcoded because `video_init_segment_with_size`
+   writes `mvhd.timescale = 90000` unconditionally). Audio on_init
+   fire captures `config.sample_rate` into a local `audio_timescale`
+   before the `AudioConfig` moves into `stream.audio_config`, then
+   passes it through. No other bridge semantics change.
+
+4. **`crates/lvqr-hls/src/server.rs`**.
+   `MultiHlsServer::ensure_audio(broadcast, timescale)` now takes
+   the audio track timescale as a second argument. The derived
+   `audio_config_from(video, timescale)` swaps the hardcoded
+   48_000 for the passed value so
+   `PlaylistBuilderConfig::timescale` on the audio rendition
+   reflects the real sample rate. The session-13 TODO comment on
+   `audio_config_from` called for exactly this.
+
+5. **`crates/lvqr-cli/src/hls.rs`**. `HlsFragmentBridge::on_init`
+   builds the per-track `CmafPolicy` via
+   `CmafPolicy::for_timescale(timescale)` and passes the same
+   `timescale` into `ensure_audio`. `on_fragment`'s audio and
+   video branches switch from `ensure_video` / `ensure_audio`
+   (producer-side side-effects) to pure `self.multi.video()` /
+   `self.multi.audio()` lookups that skip cleanly if the init
+   has not landed yet -- a defensive branch since the FLV
+   sequence header always arrives before any raw frame.
+
+6. **`crates/lvqr-hls/tests/integration_master.rs`**. Session-13
+   test updated to pass `48_000` as the audio timescale, matching
+   the test's pre-existing `audio_chunk(..., 96_000, ...)`
+   duration assumptions.
+
+### Verification
+
+`rtmp_hls_e2e` now prints the exact expected value in its audio
+playlist body: `#EXT-X-PART:DURATION=0.023220` for both audio
+partials (the test publishes two AAC frames at 44.1 kHz). That
+is `1024 / 44100 = 0.0232199...` rounded to six decimals by the
+playlist renderer's `{:.6}` format specifier. `cargo test
+--workspace` passes 269 tests. `cargo clippy --workspace
+--all-targets -- -D warnings` clean. `cargo fmt --all --check`
+clean.
+
+### Recommended entry point (session 19)
+
+With the audio timescale follow-up closed, the remaining open
+threads are unchanged from the session 17 handoff:
+
+1. **str0m-backed `Str0mAnswerer`**. The full WHEP signaling →
+   transport integration. Still a full session of its own.
+2. **`--whep-addr` flag in `lvqr-cli`** + `RawSampleObserver`
+   attachment. Small follow-up after item 1.
+3. **Fuzz slot for the SDP offer parser**. Lands with item 1.
+
+Session 18 did not touch any of these.
 
 ## Session 17 (2026-04-14): close deferred audit findings
 
