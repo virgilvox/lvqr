@@ -35,14 +35,16 @@ use std::path::PathBuf;
 /// Per-protocol toggles plus auth injection for a [`TestServer`].
 ///
 /// Defaults are the common case for integration tests: every LVQR
-/// protocol enabled on `127.0.0.1:0`, no mesh, no recording, open
-/// access. Override individual fields through the builder methods.
+/// protocol enabled on `127.0.0.1:0` including the LL-HLS surface,
+/// no mesh, no recording, open access. Override individual fields
+/// through the builder methods.
 #[derive(Default, Clone)]
 pub struct TestServerConfig {
     mesh_enabled: bool,
     max_peers: Option<usize>,
     auth: Option<SharedAuth>,
     record_dir: Option<PathBuf>,
+    hls_disabled: bool,
 }
 
 impl TestServerConfig {
@@ -68,6 +70,13 @@ impl TestServerConfig {
     /// Enable disk recording into the given directory.
     pub fn with_record_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.record_dir = Some(dir.into());
+        self
+    }
+
+    /// Turn off the LL-HLS HTTP surface. Tests that do not exercise
+    /// HLS can opt out to skip the extra TCP listener.
+    pub fn without_hls(mut self) -> Self {
+        self.hls_disabled = true;
         self
     }
 }
@@ -96,6 +105,7 @@ impl TestServer {
             relay_addr: ephemeral,
             rtmp_addr: ephemeral,
             admin_addr: ephemeral,
+            hls_addr: if config.hls_disabled { None } else { Some(ephemeral) },
             mesh_enabled: config.mesh_enabled,
             max_peers: config.max_peers.unwrap_or(3),
             auth: config.auth,
@@ -125,6 +135,22 @@ impl TestServer {
     /// Bound admin HTTP address (also hosts `/ws/*` and `/ingest/*`).
     pub fn admin_addr(&self) -> SocketAddr {
         self.handle.admin_addr()
+    }
+
+    /// Bound LL-HLS HTTP address. Panics if HLS was disabled via
+    /// [`TestServerConfig::without_hls`].
+    pub fn hls_addr(&self) -> SocketAddr {
+        self.handle
+            .hls_addr()
+            .expect("HLS surface disabled on this TestServer; remove without_hls() to enable")
+    }
+
+    /// Build an HTTP URL pointing at a path on the LL-HLS surface, e.g.
+    /// `hls_url("/playlist.m3u8")`. Panics if HLS was disabled.
+    pub fn hls_url(&self, path: &str) -> String {
+        self.handle
+            .hls_url(path)
+            .expect("HLS surface disabled on this TestServer; remove without_hls() to enable")
     }
 
     /// Admin HTTP base URL (e.g. `http://127.0.0.1:34921`).

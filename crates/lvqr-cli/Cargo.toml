@@ -23,6 +23,11 @@ default = ["rtmp", "quinn-transport"]
 full = ["rtmp", "quinn-transport"]
 rtmp = ["lvqr-ingest/rtmp"]
 quinn-transport = ["lvqr-relay/quinn-transport"]
+# Forward-flag for `lvqr-ingest/cmaf-writer` so the CI matrix job can
+# enable the alternative `lvqr_cmaf::build_moof_mdat` write path with
+# a single `--features cmaf-writer` argument on the workspace top
+# crate.
+cmaf-writer = ["lvqr-ingest/cmaf-writer"]
 
 [dependencies]
 lvqr-core = { workspace = true }
@@ -35,6 +40,9 @@ lvqr-signal = { workspace = true }
 lvqr-admin = { workspace = true }
 lvqr-auth = { workspace = true, features = ["jwt"] }
 lvqr-record = { workspace = true }
+lvqr-fragment = { workspace = true }
+lvqr-cmaf = { workspace = true }
+lvqr-hls = { workspace = true }
 
 axum = { workspace = true }
 bytes = { workspace = true }

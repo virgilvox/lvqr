@@ -13,10 +13,11 @@ use lvqr_moq::Track;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use crate::observer::SharedFragmentObserver;
 use crate::remux::{
     AudioConfig, FlvAudioTag, FlvVideoTag, VideoConfig, VideoSample, audio_init_segment, audio_segment,
-    extract_resolution, generate_catalog, parse_audio_tag, parse_video_tag, video_init_segment_with_size,
-    video_segment,
+    build_video_segment, extract_resolution, generate_catalog, parse_audio_tag, parse_video_tag,
+    video_init_segment_with_size,
 };
 use crate::rtmp::{AuthCallback, MediaCallback, RtmpConfig, RtmpServer, StreamCallback};
 
@@ -52,6 +53,7 @@ pub struct RtmpMoqBridge {
     streams: Arc<DashMap<String, ActiveStream>>,
     auth: SharedAuth,
     events: Option<EventBus>,
+    observer: Option<SharedFragmentObserver>,
 }
 
 impl RtmpMoqBridge {
@@ -61,6 +63,7 @@ impl RtmpMoqBridge {
             streams: Arc::new(DashMap::new()),
             auth: Arc::new(NoopAuthProvider),
             events: None,
+            observer: None,
         }
     }
 
@@ -71,6 +74,7 @@ impl RtmpMoqBridge {
             streams: Arc::new(DashMap::new()),
             auth,
             events: None,
+            observer: None,
         }
     }
 
@@ -93,6 +97,22 @@ impl RtmpMoqBridge {
         self.events = Some(events);
     }
 
+    /// Attach a [`crate::FragmentObserver`] so the bridge fans every
+    /// emitted [`Fragment`] (and the corresponding init segment) out
+    /// to a non-MoQ consumer such as the LL-HLS server in `lvqr-cli`.
+    /// The observer is invoked synchronously from inside the RTMP
+    /// callback path, so implementations must be cheap.
+    pub fn with_observer(mut self, observer: SharedFragmentObserver) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Attach or replace the [`crate::FragmentObserver`] after
+    /// construction.
+    pub fn set_observer(&mut self, observer: SharedFragmentObserver) {
+        self.observer = Some(observer);
+    }
+
     /// Create an RTMP server wired to this bridge.
     pub fn create_rtmp_server(&self, config: RtmpConfig) -> RtmpServer {
         let origin = self.origin.clone();
@@ -102,6 +122,9 @@ impl RtmpMoqBridge {
         let streams_audio = self.streams.clone();
         let events_publish = self.events.clone();
         let events_unpublish = self.events.clone();
+
+        let observer_video = self.observer.clone();
+        let observer_audio = self.observer.clone();
 
         let on_publish: StreamCallback = Arc::new(move |app: &str, key: &str| {
             let stream_name = format!("{app}/{key}");
@@ -208,7 +231,10 @@ impl RtmpMoqBridge {
                     // group starts with it.
                     stream.video_sink.set_init_segment(init.clone());
                     stream.video_config = Some(config);
-                    stream.video_init = Some(init);
+                    stream.video_init = Some(init.clone());
+                    if let Some(obs) = observer_video.as_ref() {
+                        obs.on_init(&stream_name, "0.mp4", init);
+                    }
                     maybe_write_catalog(stream, &stream_name);
                 }
                 FlvVideoTag::Nalu {
@@ -240,7 +266,7 @@ impl RtmpMoqBridge {
                     };
 
                     stream.video_seq += 1;
-                    let seg = video_segment(stream.video_seq, base_dts, &[sample]);
+                    let seg = build_video_segment(stream.video_seq, base_dts, &[sample]);
 
                     // Build a Fragment and push it through the sink. On a
                     // keyframe the sink closes the previous group, opens a
@@ -266,6 +292,9 @@ impl RtmpMoqBridge {
                     if let Err(e) = stream.video_sink.push(&frag) {
                         debug!(error = ?e, "failed to push video fragment through sink");
                     }
+                    if let Some(obs) = observer_video.as_ref() {
+                        obs.on_fragment(&stream_name, "0.mp4", &frag);
+                    }
                 }
                 FlvVideoTag::EndOfSequence => {
                     stream.video_sink.finish_current_group();
@@ -287,7 +316,10 @@ impl RtmpMoqBridge {
                     let init = audio_init_segment(&config);
                     stream.audio_sink.set_init_segment(init.clone());
                     stream.audio_config = Some(config);
-                    stream.audio_init = Some(init);
+                    stream.audio_init = Some(init.clone());
+                    if let Some(obs) = observer_audio.as_ref() {
+                        obs.on_init(&stream_name, "1.mp4", init);
+                    }
                     maybe_write_catalog(stream, &stream_name);
                 }
                 FlvAudioTag::RawAac(aac_data) => {
@@ -325,6 +357,9 @@ impl RtmpMoqBridge {
                     );
                     if let Err(e) = stream.audio_sink.push(&frag) {
                         debug!(error = ?e, "failed to push audio fragment through sink");
+                    }
+                    if let Some(obs) = observer_audio.as_ref() {
+                        obs.on_fragment(&stream_name, "1.mp4", &frag);
                     }
                     // Close the group immediately so every audio frame is
                     // its own group on the wire. Subsequent pushes will

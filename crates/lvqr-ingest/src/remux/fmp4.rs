@@ -400,6 +400,56 @@ pub fn audio_init_segment(config: &AudioConfig) -> Bytes {
 
 // --- Media segment generation ---
 
+/// Build a video media segment (`moof + mdat`) for the bridge's
+/// per-frame ingest path.
+///
+/// Default build path delegates to the in-crate hand-rolled
+/// [`video_segment`] writer that has shipped since v0.1. With the
+/// `cmaf-writer` feature flag the build instead routes through
+/// [`lvqr_cmaf::build_moof_mdat`], which uses the `mp4-atom` typed
+/// encoder and unlocks HEVC / AV1 sample entries. Both paths are
+/// byte-divergent in fields that do not affect playback, but every
+/// playback-critical field
+/// (`mfhd.sequence_number`, `tfhd.track_id`, `tfdt`,
+/// `trun` durations / sizes / flags / cts offsets) matches; the
+/// parity gate at `crates/lvqr-ingest/tests/parity_avc_segment.rs`
+/// pins this. Both paths are exercised on every PR via a CI matrix
+/// job in `.github/workflows/ci.yml`.
+pub fn build_video_segment(sequence: u32, base_dts: u64, samples: &[VideoSample]) -> Bytes {
+    #[cfg(feature = "cmaf-writer")]
+    {
+        build_video_segment_via_cmaf(sequence, base_dts, samples)
+    }
+    #[cfg(not(feature = "cmaf-writer"))]
+    {
+        video_segment(sequence, base_dts, samples)
+    }
+}
+
+/// `cmaf-writer`-feature replacement for [`video_segment`]. Builds
+/// the per-sample [`lvqr_cmaf::RawSample`] vector from the
+/// hand-rolled [`VideoSample`] inputs and hands it to
+/// [`lvqr_cmaf::build_moof_mdat`]. Per-sample DTS is reconstructed
+/// by walking sample durations forward from `base_dts`, matching
+/// what the hand-rolled writer puts in `tfdt + trun`.
+#[cfg(feature = "cmaf-writer")]
+fn build_video_segment_via_cmaf(sequence: u32, base_dts: u64, samples: &[VideoSample]) -> Bytes {
+    let mut raws = Vec::with_capacity(samples.len());
+    let mut dts = base_dts;
+    for s in samples {
+        raws.push(lvqr_cmaf::RawSample {
+            track_id: 1,
+            dts,
+            cts_offset: s.cts_offset,
+            duration: s.duration,
+            payload: s.data.clone(),
+            keyframe: s.keyframe,
+        });
+        dts = dts.saturating_add(s.duration as u64);
+    }
+    lvqr_cmaf::build_moof_mdat(sequence, 1, base_dts, &raws)
+}
+
 /// Generate a video media segment (moof + mdat) containing one or more samples.
 pub fn video_segment(sequence: u32, base_dts: u64, samples: &[VideoSample]) -> Bytes {
     if samples.is_empty() {

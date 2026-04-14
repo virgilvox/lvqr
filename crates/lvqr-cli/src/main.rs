@@ -26,6 +26,14 @@ struct ServeArgs {
     #[arg(long, default_value = "8080", env = "LVQR_ADMIN_PORT")]
     admin_port: u16,
 
+    /// LL-HLS HTTP listen port. Set to 0 to disable HLS composition.
+    /// When non-zero, `lvqr serve` spins up a dedicated axum server on
+    /// this port that exposes `/playlist.m3u8`, `/init.mp4`, and the
+    /// per-chunk media URIs that the playlist references for the
+    /// first RTMP broadcast that publishes.
+    #[arg(long, default_value = "8888", env = "LVQR_HLS_PORT")]
+    hls_port: u16,
+
     /// Enable peer mesh relay.
     #[arg(long, env = "LVQR_MESH_ENABLED")]
     mesh_enabled: bool,
@@ -128,10 +136,17 @@ async fn serve_from_args(args: ServeArgs) -> Result<()> {
         }
     };
 
+    let hls_addr = if args.hls_port == 0 {
+        None
+    } else {
+        Some(([0, 0, 0, 0], args.hls_port).into())
+    };
+
     let config = ServeConfig {
         relay_addr: ([0, 0, 0, 0], args.port).into(),
         rtmp_addr: ([0, 0, 0, 0], args.rtmp_port).into(),
         admin_addr: ([0, 0, 0, 0], args.admin_port).into(),
+        hls_addr,
         mesh_enabled: args.mesh_enabled,
         max_peers: args.max_peers,
         auth: Some(auth),

@@ -11,6 +11,8 @@
 //! spin up a full-stack LVQR instance on ephemeral ports inside
 //! integration tests.
 
+mod hls;
+
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
@@ -20,6 +22,8 @@ use axum::routing::get;
 use bytes::Bytes;
 use lvqr_auth::{AuthContext, AuthDecision, NoopAuthProvider, SharedAuth};
 use lvqr_core::{EventBus, RelayEvent};
+use lvqr_hls::{HlsServer, PlaylistBuilderConfig};
+use lvqr_ingest::SharedFragmentObserver;
 use lvqr_moq::Track;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -28,6 +32,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
+
+use crate::hls::HlsFragmentBridge;
 
 /// Configuration passed to [`start`] to bring up a full-stack LVQR server.
 ///
@@ -41,6 +47,12 @@ pub struct ServeConfig {
     pub rtmp_addr: SocketAddr,
     /// Admin HTTP (and WS relay/ingest) bind address.
     pub admin_addr: SocketAddr,
+    /// Optional LL-HLS HTTP bind address. When `Some`, `start()` spins up a
+    /// dedicated `HlsServer` axum router on this address that observes the
+    /// RTMP bridge's fragment output and serves `/playlist.m3u8`,
+    /// `/init.mp4`, and the per-chunk media URIs the playlist references.
+    /// When `None`, no HLS surface is exposed.
+    pub hls_addr: Option<SocketAddr>,
     /// Enable the peer mesh coordinator and `/signal` endpoint.
     pub mesh_enabled: bool,
     /// Max children per mesh parent when `mesh_enabled`.
@@ -69,6 +81,7 @@ impl ServeConfig {
             relay_addr: (loopback, 0).into(),
             rtmp_addr: (loopback, 0).into(),
             admin_addr: (loopback, 0).into(),
+            hls_addr: Some((loopback, 0).into()),
             mesh_enabled: false,
             max_peers: 3,
             auth: None,
@@ -90,6 +103,7 @@ pub struct ServerHandle {
     relay_addr: SocketAddr,
     rtmp_addr: SocketAddr,
     admin_addr: SocketAddr,
+    hls_addr: Option<SocketAddr>,
     shutdown: CancellationToken,
     join: Option<tokio::task::JoinHandle<()>>,
 }
@@ -110,9 +124,27 @@ impl ServerHandle {
         self.admin_addr
     }
 
+    /// Bound LL-HLS HTTP address, when HLS composition is enabled.
+    pub fn hls_addr(&self) -> Option<SocketAddr> {
+        self.hls_addr
+    }
+
     /// HTTP base URL for the admin / WS surface.
     pub fn http_base(&self) -> String {
         format!("http://{}", self.admin_addr)
+    }
+
+    /// HTTP URL pointing at a path on the LL-HLS surface, e.g.
+    /// `hls_url("/playlist.m3u8")`. Returns `None` when HLS is not
+    /// enabled.
+    pub fn hls_url(&self, path: &str) -> Option<String> {
+        let addr = self.hls_addr?;
+        let path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        Some(format!("http://{addr}{path}"))
     }
 
     /// Construct the WebSocket subscribe URL for a broadcast.
@@ -203,11 +235,24 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let (mut moq_server, relay_bound) = relay.init_server()?;
     tracing::info!(addr = %relay_bound, "MoQ relay bound");
 
+    // Optional LL-HLS server. Built before the bridge so we can hand
+    // the bridge a `FragmentObserver` that pumps fragments into the
+    // shared `HlsServer` state. The actual TCP listener and axum
+    // serve task are wired further down once we know all bind
+    // addresses are reachable.
+    let hls_server = config
+        .hls_addr
+        .map(|_| HlsServer::new(PlaylistBuilderConfig::default()));
+
     // RTMP ingest bridged to MoQ. Pre-bind the TCP listener so we can
     // report the real bound port (for ephemeral-port test setups).
-    let bridge = Arc::new(
-        lvqr_ingest::RtmpMoqBridge::with_auth(relay.origin().clone(), auth.clone()).with_events(events.clone()),
-    );
+    let mut bridge_builder =
+        lvqr_ingest::RtmpMoqBridge::with_auth(relay.origin().clone(), auth.clone()).with_events(events.clone());
+    if let Some(hls) = hls_server.clone() {
+        let observer: SharedFragmentObserver = Arc::new(HlsFragmentBridge::new(hls));
+        bridge_builder = bridge_builder.with_observer(observer);
+    }
+    let bridge = Arc::new(bridge_builder);
     let rtmp_config = lvqr_ingest::RtmpConfig {
         bind_addr: config.rtmp_addr,
     };
@@ -220,6 +265,18 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let admin_listener = tokio::net::TcpListener::bind(config.admin_addr).await?;
     let admin_bound = admin_listener.local_addr()?;
     tracing::info!(addr = %admin_bound, "admin HTTP bound");
+
+    // HLS listener: pre-bind so the test harness can read the
+    // ephemeral port back via `ServerHandle::hls_addr` immediately
+    // after `start()` returns.
+    let (hls_listener, hls_bound) = if let Some(addr) = config.hls_addr {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let bound = listener.local_addr()?;
+        tracing::info!(addr = %bound, "LL-HLS HTTP bound");
+        (Some(listener), Some(bound))
+    } else {
+        (None, None)
+    };
 
     // Optional disk recorder.
     if let Some(ref dir) = config.record_dir {
@@ -384,7 +441,10 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let relay_shutdown = shutdown.clone();
     let rtmp_shutdown = shutdown.clone();
     let admin_shutdown = shutdown.clone();
+    let hls_shutdown = shutdown.clone();
     let bg_shutdown_for_task = shutdown.clone();
+    let hls_router_pair =
+        hls_listener.map(|listener| (listener, hls_server.expect("hls_server set when listener is set")));
 
     let join = tokio::spawn(async move {
         let shutdown_on_exit_relay = bg_shutdown_for_task.clone();
@@ -415,7 +475,22 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             shutdown_on_exit_admin.cancel();
         };
 
-        let _ = tokio::join!(relay_fut, rtmp_fut, admin_fut);
+        let shutdown_on_exit_hls = bg_shutdown_for_task.clone();
+        let hls_fut = async move {
+            let Some((listener, server)) = hls_router_pair else {
+                return;
+            };
+            let router = server.router();
+            let result = axum::serve(listener, router)
+                .with_graceful_shutdown(async move { hls_shutdown.cancelled().await })
+                .await;
+            if let Err(e) = &result {
+                tracing::error!(error = %e, "HLS server error");
+            }
+            shutdown_on_exit_hls.cancel();
+        };
+
+        let _ = tokio::join!(relay_fut, rtmp_fut, admin_fut, hls_fut);
         tracing::info!("shutdown complete");
     });
 
@@ -423,6 +498,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         relay_addr: relay_bound,
         rtmp_addr: rtmp_bound,
         admin_addr: admin_bound,
+        hls_addr: hls_bound,
         shutdown,
         join: Some(join),
     })

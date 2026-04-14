@@ -32,11 +32,3 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 proptest = "1"
 lvqr-test-utils = { workspace = true }
 lvqr-conformance = { workspace = true }
-# Dev-only: the AVC parity test in `tests/parity_avc_init.rs` runs
-# `lvqr-ingest`'s hand-rolled fMP4 writer side-by-side with the
-# `mp4-atom`-backed writer in this crate and structurally diffs the
-# decoded Moov trees. This is the only path `lvqr-ingest` appears in
-# `lvqr-cmaf`'s dep graph and it is test-only; the normal dep graph
-# still points the other direction (lvqr-ingest will eventually
-# consume lvqr-cmaf, not the reverse).
-lvqr-ingest = { workspace = true }

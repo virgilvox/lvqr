@@ -65,6 +65,6 @@ pub use init::{
     AudioInitParams, HevcInitParams, InitSegmentError, VideoInitParams, write_aac_init_segment, write_avc_init_segment,
     write_hevc_init_segment,
 };
-pub use policy::{CmafPolicy, PolicyDecision};
+pub use policy::{CmafPolicy, CmafPolicyState, PolicyDecision};
 pub use sample::{RawSample, SampleStream};
 pub use segmenter::{CmafSegmenter, SegmenterError};
