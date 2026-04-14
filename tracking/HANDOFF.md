@@ -1,14 +1,157 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- WHEP video E2E + Tier 2.4 archive index open
+## Project Status: v0.4-dev -- Tier 2.4 archive writer + playback HTTP surface real
 
-**Last Updated**: 2026-04-14 (session 23 close)
+**Last Updated**: 2026-04-14 (session 24 close)
 **Tests**: `cargo test --workspace` green under the default feature
-set: 72 test binaries, 296+ individual tests passing, 1 doctest
+set: 73 test binaries, 297+ individual tests passing, 1 doctest
 marked `ignore` (a non-runnable doc example in
 `lvqr-fragment/src/moq_sink.rs:39`), 0 failures. `cargo clippy
 --workspace --all-targets -- -D warnings` clean. `cargo fmt --all
 --check` clean.
+
+## Session 24 (2026-04-14): Tier 2.4 writer integration + playback endpoints
+
+One commit on top of session 23's baseline. Closes every session-23
+recommended item 1 and 2 in a single session: the archive index now
+has a real writer feeding it and a real HTTP surface reading it
+back, so DVR scrub is end-to-end through a full RTMP publish.
+
+### Commits
+
+* **7c84344** -- Tier 2.4: archive writer integration + playback
+  HTTP endpoints. `IndexingFragmentObserver` in
+  `crates/lvqr-cli/src/archive.rs` captures the track timescale
+  from `FragmentObserver::on_init` (already carried since session
+  18), then on every `on_fragment` call spawns a blocking task
+  that writes the fragment payload to
+  `<archive_dir>/<broadcast>/<track>/<seq>.m4s` and records a
+  `SegmentRef` against a shared `Arc<RedbSegmentIndex>`.
+  `TeeFragmentObserver` composes the archive observer with the
+  LL-HLS bridge without widening the ingest bridge's single-
+  observer slot. `ServeConfig` grows `archive_dir: Option<PathBuf>`;
+  `--archive-dir` / `LVQR_ARCHIVE_DIR` wired through `lvqr-cli::
+  main`. `TestServerConfig::with_archive_dir` lets integration
+  tests opt in; `loopback_ephemeral` leaves it `None` so the
+  pre-existing tests are untouched. `GET /playback/{*broadcast}?
+  track=&from=&to=` on the admin axum router returns a JSON array
+  of `PlaybackSegment` rows sharing the same `Arc<RedbSegmentIndex>`
+  as the writer (avoiding redb's exclusive-file lock), with the
+  sync scan running under `spawn_blocking`. `GET /playback/latest/
+  {*broadcast}?track=` returns the single most-recent row or 404,
+  declared before the catch-all so axum specificity wins. New
+  `crates/lvqr-cli/tests/rtmp_archive_e2e.rs` publishes a real
+  two-keyframe RTMP stream into a temp archive dir via
+  `TestServer` and asserts (1) the range query returns sorted
+  non-empty rows whose paths point at real files whose lengths
+  match the recorded byte counts and whose first box is `moof`,
+  (2) a future window returns an empty array, (3) an unknown
+  broadcast returns an empty array, (4) the `latest` endpoint
+  matches the last entry of the range scan, and (5) `latest` on
+  an unknown broadcast returns 404. After shutdown the test
+  reopens the redb file directly for a second round of on-disk
+  assertions against `SegmentIndex::latest`.
+
+### Load-bearing investigation resolved
+
+The session-23 HANDOFF flagged a load-bearing unknown: does
+`lvqr_fragment::Fragment` already carry `(start_dts, end_dts,
+keyframe, timescale)` or does the coalescer need to widen
+`FragmentObserver::on_fragment`? Reading
+`crates/lvqr-fragment/src/fragment.rs` resolved the question: the
+`Fragment` type already carries `dts`, `duration` (→ `end_dts =
+dts + duration`), `flags.keyframe`, and `track_id`. `on_init` was
+already extended in session 18 to carry the per-track
+`timescale`. No observer-signature change was required; the
+stop-and-document fallback was not triggered.
+
+### Design decisions
+
+* **Own the on-disk writer inside the observer**, option (a) from
+  the pre-coding plan. `lvqr-record` is untouched and keeps its
+  MoQ-consumer writer; the archive is a fully self-contained data
+  path hanging off the `FragmentObserver` tap. Two independent
+  writers, one canonical index. Considered option (b) (have the
+  index point at files produced by `lvqr-record`) and rejected it
+  because it would have coupled two asynchronous writers that
+  already disagree on segmentation boundaries.
+* **Tee observer in `lvqr-cli`, not a bridge-API widening**. The
+  ingest bridge keeps its single `observer: Option<
+  SharedFragmentObserver>` slot. `lvqr-cli::start` composes
+  `HlsFragmentBridge` and `IndexingFragmentObserver` into a
+  `TeeFragmentObserver` when both are enabled; single observer
+  otherwise. No churn in `lvqr-ingest`.
+* **Shared `Arc<RedbSegmentIndex>` between writer and HTTP
+  handlers**. redb takes an exclusive file lock, so a separate
+  read-only open would race the writer. The playback router
+  borrows the same Arc the `IndexingFragmentObserver` holds;
+  `spawn_blocking` wraps the sync scan so the admin runtime stays
+  responsive.
+* **Per-fragment granularity, not per-segment**. The bridge emits
+  one `moof+mdat` Fragment per video NAL / per AAC access unit,
+  so the index granularity matches the smallest addressable media
+  unit. Range scans still return rows ordered by `start_dts`. A
+  future coalescing writer that packs multiple samples into a
+  single file is supported by the `byte_offset` + `length` fields
+  on `SegmentRef` but not used today.
+
+### What is still not real
+
+* **Rotation / compaction / quota**. The archive grows unbounded.
+  `lvqr-record` has the same property; this is Tier 3 work.
+* **S3 / object-store upload and cross-node replication**. Also
+  Tier 3; the single-writer `Arc<Database>` shape would need to
+  move behind an opaque interface first.
+* **Playlist rendering from the archive**. The HANDOFF-23
+  suggestion of "JSON `[SegmentRef, ...]` or an LL-HLS playlist
+  window over the matched segments" landed only the JSON half.
+  A `/playback/{*broadcast}/playlist.m3u8` that renders an HLS
+  window over archived rows is a natural follow-up once the
+  `lvqr-hls` playlist builder grows a non-live mode.
+* **Archive authentication**. The playback surface is open,
+  matching the precedent of the LL-HLS surface. A future
+  `--playback-auth` flag should reuse the existing `SharedAuth`.
+* **`lvqr-archive` crate-level integration test slot**. The
+  real integration test lives in `crates/lvqr-cli/tests/
+  rtmp_archive_e2e.rs`, not `crates/lvqr-archive/tests/`. The
+  5-artifact contract does not check `lvqr-archive` yet (it is
+  still commented out in `scripts/check_test_contract.sh`
+  IN_SCOPE), so the placement is forward-compatible; when the
+  contract is enabled for the crate, a thin `tests/
+  archive_integration.rs` that exercises `RedbSegmentIndex`
+  directly will close the slot without duplicating the cli-level
+  round trip.
+
+### Cumulative commit range since session 19
+
+Sessions 20 through 24 landed eight commits on top of `f50cc4f`:
+`580d152`, `db9fd10`, `ddcb599`, `ed9c6e3`, `8f30e8f`, `c0d474f`,
+`cbffab9`, `939e743`, `7c84344`. `origin/main` is at `7c84344`.
+Session 25 starts from there.
+
+### Recommended entry point (session 25)
+
+1. **`lvqr-wasm` deletion**. Mechanical one-commit removal of the
+   deprecated crate + its workspace member + any CI wasm job.
+   Unblocks a cleaner crate table in `README.md` and reduces the
+   "what ships" confusion the session-19 audit sweep flagged.
+2. **CORS restrictive default**. Replace
+   `CorsLayer::permissive()` in `crates/lvqr-cli/src/lib.rs` with
+   an allow-list default (admin origin + localhost) plus a
+   `--cors-allow-origin` flag. Breaking change; ship with a
+   release note.
+3. **Archive playlist rendering**. `GET /playback/{*broadcast}/
+   playlist.m3u8?from=&to=` that walks the archive rows and
+   renders a VOD HLS playlist with `#EXT-X-MAP` + one
+   `#EXTINF`/`#EXT-X-BYTERANGE` per row. Closes the HANDOFF-23
+   "or an LL-HLS playlist window" suggestion. Requires
+   `lvqr-hls` to grow a non-live / VOD builder; budget one
+   session for the builder + one session for the integration.
+4. **HEVC+Opus end-to-end**. Highest-leverage Tier 2.3 follow-up.
+   Needs a real RTMP HEVC fixture and an Opus bridge path;
+   budget multi-session.
+5. **WHIP ingest**, **DASH egress**: each a full session of its
+   own.
 
 ## Session 23 (2026-04-14): Tier 2.4 start -- lvqr-archive segment index
 
