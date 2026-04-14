@@ -32,7 +32,15 @@ pub trait FragmentObserver: Send + Sync {
     /// track)`. Fired again on every codec re-config (e.g. mid-stream
     /// resolution change), so implementations should treat repeat
     /// calls as overwrites rather than errors.
-    fn on_init(&self, broadcast: &str, track: &str, init: Bytes);
+    ///
+    /// `timescale` is the track's native timescale in Hz (e.g. 90_000
+    /// for video, 44_100 / 48_000 for audio) so downstream consumers
+    /// that need to render a wall-clock duration from tick counts can
+    /// do the division with the right denominator. The LL-HLS bridge
+    /// uses this to build a [`lvqr_cmaf::CmafPolicy`] that matches
+    /// the real track timescale rather than assuming a hardcoded
+    /// default.
+    fn on_init(&self, broadcast: &str, track: &str, timescale: u32, init: Bytes);
 
     /// Called for every video / audio [`Fragment`] the bridge emits,
     /// in DTS order per track.
@@ -66,7 +74,7 @@ pub trait RawSampleObserver: Send + Sync {
 pub struct NoopFragmentObserver;
 
 impl FragmentObserver for NoopFragmentObserver {
-    fn on_init(&self, _broadcast: &str, _track: &str, _init: Bytes) {}
+    fn on_init(&self, _broadcast: &str, _track: &str, _timescale: u32, _init: Bytes) {}
     fn on_fragment(&self, _broadcast: &str, _track: &str, _fragment: &Fragment) {}
 }
 

@@ -104,29 +104,50 @@ impl HlsFragmentBridge {
 }
 
 impl FragmentObserver for HlsFragmentBridge {
-    fn on_init(&self, broadcast: &str, track: &str, init: Bytes) {
+    fn on_init(&self, broadcast: &str, track: &str, timescale: u32, init: Bytes) {
+        // Build a `CmafPolicy` that matches the track's native
+        // timescale so LL-HLS `#EXT-X-PART:DURATION` reporting lines
+        // up with the real wall-clock duration of each partial.
+        // Previously the audio path hard-wired
+        // `AUDIO_48KHZ_DEFAULT`, which overstated AAC 44.1 kHz
+        // partial durations by ~8.8% (1024 / 48000 instead of
+        // 1024 / 44100). Video still lands on the 90 kHz constant
+        // because the bridge's video init writer is hardcoded to
+        // that timescale, but the code path is uniform.
+        let policy = CmafPolicy::for_timescale(timescale);
         match track {
             VIDEO_TRACK => {
-                Self::reset(&self.video_states, CmafPolicy::VIDEO_90KHZ_DEFAULT, broadcast);
+                Self::reset(&self.video_states, policy, broadcast);
                 Self::dispatch_init(self.multi.ensure_video(broadcast), init);
             }
             AUDIO_TRACK => {
-                Self::reset(&self.audio_states, CmafPolicy::AUDIO_48KHZ_DEFAULT, broadcast);
-                Self::dispatch_init(self.multi.ensure_audio(broadcast), init);
+                Self::reset(&self.audio_states, policy, broadcast);
+                Self::dispatch_init(self.multi.ensure_audio(broadcast, timescale), init);
             }
             _ => {}
         }
     }
 
     fn on_fragment(&self, broadcast: &str, track: &str, fragment: &Fragment) {
+        // `on_fragment` runs after `on_init` has created the per-track
+        // HlsServer, so both branches use pure lookups here instead of
+        // `ensure_*`. A fragment arriving before its init is skipped;
+        // the bridge invariants guarantee the sequence header always
+        // lands first, so this is a defensive branch not a hot path.
         let (server, kind) = match track {
             VIDEO_TRACK => {
                 let kind = Self::classify(&self.video_states, CmafPolicy::VIDEO_90KHZ_DEFAULT, broadcast, fragment);
-                (self.multi.ensure_video(broadcast), kind)
+                let Some(server) = self.multi.video(broadcast) else {
+                    return;
+                };
+                (server, kind)
             }
             AUDIO_TRACK => {
                 let kind = Self::classify(&self.audio_states, CmafPolicy::AUDIO_48KHZ_DEFAULT, broadcast, fragment);
-                (self.multi.ensure_audio(broadcast), kind)
+                let Some(server) = self.multi.audio(broadcast) else {
+                    return;
+                };
+                (server, kind)
             }
             _ => return,
         };

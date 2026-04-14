@@ -71,7 +71,7 @@ async fn master_playlist_includes_audio_rendition_when_both_tracks_present() {
         .expect("push video chunk");
 
     // --- Push an audio init + one segment chunk into the same broadcast. ---
-    let audio = multi.ensure_audio("live/test");
+    let audio = multi.ensure_audio("live/test", 48_000);
     audio.push_init(Bytes::from_static(b"audio-init")).await;
     audio
         .push_chunk_bytes(

@@ -382,11 +382,21 @@ impl MultiHlsServer {
     /// Producer-side entry point for the audio rendition of
     /// `broadcast`. Returns a cheap clone of the per-broadcast
     /// audio [`HlsServer`], creating both the broadcast entry and
-    /// the audio rendition if either does not yet exist. Audio
-    /// renditions are configured with a distinct init-segment URI
-    /// (`audio-init.mp4`) and chunk URI prefix (`audio-`) so they
-    /// never collide with the video rendition's cache.
-    pub fn ensure_audio(&self, broadcast: &str) -> HlsServer {
+    /// the audio rendition if either does not yet exist.
+    ///
+    /// `timescale` is the track's native sample rate (44_100 for
+    /// typical AAC-LC, 48_000 for Opus / HE-AAC etc.). The derived
+    /// audio `PlaylistBuilderConfig` uses it so `#EXT-X-PART:DURATION`
+    /// values in the rendered audio playlist report the real
+    /// wall-clock duration of each partial rather than the
+    /// session-13 hardcoded 48 kHz approximation that overstated
+    /// 44.1 kHz AAC partial durations by ~8.8%.
+    ///
+    /// Audio renditions are also configured with a distinct init-
+    /// segment URI (`audio-init.mp4`) and chunk URI prefix
+    /// (`audio-`) so they never collide with the video rendition's
+    /// cache.
+    pub fn ensure_audio(&self, broadcast: &str, timescale: u32) -> HlsServer {
         let mut map = self
             .inner
             .broadcasts
@@ -397,7 +407,7 @@ impl MultiHlsServer {
             audio: None,
         });
         if entry.audio.is_none() {
-            entry.audio = Some(HlsServer::new(audio_config_from(&self.inner.config)));
+            entry.audio = Some(HlsServer::new(audio_config_from(&self.inner.config, timescale)));
         }
         entry.audio.clone().expect("audio just assigned")
     }
@@ -459,14 +469,14 @@ impl MultiHlsServer {
 }
 
 /// Derive an audio-rendition [`PlaylistBuilderConfig`] from the
-/// video template. Uses the video template's timing parameters but
-/// swaps the `map_uri`, `uri_prefix`, and timescale to values
-/// appropriate for a 48 kHz AAC track. Session 13 hardcodes 48 kHz;
-/// later sessions will read the real sample rate from the
-/// producer-supplied [`lvqr_cmaf::RawSample`] metadata.
-fn audio_config_from(video: &PlaylistBuilderConfig) -> PlaylistBuilderConfig {
+/// video template and the real audio track timescale. Uses the
+/// video template's timing parameters but swaps the `map_uri`,
+/// `uri_prefix`, and timescale to values that match the audio
+/// track. Callers plumb `timescale` from the FLV AAC sequence
+/// header's `AudioConfig::sample_rate`.
+fn audio_config_from(video: &PlaylistBuilderConfig, timescale: u32) -> PlaylistBuilderConfig {
     PlaylistBuilderConfig {
-        timescale: 48_000,
+        timescale,
         starting_sequence: video.starting_sequence,
         map_uri: "audio-init.mp4".into(),
         uri_prefix: "audio-".into(),

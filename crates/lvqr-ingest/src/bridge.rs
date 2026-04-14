@@ -253,7 +253,11 @@ impl RtmpMoqBridge {
                     stream.video_config = Some(config);
                     stream.video_init = Some(init.clone());
                     if let Some(obs) = observer_video.as_ref() {
-                        obs.on_init(&stream_name, "0.mp4", init);
+                        // Video init writer is hardcoded to 90 kHz
+                        // (see `video_init_segment_with_size` ->
+                        // `mvhd.timescale = 90000`), so the bridge
+                        // reports the same value here.
+                        obs.on_init(&stream_name, "0.mp4", 90_000, init);
                     }
                     maybe_write_catalog(stream, &stream_name);
                 }
@@ -339,12 +343,18 @@ impl RtmpMoqBridge {
             match parse_audio_tag(&data) {
                 FlvAudioTag::SequenceHeader(config) => {
                     debug!(stream = %stream_name, codec = %config.codec_string(), "audio sequence header");
+                    // Capture the sample rate before moving `config`
+                    // into `stream.audio_config`; the observer needs
+                    // it as the track timescale so the LL-HLS bridge
+                    // can build a `CmafPolicy` that matches the real
+                    // audio sample rate (44.1 kHz vs 48 kHz vs other).
+                    let audio_timescale = config.sample_rate;
                     let init = audio_init_segment(&config);
                     stream.audio_sink.set_init_segment(init.clone());
                     stream.audio_config = Some(config);
                     stream.audio_init = Some(init.clone());
                     if let Some(obs) = observer_audio.as_ref() {
-                        obs.on_init(&stream_name, "1.mp4", init);
+                        obs.on_init(&stream_name, "1.mp4", audio_timescale, init);
                     }
                     maybe_write_catalog(stream, &stream_name);
                 }

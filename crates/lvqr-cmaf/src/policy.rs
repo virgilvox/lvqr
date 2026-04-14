@@ -43,6 +43,26 @@ impl CmafPolicy {
         partial_duration: 9_600,
         segment_duration: 96_000,
     };
+
+    /// Build a policy for an arbitrary track timescale. 200 ms partial
+    /// targets and 2 s segment targets scaled to the given timescale.
+    /// `VIDEO_90KHZ_DEFAULT` and `AUDIO_48KHZ_DEFAULT` are the
+    /// specialized shapes this constructor returns for 90_000 Hz and
+    /// 48_000 Hz respectively.
+    ///
+    /// The HLS bridge uses this so LL-HLS `#EXT-X-PART:DURATION`
+    /// reporting matches the track's actual sample rate -- e.g. AAC at
+    /// 44_100 Hz reports `1024 / 44100 ≈ 0.02322 s` per frame, not
+    /// `1024 / 48000 ≈ 0.02133 s` which was off by ~8.8% when the
+    /// bridge hard-wired the 48 kHz constant regardless of the real
+    /// sample rate.
+    pub const fn for_timescale(timescale: u32) -> Self {
+        let ts = timescale as u64;
+        Self {
+            partial_duration: ts / 5, // 200 ms
+            segment_duration: ts * 2, // 2 s
+        }
+    }
 }
 
 /// Result of a policy step.
