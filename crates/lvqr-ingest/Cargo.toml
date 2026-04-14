@@ -11,17 +11,25 @@ keywords = ["streaming", "rtmp", "ingest", "video"]
 categories = ["multimedia", "network-programming"]
 
 [features]
-default = ["rtmp"]
+default = ["rtmp", "cmaf-writer"]
 rtmp = ["dep:rml_rtmp"]
 # Route the bridge's per-frame video media segment through
 # `lvqr_cmaf::build_moof_mdat` instead of the in-crate hand-rolled
-# `remux::fmp4::video_segment` writer. Default off during the
-# Tier 2.3 transition so both paths exist side-by-side and the
-# parity gate at `tests/parity_avc_segment.rs` keeps them honest.
-# Enabled in a CI matrix job so every PR exercises the cmaf path
-# end-to-end through the RTMP -> WebSocket / RTMP -> HLS
-# integration tests.
+# `remux::fmp4::video_segment` writer. Default ON as of session 12.2
+# (the hand-rolled path is on its way out; see `legacy-fmp4` below).
+# The Tier 2.3 transition is tracked in `tracking/HANDOFF.md`.
 cmaf-writer = ["dep:lvqr-cmaf"]
+# Marker feature for the in-crate hand-rolled fMP4 writer
+# (`remux::fmp4::video_segment` + its unit tests, the golden-file
+# regression suite, the proptest target, and the parity gate at
+# `tests/parity_avc_segment.rs`). The feature is always available on
+# this crate; its purpose is to provide a named anchor for the code
+# slated for deletion in the next session. The CI matrix job
+# `test-legacy-fmp4-path` still exercises the hand-rolled dispatch
+# path via `--no-default-features --features rtmp` so the code stays
+# honest until it is removed. No consumer should take a dependency on
+# this feature going forward.
+legacy-fmp4 = []
 
 [dependencies]
 lvqr-core = { workspace = true }

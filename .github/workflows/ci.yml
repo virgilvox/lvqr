@@ -51,32 +51,35 @@ jobs:
       - name: Test (lib + integration + doc)
         run: cargo test --workspace
 
-  test-cmaf-writer:
-    name: Test (cmaf-writer feature)
+  test-legacy-fmp4-path:
+    name: Test (legacy hand-rolled fMP4 writer)
     runs-on: ubuntu-latest
-    # Matrix companion to the `test` job above. Builds and tests the
-    # whole workspace with the `cmaf-writer` feature flipped on so
-    # the alternative `lvqr_cmaf::build_moof_mdat` write path is
-    # exercised end-to-end through the RTMP -> WebSocket and
-    # RTMP -> HLS integration tests on every PR. The default-off
-    # path is still covered by the `test` job; once both jobs have
-    # been green on main for a few release cycles the default flips.
+    # Matrix companion to the `test` job above. As of session 12.2 the
+    # `cmaf-writer` feature is default-on (see
+    # `crates/lvqr-ingest/Cargo.toml`), so the main `test` job
+    # already exercises the `lvqr_cmaf::build_moof_mdat` write path
+    # end-to-end. This job keeps the legacy in-crate hand-rolled
+    # `remux::fmp4::video_segment` path honest during the final
+    # transition cycle by disabling default features on `lvqr-cli`
+    # so `cmaf-writer` switches off and the bridge dispatches to the
+    # hand-rolled writer. Once the hand-rolled path is deleted in a
+    # later session this job goes away with it.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: cmaf-writer-v1
+          prefix-key: legacy-fmp4-v1
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Verify ffprobe is on PATH
         run: ffprobe -version | head -n 1
-      - name: Build (cmaf-writer)
-        run: cargo build -p lvqr-cli --features cmaf-writer
-      - name: Test lvqr-ingest (cmaf-writer)
-        run: cargo test -p lvqr-ingest --features cmaf-writer
-      - name: Test lvqr-cli (cmaf-writer, RTMP -> WS / HLS E2E)
-        run: cargo test -p lvqr-cli --features cmaf-writer
+      - name: Build (legacy fMP4 path)
+        run: cargo build -p lvqr-cli --no-default-features --features rtmp,quinn-transport
+      - name: Test lvqr-ingest (legacy fMP4 path)
+        run: cargo test -p lvqr-ingest --no-default-features --features rtmp,quinn-transport
+      - name: Test lvqr-cli (legacy fMP4 path, RTMP -> WS / HLS E2E)
+        run: cargo test -p lvqr-cli --no-default-features --features rtmp,quinn-transport
 
   audit:
     name: Supply Chain (cargo-audit)

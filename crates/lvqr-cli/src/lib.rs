@@ -824,7 +824,7 @@ async fn ws_ingest_session(mut socket: WebSocket, state: WsRelayState, broadcast
                 };
                 if let Ok(mut group) = video_track.append_group() {
                     let _ = group.write_frame(init.clone());
-                    let seg = remux::video_segment(video_seq, base_dts, &[sample]);
+                    let seg = remux::build_video_segment(video_seq, base_dts, &[sample]);
                     let _ = group.write_frame(seg);
                     video_group = Some(group);
                 }
@@ -842,7 +842,7 @@ async fn ws_ingest_session(mut socket: WebSocket, state: WsRelayState, broadcast
                     keyframe: false,
                 };
                 if let Some(ref mut group) = video_group {
-                    let seg = remux::video_segment(video_seq, base_dts, &[sample]);
+                    let seg = remux::build_video_segment(video_seq, base_dts, &[sample]);
                     let _ = group.write_frame(seg);
                 }
             }

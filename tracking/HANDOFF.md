@@ -1,14 +1,133 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.3 multi-broadcast LL-HLS routing
+## Project Status: v0.4-dev -- Tier 2.3 multi-broadcast LL-HLS + cmaf-writer default
 
-**Last Updated**: 2026-04-13 (session 12 close)
-**Tests**: workspace-wide `cargo test --workspace` green on the
-default feature set; `cargo test -p lvqr-cli --features cmaf-writer
---test rtmp_hls_e2e --test rtmp_ws_e2e` green on the alternate
-writer path. `cargo clippy --workspace --all-targets -- -D warnings`
-clean on both the default and `cmaf-writer` feature sets.
+**Last Updated**: 2026-04-13 (session 12.2 close)
+**Tests**: workspace-wide `cargo test --workspace` green under the
+new default (cmaf-writer on): 66 test binaries, 0 failures.
+`cargo test -p lvqr-cli --no-default-features --features
+rtmp,quinn-transport --test rtmp_hls_e2e --test rtmp_ws_e2e`
+green on the legacy hand-rolled fMP4 writer path.
+`cargo clippy --workspace --all-targets -- -D warnings` clean on
+both the default and the `--no-default-features --features
+rtmp,quinn-transport` legacy configuration.
 `cargo fmt --all --check` clean.
+
+## Session 12.2 (2026-04-13): `cmaf-writer` default-on + `legacy-fmp4` marker
+
+Session 12.2 closed item 4 from the session-11 work list: flip
+`lvqr-ingest`'s `cmaf-writer` feature to default-on and move the
+in-crate hand-rolled fMP4 writer into retirement under a
+`legacy-fmp4` marker feature. No code was gated out this session;
+the retirement is a bookkeeping + dispatch flip, and a CI job
+continues to exercise the hand-rolled path end-to-end until it is
+deleted in a later session. Four files touched:
+
+1. **`crates/lvqr-ingest/Cargo.toml`**. `default = ["rtmp"]` ->
+   `default = ["rtmp", "cmaf-writer"]`. Added `legacy-fmp4 = []`
+   as a marker feature. `cmaf-writer`'s docstring updated to
+   reflect the new default state; `legacy-fmp4`'s docstring
+   names the code slated for deletion in the next session and
+   points at the CI matrix job that still exercises it.
+
+2. **`crates/lvqr-cli/Cargo.toml`**. Added `cmaf-writer` to
+   `default` and `full`. Changed the `lvqr-ingest` dep from
+   `workspace = true` to an inline path dep with
+   `default-features = false` so the `--no-default-features
+   --features rtmp,quinn-transport` CI invocation actually
+   cascades through and disables `cmaf-writer` transitively.
+   Cargo disallows overriding a workspace dep's
+   `default-features` when a crate inherits via `workspace =
+   true`, so the path dep is inlined here with the same version
+   pin to keep the graph consistent. Workspace `Cargo.toml`
+   stays untouched.
+
+3. **`crates/lvqr-cli/src/lib.rs`** (WS ingest handler). The
+   WS ingest path was calling `remux::video_segment` directly,
+   bypassing the `build_video_segment` dispatch. Switched both
+   call sites (keyframe + delta) to `remux::build_video_segment`
+   so the WS-ingest bridge honors the feature flag exactly like
+   the RTMP-ingest bridge does. Under the new default this
+   routes through `lvqr_cmaf::build_moof_mdat`.
+
+4. **`.github/workflows/ci.yml`**. Renamed `test-cmaf-writer` to
+   `test-legacy-fmp4-path`. The job now runs
+   `cargo build -p lvqr-cli --no-default-features --features
+   rtmp,quinn-transport`, `cargo test -p lvqr-ingest
+   --no-default-features --features rtmp`, and `cargo test -p
+   lvqr-cli --no-default-features --features rtmp,quinn-transport`
+   so both the bridge dispatch and the two E2E integration tests
+   exercise the legacy writer on every PR. The job cache-prefix
+   was updated to `legacy-fmp4-v1`.
+
+### Verification run
+
+* `cargo test --workspace` -- 66 binaries, 0 failures (default:
+  cmaf-writer on).
+* `cargo test -p lvqr-cli --no-default-features --features
+  rtmp,quinn-transport --test rtmp_hls_e2e --test rtmp_ws_e2e` --
+  both E2E tests green under the legacy writer path (verified the
+  legacy dispatch branch is active by inspecting `cargo tree
+  --no-default-features --features rtmp,quinn-transport` and
+  confirming `lvqr-ingest` no longer pulls `lvqr-cmaf` as a
+  normal dep under this config).
+* `cargo test -p lvqr-ingest --test parity_avc_init --test
+  parity_avc_segment` -- both parity gates green (they run under
+  the default config, which has both writers available: the
+  hand-rolled one is unconditionally compiled for this cycle,
+  and `lvqr-cmaf` is on as a dev-dep).
+* `cargo clippy --workspace --all-targets -- -D warnings` clean
+  under the default feature set.
+* `cargo clippy -p lvqr-cli --no-default-features --features
+  rtmp,quinn-transport --all-targets -- -D warnings` clean on the
+  legacy path.
+* `cargo fmt --all --check` clean.
+
+### What session 12.2 did NOT land
+
+* **Deletion of the hand-rolled `video_segment` writer.** That is
+  the follow-up session's job, now that the feature flag is in
+  place and the cycle clock has started. Deletion removes
+  `remux::fmp4::video_segment` plus its unit tests, the golden
+  file tests at `tests/golden_fmp4.rs` that still reference it,
+  the proptest target at `tests/proptest_parsers.rs::video_segment_is_well_formed`,
+  the parity tests at `tests/parity_avc_init.rs` +
+  `tests/parity_avc_segment.rs`, the `legacy-fmp4` feature on
+  `lvqr-ingest/Cargo.toml`, and the `test-legacy-fmp4-path` CI
+  job. That is a cohesive single-commit change once a future
+  session decides the retirement cycle is over.
+* **Audio rendition group in HLS.** Still deferred; see the
+  session 12 entry below.
+* **`lvqr-whep` implementation.** Still scoping-doc only.
+
+### Recommended entry point (session 13)
+
+With session 12.2's flip landed, the session 11 work list has
+shrunk to two remaining candidates:
+
+1. **Audio rendition group in HLS** (was item 2). Scope
+   unchanged. Forces `lvqr-hls` to learn master-playlist
+   (`EXT-X-STREAM-INF`) generation. Full-session item.
+2. **Begin `lvqr-whep` implementation** (was item 3). Needs a
+   `RawSampleObserver` hook on `RtmpMoqBridge` plus answers to
+   the four open questions in
+   `crates/lvqr-whep/docs/design.md`. Full-session item.
+
+Plus the natural follow-up from this session:
+
+3. **Delete the hand-rolled fMP4 writer**. Scoped above. The
+   risk here is purely "did we miss a caller?"; the CI job has
+   been guarding the dispatch for multiple sessions and the
+   parity gate has caught every drift during the transition. A
+   half-session task if it is bundled with one of items 1 or 2.
+
+My recommendation: pair **(3) deletion + (1) audio rendition
+group start**. Deletion is mechanical enough to fit in the first
+half of a session; the remaining time covers adding master-playlist
+scaffolding to `lvqr-hls` and a single-rendition master-playlist
+rendering test. If (1) blows the time budget, item (3) can be
+deferred to the next cycle with no harm done -- the flag is
+already in place and the CI job already exists.
 
 ## Session 12 (2026-04-13): multi-broadcast LL-HLS routing
 
