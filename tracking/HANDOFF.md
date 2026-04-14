@@ -2,14 +2,158 @@
 
 ## Project Status: v0.4-dev -- `lvqr-whep` signaling router shipped, str0m pending
 
-**Last Updated**: 2026-04-14 (session 18 close)
+**Last Updated**: 2026-04-14 (session 19 close)
 **Tests**: `cargo test --workspace` green under the default feature
-set: 69 test binaries, 269 individual tests, 0 failures. The
+set: 69 test binaries, 269 individual tests passing, 1 doctest
+marked `ignore` (a non-runnable doc example in
+`lvqr-fragment/src/moq_sink.rs:39`), 0 failures. The
 `--no-default-features --features rtmp,quinn-transport` legacy
 configuration is retired along with the hand-rolled fMP4 writer; the
 `test-legacy-fmp4-path` CI matrix job was deleted in session 14.
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 `cargo fmt --all --check` clean.
+
+## Session 19 (2026-04-14): audit sweep + README refresh
+
+Session 19 is a bookkeeping + drift-closure session. No code
+changes, one doc commit. The eight sessions before it had
+accumulated enough state drift in the top-level `README.md` that
+a new contributor reading the repo cold would get a materially
+wrong picture of what ships. The audit sweep also re-verified the
+tracked debt backlog so session 20 inherits an honest status
+table rather than a stale "maybe closed" hint.
+
+### Audit findings
+
+A full sweep over the tree + the tracking docs surfaced one real
+drift case and several already-closed items whose status was not
+reflected in the docs:
+
+1. **`README.md` was stale by approximately 40 test binaries and
+   139+ individual tests**. The Status section still claimed "29
+   test binaries workspace-wide, 130+ individual tests including
+   2560 generated proptest cases" from what looks like a
+   Tier 1-era snapshot. Reality at session 18 close is 69
+   binaries and 269 tests. The feature list explicitly said "No
+   HLS, LL-HLS, DASH, WHIP, WHEP, SRT, or RTSP egress or ingest
+   yet", which is now false: LL-HLS with multi-broadcast routing
+   and an audio rendition group has been on `main` since
+   session 13, and the WHEP signaling router has been on `main`
+   since session 16. The crate table omitted `lvqr-fragment`,
+   `lvqr-cmaf`, `lvqr-hls`, `lvqr-codec`, `lvqr-moq`, and
+   `lvqr-whep` entirely -- six of the seven Tier 2.x data-plane
+   crates were invisible. The CLI reference omitted `--hls-port`
+   (default `8888`). The architecture diagram showed only the
+   original RTMP -> MoQ -> Browser path with no LL-HLS or WHEP
+   fork. All four drift vectors addressed in this commit.
+
+2. **`AUDIT-INTERNAL-2026-04-13.md` "Fix Plan for This Session"
+   is 100% closed.** Session 17 closed the admin auth-failure
+   metric; earlier sessions had silently closed the other four.
+   The HANDOFF session 17 entry already lists this, but the
+   top-of-file status line lacked a pointer.
+
+3. **`AUDIT-INTERNAL` "Deferred" items**. Status re-verified
+   against the current tree:
+
+   | Item | Status |
+   |---|---|
+   | Delete `lvqr-core::{Registry, RingBuffer, GopCache}` | CLOSED (types gone from source; README fixed session 17) |
+   | Delete `lvqr-wasm` | OPEN (scheduled for v0.5; crate is still marked `# DEPRECATED` in its own lib.rs header) |
+   | Admin auth-failure metric | CLOSED (session 17) |
+   | CORS restrict | OPEN. `CorsLayer::permissive()` at `crates/lvqr-cli/src/lib.rs:438`. Breaking change; scope as its own commit with a release note. |
+   | Rate limits on every auth surface | OPEN (Tier 3) |
+   | `lvqr-signal` input validation | CLOSED. `is_valid_peer_id`, `is_valid_track`, `MAX_PEER_ID_LEN`, `MAX_TRACK_LEN` all in `crates/lvqr-signal/src/signaling.rs`. |
+   | `lvqr-record` integration test via event bus | CLOSED. `crates/lvqr-record/tests/record_integration.rs`. |
+   | fMP4 `esds` multi-byte descriptor length | CLOSED. `write_mpeg4_descriptor` in `lvqr-ingest::remux::fmp4` uses the 4-byte variable-length encoding. |
+
+4. **Test-count drift in the HANDOFF top-of-file status line**.
+   Session 18's HANDOFF entry reported "269 individual tests";
+   the actual accounting is "269 passing + 1 `ignore`d doctest"
+   because `cargo test --workspace` shows `1 ignored` in a
+   `lvqr-fragment` doc block marked `ignore` (a code example
+   that intentionally does not compile). Cosmetic but worth
+   being accurate. Top line refined here.
+
+5. **`docs/architecture.md` + `docs/quickstart.md`**. Still
+   stale per the `AUDIT-READINESS-2026-04-13.md` findings --
+   architecture.md references `tokio::select!` (pre-Tier 0
+   shape), quickstart.md references a `your-server:8080/watch/my-stream`
+   URL that does not exist. `AUDIT-READINESS` deliberately gated
+   these on a "Tier 5 docs site pass", so they stay out of scope
+   for session 19. `README.md` is the authoritative public
+   surface for now.
+
+### What session 19 landed
+
+One logical change, one commit, docs-only:
+
+* **`README.md`**: Rewrote the Status section to reflect Tier 2.3
+  closure (`lvqr-ingest` -> `lvqr-cmaf` -> `lvqr-hls` /
+  `lvqr-whep`, real RTMP-with-audio E2E, retired hand-rolled
+  video writer, WHEP signaling router shipped behind an
+  `SdpAnswerer` trait boundary, audio timescale fix). Refreshed
+  the test counts to the authoritative 69 binaries / 269 tests.
+  Replaced the "No HLS, LL-HLS, DASH, WHIP, WHEP, SRT, or RTSP"
+  line with an honest list of remaining limitations (no str0m
+  backend yet, no DASH / WHIP / SRT / RTSP, mesh is topology
+  only, CORS is still permissive, HEVC / AV1 / Opus surface
+  untested in the full ingest path). Added `lvqr-fragment`,
+  `lvqr-cmaf`, `lvqr-hls`, `lvqr-codec`, `lvqr-moq`, `lvqr-whep`
+  to the crate table with one-line descriptions matching the
+  actual crate surface. Updated the architecture diagram to
+  fork from a single bridge output into four egress paths
+  (MoQ / WebSocket fMP4 / LL-HLS / WHEP). Added `--hls-port`
+  to the CLI reference. Added `tracking/HANDOFF.md` to the
+  "Read before contributing" list as the canonical source of
+  truth for current state, pointing new contributors at the
+  session-by-session entries rather than the frozen three-audit
+  snapshot.
+
+* **`tracking/HANDOFF.md`** (this file): Top status line refined
+  to distinguish passing tests from the `ignored` doctest.
+  Added this session-19 section.
+
+### Verification run (session 19)
+
+* `cargo test --workspace` -- 69 binaries, 269 passing + 1
+  ignored doctest, 0 failures.
+* `cargo clippy --workspace --all-targets -- -D warnings` clean.
+* `cargo fmt --all --check` clean.
+* Audit-item status table above re-verified against the current
+  tree via `grep` / `ls` / source reads, not by trusting earlier
+  HANDOFF claims.
+
+### Recommended entry point (session 20)
+
+Unchanged from session 18's handoff. The code-work picking list:
+
+1. **str0m-backed `Str0mAnswerer`**. Full session of its own;
+   session 20 should start by reading str0m's crate docs in
+   the cargo registry cache before writing any code. Expect
+   offer -> answer to require binding a UDP socket for ICE
+   candidates, and expect `Rtc::sdp_api().accept_offer` to need
+   explicit media direction + codec configuration (H264 is not
+   always default enabled in str0m).
+2. **`--whep-addr` flag in `lvqr-cli`** + `RawSampleObserver`
+   attachment on the bridge. Small follow-up once item 1 is
+   real. Should not ship without item 1 because an `--whep-addr`
+   flag that returns 501 on every POST is worse than no flag.
+3. **Fuzz slot for the SDP offer parser**
+   (`crates/lvqr-whep/fuzz/fuzz_targets/parse_offer_sdp.rs`).
+   Lands naturally with item 1 because the fuzz corpus needs
+   the real offer parser to target.
+
+Optional low-risk cleanup items that do not require str0m:
+
+* **Delete `lvqr-wasm`**. Scheduled for v0.5, crate is marked
+  `# DEPRECATED`, no consumers. One-commit mechanical deletion
+  + workspace Cargo.toml + CI `wasm` job removal.
+* **CORS restrictive default**. Scope: replace
+  `CorsLayer::permissive()` in `crates/lvqr-cli/src/lib.rs:438`
+  with a tight default allowing only the configured admin
+  origin plus localhost. Add a `--cors-allow-origin` flag for
+  opt-in. Breaking change; ship with a release note.
 
 ## Session 18 (2026-04-14): fix LL-HLS audio partial duration reporting
 
