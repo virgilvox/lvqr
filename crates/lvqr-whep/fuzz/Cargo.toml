@@ -1,0 +1,37 @@
+[package]
+name = "lvqr-whep-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+# Excluded from the main workspace because libfuzzer-sys requires nightly
+# rustc and sanitizer instrumentation that the stable workspace builds
+# cannot produce. Run with:
+#
+#   cargo +nightly fuzz run parse_offer_sdp
+#
+# Seeds for each target live under fuzz/corpus/<target>/ and can be
+# populated from captured browser offers (Chrome devtools copy-as or
+# saved .sdp files) plus regression samples from past crashes. The
+# fuzz target invokes the exact same str0m entry point (`SdpOffer::
+# from_sdp_string`) that `lvqr-whep::str0m_backend::Str0mAnswerer::
+# create_session` calls on every WHEP POST, so any crash found here is
+# a real reachable bug on the signaling surface.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+str0m = "0.18"
+
+[[bin]]
+name = "parse_offer_sdp"
+path = "fuzz_targets/parse_offer_sdp.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true
