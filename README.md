@@ -6,10 +6,13 @@
 
 A Rust binary that relays live video using QUIC/MoQ. Built on moq-lite for zero-copy fan-out from ingest to delivery.
 
-## Status (v0.4-dev, session 18 close)
+## Status (v0.4-dev, session 24 close)
 
-**Tier 2.3 data plane is closed.** Real end-to-end coverage across
-three browser-facing egress paths lands from a single RTMP publish:
+**Tier 2.3 data plane is closed and Tier 2.4 archive is live.** Real
+end-to-end coverage across three browser-facing egress paths lands
+from a single RTMP publish, and a redb-backed DVR segment index
+plus a JSON + byte-serving HTTP surface lets clients scrub recorded
+segments by decode-time window:
 
 - **RTMP -> MoQ -> WebSocket fMP4** (the original path; still honest,
   still tested by `rtmp_ws_e2e`).
@@ -29,8 +32,24 @@ three browser-facing egress paths lands from a single RTMP publish:
   proves a client `Rtc` receives video frames from a publishing
   `Str0mAnswerer` in ~0.15-0.18s of wall time. Audio (Opus) is out
   of scope pending an AAC -> Opus transcoder.
+- **DVR archive + playback HTTP surface** via `lvqr-archive`
+  (Tier 2.4). `--archive-dir` (env `LVQR_ARCHIVE_DIR`) opens a
+  redb-backed `SegmentIndex` at `<dir>/archive.redb` and attaches
+  an `IndexingFragmentObserver` to the RTMP bridge. Every fragment
+  is written to `<dir>/<broadcast>/<track>/<seq>.m4s` and recorded
+  as a `SegmentRef` row. The admin router gains three routes when
+  the flag is set: `GET /playback/{*broadcast}?track=&from=&to=`
+  (JSON array of overlapping rows, sorted by `start_dts`),
+  `GET /playback/latest/{*broadcast}?track=` (single anchor row
+  or 404), and `GET /playback/file/{*rel}` (raw fragment bytes
+  with a canonicalized path-traversal guard). Covered end-to-end
+  by `crates/lvqr-cli/tests/rtmp_archive_e2e.rs`, which publishes
+  a real RTMP stream into a temp archive dir and then walks the
+  redb file, the JSON API, the latest anchor, the file-serve
+  route, and a traversal-attack rejection before tearing the
+  server down.
 
-**Working and tested** (70 test binaries workspace-wide, 276+
+**Working and tested** (73 test binaries workspace-wide, 297+
 individual tests, 0 failures under the default feature set,
 `cargo clippy --workspace --all-targets -- -D warnings` clean,
 `cargo fmt --all --check` clean):
@@ -114,6 +133,11 @@ individual tests, 0 failures under the default feature set,
   through the bridge is a later session.
 - CORS is `permissive()` by default. Tracked as Tier 3 hardening;
   tighten before public deployment.
+- The `/playback/*` archive surface is served on the admin port
+  and is open by default. Do not expose the admin port publicly
+  with `--archive-dir` set until a `--playback-auth` flag lands;
+  tracked in `tracking/HANDOFF.md` session-25 recommended entry
+  point item 1.
 
 **Read before contributing:**
 
@@ -176,6 +200,10 @@ OBS/ffmpeg --RTMP--> lvqr-ingest --Fragment--+-> lvqr-cli WS relay --WebSocket f
                                              |   (master.m3u8 + audio rendition)
                                              |
                                              +-> lvqr-whep Str0mAnswerer --WebRTC (ICE/DTLS/SRTP)--> Browser
+                                             |
+                                             +-> lvqr-archive IndexingFragmentObserver
+                                                 (redb segment index + on-disk fragments)
+                                                 --HTTP /playback/* --> DVR scrub client
 
 Supporting crates:
   lvqr-fragment  -- unified `Fragment` model every egress crate consumes
@@ -184,6 +212,7 @@ Supporting crates:
   lvqr-moq       -- facade over moq-lite + moq-native
   lvqr-auth      -- AuthProvider: noop / static / HS256 JWT
   lvqr-record    -- disk recorder driven by EventBus lifecycle
+  lvqr-archive   -- redb segment index for DVR scrub / time-range playback
   lvqr-mesh      -- peer tree topology planner (no media forwarding yet)
   lvqr-signal    -- WebRTC signaling server (mesh assignments)
   lvqr-admin     -- HTTP API: stats, streams, mesh, Prometheus metrics
@@ -205,6 +234,7 @@ Supporting crates:
 | `lvqr-relay` | MoQ relay wrapping `moq-lite` with auth, metrics, and connection callbacks |
 | `lvqr-ingest` | RTMP server, FLV parser, `RtmpMoqBridge`, `FragmentObserver` + `RawSampleObserver` hooks |
 | `lvqr-record` | Disk recorder that subscribes to MoQ broadcasts and writes fMP4 |
+| `lvqr-archive` | redb-backed `SegmentIndex` for DVR scrub and time-range playback (find_range, latest); `IndexingFragmentObserver` in `lvqr-cli` populates it from the RTMP bridge |
 | `lvqr-mesh` | Peer tree topology planner (topology only; media forwarding TBD in Tier 4) |
 | `lvqr-signal` | WebRTC signaling server that pushes mesh assignments; validated peer IDs and tracks |
 | `lvqr-admin` | HTTP API: stats, streams, mesh, Prometheus metrics, admin auth + auth-failure metric |
@@ -237,6 +267,7 @@ lvqr serve [OPTIONS]
   --rtmp-port <PORT>       RTMP ingest port [default: 1935]
   --admin-port <PORT>      Admin HTTP port [default: 8080]
   --hls-port <PORT>        LL-HLS HTTP port; set to 0 to disable [default: 8888]
+  --whep-port <PORT>       WHEP HTTP port; set to 0 to disable [default: 0] (env: LVQR_WHEP_PORT)
   --mesh-enabled           Enable peer mesh topology planner
   --max-peers <N>          Max children per mesh peer [default: 3]
   --tls-cert <PATH>        TLS certificate (auto-generates if omitted)
@@ -245,6 +276,7 @@ lvqr serve [OPTIONS]
   --publish-key <KEY>      Required RTMP / WS publish key (env: LVQR_PUBLISH_KEY)
   --subscribe-token <TOK>  Required viewer token (env: LVQR_SUBSCRIBE_TOKEN)
   --record-dir <PATH>      Directory to record broadcasts into (env: LVQR_RECORD_DIR)
+  --archive-dir <PATH>     DVR archive directory; enables /playback/* on the admin port (env: LVQR_ARCHIVE_DIR)
   --jwt-secret <SECRET>    HS256 secret enabling JWT auth (env: LVQR_JWT_SECRET)
   --jwt-issuer <ISS>       Expected JWT `iss` claim (env: LVQR_JWT_ISSUER)
   --jwt-audience <AUD>     Expected JWT `aud` claim (env: LVQR_JWT_AUDIENCE)
@@ -264,6 +296,22 @@ curl http://localhost:8080/api/v1/stats
 
 # Mesh state (peer count, offload percentage)
 curl http://localhost:8080/api/v1/mesh
+```
+
+### DVR playback (only when `--archive-dir` is set)
+
+```bash
+# Every archived video segment for a broadcast, oldest first
+curl 'http://localhost:8080/playback/live/my-stream'
+
+# Decode-time window scrub (track timescale, not wallclock)
+curl 'http://localhost:8080/playback/live/my-stream?track=0.mp4&from=0&to=1800000'
+
+# Most-recent segment anchor (for "jump to live minus 10 seconds" clients)
+curl 'http://localhost:8080/playback/latest/live/my-stream'
+
+# Raw fragment bytes by relative path (see the `segment_seq` field on each row)
+curl 'http://localhost:8080/playback/file/live/my-stream/0.mp4/00000001.m4s'
 ```
 
 ## Development

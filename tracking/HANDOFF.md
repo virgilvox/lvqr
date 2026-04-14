@@ -12,10 +12,12 @@ marked `ignore` (a non-runnable doc example in
 
 ## Session 24 (2026-04-14): Tier 2.4 writer integration + playback endpoints
 
-One commit on top of session 23's baseline. Closes every session-23
-recommended item 1 and 2 in a single session: the archive index now
-has a real writer feeding it and a real HTTP surface reading it
-back, so DVR scrub is end-to-end through a full RTMP publish.
+Three code commits plus two doc commits on top of session 23's
+baseline. Closes session-23 recommended items 1 and 2 in a single
+session: the archive index now has a real writer feeding it, a
+real JSON query surface reading it back, a real `latest` anchor
+endpoint, and a real byte-serving endpoint with a path-traversal
+guard. DVR scrub is end-to-end through a full RTMP publish.
 
 ### Commits
 
@@ -51,6 +53,31 @@ back, so DVR scrub is end-to-end through a full RTMP publish.
   an unknown broadcast returns 404. After shutdown the test
   reopens the redb file directly for a second round of on-disk
   assertions against `SegmentIndex::latest`.
+* **4abc74c** -- docs: session 24 HANDOFF notes (this section's
+  initial shape, later extended in-place by the drift-closure
+  commit below).
+* **5ccfd97** -- Tier 2.4: archive file-serve endpoint with
+  traversal guard. `GET /playback/file/{*rel}` on the admin router
+  joins `rel` onto the configured archive directory, canonicalizes
+  the result, and rejects requests that escape the canonicalized
+  archive root with 400 (or 404 when the file simply does not
+  exist). `ArchiveState` carries `(dir, canonical_dir, index)` so
+  the guard runs in constant time per request; `FromRef<
+  ArchiveState>` keeps the pre-existing `find_range` and `latest`
+  handler signatures unchanged. `application/octet-stream` response
+  body with an explicit `Content-Length`. Integration test gains
+  four assertions: valid fetch returns a `moof`-prefixed body,
+  missing-file 404, percent-encoded `..` traversal stays inside
+  the archive root (400 or 404, never leaks outside bytes), and
+  the range + latest routes still work after the state refactor.
+
+### Archive HTTP surface (admin router, when `--archive-dir` is set)
+
+| Route | Behaviour |
+|---|---|
+| `GET /playback/{*broadcast}?track=&from=&to=` | JSON array of `PlaybackSegment` rows overlapping `[from, to)`, ordered by `start_dts`. Defaults `track=0.mp4`, `from=0`, `to=u64::MAX`. |
+| `GET /playback/latest/{*broadcast}?track=` | Single most-recent row or 404. Declared before the catch-all so axum specificity wins. |
+| `GET /playback/file/{*rel}` | Raw fragment bytes. Path traversal guarded via canonicalized-root prefix check. |
 
 ### Load-bearing investigation resolved
 
@@ -107,10 +134,18 @@ stop-and-document fallback was not triggered.
   window over the matched segments" landed only the JSON half.
   A `/playback/{*broadcast}/playlist.m3u8` that renders an HLS
   window over archived rows is a natural follow-up once the
-  `lvqr-hls` playlist builder grows a non-live mode.
-* **Archive authentication**. The playback surface is open,
-  matching the precedent of the LL-HLS surface. A future
-  `--playback-auth` flag should reuse the existing `SharedAuth`.
+  `lvqr-hls` playlist builder grows a non-live mode (no
+  `EXT-X-PLAYLIST-TYPE:VOD` / `EXT-X-ENDLIST` support exists
+  today; verified by grep over `crates/lvqr-hls/src/`).
+* **Archive authentication**. The playback surface is open **on
+  the same port as the admin router**, which means a deployment
+  that exposes the admin port publicly also exposes every
+  archived fragment. The LL-HLS precedent ("open by default")
+  only holds because `lvqr-hls` is on a separate `--hls-port`;
+  merging `/playback/*` onto the admin port is a new footgun.
+  A `--playback-auth` flag that reuses `SharedAuth::check(
+  AuthContext::Subscribe{..})` should land before the archive
+  ships in a default-on configuration.
 * **`lvqr-archive` crate-level integration test slot**. The
   real integration test lives in `crates/lvqr-cli/tests/
   rtmp_archive_e2e.rs`, not `crates/lvqr-archive/tests/`. The
@@ -124,33 +159,44 @@ stop-and-document fallback was not triggered.
 
 ### Cumulative commit range since session 19
 
-Sessions 20 through 24 landed eight commits on top of `f50cc4f`:
+Sessions 20 through 24 landed eleven commits on top of `f50cc4f`:
 `580d152`, `db9fd10`, `ddcb599`, `ed9c6e3`, `8f30e8f`, `c0d474f`,
-`cbffab9`, `939e743`, `7c84344`. `origin/main` is at `7c84344`.
+`cbffab9`, `939e743`, `7c84344`, `4abc74c`, `5ccfd97` (plus any
+session-24 doc drift-closure commits landed after this entry
+was written). `origin/main` tracks the most recent of these.
 Session 25 starts from there.
 
 ### Recommended entry point (session 25)
 
-1. **`lvqr-wasm` deletion**. Mechanical one-commit removal of the
+1. **Playback authentication**. Security-critical follow-up from
+   the archive landing. Wire the existing `SharedAuth::check(
+   AuthContext::Subscribe{..})` into the three `/playback/*`
+   handlers behind a `--playback-auth` flag (default-off to
+   preserve current behaviour, documented as "enable before
+   exposing the admin port publicly"). Budget: one session.
+2. **`lvqr-wasm` deletion**. Mechanical one-commit removal of the
    deprecated crate + its workspace member + any CI wasm job.
    Unblocks a cleaner crate table in `README.md` and reduces the
    "what ships" confusion the session-19 audit sweep flagged.
-2. **CORS restrictive default**. Replace
+3. **CORS restrictive default**. Replace
    `CorsLayer::permissive()` in `crates/lvqr-cli/src/lib.rs` with
    an allow-list default (admin origin + localhost) plus a
-   `--cors-allow-origin` flag. Breaking change; ship with a
+   `--cors-allow-origin` flag. Breaking change; verify the
+   playwright test in `tests/e2e/test-app.spec.ts` does not
+   depend on permissive before flipping the default. Ship with a
    release note.
-3. **Archive playlist rendering**. `GET /playback/{*broadcast}/
+4. **Archive playlist rendering**. `GET /playback/{*broadcast}/
    playlist.m3u8?from=&to=` that walks the archive rows and
    renders a VOD HLS playlist with `#EXT-X-MAP` + one
    `#EXTINF`/`#EXT-X-BYTERANGE` per row. Closes the HANDOFF-23
    "or an LL-HLS playlist window" suggestion. Requires
-   `lvqr-hls` to grow a non-live / VOD builder; budget one
-   session for the builder + one session for the integration.
-4. **HEVC+Opus end-to-end**. Highest-leverage Tier 2.3 follow-up.
+   `lvqr-hls` to grow a non-live / VOD builder (no
+   `PLAYLIST-TYPE:VOD` path today); budget one session for the
+   builder + one session for the integration.
+5. **HEVC+Opus end-to-end**. Highest-leverage Tier 2.3 follow-up.
    Needs a real RTMP HEVC fixture and an Opus bridge path;
    budget multi-session.
-5. **WHIP ingest**, **DASH egress**: each a full session of its
+6. **WHIP ingest**, **DASH egress**: each a full session of its
    own.
 
 ## Session 23 (2026-04-14): Tier 2.4 start -- lvqr-archive segment index
