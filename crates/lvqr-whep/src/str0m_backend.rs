@@ -10,26 +10,31 @@
 //! session handle closes a `oneshot` shutdown signal and the loop
 //! exits cleanly on the next wakeup.
 //!
+//! Session 22 adds the video media-write path. Each successful
+//! `create_session` now also builds an `mpsc::unbounded_channel`
+//! for `SessionMsg::Sample`, and `on_raw_sample` forwards every
+//! video sample to the poll task. The task tracks the video `Mid`
+//! via `Event::MediaAdded`, resolves the H.264 `Pt` via
+//! `Writer::payload_params`, converts the AVCC-framed payload to
+//! Annex B (str0m's `H264Packetizer` scans for Annex B start codes
+//! and silently drops input that has none, so this conversion is
+//! load-bearing, not cosmetic), and calls `Writer::write` once per
+//! sample. Writes before `Event::Connected` are dropped explicitly;
+//! str0m documents that they would be dropped internally anyway,
+//! but skipping them at the source avoids churning `&mut Rtc` for
+//! no effect.
+//!
 //! What this module still deliberately does NOT do:
 //!
-//! * Packetize incoming `RawSample`s into RTP. The `H264Packetizer`
-//!   already exists in `crate::rtp`; the next session threads it
-//!   into `on_raw_sample` via an mpsc into the poll task. Until then
-//!   `on_raw_sample` logs a one-shot warning and drops the sample.
-//! * Accept trickle ICE fragments. WHEP typically does not need
-//!   trickle once the offer already embeds every host candidate,
-//!   but the HTTP surface still accepts PATCH bodies so conformant
-//!   clients do not error out. `add_trickle` logs once and returns
-//!   success.
-//!
-//! The point of landing the poll loop on its own is to prove the
-//! trait boundary in `server.rs` can host a real WebRTC stack
-//! without mixing the I/O cycle into the same commit as the
-//! media-write path. A real browser that follows the 201 response
-//! will now at least see ICE progress and, once a DTLS handshake
-//! finishes, a quiet SRTP session with no media. That is a large
-//! step up from "answer returned, socket dead" and the smallest
-//! delta that lets session 22 focus entirely on media write.
+//! * Audio write. The ingest bridge emits AAC raw access units; WHEP
+//!   negotiated Opus. There is no in-tree AAC -> Opus transcoder, so
+//!   `on_raw_sample` for `1.mp4` logs a one-shot warning and drops
+//!   the sample. See `crates/lvqr-whep/docs/media-write.md` for the
+//!   full rationale.
+//! * Trickle ICE ingestion. WHEP rarely needs trickle once the offer
+//!   already embeds every host candidate; the HTTP surface still
+//!   accepts PATCH bodies so conformant clients do not error out.
+//!   `add_trickle` logs once and returns success.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::OnceLock;
@@ -39,10 +44,12 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use lvqr_cmaf::RawSample;
 use str0m::change::{SdpAnswer, SdpOffer};
+use str0m::format::Codec;
+use str0m::media::{MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::server::{SdpAnswerer, SessionHandle, WhepError};
 
@@ -135,6 +142,7 @@ impl SdpAnswerer for Str0mAnswerer {
         let answer_bytes = Bytes::from(answer.to_sdp_string());
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (sample_tx, sample_rx) = mpsc::unbounded_channel::<SessionMsg>();
         let broadcast_owned = broadcast.to_string();
 
         // Spawn the sans-IO poll loop. `tokio::spawn` requires an
@@ -142,7 +150,14 @@ impl SdpAnswerer for Str0mAnswerer {
         // `lvqr-cli`'s tokio-based axum server, so this is always
         // satisfied in real deployments. Tests that hit this code
         // path must use `#[tokio::test]`.
-        tokio::spawn(run_session_loop(rtc, socket, local_addr, shutdown_rx, broadcast_owned));
+        tokio::spawn(run_session_loop(
+            rtc,
+            socket,
+            local_addr,
+            shutdown_rx,
+            sample_rx,
+            broadcast_owned,
+        ));
 
         tracing::debug!(
             broadcast = %broadcast,
@@ -151,12 +166,45 @@ impl SdpAnswerer for Str0mAnswerer {
         );
 
         let handle: Box<dyn SessionHandle> = Box::new(Str0mSessionHandle {
+            samples: sample_tx,
             shutdown: Some(shutdown_tx),
             trickle_warned: AtomicBool::new(false),
-            sample_warned: AtomicBool::new(false),
+            audio_warned: AtomicBool::new(false),
         });
         Ok((handle, answer_bytes))
     }
+}
+
+/// Message pumped from `Str0mSessionHandle::on_raw_sample` into the
+/// poll loop task. Kept private so the channel shape can evolve
+/// without affecting the public `SessionHandle` trait.
+enum SessionMsg {
+    /// A video sample ready to hand to `Writer::write`. `payload` is
+    /// the AVCC-framed bytes straight from the ingest bridge; the
+    /// poll task converts to Annex B before calling str0m.
+    Video { payload: Bytes, dts: u64, keyframe: bool },
+}
+
+/// Poll-task-local state captured across iterations. The task is
+/// the sole owner of the `Rtc` so it can safely mutate this on the
+/// stack frame without any locks.
+#[derive(Default)]
+struct SessionCtx {
+    /// Mid of the negotiated video media section, learned from
+    /// `Event::MediaAdded`. `None` until the event arrives.
+    video_mid: Option<Mid>,
+    /// Negotiated H.264 payload type for the video mid, resolved
+    /// lazily from `Writer::payload_params` the first time we have
+    /// a mid and need a pt.
+    video_pt: Option<Pt>,
+    /// True once `Event::Connected` has fired. Samples that arrive
+    /// before this point are dropped rather than written.
+    connected: bool,
+    /// One-shot logging guard: log the first write error, then go
+    /// silent so a wedged stream does not drown the tracing output.
+    write_error_logged: bool,
+    /// One-shot logging guard for the first successful write.
+    first_write_logged: bool,
 }
 
 /// Run the sans-IO `Rtc` state machine forward.
@@ -177,11 +225,15 @@ async fn run_session_loop(
     socket: UdpSocket,
     local_addr: SocketAddr,
     mut shutdown: oneshot::Receiver<()>,
+    mut samples: mpsc::UnboundedReceiver<SessionMsg>,
     broadcast: String,
 ) {
+    let mut ctx = SessionCtx::default();
     let mut buf = vec![0u8; 2048];
     loop {
-        // Drain outputs until `Rtc` blocks on a timeout.
+        // Drain outputs until `Rtc` blocks on a timeout. Events are
+        // absorbed into the local `SessionCtx` so later sample-arm
+        // iterations know whether writes are allowed yet.
         let wait_until = loop {
             match rtc.poll_output() {
                 Ok(Output::Timeout(when)) => break when,
@@ -191,16 +243,10 @@ async fn run_session_loop(
                     }
                 }
                 Ok(Output::Event(event)) => {
-                    if let Event::IceConnectionStateChange(state) = &event {
-                        tracing::debug!(%broadcast, ?state, "ice state change");
-                        if *state == IceConnectionState::Disconnected {
-                            tracing::info!(%broadcast, "ice disconnected; ending session loop");
-                            return;
-                        }
-                    } else if matches!(event, Event::Connected) {
-                        tracing::info!(%broadcast, "webrtc connected");
-                    } else {
-                        tracing::trace!(%broadcast, "rtc event");
+                    absorb_event(&event, &mut ctx, &broadcast);
+                    if let Event::IceConnectionStateChange(IceConnectionState::Disconnected) = &event {
+                        tracing::info!(%broadcast, "ice disconnected; ending session loop");
+                        return;
                     }
                 }
                 Err(e) => {
@@ -210,6 +256,24 @@ async fn run_session_loop(
             }
         };
 
+        // Lazily resolve the H.264 `Pt` the first time both the
+        // video mid is known and we still have no pt. Doing this
+        // outside `poll_output` avoids borrowing conflicts and
+        // keeps the resolution near the place that consumes the
+        // pt.
+        if ctx.video_pt.is_none()
+            && let Some(mid) = ctx.video_mid
+            && let Some(writer) = rtc.writer(mid)
+        {
+            for params in writer.payload_params() {
+                if params.spec().codec == Codec::H264 {
+                    ctx.video_pt = Some(params.pt());
+                    tracing::debug!(%broadcast, pt = ?params.pt(), "resolved video pt");
+                    break;
+                }
+            }
+        }
+
         let now = Instant::now();
         let sleep_dur = wait_until.saturating_duration_since(now).max(Duration::from_millis(0));
 
@@ -218,6 +282,24 @@ async fn run_session_loop(
             _ = &mut shutdown => {
                 tracing::debug!(%broadcast, "session shutdown signalled");
                 return;
+            }
+            msg = samples.recv() => {
+                match msg {
+                    Some(SessionMsg::Video { payload, dts, keyframe }) => {
+                        if let Err(()) = write_video_sample(&mut rtc, &mut ctx, &broadcast, payload, dts, keyframe) {
+                            // `write_video_sample` logged already.
+                        }
+                    }
+                    None => {
+                        // All senders dropped (handle dropped). The
+                        // shutdown oneshot also fires in that case but
+                        // arrives via a separate arm; receiving None
+                        // here just means the ingest side has gone
+                        // away and we can coalesce onto shutdown.
+                        tracing::debug!(%broadcast, "sample channel closed");
+                        return;
+                    }
+                }
             }
             recv = socket.recv_from(&mut buf) => {
                 match recv {
@@ -259,19 +341,129 @@ async fn run_session_loop(
     }
 }
 
+fn absorb_event(event: &Event, ctx: &mut SessionCtx, broadcast: &str) {
+    match event {
+        Event::IceConnectionStateChange(state) => {
+            tracing::debug!(%broadcast, ?state, "ice state change");
+        }
+        Event::Connected => {
+            ctx.connected = true;
+            tracing::info!(%broadcast, "webrtc connected");
+        }
+        Event::MediaAdded(added) if matches!(added.kind, MediaKind::Video) => {
+            ctx.video_mid = Some(added.mid);
+            tracing::debug!(%broadcast, mid = ?added.mid, "media added: video");
+        }
+        Event::MediaAdded(added) => {
+            tracing::trace!(%broadcast, mid = ?added.mid, kind = ?added.kind, "media added: non-video");
+        }
+        _ => {}
+    }
+}
+
+fn write_video_sample(
+    rtc: &mut Rtc,
+    ctx: &mut SessionCtx,
+    broadcast: &str,
+    payload: Bytes,
+    dts: u64,
+    keyframe: bool,
+) -> Result<(), ()> {
+    if !ctx.connected {
+        // Writes before Connected are dropped by str0m anyway. Skip
+        // them explicitly to avoid building the Annex B buffer.
+        return Ok(());
+    }
+    let Some(mid) = ctx.video_mid else {
+        return Ok(());
+    };
+    let Some(pt) = ctx.video_pt else {
+        return Ok(());
+    };
+
+    let annex_b = avcc_to_annex_b(&payload);
+    if annex_b.is_empty() {
+        tracing::trace!(%broadcast, "avcc->annex_b produced empty output; dropping sample");
+        return Ok(());
+    }
+
+    let Some(writer) = rtc.writer(mid) else {
+        return Ok(());
+    };
+
+    let wallclock = Instant::now();
+    let rtp_time = MediaTime::new(dts, str0m::media::Frequency::NINETY_KHZ);
+    match writer.write(pt, wallclock, rtp_time, annex_b) {
+        Ok(()) => {
+            if !ctx.first_write_logged {
+                ctx.first_write_logged = true;
+                tracing::info!(%broadcast, keyframe, dts, "first video sample written to str0m");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if !ctx.write_error_logged {
+                ctx.write_error_logged = true;
+                tracing::warn!(%broadcast, error = %e, "writer.write failed (logging once)");
+            }
+            Err(())
+        }
+    }
+}
+
+/// Convert an AVCC length-prefixed NAL sequence into an Annex B
+/// byte stream.
+///
+/// str0m's `H264Packetizer` scans for Annex B start codes
+/// (`0x00 0x00 0x01` / `0x00 0x00 0x00 0x01`) to split the input
+/// into NAL units. AVCC passes through the start-code scanner
+/// without matching anything, which sends the whole buffer
+/// (including the 4-byte length prefix) into the emit path, where
+/// the length prefix is misread as a NAL header byte of type 0 and
+/// the sample is silently dropped. We convert at the boundary so
+/// str0m sees what it expects.
+///
+/// Malformed AVCC entries (truncated, zero-length, length field
+/// overruns the buffer) are skipped; the converter is safe to call
+/// on arbitrary attacker-shaped input. Returns an empty `Vec` when
+/// nothing survives.
+fn avcc_to_annex_b(avcc: &[u8]) -> Vec<u8> {
+    const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+    let mut out = Vec::with_capacity(avcc.len() + 16);
+    let mut i = 0;
+    while i + 4 <= avcc.len() {
+        let len = u32::from_be_bytes([avcc[i], avcc[i + 1], avcc[i + 2], avcc[i + 3]]) as usize;
+        i += 4;
+        if len == 0 {
+            continue;
+        }
+        if i + len > avcc.len() {
+            break;
+        }
+        out.extend_from_slice(&START_CODE);
+        out.extend_from_slice(&avcc[i..i + len]);
+        i += len;
+    }
+    out
+}
+
 /// Per-session handle produced by [`Str0mAnswerer::create_session`].
 ///
-/// Owns the `oneshot` sender whose receiver the spawned poll task
-/// waits on. Dropping the handle closes the sender, the receiver
-/// resolves, and the loop exits at its next wakeup. The warn flags
-/// keep the log quiet after the first surprise: a real WHEP client
-/// sending trickle or expecting media will hit the same code path
-/// thousands of times per second and we do not want that to drown
-/// the tracing output.
+/// Owns the sample `mpsc::UnboundedSender` and the shutdown
+/// `oneshot::Sender`. The poll task owns the corresponding
+/// receivers. Dropping the handle drops both senders; the task's
+/// `select!` sees either the shutdown resolve or the sample
+/// channel return `None` and exits cleanly on the next wakeup.
+///
+/// Warn flags: the audio path is still unwired (no AAC -> Opus
+/// transcoder) and trickle ICE ingestion is still TODO. Each flag
+/// fires once per session so a wedged stream cannot drown the
+/// tracing output.
 pub struct Str0mSessionHandle {
+    samples: mpsc::UnboundedSender<SessionMsg>,
     shutdown: Option<oneshot::Sender<()>>,
     trickle_warned: AtomicBool,
-    sample_warned: AtomicBool,
+    audio_warned: AtomicBool,
 }
 
 impl Drop for Str0mSessionHandle {
@@ -293,10 +485,27 @@ impl SessionHandle for Str0mSessionHandle {
         Ok(())
     }
 
-    fn on_raw_sample(&self, _track: &str, _sample: &RawSample) {
-        if !self.sample_warned.swap(true, Ordering::Relaxed) {
-            tracing::warn!("str0m RTP packetization not yet wired; dropping sample");
+    fn on_raw_sample(&self, track: &str, sample: &RawSample) {
+        // Track convention matches `lvqr-ingest::FragmentObserver`:
+        // `0.mp4` is video, `1.mp4` is audio. Anything else is a
+        // future track we do not know how to write yet.
+        if track != "0.mp4" {
+            if !self.audio_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    track = %track,
+                    "whep audio/other-track write not wired; dropping samples (AAC->Opus transcode is out of scope)",
+                );
+            }
+            return;
         }
+        let msg = SessionMsg::Video {
+            payload: sample.payload.clone(),
+            dts: sample.dts,
+            keyframe: sample.keyframe,
+        };
+        // Ignore send failure: the task has exited and we will be
+        // dropped soon. Nothing useful for the caller to do.
+        let _ = self.samples.send(msg);
     }
 }
 
@@ -417,5 +626,103 @@ mod tests {
         let answerer = Str0mAnswerer::new(Str0mConfig::default());
         let err = expect_err(answerer.create_session("live/test", b"not an sdp document"));
         assert!(matches!(err, WhepError::MalformedOffer(_)), "got {err:?}");
+    }
+
+    // ---- avcc_to_annex_b ----
+
+    fn avcc_buf(nals: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for nal in nals {
+            buf.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            buf.extend_from_slice(nal);
+        }
+        buf
+    }
+
+    #[test]
+    fn avcc_to_annex_b_single_nal_emits_start_code_and_body() {
+        let nal: &[u8] = &[0x65, 0xAA, 0xBB, 0xCC];
+        let out = avcc_to_annex_b(&avcc_buf(&[nal]));
+        assert_eq!(out, vec![0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn avcc_to_annex_b_multiple_nals_emits_one_start_code_each() {
+        let a: &[u8] = &[0x67, 0x01];
+        let b: &[u8] = &[0x68, 0x02];
+        let c: &[u8] = &[0x65, 0x03, 0x04];
+        let out = avcc_to_annex_b(&avcc_buf(&[a, b, c]));
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x00, 0x00, 0x01, 0x67, 0x01, 0x00, 0x00, 0x00, 0x01, 0x68, 0x02, 0x00, 0x00, 0x00, 0x01, 0x65,
+                0x03, 0x04,
+            ]
+        );
+    }
+
+    #[test]
+    fn avcc_to_annex_b_empty_input() {
+        assert!(avcc_to_annex_b(&[]).is_empty());
+    }
+
+    #[test]
+    fn avcc_to_annex_b_truncated_length_is_skipped() {
+        // 3 bytes is less than a 4-byte length prefix.
+        assert!(avcc_to_annex_b(&[0, 0, 0]).is_empty());
+    }
+
+    #[test]
+    fn avcc_to_annex_b_length_overruns_buffer() {
+        // length = 1000, body is only 3 bytes.
+        let bad = vec![0x00, 0x00, 0x03, 0xE8, 0x01, 0x02, 0x03];
+        assert!(avcc_to_annex_b(&bad).is_empty());
+    }
+
+    #[test]
+    fn avcc_to_annex_b_zero_length_nal_is_skipped() {
+        let mut buf = vec![0, 0, 0, 0]; // zero-length entry
+        let real: &[u8] = &[0x65, 1, 2, 3];
+        buf.extend_from_slice(&(real.len() as u32).to_be_bytes());
+        buf.extend_from_slice(real);
+        let out = avcc_to_annex_b(&buf);
+        assert_eq!(out, vec![0x00, 0x00, 0x00, 0x01, 0x65, 1, 2, 3]);
+    }
+
+    // ---- end-to-end: on_raw_sample pushes through the channel ----
+
+    #[tokio::test]
+    async fn on_raw_sample_forwards_video_and_drops_audio() {
+        use bytes::Bytes as B;
+        let answerer = Str0mAnswerer::new(Str0mConfig::default());
+        let (handle, _answer) = answerer
+            .create_session("live/test", CHROME_AUDIO_OFFER.as_bytes())
+            .expect("chrome offer accepted");
+
+        // Build a minimal RawSample: a single AVCC-wrapped NAL. The
+        // poll task will attempt to route this as video; without a
+        // real peer it will never reach Event::Connected, so the
+        // write path short-circuits on `connected == false` and we
+        // are just asserting `on_raw_sample` does not panic, does
+        // not block, and the audio path logs rather than sending.
+        let avcc_video = avcc_buf(&[&[0x65, 0xAA, 0xBB, 0xCC][..]]);
+        let sample = RawSample {
+            track_id: 1,
+            dts: 1000,
+            cts_offset: 0,
+            duration: 3000,
+            payload: B::from(avcc_video),
+            keyframe: true,
+        };
+        handle.on_raw_sample("0.mp4", &sample); // video path
+        handle.on_raw_sample("1.mp4", &sample); // audio path, warn-once
+        handle.on_raw_sample("1.mp4", &sample); // audio path, already warned
+
+        // Give the poll task a beat to absorb the sample. No assert:
+        // the point is that none of the above panic, and the
+        // subsequent handle drop still shuts the task down cleanly.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(handle);
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

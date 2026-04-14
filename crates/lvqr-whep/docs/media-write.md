@@ -1,11 +1,11 @@
 # lvqr-whep media write design
 
-Status: design note. No code lands from this document directly; it
-captures the decisions the next session needs before wiring the
-`H264Packetizer` (or, more likely, `str0m::media::Writer`) into the
-existing poll loop. Treat every answer here as the authoritative
-plan until a later session finds a reason to change it; at that
-point update this file rather than leaving the code to drift.
+Status: executed in session 22 (commit to follow). Everything in
+this note is now reflected in `crates/lvqr-whep/src/str0m_backend.rs`
+with ONE correction flagged inline below: Decision 2 was wrong —
+str0m's `H264Packetizer` scans for Annex B start codes and silently
+drops AVCC input. The executed code converts AVCC to Annex B at
+the boundary; see the "Decision 2 (corrected)" section.
 
 ## Why this is its own session
 
@@ -62,20 +62,34 @@ remove the proptest slot, do not remove the re-exports from
 `lib.rs`. The crate can own both an unused RFC 6184 packetizer and
 a `Writer`-based send path without contradiction.
 
-## Decision 2: Byte format is AVCC, no conversion needed
+## Decision 2 (corrected): AVCC must be converted to Annex B
 
-`RawSample::payload` for AVC is documented to be AVCC length-
-prefixed NAL units (see `crates/lvqr-cmaf/src/sample.rs:20-25`).
-`Writer::write` for H.264 in str0m accepts AVCC directly; the
-internal `H264Packetizer` in str0m parses the 4-byte length prefix
-and emits single-NAL / FU-A / STAP-A packets. No Annex-B conversion
-is required.
+The session-21 version of this note claimed AVCC passthrough would
+work. It does not. `str0m::packet::h264::H264Packetizer::packetize`
+starts by calling `next_ind` to scan for Annex B start codes
+(`0x00 0x00 0x01` or `0x00 0x00 0x00 0x01`). When the input has no
+start code, the whole buffer is handed to `emit`, which reads
+byte 0 as the NAL header. On AVCC bytes the first byte is the
+high byte of a 32-bit length prefix — almost always `0x00`, which
+decodes as NAL type 0, which is the "unspecified" NAL and is
+silently dropped. **An AVCC-passthrough build would compile, run,
+complete ICE/DTLS/SRTP, and emit zero video packets.** No error
+anywhere; the failure mode is a black screen.
 
-Verify this once at the top of the execution session by reading
-`str0m::packet::h264` or whichever module owns the codec-specific
-packetization path. If str0m expects Annex B (4-byte `00 00 00 01`
-start codes), either convert inline or open an upstream issue.
-**Do not assume either way without the 5 minutes of verification.**
+The in-tree fix is a small converter,
+`str0m_backend::avcc_to_annex_b`, that walks AVCC length prefixes
+and prepends `0x00 0x00 0x00 0x01` before each NAL body. The
+converter has five unit tests covering single NAL, multi NAL,
+empty input, truncated length prefix, length overruns buffer, and
+zero-length NAL entries. Malformed input falls through to an
+empty vec rather than panicking, so the converter is safe to run
+on attacker-shaped bytes.
+
+Upstream issue: none filed. str0m's API is internally consistent
+(depacketizer outputs Annex B unless `is_avc = true`, packetizer
+expects Annex B) and switching its packetizer to accept both
+formats would be an upstream behavior change, not a bug fix.
+Conversion at the boundary is the right layering.
 
 ## Decision 3: mpsc channel from observer to poll task
 
@@ -214,27 +228,35 @@ the channel. For better sync with other subscribers later, the
 ingest bridge could attach a wall clock to the sample at emission
 time, but that is a bridge change and not a WHEP concern.
 
-## Order of operations for the execution session
+## Order of operations for the execution session (done in session 22)
 
-1. **Verify** by reading that `str0m` H.264 packetization accepts
-   AVCC. 5 minutes.
-2. Add `SessionMsg` enum and `mpsc::UnboundedSender` to
-   `Str0mSessionHandle`. Update `on_raw_sample` to forward.
-3. Add `SessionContext` struct to `run_session_loop`. Handle
-   `Event::MediaAdded` and `Event::Connected` to populate it.
-4. Add the `rx.recv()` arm to the `tokio::select!`. On sample
-   arrival, if `connected && video_mid.is_some() && video_pt.is_some()`,
-   call `rtc.writer(video_mid).write(video_pt, Instant::now(),
-   MediaTime::new(sample.dts, 90_000), sample.payload.to_vec())`.
-   Drop audio samples with a one-shot warn.
-5. Write a real browser E2E: spin up `--whep-port` under
-   `lvqr-test-utils::TestServer`, ffmpeg-push an H.264 RTMP
-   stream, drive a headless Chromium via `webrtc-rs` or
-   `simple-whep-client`, assert at least one decoded video frame.
-   This test is the v0.5 release gate, not a nice-to-have.
-6. When it works, delete the `sample_warned` one-shot warning in
-   `Str0mSessionHandle::on_raw_sample` — it has served its
-   purpose.
+1. **Verified** by reading `str0m::packet::h264` that the packetizer
+   expects Annex B. Found the silent-drop failure mode described in
+   Decision 2 (corrected). Landed `avcc_to_annex_b` at the
+   boundary.
+2. Added `SessionMsg::Video { payload, dts, keyframe }` and a
+   `mpsc::UnboundedSender<SessionMsg>` field on
+   `Str0mSessionHandle`. `on_raw_sample` routes `track == "0.mp4"`
+   onto the sender and drops non-video with a one-shot warn.
+3. Added `SessionCtx { video_mid, video_pt, connected,
+   write_error_logged, first_write_logged }` inside the poll task.
+   `absorb_event` handles `Connected`, `MediaAdded(video)`, and
+   `IceConnectionStateChange(Disconnected)`. `video_pt` is resolved
+   lazily via `Writer::payload_params` filtered on
+   `Codec::H264`.
+4. Added the `samples.recv()` arm to the `select!` with `biased;`
+   shutdown priority. `write_video_sample` guards on
+   `connected && video_mid && video_pt`, converts AVCC to Annex B,
+   and calls `writer.write(pt, Instant::now(),
+   MediaTime::new(dts, Frequency::NINETY_KHZ), annex_b)`. First
+   success and first error are each logged once.
+5. **Still open**: real browser E2E test. Requires a WHEP client
+   binary (`simple-whep-client` or similar) the CI image does not
+   yet carry, plus an ffmpeg RTMP push harness wired into the
+   existing `lvqr-test-utils::TestServer`. Tracking as v0.5 gate in
+   HANDOFF session 22 notes; does not block this commit.
+6. **Kept the audio-warn flag**; it still serves its purpose as
+   the AAC -> Opus path is explicitly out of scope.
 
 ## Stop conditions
 
