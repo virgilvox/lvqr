@@ -53,14 +53,18 @@
 //! mp4-atom structures).
 
 pub mod chunk;
+pub mod coalescer;
 pub mod init;
 pub mod policy;
+pub mod sample;
 pub mod segmenter;
 
 pub use chunk::{CmafChunk, CmafChunkKind};
+pub use coalescer::{TrackCoalescer, build_moof_mdat};
 pub use init::{
     AudioInitParams, HevcInitParams, InitSegmentError, VideoInitParams, write_aac_init_segment, write_avc_init_segment,
     write_hevc_init_segment,
 };
 pub use policy::{CmafPolicy, PolicyDecision};
+pub use sample::RawSample;
 pub use segmenter::{CmafSegmenter, SegmenterError};

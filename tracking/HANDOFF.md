@@ -1,13 +1,124 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.3 lvqr-hls at 4-of-5 contract slots
+## Project Status: v0.4-dev -- Tier 2.3 TrackCoalescer lands ffprobe-validated
 
-**Last Updated**: 2026-04-13 (session 8)
-**Tests**: 57 test binaries across the workspace, 230 individual
+**Last Updated**: 2026-04-13 (session 9)
+**Tests**: 58 test binaries across the workspace, 236 individual
 tests (plus ~6300 generated proptest cases per run across the
 ingest, fragment, hevc, aac, cmaf-policy, and hls-manifest
 harnesses), all green. cargo clippy --workspace --all-targets --
 -D warnings is clean. cargo fmt --check is clean.
+
+## Session 9 additions (2026-04-13): raw-sample TrackCoalescer
+
+Session 8 closed every item from the session-8 work list; session 9
+inherits the remaining Tier 2.3 items. This session lands the
+largest of those three: the raw-sample coalescer scoped by the
+session-7 design note in `lvqr-cmaf::segmenter`.
+
+1. **`RawSample` type** (`crates/lvqr-cmaf/src/sample.rs`). Minimal
+   producer-side value type carrying `track_id`, `dts`, `cts_offset`,
+   `duration`, `payload`, and `keyframe`. The payload layout is
+   codec-defined: AVCC length-prefixed for AVC/HEVC, raw AU for
+   AAC. The producer is authoritative for every field; the
+   coalescer never re-parses the payload to infer keyframe status
+   or re-derives DTS from PTS. `RawSample::keyframe` and
+   `RawSample::delta` constructors cover the common AVC Baseline
+   and audio cases without a struct literal.
+
+2. **`TrackCoalescer` state machine**
+   (`crates/lvqr-cmaf/src/coalescer.rs`). Per-track pure state
+   machine that accumulates `RawSample` values and flushes them on
+   partial / segment boundaries as `CmafChunk` values. State
+   transitions mirror the session-7 design note exactly: on push,
+   if the pending batch exists and the new sample crosses a
+   partial boundary OR a segment-window keyframe, flush the batch
+   and return the chunk; otherwise append. The returned chunk
+   carries the `pending_kind` that was fixed when the batch was
+   opened, so later samples inside the same partial window cannot
+   change the chunk's kind retroactively. A trailing `flush` at
+   end-of-stream drains whatever is still pending.
+
+3. **`build_moof_mdat` writer**. The coalescer's `flush_pending`
+   builds a wire-ready `moof + mdat` pair via `mp4-atom`'s
+   `Moof` / `Mfhd` / `Traf` / `Tfhd` / `Tfdt` / `Trun` types. The
+   `trun.data_offset` field is computed via a two-pass encode: the
+   first pass populates `data_offset = 0` to measure the moof
+   size; the second pass re-encodes with `data_offset = moof_size
+   + 8`. Every field in the moof is fixed-width so the total size
+   is stable across the two encodes. The mdat header is written
+   by hand (4 bytes size + 4 bytes `"mdat"`) rather than through
+   `mp4-atom::Mdat` so the per-sample payload `Bytes` blobs are
+   extended into the buffer without an intermediate `Vec<u8>`
+   copy. Sample flags use the same `0x02000000` sync / `0x01010000`
+   non-sync layout the hand-rolled writer at
+   `lvqr-ingest::remux::fmp4::video_segment` ships today, so
+   byte-level diffs against the hand-rolled path see identical
+   sample-flag fields.
+
+4. **ffprobe-validated round trip**
+   (`crates/lvqr-cmaf/tests/conformance_coalescer.rs`). New
+   integration test that builds a real AVC init segment via
+   `write_avc_init_segment`, pushes 10 AVCC-wrapped synthetic
+   samples (one IDR + nine P-slices) through a `TrackCoalescer`,
+   concatenates the init segment with every chunk's payload, and
+   runs the whole thing through ffprobe 8.1 via the soft-skip
+   helper. **ffprobe accepts the output.** This is the first
+   real-encoder-validated proof that the mp4-atom-backed
+   coalescer produces sound CMAF output and that the two-pass
+   `data_offset` patch lands at the right byte offset.
+
+5. **Lib-level unit tests**. Five new tests in
+   `coalescer.rs::tests` cover: first sample does not flush,
+   partial boundary flushes pending, segment boundary fires on
+   keyframe past window, `flush` drains pending at end-of-stream,
+   and the moof structure round-trips through mp4-atom's own
+   decoder (asserting sequence number, track id, tfdt DTS, trun
+   entry count and sizes, and the data_offset placeholder
+   position).
+
+### What the coalescer is NOT yet wired into
+
+* **`CmafSegmenter::from_sample_stream`** constructor. The
+   design note scheduled it as part of this session's deliverable.
+   Deferred because the existing `CmafSegmenter::new` consumes a
+   `FragmentStream` (pre-muxed) and the `TrackCoalescer` operates
+   at the `RawSample` level; unifying the two under one segmenter
+   type requires a `SampleStream` trait and the producer side
+   does not yet emit raw samples. Session 10 wires it when the
+   first producer migrates.
+* **The RTMP bridge**. `lvqr-ingest::remux::fmp4::video_segment`
+   still ships the media segments for the `rtmp_ws_e2e` path.
+   Retirement behind a feature flag requires flipping the
+   `lvqr-ingest` -> `lvqr-cmaf` dep direction (currently
+   `lvqr-cmaf` dev-deps `lvqr-ingest` for the parity test); the
+   cleanest migration is to move the parity test out of
+   `lvqr-cmaf` and into a top-level workspace test, or to accept
+   the test-only dev-dep cycle. Deferred to session 10.
+* **Audio coalescing**. The state machine is codec-agnostic but
+   the ffprobe round-trip test only exercises video. Audio works
+   by construction (every sample is a keyframe, so every chunk
+   fires a partial boundary cleanly), but no test covers it yet.
+
+### Contract slot status as of session 9
+
+| Crate | proptest | fuzz | integration | E2E | conformance |
+|---|---|---|---|---|---|
+| lvqr-ingest | y | y | y | y | y |
+| lvqr-codec | y | y | y | via rtmp_ws_e2e | y (multi-sublayer covered) |
+| lvqr-cmaf | y | open (no parser surface) | y | via rtmp_ws_e2e | y (AVC + HEVC + AAC init + coalescer) |
+| lvqr-hls | y | open (no parser surface) | y | via router oneshot | soft-skip (mediastreamvalidator) |
+| lvqr-record | y | open | y | workspace e2e | y |
+| lvqr-moq | y | open | y | via rtmp_ws_e2e | n/a (pure value type) |
+| lvqr-fragment | y | open | y | via rtmp_ws_e2e | n/a (pure value type) |
+
+`lvqr-cmaf`'s conformance slot grew from "AVC + HEVC + AAC init"
+to "AVC + HEVC + AAC init + coalescer". The coalescer test is the
+first one in the crate that exercises both the init writer and
+the media writer through a single ffprobe check, which is the
+minimal shape of a real segmenter->consumer handshake.
+
+## Session 8 additions (2026-04-13)
 
 ## Session 8 additions (2026-04-13)
 
@@ -926,40 +1037,70 @@ should be aware of so nothing is discovered twice.
   reusing the x265 fixture already in
   `parse_sps_decodes_real_x265_single_sublayer` as the seed.
 
-## Recommended Tier 2.3 entry point (session 9)
+## Recommended Tier 2.3 entry point (session 10)
 
-Session 8 closed every session-8 work list item (router,
-integration tests, conformance helper). Session 9 inherits the two
-remaining Tier 2.3 items plus the composition-root wiring.
+Session 9 closed the big-ticket item from the session-9 list (the
+raw-sample `TrackCoalescer`). Session 10 inherits the two
+remaining items plus two follow-ups the coalescer surfaced.
 
-1. **Implement the raw-sample coalescer** per the design note in
-   `crates/lvqr-cmaf/src/segmenter.rs`. Session 7 pinned the spec;
-   session 8 lands:
-   * A `RawSample` + `SampleStream` trait pair in
-     `lvqr-fragment` (or `lvqr-cmaf::sample`; pick based on which
-     crate ends up owning the producer side long-term).
-   * A `TrackCoalescer` struct with `push(sample) -> Option<CmafChunk>`.
-   * `CmafSegmenter::from_sample_stream` constructor wrapping a
-     `HashMap<TrackId, TrackCoalescer>`.
-   * A round-trip test that drives a scripted sample stream through
-     the coalescer and asserts structural equivalence with
-     `lvqr-ingest::remux::fmp4::video_segment` output. The session-7
-     `parity_avc_init.rs` test is the template for the assertion
-     style.
-3. **Wire `lvqr-cmaf::write_avc_init_segment` into `rtmp_ws_e2e`**.
-   The session-7 parity gate proved the writers are structurally
-   equivalent; now the hand-rolled path at
-   `lvqr-ingest::remux::fmp4::video_init_segment` can be retired
-   behind a feature flag and eventually removed. Migration order:
-   (a) add a `#[cfg(feature = "cmaf-init")]` code path in the RTMP
-   bridge that calls `lvqr_cmaf::write_avc_init_segment` when the
-   feature is on, (b) flip the feature on in CI and verify
-   `rtmp_ws_e2e` is still green, (c) flip the default-on, (d) a
-   later session removes the hand-rolled path and the feature
-   flag.
+1. **Add `CmafSegmenter::from_sample_stream`** plus a `SampleStream`
+   trait. Scaffold:
+   ```text
+   pub trait SampleStream: Send {
+       fn next_sample<'a>(&'a mut self)
+           -> Pin<Box<dyn Future<Output = Option<RawSample>> + Send + 'a>>;
+       fn meta(&self) -> &FragmentMeta;
+   }
+   ```
+   The `CmafSegmenter::from_sample_stream` constructor owns a
+   `HashMap<u32, TrackCoalescer>` keyed by track id and pulls
+   samples via the trait, routing each into its track's
+   coalescer. `next_chunk` returns the next flushed chunk across
+   any track. This lets the lvqr-hls router consume a real
+   producer (once one emits `RawSample` values) without an extra
+   adapter layer.
+
+2. **Wire `lvqr-cli serve` to compose HLS**. Add an `--hls-addr`
+   flag to `ServeConfig`, have `lvqr_cli::start` spin up an axum
+   binding on the address with `HlsServer::router()`, and teach
+   the RTMP bridge to push CmafChunks into the `HlsServer`. The
+   RTMP bridge today emits pre-muxed `Fragment` values; session
+   10 can route those through the pass-through `CmafSegmenter`
+   (no coalescer needed yet) and then into `HlsServer::push_chunk_bytes`.
+   Day-one E2E: `lvqr-test-utils::TestServer::hls_url()` plus a
+   real tokio HTTP client that publishes RTMP and GETs
+   `/playlist.m3u8`, asserting the returned playlist contains
+   the RTMP-ingested broadcast's segments.
+
+3. **Retire the hand-rolled
+   `lvqr-ingest::remux::fmp4::video_segment` writer behind a
+   feature flag**. The session-7 parity gate proves the cmaf
+   path is structurally equivalent for the AVC init segment; the
+   session-9 coalescer now has ffprobe-validated media segment
+   output too. The migration is a feature flag on `lvqr-cli` (or
+   `lvqr-ingest`) that switches between the two writers. CI
+   matrix runs with both settings; when both are green on main,
+   the hand-rolled path moves to a `legacy-fmp4` feature gate
+   and eventually to deletion.
+
+4. **Audio coalescing round trip**. Extend
+   `conformance_coalescer.rs` with an AAC variant so the
+   audio-side coalescer state is covered by a real ffprobe run,
+   not just the shared unit tests. Blocker today is that the AAC
+   init writer refuses non-indexable sample rates; the test can
+   pick 44.1 kHz or 48 kHz to stay on the happy path.
+
+5. **Session 7 byte-diff followups against the hand-rolled
+   writer**. Expand `parity_avc_init.rs` into
+   `parity_avc_segment.rs` that compares coalescer output against
+   `lvqr-ingest::remux::fmp4::video_segment` for the same sample
+   sequence. If the bytes match structurally, the feature flag
+   migration in item 3 is low-risk; if they differ, document
+   the harmless differences and pin the structural assertions.
 
 Do NOT start `lvqr-dash`, `lvqr-whip`, `lvqr-whep`, `lvqr-srt`,
-`lvqr-rtsp`, or `lvqr-archive` before the raw-sample coalescer lands.
+`lvqr-rtsp`, or `lvqr-archive` until the `CmafSegmenter::from_sample_stream`
+constructor and the `lvqr-cli` HLS composition above are in place.
 Every egress beyond LL-HLS needs the coalescer to produce chunks
 from arbitrary sample sources, not just the RTMP pre-muxed path.
 
