@@ -69,4 +69,4 @@ pub mod server;
 pub use manifest::{
     HlsError, Manifest, Part, PlaylistBuilder, PlaylistBuilderConfig, Segment, ServerControl, render_manifest,
 };
-pub use server::HlsServer;
+pub use server::{HlsServer, MultiHlsServer};

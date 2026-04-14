@@ -22,7 +22,7 @@ use axum::routing::get;
 use bytes::Bytes;
 use lvqr_auth::{AuthContext, AuthDecision, NoopAuthProvider, SharedAuth};
 use lvqr_core::{EventBus, RelayEvent};
-use lvqr_hls::{HlsServer, PlaylistBuilderConfig};
+use lvqr_hls::{MultiHlsServer, PlaylistBuilderConfig};
 use lvqr_ingest::SharedFragmentObserver;
 use lvqr_moq::Track;
 use std::collections::HashMap;
@@ -235,14 +235,15 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let (mut moq_server, relay_bound) = relay.init_server()?;
     tracing::info!(addr = %relay_bound, "MoQ relay bound");
 
-    // Optional LL-HLS server. Built before the bridge so we can hand
-    // the bridge a `FragmentObserver` that pumps fragments into the
-    // shared `HlsServer` state. The actual TCP listener and axum
-    // serve task are wired further down once we know all bind
-    // addresses are reachable.
+    // Optional multi-broadcast LL-HLS server. Built before the bridge
+    // so we can hand the bridge a `FragmentObserver` that pumps
+    // fragments into the shared `MultiHlsServer` state. Each
+    // broadcast gets its own per-broadcast `HlsServer` on first
+    // publish; the axum router demultiplexes requests under
+    // `/hls/{broadcast}/...`.
     let hls_server = config
         .hls_addr
-        .map(|_| HlsServer::new(PlaylistBuilderConfig::default()));
+        .map(|_| MultiHlsServer::new(PlaylistBuilderConfig::default()));
 
     // RTMP ingest bridged to MoQ. Pre-bind the TCP listener so we can
     // report the real bound port (for ephemeral-port test setups).

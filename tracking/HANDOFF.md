@@ -1,15 +1,123 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.3 RTMP -> LL-HLS pipeline serving real HTTP
+## Project Status: v0.4-dev -- Tier 2.3 multi-broadcast LL-HLS routing
 
-**Last Updated**: 2026-04-13 (session 11 close)
-**Tests**: 66 test binaries across the workspace, 242 individual
-tests (plus ~6300 generated proptest cases per run across the
-ingest, fragment, hevc, aac, cmaf-policy, and hls-manifest
-harnesses), all green. `cargo clippy --workspace --all-targets --
--D warnings` is clean for both the default feature set and the
-`cmaf-writer` matrix path. `cargo fmt --check` is clean.
-Eleven commits pushed across sessions 6-11 to `origin/main`.
+**Last Updated**: 2026-04-13 (session 12 close)
+**Tests**: workspace-wide `cargo test --workspace` green on the
+default feature set; `cargo test -p lvqr-cli --features cmaf-writer
+--test rtmp_hls_e2e --test rtmp_ws_e2e` green on the alternate
+writer path. `cargo clippy --workspace --all-targets -- -D warnings`
+clean on both the default and `cmaf-writer` feature sets.
+`cargo fmt --all --check` clean.
+
+## Session 12 (2026-04-13): multi-broadcast LL-HLS routing
+
+Session 12 closed item 1 from the session-11 work list
+("Multi-broadcast HLS routing"). One logical change landed across
+four files:
+
+1. **`MultiHlsServer` in `lvqr-hls`**
+   (`crates/lvqr-hls/src/server.rs`). New type that owns a
+   `std::sync::Mutex<HashMap<String, HlsServer>>` keyed by broadcast
+   name plus a template `PlaylistBuilderConfig` for lazily creating
+   per-broadcast state. Exposes `ensure_broadcast(name) -> HlsServer`
+   for the producer side, `get_broadcast(name) -> Option<HlsServer>`
+   for the consumer side (so unknown broadcasts return 404 instead
+   of an empty 200), `broadcast_count()` for tests, and
+   `router()` which mounts a single `/hls/{*path}` catch-all.
+   The catch-all exists because broadcast names contain a slash
+   today (the RTMP bridge names broadcasts `{app}/{key}`, e.g.
+   `live/test`), so a simple `/hls/{broadcast}/...` path param
+   would not capture them. A `split_broadcast_path` helper splits
+   the tail off the path, matches it against `playlist.m3u8`,
+   `init.mp4`, or a chunk URI, and dispatches to one of three
+   new shared `render_*` helpers extracted from the old free
+   handlers. The single-broadcast `HlsServer::router()` still
+   exists and still works; the `render_playlist` / `render_init`
+   / `render_uri` helpers are the only rendering path, so the
+   blocking-reload semantic lives in one place.
+
+2. **`HlsFragmentBridge` in `lvqr-cli`**
+   (`crates/lvqr-cli/src/hls.rs`). Rewritten around
+   `MultiHlsServer`. Removed the "first broadcast wins" logic;
+   every broadcast that publishes a video track now gets its own
+   per-broadcast `CmafPolicyState` keyed by broadcast name in a
+   `Mutex<HashMap<String, CmafPolicyState>>`. A fresh
+   `VIDEO_90KHZ_DEFAULT` entry is installed the first time a
+   broadcast publishes its init segment; a new init on the same
+   broadcast resets the entry so a mid-stream codec change starts
+   from a clean slate. Audio is still ignored here; audio
+   rendition groups land separately when `lvqr-hls` grows
+   master-playlist support.
+
+3. **`lvqr-cli::start()`** (`crates/lvqr-cli/src/lib.rs`). Swapped
+   the single `HlsServer::new(...)` construction for
+   `MultiHlsServer::new(...)`. The axum serve task still just
+   calls `server.router()`; the import line is the only other
+   change. `ServerHandle::hls_url` stays unchanged (still a base-
+   URL helper); tests compose `/hls/{broadcast}/...` paths
+   explicitly.
+
+4. **`crates/lvqr-cli/tests/rtmp_hls_e2e.rs`**. Renamed to
+   `rtmp_publish_reaches_multi_broadcast_hls_router`. Extracted
+   the publish-two-keyframes sequence into a
+   `publish_two_keyframes(addr, app, key)` helper and the
+   playlist-fetch-and-parse check into a
+   `fetch_playlist_and_part_uris(hls_addr, app, key)` helper.
+   The test now publishes two concurrent RTMP broadcasts
+   (`live/one` and `live/two`) to the same `TestServer`, fetches
+   `/hls/live/one/playlist.m3u8` and `/hls/live/two/playlist.m3u8`,
+   asserts each playlist is well-formed LL-HLS (starts with
+   `#EXTM3U`, carries `#EXT-X-VERSION:9`, names `init.mp4` via
+   `#EXT-X-MAP`, and references at least one `#EXT-X-PART:` URI),
+   fetches one part from each broadcast and asserts both bodies
+   start with a `moof` box, fetches `/hls/live/one/init.mp4` and
+   `/hls/live/two/init.mp4` and asserts both start with `ftyp`,
+   and finally fetches `/hls/live/ghost/playlist.m3u8` and
+   asserts it returns 404. Passed first run under both the
+   default feature set and `--features cmaf-writer`.
+
+### What session 12 did NOT land
+
+* **`cmaf-writer` flipped to default-on.** The session 11
+  directive called for at least one release cycle on main before
+  flipping; session 12 honored that by leaving the feature
+  default-off. Candidate for session 13 if the matrix stays
+  green.
+* **Hand-rolled `video_segment` retirement behind `legacy-fmp4`.**
+  Same gating. Parity test at
+  `crates/lvqr-ingest/tests/parity_avc_segment.rs` still owns
+  the correctness property.
+* **Audio rendition group in HLS.** Still deferred. Forces
+  `lvqr-hls` to learn master-playlist / `EXT-X-STREAM-INF`
+  generation; scoped as a full session by itself in the session
+  11 handoff.
+* **`lvqr-whep` implementation.** Still scoping-doc only at
+  `crates/lvqr-whep/docs/design.md`.
+
+### Recommended entry point (session 13)
+
+The four candidates from session 11 minus the one that landed:
+
+1. **Audio rendition group in HLS** (was item 2). Scope
+   unchanged; forces master-playlist generation in `lvqr-hls`.
+2. **Begin `lvqr-whep` implementation** (was item 3). Needs a
+   `RawSampleObserver` hook on `RtmpMoqBridge` plus answers to
+   the four open questions in
+   `crates/lvqr-whep/docs/design.md`.
+3. **Flip `cmaf-writer` to default-on + retire the hand-rolled
+   writer behind `legacy-fmp4`** (was item 4). Session 11's
+   gating language ("at least one release cycle on main") is
+   now satisfiable: the matrix shipped in session 11, session 12
+   added to the surface it exercises, and both writer paths
+   stayed green.
+
+The safest single-session pair is (3) plus a start on (1):
+flipping `cmaf-writer` is mechanical once the release-cycle
+clock is up, and master-playlist work in `lvqr-hls` is
+incremental enough that even landing just the master-playlist
+type plus a single-rendition rendering test is forward
+progress toward (1).
 
 ## Session 11 (2026-04-13): CLI HLS composition + `cmaf-writer` feature flag
 

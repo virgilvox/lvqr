@@ -3,17 +3,19 @@
 //! This is the consumer side of the [`lvqr_ingest::FragmentObserver`]
 //! hook. The bridge in `lvqr-ingest` already produces `Fragment` values
 //! out of every RTMP publisher; the [`HlsFragmentBridge`] here observes
-//! those fragments, walks them through a [`CmafPolicyState`] to classify
-//! each chunk as a partial / partial-independent / segment boundary, and
-//! pushes the resulting [`CmafChunk`] into a shared [`HlsServer`].
+//! those fragments, walks them through a per-broadcast [`CmafPolicyState`]
+//! to classify each chunk as a partial / partial-independent / segment
+//! boundary, and pushes the resulting [`CmafChunk`] into a shared
+//! [`MultiHlsServer`].
 //!
-//! Today the wiring is single-rendition: only the first broadcast that
-//! the bridge announces is forwarded to the HLS server, and only its
-//! video track. The HLS server itself is single-rendition (no
-//! `EXT-X-STREAM-INF` master playlist); multi-broadcast routing lands
-//! when a `lvqr-cli` flag asks for it. The integration test in
-//! `crates/lvqr-cli/tests/rtmp_hls_e2e.rs` publishes exactly one RTMP
-//! stream so the limit is invisible at the contract layer.
+//! Session 12 (multi-broadcast routing): the bridge now maintains one
+//! `CmafPolicyState` per observed broadcast, keyed by the broadcast name
+//! the ingest layer reports. Every broadcast that publishes a video track
+//! gets its own per-broadcast [`HlsServer`] inside the shared
+//! `MultiHlsServer`, and the axum router serves them at
+//! `/hls/{broadcast}/playlist.m3u8`. Audio is still ignored here; audio
+//! rendition groups land separately when `lvqr-hls` grows master-playlist
+//! support.
 //!
 //! The observer is invoked synchronously from the `rml_rtmp` callback
 //! path, but [`HlsServer::push_chunk_bytes`] is async. Each on_init /
@@ -23,77 +25,68 @@
 use bytes::Bytes;
 use lvqr_cmaf::{CmafChunk, CmafPolicy, CmafPolicyState};
 use lvqr_fragment::Fragment;
-use lvqr_hls::HlsServer;
+use lvqr_hls::MultiHlsServer;
 use lvqr_ingest::FragmentObserver;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use tokio::runtime::Handle;
 
-/// Fans bridge-emitted fragments into a single LL-HLS server.
+/// Fans bridge-emitted fragments into a multi-broadcast LL-HLS server.
 ///
 /// Construct one per `lvqr-cli` instance, hand it to the bridge via
 /// `RtmpMoqBridge::with_observer`, and clone the underlying
-/// [`HlsServer`] into the axum router that serves `/playlist.m3u8`.
+/// [`MultiHlsServer`] into the axum router that serves
+/// `/hls/{broadcast}/playlist.m3u8`.
 pub(crate) struct HlsFragmentBridge {
-    server: HlsServer,
-    state: Mutex<HlsBridgeState>,
-}
-
-struct HlsBridgeState {
-    /// First broadcast we observed. Only this broadcast feeds HLS
-    /// today; subsequent broadcasts are tracked but their fragments
-    /// are dropped.
-    primary: Option<String>,
-    /// Per-track policy state machine. Reset whenever the primary
-    /// broadcast publishes a new init segment so a republish on the
-    /// same broadcast starts cleanly.
-    video_policy: CmafPolicyState,
+    multi: MultiHlsServer,
+    /// Per-broadcast video policy state machines. Keyed on the
+    /// broadcast name the ingest layer reports. A fresh entry is
+    /// installed the first time a broadcast publishes its init
+    /// segment; a new init on the same broadcast resets the entry so
+    /// a republish (e.g. mid-stream codec change or RTMP reconnect)
+    /// starts cleanly.
+    video_states: Mutex<HashMap<String, CmafPolicyState>>,
 }
 
 impl HlsFragmentBridge {
-    pub fn new(server: HlsServer) -> Self {
+    pub fn new(multi: MultiHlsServer) -> Self {
         Self {
-            server,
-            state: Mutex::new(HlsBridgeState {
-                primary: None,
-                video_policy: CmafPolicyState::new(CmafPolicy::VIDEO_90KHZ_DEFAULT),
-            }),
+            multi,
+            video_states: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Decide whether a `(broadcast, track)` pair belongs to the
-    /// active HLS rendition. The first video track to appear becomes
-    /// the primary; everything else is ignored.
-    fn is_primary_video(&self, broadcast: &str, track: &str) -> bool {
-        if track != "0.mp4" {
-            return false;
-        }
-        let mut state = self.state.lock().expect("hls bridge mutex poisoned");
-        match &state.primary {
-            Some(name) if name == broadcast => true,
-            Some(_) => false,
-            None => {
-                state.primary = Some(broadcast.to_string());
-                tracing::info!(broadcast, "HLS bridge attached to first broadcast");
-                true
-            }
-        }
+    /// Return the chunk classification for the next video fragment on
+    /// `broadcast`, installing a fresh `CmafPolicyState` if this is
+    /// the first fragment observed for that broadcast.
+    fn classify_video(&self, broadcast: &str, fragment: &Fragment) -> lvqr_cmaf::CmafChunkKind {
+        let mut states = self.video_states.lock().expect("hls bridge mutex poisoned");
+        let state = states
+            .entry(broadcast.to_string())
+            .or_insert_with(|| CmafPolicyState::new(CmafPolicy::VIDEO_90KHZ_DEFAULT));
+        state.step(fragment.flags.keyframe, fragment.dts).kind
+    }
+
+    /// Reset the policy state for `broadcast` to a fresh
+    /// `VIDEO_90KHZ_DEFAULT` baseline. Called whenever a new init
+    /// segment lands so that a mid-stream codec change starts from a
+    /// clean slate.
+    fn reset_video_state(&self, broadcast: &str) {
+        let mut states = self.video_states.lock().expect("hls bridge mutex poisoned");
+        states.insert(
+            broadcast.to_string(),
+            CmafPolicyState::new(CmafPolicy::VIDEO_90KHZ_DEFAULT),
+        );
     }
 }
 
 impl FragmentObserver for HlsFragmentBridge {
     fn on_init(&self, broadcast: &str, track: &str, init: Bytes) {
-        if !self.is_primary_video(broadcast, track) {
+        if track != "0.mp4" {
             return;
         }
-        // Reset the policy state machine whenever a new init segment
-        // arrives so a mid-stream codec change starts from a clean
-        // baseline. The HLS server itself accepts repeated push_init
-        // calls as overwrites.
-        {
-            let mut state = self.state.lock().expect("hls bridge mutex poisoned");
-            state.video_policy = CmafPolicyState::new(CmafPolicy::VIDEO_90KHZ_DEFAULT);
-        }
-        let server = self.server.clone();
+        self.reset_video_state(broadcast);
+        let server = self.multi.ensure_broadcast(broadcast);
         let Ok(handle) = Handle::try_current() else {
             tracing::warn!("HLS bridge on_init outside tokio runtime; dropping init");
             return;
@@ -104,21 +97,18 @@ impl FragmentObserver for HlsFragmentBridge {
     }
 
     fn on_fragment(&self, broadcast: &str, track: &str, fragment: &Fragment) {
-        if !self.is_primary_video(broadcast, track) {
+        if track != "0.mp4" {
             return;
         }
-        let chunk = {
-            let mut state = self.state.lock().expect("hls bridge mutex poisoned");
-            let decision = state.video_policy.step(fragment.flags.keyframe, fragment.dts);
-            CmafChunk {
-                track_id: fragment.track_id.clone(),
-                payload: fragment.payload.clone(),
-                dts: fragment.dts,
-                duration: fragment.duration,
-                kind: decision.kind,
-            }
+        let kind = self.classify_video(broadcast, fragment);
+        let chunk = CmafChunk {
+            track_id: fragment.track_id.clone(),
+            payload: fragment.payload.clone(),
+            dts: fragment.dts,
+            duration: fragment.duration,
+            kind,
         };
-        let server = self.server.clone();
+        let server = self.multi.ensure_broadcast(broadcast);
         let Ok(handle) = Handle::try_current() else {
             tracing::warn!("HLS bridge on_fragment outside tokio runtime; dropping chunk");
             return;

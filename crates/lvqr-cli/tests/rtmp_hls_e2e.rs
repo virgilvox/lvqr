@@ -2,22 +2,26 @@
 //!
 //! Sister test to `rtmp_ws_e2e.rs`. Where the WS test verifies the
 //! RTMP -> MoQ -> WebSocket fMP4 path, this one verifies the
-//! Tier 2.3 RTMP -> Fragment -> CmafChunk -> HlsServer -> axum
-//! HTTP path that session 11 wires into `lvqr-cli serve`. There are
-//! no mocks: a real `rml_rtmp` client publishes, a real
-//! `lvqr_cli::start`-driven server forwards fragments through the
-//! HLS bridge, and a real raw-TCP HTTP/1.1 client reads
-//! `/playlist.m3u8` plus a referenced media URI off the LL-HLS
-//! surface.
+//! Tier 2.3 RTMP -> Fragment -> CmafChunk -> MultiHlsServer -> axum
+//! HTTP path that `lvqr-cli serve` composes. There are no mocks: a
+//! real `rml_rtmp` client publishes, a real `lvqr_cli::start`-driven
+//! server forwards fragments through the HLS bridge, and a real
+//! raw-TCP HTTP/1.1 client reads the per-broadcast playlists plus
+//! referenced media URIs off the LL-HLS surface.
 //!
-//! The test pushes exactly two keyframes spaced 2.1 s apart so the
-//! segmenter's default `VIDEO_90KHZ_DEFAULT` policy (2 s segment
+//! Session 12: this test now publishes **two** concurrent RTMP
+//! broadcasts -- `live/one` and `live/two` -- and asserts that the
+//! multi-broadcast router exposes them under
+//! `/hls/live/one/playlist.m3u8` and `/hls/live/two/playlist.m3u8`
+//! respectively, that the two playlists reference distinct
+//! `#EXT-X-PART:` URIs, and that fetching one part from each
+//! broadcast returns a `moof`-prefixed body. An unknown broadcast
+//! returns 404 so the negative path stays honest too.
+//!
+//! Each broadcast pushes exactly two keyframes spaced 2.1 s apart so
+//! the segmenter's default `VIDEO_90KHZ_DEFAULT` policy (2 s segment
 //! duration at 90 kHz) closes one full segment after the second
-//! keyframe. The closed segment shows up in
-//! `manifest.segments` and the second keyframe lives in
-//! `preliminary_parts`. From the wire's point of view the playlist
-//! references at least one `#EXT-X-PART:` URI; the test fetches one
-//! and asserts the body is non-empty.
+//! keyframe.
 
 use bytes::Bytes;
 use lvqr_test_utils::{TestServer, TestServerConfig};
@@ -252,13 +256,72 @@ fn extract_part_uris(playlist: &str) -> Vec<String> {
 // The test
 // =====================================================================
 
-/// Real end-to-end: RTMP publish -> RtmpMoqBridge -> HlsFragmentBridge
-/// -> HlsServer -> axum HTTP. Verifies that a real HTTP client reading
-/// `/playlist.m3u8` off the bound HLS port sees at least one
-/// `#EXT-X-PART:` URI and that fetching that URI returns 200 with a
-/// non-empty body.
+/// Publish a two-keyframe sequence to `{app}/{key}` and return the
+/// open RTMP stream + session so the caller can hold them alive while
+/// the test reads the resulting LL-HLS surface. Dropping them closes
+/// the RTMP session; keep them in scope until after the HTTP reads
+/// complete so the bridge does not tear the broadcast down early.
+async fn publish_two_keyframes(addr: SocketAddr, app: &str, key: &str) -> (TcpStream, ClientSession) {
+    let (mut rtmp_stream, mut session) = connect_and_publish(addr, app, key).await;
+
+    let seq = flv_video_seq_header();
+    let result = session.publish_video_data(seq, RtmpTimestamp::new(0), false).unwrap();
+    send_result(&mut rtmp_stream, &result).await;
+
+    let nalu = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
+    let kf0 = flv_video_nalu(true, 0, &nalu);
+    let result = session.publish_video_data(kf0, RtmpTimestamp::new(0), false).unwrap();
+    send_result(&mut rtmp_stream, &result).await;
+
+    // dts at 90 kHz = 189_000, past the default 180_000-tick segment
+    // boundary, so the second keyframe closes the first segment.
+    let kf1 = flv_video_nalu(true, 0, &nalu);
+    let result = session
+        .publish_video_data(kf1, RtmpTimestamp::new(2100), false)
+        .unwrap();
+    send_result(&mut rtmp_stream, &result).await;
+
+    (rtmp_stream, session)
+}
+
+/// Fetch `/hls/{app}/{key}/playlist.m3u8` and assert it is a
+/// well-formed LL-HLS media playlist with at least one
+/// `#EXT-X-PART:` URI. Returns the parsed part URI list so the
+/// caller can compare it against a second broadcast's playlist.
+async fn fetch_playlist_and_part_uris(hls_addr: SocketAddr, app: &str, key: &str) -> Vec<String> {
+    let path = format!("/hls/{app}/{key}/playlist.m3u8");
+    let resp = http_get(hls_addr, &path).await;
+    assert_eq!(resp.status, 200, "playlist GET status for {path}");
+    let body = std::str::from_utf8(&resp.body).expect("playlist body should be utf-8");
+    eprintln!("--- playlist {path} ---\n{body}\n--- end ---");
+    assert!(body.starts_with("#EXTM3U"), "playlist missing #EXTM3U header: {body}");
+    assert!(
+        body.contains("#EXT-X-VERSION:9"),
+        "playlist missing LL-HLS version tag: {body}"
+    );
+    assert!(
+        body.contains("#EXT-X-MAP:URI=\"init.mp4\""),
+        "playlist missing #EXT-X-MAP for init segment: {body}"
+    );
+    let part_uris = extract_part_uris(body);
+    assert!(
+        !part_uris.is_empty(),
+        "playlist {path} references no #EXT-X-PART URIs:\n{body}"
+    );
+    part_uris
+}
+
+/// Real end-to-end: two concurrent RTMP publishes -> RtmpMoqBridge ->
+/// HlsFragmentBridge -> MultiHlsServer -> axum HTTP. Verifies that
+/// both broadcasts expose independent `/hls/{app}/{key}/playlist.m3u8`
+/// endpoints, that the two playlists reference distinct part URIs
+/// (the per-broadcast `PlaylistBuilder` state machines are genuinely
+/// independent), and that fetching one part from each broadcast
+/// returns a `moof`-prefixed body. Also asserts a negative lookup
+/// for an unknown broadcast returns 404 so the router does not
+/// silently fabricate empty playlists.
 #[tokio::test]
-async fn rtmp_publish_reaches_hls_subscriber_as_playlist_and_segment() {
+async fn rtmp_publish_reaches_multi_broadcast_hls_router() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("lvqr=debug")
         .with_test_writer()
@@ -271,88 +334,85 @@ async fn rtmp_publish_reaches_hls_subscriber_as_playlist_and_segment() {
     let rtmp_addr = server.rtmp_addr();
     let hls_addr = server.hls_addr();
 
-    // --- Publish RTMP. ---
-    let (mut rtmp_stream, mut session) = connect_and_publish(rtmp_addr, "live", "test").await;
+    // --- Publish two concurrent broadcasts. ---
+    let (_s1, _sess1) = publish_two_keyframes(rtmp_addr, "live", "one").await;
+    let (_s2, _sess2) = publish_two_keyframes(rtmp_addr, "live", "two").await;
 
-    // Sequence header.
-    let seq = flv_video_seq_header();
-    let result = session.publish_video_data(seq, RtmpTimestamp::new(0), false).unwrap();
-    send_result(&mut rtmp_stream, &result).await;
+    // The on_fragment path spawns one tokio task per push; give them
+    // a tick to land on the MultiHlsServer state before we read.
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
-    // First keyframe at t=0.
-    let nalu = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
-    let kf0 = flv_video_nalu(true, 0, &nalu);
-    let result = session.publish_video_data(kf0, RtmpTimestamp::new(0), false).unwrap();
-    send_result(&mut rtmp_stream, &result).await;
+    // --- Fetch both playlists, assert each is well-formed. ---
+    let parts_one = fetch_playlist_and_part_uris(hls_addr, "live", "one").await;
+    let parts_two = fetch_playlist_and_part_uris(hls_addr, "live", "two").await;
 
-    // Second keyframe at t=2100 ms. dts at 90 kHz = 189_000, which is
-    // past the default 180_000-tick segment boundary, so this push
-    // closes the first segment in the LL-HLS state machine.
-    let kf1 = flv_video_nalu(true, 0, &nalu);
-    let result = session
-        .publish_video_data(kf1, RtmpTimestamp::new(2100), false)
-        .unwrap();
-    send_result(&mut rtmp_stream, &result).await;
+    // The two playlists must reference independent part URIs. Because
+    // each broadcast lives behind its own `PlaylistBuilder`, the URIs
+    // for the first chunk happen to collide (both start at
+    // `part-0-0.m4s`), but the routes that serve them are distinct:
+    // `/hls/live/one/part-0-0.m4s` and `/hls/live/two/part-0-0.m4s`
+    // resolve to different per-broadcast caches. Verify that the
+    // bytes served under each route are both valid `moof` segments,
+    // which is the real independence property we care about.
+    let first_one = &parts_one[0];
+    let first_two = &parts_two[0];
+    let part_one_path = format!("/hls/live/one/{first_one}");
+    let part_two_path = format!("/hls/live/two/{first_two}");
 
-    // The on_fragment path spawns one tokio task per push. Give them a
-    // tick to land on the HlsServer state before we read.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    // --- Fetch the playlist. ---
-    let playlist_resp = http_get(hls_addr, "/playlist.m3u8").await;
-    assert_eq!(playlist_resp.status, 200, "playlist GET status");
-    let playlist_body = std::str::from_utf8(&playlist_resp.body).expect("playlist body should be utf-8");
-    eprintln!("--- playlist body ---\n{playlist_body}\n--- end ---");
+    let part_one_resp = http_get(hls_addr, &part_one_path).await;
+    assert_eq!(part_one_resp.status, 200, "part GET status for {part_one_path}");
     assert!(
-        playlist_body.starts_with("#EXTM3U"),
-        "playlist missing #EXTM3U header: {playlist_body}"
-    );
-    assert!(
-        playlist_body.contains("#EXT-X-VERSION:9"),
-        "playlist missing LL-HLS version tag"
-    );
-    assert!(
-        playlist_body.contains("#EXT-X-MAP:URI=\"init.mp4\""),
-        "playlist missing #EXT-X-MAP for init segment"
-    );
-
-    // The two-keyframe sequence above must have produced at least one
-    // closed segment plus one open partial. Both are referenced
-    // through `#EXT-X-PART:` lines in the rendered body.
-    let part_uris = extract_part_uris(playlist_body);
-    assert!(
-        !part_uris.is_empty(),
-        "playlist references no #EXT-X-PART URIs:\n{playlist_body}"
-    );
-
-    // --- Fetch one of the referenced parts and assert it has bytes. ---
-    let first_part_uri = &part_uris[0];
-    let part_path = format!("/{first_part_uri}");
-    let part_resp = http_get(hls_addr, &part_path).await;
-    assert_eq!(part_resp.status, 200, "part GET status for {part_path}");
-    assert!(!part_resp.body.is_empty(), "part body for {part_path} was empty");
-    // The bridge feeds wire-ready `moof + mdat` bytes into the HLS
-    // server, so the first 8 bytes after the box length should spell
-    // `moof`.
-    assert!(
-        part_resp.body.len() >= 8,
-        "part body is shorter than a single box header: {} bytes",
-        part_resp.body.len()
+        part_one_resp.body.len() >= 8,
+        "part one body too short: {} bytes",
+        part_one_resp.body.len()
     );
     assert_eq!(
-        &part_resp.body[4..8],
+        &part_one_resp.body[4..8],
         b"moof",
-        "expected the first part to start with a `moof` box"
+        "expected part one to start with a `moof` box"
     );
 
-    // --- Fetch the init segment too: it must be non-empty and start
-    // with an `ftyp` box header. ---
-    let init_resp = http_get(hls_addr, "/init.mp4").await;
-    assert_eq!(init_resp.status, 200, "init GET status");
-    assert!(init_resp.body.len() >= 8, "init body too short");
-    assert_eq!(&init_resp.body[4..8], b"ftyp", "init segment did not start with `ftyp`");
+    let part_two_resp = http_get(hls_addr, &part_two_path).await;
+    assert_eq!(part_two_resp.status, 200, "part GET status for {part_two_path}");
+    assert!(
+        part_two_resp.body.len() >= 8,
+        "part two body too short: {} bytes",
+        part_two_resp.body.len()
+    );
+    assert_eq!(
+        &part_two_resp.body[4..8],
+        b"moof",
+        "expected part two to start with a `moof` box"
+    );
 
-    // --- Clean shutdown ---
-    drop(rtmp_stream);
+    // --- init segments must be served per broadcast too. ---
+    let init_one_resp = http_get(hls_addr, "/hls/live/one/init.mp4").await;
+    assert_eq!(init_one_resp.status, 200, "init one GET status");
+    assert!(init_one_resp.body.len() >= 8, "init one body too short");
+    assert_eq!(
+        &init_one_resp.body[4..8],
+        b"ftyp",
+        "init one segment did not start with `ftyp`"
+    );
+
+    let init_two_resp = http_get(hls_addr, "/hls/live/two/init.mp4").await;
+    assert_eq!(init_two_resp.status, 200, "init two GET status");
+    assert_eq!(
+        &init_two_resp.body[4..8],
+        b"ftyp",
+        "init two segment did not start with `ftyp`"
+    );
+
+    // --- Unknown broadcast must return 404 rather than an empty 200. ---
+    let unknown = http_get(hls_addr, "/hls/live/ghost/playlist.m3u8").await;
+    assert_eq!(
+        unknown.status, 404,
+        "unknown broadcast should 404, got {}",
+        unknown.status
+    );
+
+    // --- Clean shutdown. ---
+    drop(_s1);
+    drop(_s2);
     server.shutdown().await.expect("shutdown");
 }

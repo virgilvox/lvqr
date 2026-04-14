@@ -82,6 +82,9 @@ use tokio::sync::{Notify, RwLock};
 
 use crate::manifest::{HlsError, PlaylistBuilder, PlaylistBuilderConfig};
 
+/// Default base path used when mounting a [`MultiHlsServer`] router.
+const MULTI_HLS_PREFIX: &str = "/hls";
+
 /// Maximum time a blocking-reload request will park on the
 /// `Notify` waker before giving up and returning the current
 /// playlist anyway. Three target durations is the Apple-recommended
@@ -209,7 +212,11 @@ struct BlockingReloadQuery {
     hls_part: Option<u32>,
 }
 
-async fn handle_playlist(State(state): State<Arc<HlsState>>, Query(q): Query<BlockingReloadQuery>) -> Response {
+/// Render the playlist response for an [`HlsState`], honouring the
+/// LL-HLS blocking reload semantic. Shared between the single-broadcast
+/// router and the [`MultiHlsServer`] router so the blocking behaviour
+/// lives in exactly one place.
+async fn render_playlist(state: &Arc<HlsState>, hls_msn: Option<u64>, hls_part: Option<u32>) -> Response {
     let timeout = Duration::from_secs((state.target_duration_secs * BLOCK_TIMEOUT_MULTIPLIER).max(1) as u64);
     let deadline = tokio::time::Instant::now() + timeout;
 
@@ -217,24 +224,14 @@ async fn handle_playlist(State(state): State<Arc<HlsState>>, Query(q): Query<Blo
         let ready = {
             let builder = state.builder.read().await;
             let m = builder.manifest();
-            match (q.hls_msn, q.hls_part) {
+            match (hls_msn, hls_part) {
                 (None, _) => true,
                 (Some(target_msn), None) => m.segments.iter().any(|s| s.sequence >= target_msn),
                 (Some(target_msn), Some(target_part)) => {
-                    // Either the target sequence is already closed,
-                    // or we are waiting on partials inside the
-                    // currently open segment. `next_sequence` is
-                    // not exposed, so we infer the open-segment
-                    // sequence as segments.len() + starting offset.
                     let closed = m.segments.iter().any(|s| s.sequence >= target_msn);
                     if closed {
                         true
                     } else {
-                        // The preliminary parts belong to the next
-                        // segment after the last closed one. Work
-                        // out that segment's sequence and check
-                        // whether it matches `target_msn` with at
-                        // least `target_part + 1` partials in hand.
                         let open_seq = m.segments.last().map(|s| s.sequence + 1).unwrap_or(0);
                         open_seq == target_msn && (m.preliminary_parts.len() as u32) > target_part
                     }
@@ -246,12 +243,9 @@ async fn handle_playlist(State(state): State<Arc<HlsState>>, Query(q): Query<Blo
             let body = builder.manifest().render();
             return ([(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")], body).into_response();
         }
-        // Park until the next push or timeout.
         let notified = state.notify.notified();
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            // Ran out the clock; serve whatever we have so the
-            // client does not hang forever.
             let builder = state.builder.read().await;
             let body = builder.manifest().render();
             return (
@@ -262,27 +256,165 @@ async fn handle_playlist(State(state): State<Arc<HlsState>>, Query(q): Query<Blo
                 .into_response();
         }
         if tokio::time::timeout(remaining, notified).await.is_err() {
-            // Timeout fired; loop once more, the `deadline` check
-            // above will flush the current playlist.
             continue;
         }
     }
 }
 
-async fn handle_init(State(state): State<Arc<HlsState>>) -> Response {
+async fn render_init(state: &Arc<HlsState>) -> Response {
     match state.init_segment.read().await.clone() {
         Some(bytes) => ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response(),
         None => (StatusCode::NOT_FOUND, "init segment not yet published").into_response(),
     }
 }
 
+async fn render_uri(state: &Arc<HlsState>, uri: &str) -> Response {
+    match state.cache.read().await.get(uri).cloned() {
+        Some(bytes) => ([(header::CONTENT_TYPE, "video/iso.segment")], bytes).into_response(),
+        None => (StatusCode::NOT_FOUND, format!("unknown chunk {uri}")).into_response(),
+    }
+}
+
+async fn handle_playlist(State(state): State<Arc<HlsState>>, Query(q): Query<BlockingReloadQuery>) -> Response {
+    render_playlist(&state, q.hls_msn, q.hls_part).await
+}
+
+async fn handle_init(State(state): State<Arc<HlsState>>) -> Response {
+    render_init(&state).await
+}
+
 async fn handle_uri(
     State(state): State<Arc<HlsState>>,
     axum::extract::Path(uri): axum::extract::Path<String>,
 ) -> Response {
-    match state.cache.read().await.get(&uri).cloned() {
-        Some(bytes) => ([(header::CONTENT_TYPE, "video/iso.segment")], bytes).into_response(),
-        None => (StatusCode::NOT_FOUND, format!("unknown chunk {uri}")).into_response(),
+    render_uri(&state, &uri).await
+}
+
+// =====================================================================
+// MultiHlsServer: per-broadcast LL-HLS fan-out.
+// =====================================================================
+
+/// Multi-broadcast LL-HLS server.
+///
+/// Wraps a map of broadcast name -> [`HlsServer`] so that a single axum
+/// router can serve `/hls/{broadcast}/playlist.m3u8` for many parallel
+/// broadcasts. The producer side creates per-broadcast state on demand
+/// via [`MultiHlsServer::ensure_broadcast`]; the consumer side looks up
+/// existing state via [`MultiHlsServer::get_broadcast`] and returns
+/// `404` for broadcasts that have not published anything yet.
+///
+/// The routed path is a single catch-all (`/hls/{*path}`) because
+/// broadcast names legitimately contain slashes today -- the RTMP
+/// bridge names broadcasts `{app}/{key}` (for example `live/test`) --
+/// so a simple `/hls/{broadcast}/...` pattern would not capture them.
+/// The handler splits the tail off and treats the remainder as the
+/// broadcast key.
+#[derive(Debug, Clone)]
+pub struct MultiHlsServer {
+    inner: Arc<MultiHlsState>,
+}
+
+#[derive(Debug)]
+struct MultiHlsState {
+    config: PlaylistBuilderConfig,
+    broadcasts: std::sync::Mutex<HashMap<String, HlsServer>>,
+}
+
+impl MultiHlsServer {
+    /// Build a new multi-broadcast server. `config` is used as the
+    /// template `PlaylistBuilderConfig` for every broadcast created
+    /// on the fly by [`Self::ensure_broadcast`].
+    pub fn new(config: PlaylistBuilderConfig) -> Self {
+        Self {
+            inner: Arc::new(MultiHlsState {
+                config,
+                broadcasts: std::sync::Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// Producer-side entry point. Returns a cheap clone of the
+    /// per-broadcast [`HlsServer`], creating one if this is the first
+    /// time `broadcast` has been seen.
+    pub fn ensure_broadcast(&self, broadcast: &str) -> HlsServer {
+        let mut map = self
+            .inner
+            .broadcasts
+            .lock()
+            .expect("multi hls broadcasts mutex poisoned");
+        if let Some(existing) = map.get(broadcast) {
+            return existing.clone();
+        }
+        let server = HlsServer::new(self.inner.config.clone());
+        map.insert(broadcast.to_string(), server.clone());
+        server
+    }
+
+    /// Consumer-side lookup. Returns `None` when the broadcast has
+    /// never been announced by a producer. Used by HTTP handlers so
+    /// an unknown broadcast becomes a 404 instead of an empty-playlist
+    /// 200.
+    pub fn get_broadcast(&self, broadcast: &str) -> Option<HlsServer> {
+        self.inner
+            .broadcasts
+            .lock()
+            .expect("multi hls broadcasts mutex poisoned")
+            .get(broadcast)
+            .cloned()
+    }
+
+    /// Number of broadcasts currently tracked. Test-oriented.
+    pub fn broadcast_count(&self) -> usize {
+        self.inner
+            .broadcasts
+            .lock()
+            .expect("multi hls broadcasts mutex poisoned")
+            .len()
+    }
+
+    /// Build an `axum::Router` that serves every tracked broadcast
+    /// under `/hls/{broadcast}/...`. The router has no middleware and
+    /// no auth; both are the responsibility of the composing binary.
+    pub fn router(&self) -> Router {
+        Router::new()
+            .route(&format!("{MULTI_HLS_PREFIX}/{{*path}}"), get(handle_multi_get))
+            .with_state(self.clone())
+    }
+}
+
+/// Split an `/hls/{broadcast}/<tail>` catch-all capture into
+/// `(broadcast, tail)` where `tail` is one of `playlist.m3u8`,
+/// `init.mp4`, or a chunk URI. The broadcast is everything before the
+/// final `/`.
+fn split_broadcast_path(path: &str) -> Option<(&str, &str)> {
+    let idx = path.rfind('/')?;
+    if idx == 0 {
+        return None;
+    }
+    let broadcast = &path[..idx];
+    let tail = &path[idx + 1..];
+    if broadcast.is_empty() || tail.is_empty() {
+        return None;
+    }
+    Some((broadcast, tail))
+}
+
+async fn handle_multi_get(
+    State(multi): State<MultiHlsServer>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+    Query(q): Query<BlockingReloadQuery>,
+) -> Response {
+    let Some((broadcast, tail)) = split_broadcast_path(&path) else {
+        return (StatusCode::NOT_FOUND, "malformed hls path").into_response();
+    };
+    let Some(server) = multi.get_broadcast(broadcast) else {
+        return (StatusCode::NOT_FOUND, format!("unknown broadcast {broadcast}")).into_response();
+    };
+    let state = server.state.clone();
+    match tail {
+        "playlist.m3u8" => render_playlist(&state, q.hls_msn, q.hls_part).await,
+        "init.mp4" => render_init(&state).await,
+        other => render_uri(&state, other).await,
     }
 }
 
