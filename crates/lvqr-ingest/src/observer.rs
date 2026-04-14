@@ -14,11 +14,15 @@
 //! per push for that reason.
 
 use bytes::Bytes;
+use lvqr_cmaf::RawSample;
 use lvqr_fragment::Fragment;
 use std::sync::Arc;
 
-/// Shared, dynamically-dispatched observer handle.
+/// Shared, dynamically-dispatched fragment observer handle.
 pub type SharedFragmentObserver = Arc<dyn FragmentObserver>;
+
+/// Shared, dynamically-dispatched raw-sample observer handle.
+pub type SharedRawSampleObserver = Arc<dyn RawSampleObserver>;
 
 /// Observer hook called by [`crate::RtmpMoqBridge`] for every fragment it
 /// emits. Implementations stay HLS- / DASH- / archive-agnostic; the
@@ -35,11 +39,40 @@ pub trait FragmentObserver: Send + Sync {
     fn on_fragment(&self, broadcast: &str, track: &str, fragment: &Fragment);
 }
 
-/// Drop-in observer that does nothing. Useful as a default when the
-/// caller does not want any side channel.
+/// Observer hook called by [`crate::RtmpMoqBridge`] for every per-sample
+/// unit it sees, *before* the sample is muxed into an fMP4 fragment.
+///
+/// Sibling to [`FragmentObserver`]. Consumers that need the raw NAL /
+/// AAC access unit bytes (notably a future WHEP egress path that
+/// packetizes per-NAL into RTP) subscribe here instead of re-parsing
+/// `CmafChunk` mdat bodies downstream. The bridge still produces
+/// fragments in parallel for the MoQ / HLS path; raw-sample observers
+/// are a read-only tap, never replace the fragment path.
+///
+/// Implementations must be cheap and non-blocking for the same reason
+/// `FragmentObserver` must: the observer is fired from inside the
+/// `rml_rtmp` callback chain, which runs on the RTMP server's tokio
+/// task. Long work or blocking I/O will stall ingest; spawn a tokio
+/// task per notification if downstream work is expensive.
+pub trait RawSampleObserver: Send + Sync {
+    /// Called for every video / audio sample the bridge receives,
+    /// in DTS order per track. `track` follows the same `0.mp4` /
+    /// `1.mp4` convention [`FragmentObserver`] uses.
+    fn on_raw_sample(&self, broadcast: &str, track: &str, sample: &RawSample);
+}
+
+/// Drop-in fragment observer that does nothing. Useful as a default
+/// when the caller does not want any side channel.
 pub struct NoopFragmentObserver;
 
 impl FragmentObserver for NoopFragmentObserver {
     fn on_init(&self, _broadcast: &str, _track: &str, _init: Bytes) {}
     fn on_fragment(&self, _broadcast: &str, _track: &str, _fragment: &Fragment) {}
+}
+
+/// Drop-in raw-sample observer that does nothing.
+pub struct NoopRawSampleObserver;
+
+impl RawSampleObserver for NoopRawSampleObserver {
+    fn on_raw_sample(&self, _broadcast: &str, _track: &str, _sample: &RawSample) {}
 }

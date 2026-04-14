@@ -14,6 +14,7 @@ members = [
     "crates/lvqr-relay",
     "crates/lvqr-mesh",
     "crates/lvqr-ingest",
+    "crates/lvqr-whep",
     "crates/lvqr-signal",
     "crates/lvqr-admin",
     "crates/lvqr-auth",
@@ -109,6 +110,7 @@ lvqr-hls = { version = "0.3.1", path = "crates/lvqr-hls" }
 lvqr-relay = { version = "0.3.1", path = "crates/lvqr-relay" }
 lvqr-mesh = { version = "0.3.1", path = "crates/lvqr-mesh" }
 lvqr-ingest = { version = "0.3.1", path = "crates/lvqr-ingest" }
+lvqr-whep = { version = "0.3.1", path = "crates/lvqr-whep" }
 lvqr-signal = { version = "0.3.1", path = "crates/lvqr-signal" }
 lvqr-admin = { version = "0.3.1", path = "crates/lvqr-admin" }
 lvqr-auth = { version = "0.3.1", path = "crates/lvqr-auth" }

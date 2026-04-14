@@ -1,0 +1,17 @@
+[package]
+name = "lvqr-whep"
+description = "WHEP (WebRTC HTTP Egress Protocol) egress for LVQR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["streaming", "webrtc", "whep", "rtp", "egress"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+bytes = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

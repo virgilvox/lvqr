@@ -13,7 +13,7 @@ use lvqr_moq::Track;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::observer::SharedFragmentObserver;
+use crate::observer::{SharedFragmentObserver, SharedRawSampleObserver};
 use crate::remux::{
     AudioConfig, FlvAudioTag, FlvVideoTag, VideoConfig, audio_init_segment, audio_segment, extract_resolution,
     generate_catalog, parse_audio_tag, parse_video_tag, video_init_segment_with_size,
@@ -53,6 +53,7 @@ pub struct RtmpMoqBridge {
     auth: SharedAuth,
     events: Option<EventBus>,
     observer: Option<SharedFragmentObserver>,
+    raw_observer: Option<SharedRawSampleObserver>,
 }
 
 impl RtmpMoqBridge {
@@ -63,6 +64,7 @@ impl RtmpMoqBridge {
             auth: Arc::new(NoopAuthProvider),
             events: None,
             observer: None,
+            raw_observer: None,
         }
     }
 
@@ -74,6 +76,7 @@ impl RtmpMoqBridge {
             auth,
             events: None,
             observer: None,
+            raw_observer: None,
         }
     }
 
@@ -112,6 +115,22 @@ impl RtmpMoqBridge {
         self.observer = Some(observer);
     }
 
+    /// Attach a [`crate::RawSampleObserver`] so the bridge fans every
+    /// per-NAL video sample and every raw AAC audio access unit out
+    /// to a consumer that needs pre-mux access (notably the future
+    /// WHEP RTP packetizer). Read-only tap; does not alter the
+    /// fragment / MoQ / HLS paths.
+    pub fn with_raw_sample_observer(mut self, observer: SharedRawSampleObserver) -> Self {
+        self.raw_observer = Some(observer);
+        self
+    }
+
+    /// Attach or replace the [`crate::RawSampleObserver`] after
+    /// construction.
+    pub fn set_raw_sample_observer(&mut self, observer: SharedRawSampleObserver) {
+        self.raw_observer = Some(observer);
+    }
+
     /// Create an RTMP server wired to this bridge.
     pub fn create_rtmp_server(&self, config: RtmpConfig) -> RtmpServer {
         let origin = self.origin.clone();
@@ -124,6 +143,8 @@ impl RtmpMoqBridge {
 
         let observer_video = self.observer.clone();
         let observer_audio = self.observer.clone();
+        let raw_observer_video = self.raw_observer.clone();
+        let raw_observer_audio = self.raw_observer.clone();
 
         let on_publish: StreamCallback = Arc::new(move |app: &str, key: &str| {
             let stream_name = format!("{app}/{key}");
@@ -266,6 +287,10 @@ impl RtmpMoqBridge {
                         keyframe,
                     };
 
+                    if let Some(obs) = raw_observer_video.as_ref() {
+                        obs.on_raw_sample(&stream_name, "0.mp4", &sample);
+                    }
+
                     stream.video_seq += 1;
                     let seg = lvqr_cmaf::build_moof_mdat(stream.video_seq, 1, base_dts, &[sample]);
 
@@ -338,6 +363,19 @@ impl RtmpMoqBridge {
                     // AAC-LC uses 1024 samples per frame at the audio sample rate
                     let duration: u32 = 1024;
                     let base_dts = (timestamp as u64) * (config.sample_rate as u64) / 1000;
+
+                    if let Some(obs) = raw_observer_audio.as_ref() {
+                        let sample = lvqr_cmaf::RawSample {
+                            track_id: 2,
+                            dts: base_dts,
+                            cts_offset: 0,
+                            duration,
+                            payload: aac_data.clone(),
+                            keyframe: true,
+                        };
+                        obs.on_raw_sample(&stream_name, "1.mp4", &sample);
+                    }
+
                     let seg = audio_segment(stream.audio_seq, base_dts, duration, &aac_data);
 
                     // Every audio fragment opens its own MoQ group (audio

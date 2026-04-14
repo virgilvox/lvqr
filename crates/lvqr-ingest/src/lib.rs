@@ -11,7 +11,10 @@ pub mod protocol;
 pub mod remux;
 
 pub use error::IngestError;
-pub use observer::{FragmentObserver, NoopFragmentObserver, SharedFragmentObserver};
+pub use observer::{
+    FragmentObserver, NoopFragmentObserver, NoopRawSampleObserver, RawSampleObserver, SharedFragmentObserver,
+    SharedRawSampleObserver,
+};
 pub use protocol::IngestProtocol;
 
 #[cfg(feature = "rtmp")]
