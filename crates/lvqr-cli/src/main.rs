@@ -76,6 +76,11 @@ struct ServeArgs {
     #[arg(long, env = "LVQR_RECORD_DIR")]
     record_dir: Option<PathBuf>,
 
+    /// Directory to archive broadcast fragments + redb segment index into.
+    /// Enables DVR scrub / time-range playback (Tier 2.4). Omit to disable.
+    #[arg(long, env = "LVQR_ARCHIVE_DIR")]
+    archive_dir: Option<PathBuf>,
+
     /// HS256 shared secret enabling JWT authentication. When set, the JWT
     /// provider replaces the static-token provider and all auth surfaces
     /// validate bearer tokens as signed JWTs.
@@ -168,6 +173,7 @@ async fn serve_from_args(args: ServeArgs) -> Result<()> {
         max_peers: args.max_peers,
         auth: Some(auth),
         record_dir: args.record_dir,
+        archive_dir: args.archive_dir,
         install_prometheus: true,
         tls_cert: args.tls_cert,
         tls_key: args.tls_key,

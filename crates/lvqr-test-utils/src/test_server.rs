@@ -44,6 +44,7 @@ pub struct TestServerConfig {
     max_peers: Option<usize>,
     auth: Option<SharedAuth>,
     record_dir: Option<PathBuf>,
+    archive_dir: Option<PathBuf>,
     hls_disabled: bool,
 }
 
@@ -70,6 +71,14 @@ impl TestServerConfig {
     /// Enable disk recording into the given directory.
     pub fn with_record_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.record_dir = Some(dir.into());
+        self
+    }
+
+    /// Enable the DVR archive index under the given directory. The
+    /// server opens `<dir>/archive.redb` and writes fragment bytes
+    /// into `<dir>/<broadcast>/<track>/<seq>.m4s` as they arrive.
+    pub fn with_archive_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.archive_dir = Some(dir.into());
         self
     }
 
@@ -111,6 +120,7 @@ impl TestServer {
             max_peers: config.max_peers.unwrap_or(3),
             auth: config.auth,
             record_dir: config.record_dir,
+            archive_dir: config.archive_dir,
             // Prometheus install is process-wide and panics on second
             // call, so tests always disable it. Metrics macros still
             // fire; they're just dropped on the floor instead of being

@@ -112,6 +112,7 @@ lvqr-relay = { version = "0.3.1", path = "crates/lvqr-relay" }
 lvqr-mesh = { version = "0.3.1", path = "crates/lvqr-mesh" }
 lvqr-ingest = { version = "0.3.1", path = "crates/lvqr-ingest" }
 lvqr-whep = { version = "0.3.1", path = "crates/lvqr-whep" }
+lvqr-archive = { version = "0.3.1", path = "crates/lvqr-archive" }
 lvqr-signal = { version = "0.3.1", path = "crates/lvqr-signal" }
 lvqr-admin = { version = "0.3.1", path = "crates/lvqr-admin" }
 lvqr-auth = { version = "0.3.1", path = "crates/lvqr-auth" }

@@ -39,6 +39,7 @@ lvqr-fragment = { workspace = true }
 lvqr-cmaf = { workspace = true }
 lvqr-hls = { workspace = true }
 lvqr-whep = { workspace = true }
+lvqr-archive = { workspace = true }
 
 axum = { workspace = true }
 bytes = { workspace = true }
@@ -73,3 +74,4 @@ lvqr-test-utils = { workspace = true }
 # transitively through `lvqr-auth/jwt`.
 jsonwebtoken = { workspace = true }
 serde_json = { workspace = true }
+tempfile = "3"

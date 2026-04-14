@@ -11,6 +11,7 @@
 //! spin up a full-stack LVQR instance on ephemeral ports inside
 //! integration tests.
 
+mod archive;
 mod hls;
 
 use anyhow::Result;
@@ -33,6 +34,7 @@ use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
+use crate::archive::{IndexingFragmentObserver, TeeFragmentObserver, playback_router};
 use crate::hls::HlsFragmentBridge;
 
 /// Configuration passed to [`start`] to bring up a full-stack LVQR server.
@@ -70,6 +72,14 @@ pub struct ServeConfig {
     pub auth: Option<SharedAuth>,
     /// Recording directory. `None` disables recording.
     pub record_dir: Option<PathBuf>,
+    /// DVR archive directory. When `Some`, `start()` opens a
+    /// `RedbSegmentIndex` under `<archive_dir>/archive.redb` and
+    /// attaches an archiving fragment observer to the RTMP bridge
+    /// that writes every emitted fragment to
+    /// `<archive_dir>/<broadcast>/<track>/<seq>.m4s` and records a
+    /// `SegmentRef` against the index. The index + segment files
+    /// back the DVR scrub / time-range playback surface (Tier 2.4).
+    pub archive_dir: Option<PathBuf>,
     /// Install the global Prometheus recorder. Must be `false` in tests
     /// because `metrics-exporter-prometheus` panics on the second install
     /// in a process. `main.rs` sets this to `true`.
@@ -96,6 +106,7 @@ impl ServeConfig {
             max_peers: 3,
             auth: None,
             record_dir: None,
+            archive_dir: None,
             install_prometheus: false,
             tls_cert: None,
             tls_key: None,
@@ -265,9 +276,41 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // report the real bound port (for ephemeral-port test setups).
     let mut bridge_builder =
         lvqr_ingest::RtmpMoqBridge::with_auth(relay.origin().clone(), auth.clone()).with_events(events.clone());
+
+    // Optional DVR archive index. Opened before the bridge is frozen
+    // so the archiving observer can be composed with the LL-HLS
+    // observer via `TeeFragmentObserver`. The index file lives at
+    // `<archive_dir>/archive.redb`; the directory is created on
+    // demand if it does not already exist.
+    let archive_index = if let Some(ref dir) = config.archive_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| anyhow::anyhow!("archive: failed to create {}: {e}", dir.display()))?;
+        let db_path = dir.join("archive.redb");
+        let index = lvqr_archive::RedbSegmentIndex::open(&db_path)
+            .map_err(|e| anyhow::anyhow!("archive: failed to open {}: {e}", db_path.display()))?;
+        tracing::info!(dir = %dir.display(), "DVR archive index enabled");
+        Some((dir.clone(), Arc::new(index)))
+    } else {
+        None
+    };
+
+    let mut fragment_observers: Vec<SharedFragmentObserver> = Vec::new();
     if let Some(hls) = hls_server.clone() {
-        let observer: SharedFragmentObserver = Arc::new(HlsFragmentBridge::new(hls));
-        bridge_builder = bridge_builder.with_observer(observer);
+        fragment_observers.push(Arc::new(HlsFragmentBridge::new(hls)));
+    }
+    if let Some((dir, index)) = archive_index.clone() {
+        fragment_observers.push(Arc::new(IndexingFragmentObserver::new(dir, index)));
+    }
+    match fragment_observers.len() {
+        0 => {}
+        1 => {
+            let observer = fragment_observers.into_iter().next().expect("len checked");
+            bridge_builder = bridge_builder.with_observer(observer);
+        }
+        _ => {
+            let tee: SharedFragmentObserver = Arc::new(TeeFragmentObserver::new(fragment_observers));
+            bridge_builder = bridge_builder.with_observer(tee);
+        }
     }
 
     // Optional WHEP surface. Constructed before the bridge is
@@ -479,7 +522,12 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             lvqr_admin::build_router(admin_state)
         };
 
-        admin_router.merge(ws_router)
+        let combined = admin_router.merge(ws_router);
+        if let Some((_, ref index)) = archive_index {
+            combined.merge(playback_router(Arc::clone(index)))
+        } else {
+            combined
+        }
     }
     .layer(CorsLayer::permissive());
 
