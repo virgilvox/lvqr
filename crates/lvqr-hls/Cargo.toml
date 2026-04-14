@@ -14,9 +14,15 @@ categories = ["multimedia", "multimedia::video"]
 lvqr-core = { workspace = true }
 lvqr-cmaf = { workspace = true }
 
+axum = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-bytes = { workspace = true }
 proptest = "1"
+tower = { workspace = true, features = ["util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+http-body-util = "0.1"

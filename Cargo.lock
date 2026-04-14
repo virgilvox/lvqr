@@ -1492,11 +1492,16 @@ dependencies = [
 name = "lvqr-hls"
 version = "0.3.1"
 dependencies = [
+ "axum",
  "bytes",
+ "http-body-util",
  "lvqr-cmaf",
  "lvqr-core",
  "proptest",
+ "serde",
  "thiserror 2.0.18",
+ "tokio",
+ "tower",
  "tracing",
 ]
 

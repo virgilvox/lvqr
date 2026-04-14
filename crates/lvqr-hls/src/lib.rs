@@ -64,7 +64,9 @@
 //! validator wrapper). Session 8 or later will fill them.
 
 pub mod manifest;
+pub mod server;
 
 pub use manifest::{
     HlsError, Manifest, Part, PlaylistBuilder, PlaylistBuilderConfig, Segment, ServerControl, render_manifest,
 };
+pub use server::HlsServer;
