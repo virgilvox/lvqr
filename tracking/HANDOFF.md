@@ -1,15 +1,266 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.3 closed, `lvqr-whep` started
+## Project Status: v0.4-dev -- `lvqr-whep` signaling router shipped, str0m pending
 
-**Last Updated**: 2026-04-14 (session 15 close)
+**Last Updated**: 2026-04-14 (session 17 close)
 **Tests**: `cargo test --workspace` green under the default feature
-set: 68 test binaries, 254 individual tests, 0 failures. The
+set: 69 test binaries, 269 individual tests, 0 failures. The
 `--no-default-features --features rtmp,quinn-transport` legacy
 configuration is retired along with the hand-rolled fMP4 writer; the
 `test-legacy-fmp4-path` CI matrix job was deleted in session 14.
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 `cargo fmt --all --check` clean.
+
+## Session 17 (2026-04-14): close deferred audit findings
+
+Session 17 is a small bookkeeping session that closes two items
+from the `AUDIT-INTERNAL-2026-04-13.md` deferred list which had
+been tracked for multiple sessions without landing. One logical
+commit (9f1c3e0), four files touched:
+
+1. **`crates/lvqr-admin/Cargo.toml`** + **`crates/lvqr-admin/src/routes.rs`**.
+   Added `metrics` as a dep and emits
+   `lvqr_auth_failures_total{entry="admin"}` from the admin
+   middleware on every `AuthDecision::Deny`. Before this commit,
+   the admin surface was the only LVQR auth entry point that
+   denied silently -- RTMP, MoQ, WS ingest, and WS subscribe all
+   already emitted the same counter with different `entry`
+   labels. Brute-force attempts against the admin token are now
+   visible to Prometheus scrapers with the exact same query shape
+   operators already use for the other entry points.
+
+2. **`crates/lvqr-core/README.md`**. Replaced the stale crate
+   overview which still documented `Registry`, `RingBuffer`, and
+   `GopCache` as shipping API. Those types were deleted from the
+   source tree at the Tier 2.1 fragment-model landing; the Rust
+   lib.rs module doc already reflected the new reality but the
+   README did not. The refreshed README lists the actual
+   remaining surface (EventBus, RelayEvent, TrackName, Frame,
+   RelayStats, CoreError) with a working usage example.
+
+### Audit sweep verifying closed items
+
+While scoping session 17 I re-verified every item on the
+`AUDIT-INTERNAL-2026-04-13.md` "Deferred" list against the current
+tree. The items tagged closed during earlier sessions without a
+HANDOFF note are:
+
+| Item | Status found in tree |
+|---|---|
+| Delete `lvqr-core::{Registry, RingBuffer, GopCache}` | CLOSED in the Rust sources already; only README drift remained. Fixed this session. |
+| `lvqr-signal` input validation | CLOSED. `is_valid_peer_id`, `is_valid_track`, `MAX_PEER_ID_LEN`, `MAX_TRACK_LEN` all present in `crates/lvqr-signal/src/signaling.rs`. |
+| `lvqr-record` integration test via event bus | CLOSED. `crates/lvqr-record/tests/record_integration.rs` exists. |
+| fMP4 esds multi-byte descriptor length encoding | CLOSED. `write_mpeg4_descriptor` in `lvqr-ingest::remux::fmp4` uses the 4-byte variable-length encoding. |
+| Admin auth-failure metric | CLOSED (this commit). |
+
+Items still correctly deferred:
+
+* **Delete `lvqr-wasm`**. Scheduled for v0.5 per the original
+  audit. The crate is marked `# DEPRECATED` in its own `lib.rs`
+  header and the browser client now lives in TypeScript. No
+  consumers; deletion is safe but mechanical and can land
+  whenever a session wants the bookkeeping.
+* **CORS restrict in `lvqr-cli`**. `CorsLayer::permissive()` is
+  still applied at `crates/lvqr-cli/src/lib.rs:438`. The audit
+  recommended a restrictive default allowing only the configured
+  admin origin plus localhost. Deferred from this session because
+  changing the CORS default is potentially a breaking change for
+  any existing browser client that depends on the wide-open
+  policy; should land as its own commit with a matching release
+  note, not piggybacked.
+* **Rate limits on every auth surface**. Tier 3 hardening; a
+  `tower::limit::RateLimit` layer on the admin router plus a
+  per-IP accept budget on WS and MoQ. Still blocked on the full
+  Tier 3 gate.
+
+## Session 16 (2026-04-14): `lvqr-whep` signaling router + integration slot
+
+Session 16 closed the second artifact slot of the 5-artifact
+contract for `lvqr-whep` by landing the full HTTP signaling
+surface. No `str0m` yet; the router talks to the WebRTC side
+through a clean trait boundary (`SdpAnswerer` + `SessionHandle`)
+so a concrete `str0m`-backed answerer drops in later as a single
+type swap at construction time. One commit (3b1433b), three new
+files plus `lib.rs` + `Cargo.toml` updates:
+
+1. **`crates/lvqr-whep/src/server.rs`** (new). `SessionId` (32-char
+   random hex via `rand::thread_rng().fill_bytes`), `WhepError`
+   enum with four variants (`UnsupportedContentType`,
+   `MalformedOffer`, `SessionNotFound`, `AnswererFailed`) and an
+   `IntoResponse` impl mapping each onto 415 / 400 / 404 / 500,
+   the `SdpAnswerer` and `SessionHandle` traits that form the
+   plug point for a real WebRTC stack, `WhepServer` (cheap
+   `Clone` around `Arc<WhepState>` so one instance lives in both
+   the axum router and the ingest bridge's `RawSampleObserver`
+   slot), and a `RawSampleObserver` impl that fans each upstream
+   sample out to every session whose `broadcast` field matches.
+   Three unit tests covering session-id entropy and error status
+   mapping.
+
+2. **`crates/lvqr-whep/src/router.rs`** (new). axum `Router` built
+   on a `/whep/{*path}` catch-all with `post(handle_offer).patch(handle_trickle).delete(handle_terminate)`
+   method routing. The catch-all exists because broadcast names
+   follow the RTMP `{app}/{stream_key}` convention and therefore
+   carry a `/` (e.g. `live/test`), and axum path parameters only
+   match single URL segments. On POST, the captured `path` is
+   the broadcast name verbatim; the handler mints a random
+   `SessionId`, registers it in the state's `DashMap<SessionId,
+   SessionEntry>`, and returns 201 Created with a `Location:
+   /whep/{broadcast}/{session_id}` header plus the SDP answer
+   body. On PATCH and DELETE the handler splits the captured
+   path on the last `/` via a `split_session_path` helper to
+   recover `(broadcast, session_id)`. POST content-type accepts
+   `application/sdp` with or without parameters; PATCH also
+   accepts `application/trickle-ice-sdpfrag` per the WHEP draft.
+
+3. **`crates/lvqr-whep/src/lib.rs`**. Added `pub mod router; pub
+   mod server;` plus re-exports for `router_for`, `SdpAnswerer`,
+   `SessionHandle`, `SessionId`, `WhepError`, `WhepServer`.
+
+4. **`crates/lvqr-whep/Cargo.toml`**. Runtime deps: `axum`,
+   `dashmap`, `lvqr-cmaf`, `lvqr-ingest`, `rand`, `thiserror`,
+   `tracing`. Dev-deps: `tokio` (features `macros`, `rt`) and
+   `tower` for `ServiceExt::oneshot`.
+
+5. **`crates/lvqr-whep/tests/integration_signaling.rs`** (new).
+   The integration slot of the 5-artifact contract. Twelve tests
+   driving the real axum router via `tower::ServiceExt::oneshot`
+   with two stub answerers: `StubAnswerer` (shared atomic
+   counters for trickle + sample call counts) and
+   `TaggingAnswerer` (tags handles by broadcast so the fanout
+   test can assert which broadcast saw each sample). Coverage:
+
+   * `post_offer_returns_created_with_location_and_answer` --
+     full happy path with 201 + Location header format assertion
+     + `Content-Type: application/sdp` + SDP answer body + session
+     count increment.
+   * `post_offer_without_content_type_returns_415`
+   * `post_offer_with_wrong_content_type_returns_415`
+   * `post_offer_accepts_content_type_with_parameters` --
+     `application/sdp; charset=utf-8` must be accepted.
+   * `post_offer_with_empty_body_returns_400` -- `MalformedOffer`
+     path; session must not be registered.
+   * `delete_unknown_session_returns_404`
+   * `session_lifecycle_post_then_delete` -- POST -> DELETE ->
+     second-DELETE, asserts the session count roundtrips to zero
+     and the second delete is 404.
+   * `patch_unknown_session_returns_404`
+   * `patch_existing_session_forwards_to_handle` -- PATCH body
+     actually reaches `SessionHandle::add_trickle` via the
+     shared atomic counter.
+   * `patch_with_wrong_content_type_returns_415`
+   * `raw_sample_observer_routes_only_to_subscribed_sessions` --
+     subscribes one session per broadcast, pushes samples for
+     `live/one` (2x), `live/two` (1x), and `live/three`
+     (unsubscribed). Asserts per-broadcast counters land on
+     2 / 1 / 0. This is the load-bearing correctness property for
+     the fanout design.
+   * `unknown_route_returns_404` -- actually asserts 405 since
+     GET matches the catch-all path but no GET handler is
+     registered. Test name is slightly stale; assertion is
+     correct.
+
+### Routing bug caught by the integration slot
+
+Session 16's first-pass router used axum's
+`/whep/{broadcast}` + `/whep/{broadcast}/{session_id}` two-route
+shape, which compiled clean and passed clippy but failed 9 of 12
+tests on first run with 405s. The bug: `{broadcast}` only matches
+single URL segments, so `/whep/live/test` was matching the
+two-segment `/whep/{broadcast}/{session_id}` route with
+broadcast = `live` and session_id = `test`, leaving POST without
+a handler (hence 405). Fixed by flipping to the `/whep/{*path}`
+catch-all with manual splitting on the last `/` inside each
+handler -- the exact pattern `lvqr-hls::MultiHlsServer::router`
+already uses for the same problem. Without the integration slot
+landing alongside the code, session 17 would have inherited a
+dead router that returns 405 for every real client; the
+integration slot paid for itself on its first CI run.
+
+### Design decisions answered (session 16)
+
+The session-11 `lvqr-whep` design note lists four open questions.
+Session 16 answered them and the answers are baked into the
+router and the trait boundary:
+
+1. **Packetizer home**: private module `lvqr-whep::rtp`. Promote
+   to a standalone `lvqr-rtp` crate later when `lvqr-whip` needs
+   the inverse depacketizer. No speculative abstraction.
+2. **Socket strategy**: one UDP socket per session for v0.x.
+   Simpler control flow, no ICE-lite demux to write. Shared
+   sockets are a perf-driven refactor later.
+3. **WHEP bind**: `Option<SocketAddr>` under a future
+   `--whep-addr` flag on `lvqr-cli`, default disabled. Users
+   opt in during the v0.x cycle. The flag itself lands with the
+   first concrete `SdpAnswerer` so the route stops returning
+   "not yet implemented" bodies.
+4. **Token transport**: `Authorization: Bearer <token>` on the
+   offer POST. The WS surface's query-param and subprotocol
+   fallbacks stay WS-specific. Not wired yet; the router already
+   reads `HeaderMap` so plumbing `SharedAuth` through
+   `WhepServer` is a small local diff in the CLI integration
+   session.
+
+### Contract slot status after session 16
+
+`lvqr-whep` is now at **2 of 5 contract slots closed**:
+
+| Slot | Status |
+|---|---|
+| proptest | CLOSED (session 15, `tests/proptest_packetizer.rs`) |
+| integration | CLOSED (session 16, `tests/integration_signaling.rs`) |
+| fuzz | OPEN (offer SDP parser lives in str0m; lands with str0m) |
+| e2e | OPEN (`lvqr-cli/tests/rtmp_whep_e2e.rs` once str0m + webrtc-rs client subprocess is available) |
+| conformance | OPEN (cross-implementation against `simple-whep-client`, not yet installed in CI) |
+
+### Recommended entry point (session 18)
+
+With session 16 closing signaling and session 17 closing the
+audit debt, the next block of work is the str0m integration
+itself. The picks for session 18:
+
+1. **Bring in `str0m` as a workspace dep and implement
+   `Str0mAnswerer`**. Replace the stub answerers in
+   integration tests with a real one for at least the offer ->
+   answer path. Expect the first implementation to need UDP
+   socket binding at construction time (str0m needs a local
+   host ICE candidate to include in the answer) and session-
+   scoped state that stores the `Rtc` state machine. Leave
+   `add_trickle` and `on_raw_sample` as TODO with tracing
+   warnings -- driving the `Rtc` state machine forward and
+   packetizing samples into RTP is a separate follow-up.
+2. **Wire `--whep-addr` in `lvqr-cli::ServeArgs`** and
+   construct the `WhepServer` with `Str0mAnswerer` in
+   `lvqr_cli::start`, attach it to the bridge via
+   `RtmpMoqBridge::with_raw_sample_observer`, and mount the
+   router on the configured binding. Small follow-up once item
+   1 is real.
+3. **Fuzz slot for the SDP offer parser** under
+   `crates/lvqr-whep/fuzz/fuzz_targets/parse_offer_sdp.rs`
+   seeded from captured browser offers. Lands naturally
+   alongside item 1.
+
+Item 1 is the full session. Items 2 and 3 are follow-ups that
+assume str0m is actually producing answers. E2E (`rtmp_whep_e2e.rs`)
+and conformance (`simple-whep-client` soft-skip) slots are
+session 19 or later.
+
+### Audio timescale follow-up (tracked from session 14)
+
+Session 14 flagged a cosmetic bug where `HlsFragmentBridge`
+pushes audio chunks through the `AUDIO_48KHZ_DEFAULT` policy
+while the bridge itself emits audio at the AAC sample rate
+(44100 Hz via `audio_init_segment` + `audio_segment`), so the
+`#EXT-X-PART:DURATION` values reported in the LL-HLS audio
+playlist are scaled by 48000 / 44100 (a 1024-sample AAC frame
+reports 0.021333 s instead of the true 0.023220 s). Still open.
+Candidate fix: either retire `audio_segment` alongside the
+session-14 `video_segment` deletion by routing AAC through
+`lvqr_cmaf::build_moof_mdat` with a proper audio-timescale
+policy, or have the bridge construct a per-broadcast
+`CmafPolicy` with the right timescale at init time. Routing
+and serving are correct today; only the reported duration is
+off. Not blocking WHEP work.
 
 ## Session 15 (2026-04-14): begin `lvqr-whep` implementation
 
