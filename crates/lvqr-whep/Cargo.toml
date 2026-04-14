@@ -17,10 +17,12 @@ dashmap = { workspace = true }
 lvqr-cmaf = { workspace = true }
 lvqr-ingest = { workspace = true }
 rand = { workspace = true }
+str0m = "0.18"
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tower = { workspace = true }

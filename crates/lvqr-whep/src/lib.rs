@@ -20,7 +20,9 @@
 pub mod router;
 pub mod rtp;
 pub mod server;
+pub mod str0m_backend;
 
 pub use router::router as router_for;
 pub use rtp::{H264Packetizer, H264RtpPayload};
 pub use server::{SdpAnswerer, SessionHandle, SessionId, WhepError, WhepServer};
+pub use str0m_backend::{Str0mAnswerer, Str0mConfig, Str0mSessionHandle};

@@ -34,6 +34,16 @@ struct ServeArgs {
     #[arg(long, default_value = "8888", env = "LVQR_HLS_PORT")]
     hls_port: u16,
 
+    /// WHEP HTTP listen port. Set to 0 to disable WHEP egress. When
+    /// non-zero, `lvqr serve` binds a dedicated axum server on this
+    /// port exposing `POST/PATCH/DELETE /whep/{broadcast}` for
+    /// WebRTC subscribers. The WHEP backend uses `str0m` and
+    /// completes ICE/DTLS against real browser clients; RTP media
+    /// write is not yet wired, so subscribers will connect but see
+    /// no frames until the media-write session lands.
+    #[arg(long, default_value = "0", env = "LVQR_WHEP_PORT")]
+    whep_port: u16,
+
     /// Enable peer mesh relay.
     #[arg(long, env = "LVQR_MESH_ENABLED")]
     mesh_enabled: bool,
@@ -142,11 +152,18 @@ async fn serve_from_args(args: ServeArgs) -> Result<()> {
         Some(([0, 0, 0, 0], args.hls_port).into())
     };
 
+    let whep_addr = if args.whep_port == 0 {
+        None
+    } else {
+        Some(([0, 0, 0, 0], args.whep_port).into())
+    };
+
     let config = ServeConfig {
         relay_addr: ([0, 0, 0, 0], args.port).into(),
         rtmp_addr: ([0, 0, 0, 0], args.rtmp_port).into(),
         admin_addr: ([0, 0, 0, 0], args.admin_port).into(),
         hls_addr,
+        whep_addr,
         mesh_enabled: args.mesh_enabled,
         max_peers: args.max_peers,
         auth: Some(auth),

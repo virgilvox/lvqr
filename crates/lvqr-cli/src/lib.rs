@@ -53,6 +53,15 @@ pub struct ServeConfig {
     /// `/init.mp4`, and the per-chunk media URIs the playlist references.
     /// When `None`, no HLS surface is exposed.
     pub hls_addr: Option<SocketAddr>,
+    /// Optional WHEP (WebRTC HTTP Egress Protocol) HTTP bind address.
+    /// When `Some`, `start()` constructs a `Str0mAnswerer` and a
+    /// `WhepServer`, attaches the server as a `RawSampleObserver` on
+    /// the RTMP bridge, and spins up an axum router on this address
+    /// that accepts `POST /whep/{broadcast}` SDP offers, answers
+    /// them via `str0m`, and fans each ingest sample into every
+    /// subscribed session. When `None`, no WHEP surface is exposed
+    /// and no `str0m` state is constructed.
+    pub whep_addr: Option<SocketAddr>,
     /// Enable the peer mesh coordinator and `/signal` endpoint.
     pub mesh_enabled: bool,
     /// Max children per mesh parent when `mesh_enabled`.
@@ -82,6 +91,7 @@ impl ServeConfig {
             rtmp_addr: (loopback, 0).into(),
             admin_addr: (loopback, 0).into(),
             hls_addr: Some((loopback, 0).into()),
+            whep_addr: None,
             mesh_enabled: false,
             max_peers: 3,
             auth: None,
@@ -104,6 +114,7 @@ pub struct ServerHandle {
     rtmp_addr: SocketAddr,
     admin_addr: SocketAddr,
     hls_addr: Option<SocketAddr>,
+    whep_addr: Option<SocketAddr>,
     shutdown: CancellationToken,
     join: Option<tokio::task::JoinHandle<()>>,
 }
@@ -127,6 +138,11 @@ impl ServerHandle {
     /// Bound LL-HLS HTTP address, when HLS composition is enabled.
     pub fn hls_addr(&self) -> Option<SocketAddr> {
         self.hls_addr
+    }
+
+    /// Bound WHEP HTTP address, when WHEP egress is enabled.
+    pub fn whep_addr(&self) -> Option<SocketAddr> {
+        self.whep_addr
     }
 
     /// HTTP base URL for the admin / WS surface.
@@ -253,6 +269,24 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         let observer: SharedFragmentObserver = Arc::new(HlsFragmentBridge::new(hls));
         bridge_builder = bridge_builder.with_observer(observer);
     }
+
+    // Optional WHEP surface. Constructed before the bridge is
+    // frozen into an `Arc` so we can attach the `WhepServer` as a
+    // `RawSampleObserver`; both the observer clone and the axum
+    // router clone share the same underlying session registry, so
+    // a POST on the router is immediately visible to the raw-sample
+    // fanout path.
+    let whep_server = if let Some(addr) = config.whep_addr {
+        let str0m_cfg = lvqr_whep::Str0mConfig { host_ip: addr.ip() };
+        let answerer = Arc::new(lvqr_whep::Str0mAnswerer::new(str0m_cfg)) as Arc<dyn lvqr_whep::SdpAnswerer>;
+        let server = lvqr_whep::WhepServer::new(answerer);
+        let observer: lvqr_ingest::SharedRawSampleObserver = Arc::new(server.clone());
+        bridge_builder = bridge_builder.with_raw_sample_observer(observer);
+        Some(server)
+    } else {
+        None
+    };
+
     let bridge = Arc::new(bridge_builder);
     let rtmp_config = lvqr_ingest::RtmpConfig {
         bind_addr: config.rtmp_addr,
@@ -274,6 +308,18 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
         tracing::info!(addr = %bound, "LL-HLS HTTP bound");
+        (Some(listener), Some(bound))
+    } else {
+        (None, None)
+    };
+
+    // WHEP listener: pre-bind the same way so test harnesses can
+    // read the ephemeral port back immediately. `whep_server` was
+    // built earlier and is `None` if `config.whep_addr` is `None`.
+    let (whep_listener, whep_bound) = if let Some(addr) = config.whep_addr {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let bound = listener.local_addr()?;
+        tracing::info!(addr = %bound, "WHEP HTTP bound");
         (Some(listener), Some(bound))
     } else {
         (None, None)
@@ -443,9 +489,12 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let rtmp_shutdown = shutdown.clone();
     let admin_shutdown = shutdown.clone();
     let hls_shutdown = shutdown.clone();
+    let whep_shutdown = shutdown.clone();
     let bg_shutdown_for_task = shutdown.clone();
     let hls_router_pair =
         hls_listener.map(|listener| (listener, hls_server.expect("hls_server set when listener is set")));
+    let whep_router_pair =
+        whep_listener.map(|listener| (listener, whep_server.expect("whep_server set when listener is set")));
 
     let join = tokio::spawn(async move {
         let shutdown_on_exit_relay = bg_shutdown_for_task.clone();
@@ -491,7 +540,22 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             shutdown_on_exit_hls.cancel();
         };
 
-        let _ = tokio::join!(relay_fut, rtmp_fut, admin_fut, hls_fut);
+        let shutdown_on_exit_whep = bg_shutdown_for_task.clone();
+        let whep_fut = async move {
+            let Some((listener, server)) = whep_router_pair else {
+                return;
+            };
+            let router = lvqr_whep::router_for(server);
+            let result = axum::serve(listener, router)
+                .with_graceful_shutdown(async move { whep_shutdown.cancelled().await })
+                .await;
+            if let Err(e) = &result {
+                tracing::error!(error = %e, "WHEP server error");
+            }
+            shutdown_on_exit_whep.cancel();
+        };
+
+        let _ = tokio::join!(relay_fut, rtmp_fut, admin_fut, hls_fut, whep_fut);
         tracing::info!("shutdown complete");
     });
 
@@ -500,6 +564,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         rtmp_addr: rtmp_bound,
         admin_addr: admin_bound,
         hls_addr: hls_bound,
+        whep_addr: whep_bound,
         shutdown,
         join: Some(join),
     })
