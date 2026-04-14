@@ -2,13 +2,17 @@
 
 ## Project Status: v0.4-dev -- Tier 2.4 archive real, gated by SharedAuth
 
-**Last Updated**: 2026-04-14 (session 24 close)
+**Last Updated**: 2026-04-14 (session 24 close, post-audit drift fix)
 **Tests**: `cargo test --workspace` green under the default feature
-set: 73 test binaries, 298+ individual tests passing, 1 doctest
+set: **63 test binaries, 302 individual tests passing**, 1 doctest
 marked `ignore` (a non-runnable doc example in
 `lvqr-fragment/src/moq_sink.rs:39`), 0 failures. `cargo clippy
 --workspace --all-targets -- -D warnings` clean. `cargo fmt --all
---check` clean.
+--check` clean. Earlier session-24 entries wrote "73 binaries,
+298+ tests"; the real numbers (verified by re-running the
+workspace test on `65cdf64`) are 63 and 302. The 73 was drift
+introduced by the session-24 HANDOFF author and persisted into
+the README; both are corrected in this closing audit.
 
 ## Session 24 (2026-04-14): Tier 2.4 writer, playback endpoints, and auth gate
 
@@ -189,37 +193,217 @@ stop-and-document fallback was not triggered.
 Sessions 20 through 24 landed thirteen commits on top of `f50cc4f`:
 `580d152`, `db9fd10`, `ddcb599`, `ed9c6e3`, `8f30e8f`, `c0d474f`,
 `cbffab9`, `939e743`, `7c84344`, `4abc74c`, `5ccfd97`, `8fa06d6`,
-`94586f9`. `origin/main` is at `94586f9` plus any session-24
-drift-closure doc commits landed after this entry. Session 25
-starts from there.
+`94586f9`, plus `65cdf64` (session-24 drift closure v2), plus
+this closing-audit drift-fix commit. `origin/main` tracks the
+latest. Session 25 starts from there.
+
+### Session 24 closing audit (2026-04-14)
+
+A deep audit of the whole repo + tracking plans, driven by a
+ground-truth test run and an exhaustive grep for debt markers,
+stubs, and strategic drift. Every claim below was verified
+against the tree at `65cdf64` immediately before this edit.
+
+**What LVQR can do right now.** Five live egress projections plus
+one DVR surface from a single `lvqr serve --archive-dir=/data`:
+(1) RTMP -> MoQ QUIC/WebTransport; (2) RTMP -> WebSocket fMP4;
+(3) RTMP -> LL-HLS multi-broadcast with master playlist + audio
+rendition group; (4) RTMP -> WHEP video via str0m (ICE/DTLS/SRTP,
+H.264 RTP packetization, real browser-compatible); (5) RTMP ->
+per-track fMP4 disk recording via `lvqr-record`; (6) the new
+Tier 2.4 archive path: `IndexingFragmentObserver` populates a
+redb segment index, and `GET /playback/{*broadcast}`, `GET
+/playback/latest/{*broadcast}`, `GET /playback/file/{*rel}` all
+honor the same `SharedAuth::check(AuthContext::Subscribe{..})`
+gate used by the WS relay.
+
+**Code-health snapshot.** 19 crates under `crates/`. 63 test
+binaries, 302 passing tests, 0 failures, 1 intentionally
+`ignore`d doctest. **0** `todo!()` / `unimplemented!()` macros
+in the entire tree. **1** `TODO`/`FIXME`/`XXX`/`HACK` comment
+total: `crates/lvqr-whep/src/str0m_backend.rs:459` referring to
+trickle-ICE ingestion, which is correctly deferred. `cargo
+clippy --workspace --all-targets -- -D warnings` clean. `cargo
+fmt --all --check` clean. MSRV pinned to `rust-version = "1.85"`
+at the workspace level and inherited by every crate.
+
+**Tier completion (measured against `tracking/ROADMAP.md`):**
+
+| Tier | Status |
+|---|---|
+| Tier 0 (audit-finding fixes) | Closed, pre-session 16 |
+| Tier 1 (test infrastructure) | ~70%. 5-artifact contract script ships soft-fail; 5 in-scope crates missing fuzz slots (`lvqr-record`, `lvqr-moq`, `lvqr-fragment`, `lvqr-cmaf`, `lvqr-hls`); no `lvqr-loadgen` / `lvqr-chaos` crates; no MediaMTX comparison harness; no soak rig; no `benches/` anywhere in the workspace. |
+| Tier 2 (unified data plane + protocol parity) | ~60% by surface area, ~70% by user-visible capability. 2.1 `lvqr-moq` facade + `lvqr-fragment` real. 2.2 `lvqr-codec` real for HEVC SPS + AAC ASC, missing VP9 / AV1 / Opus. 2.3 `lvqr-cmaf` real for AVC init+media and AAC init+media; HEVC init writer real (`write_hevc_init_segment`, x265-captured tests) but no bridge path produces HEVC fragments because RTMP carries AVC. 2.4 `lvqr-archive` + playback routes + auth gate -- **landed this session**. 2.5 `lvqr-hls` LL-HLS real. 2.6 `lvqr-dash` **not started**. 2.7 `lvqr-whep` real for video; `lvqr-whip` **not started**. 2.8 `lvqr-srt`, 2.9 `lvqr-rtsp` **not started**. 2.10 single-binary default real except for the missing protocols. |
+| Tier 3 (cluster / DVR UI / operational) | ~5%. Only the DVR scrub primitive (archive index + JSON endpoint) exists; everything else is untouched. |
+| Tier 4 (differentiation moats) | 0%, correctly deferred. |
+| Tier 5 (ecosystem / SDKs / docs site) | 0%, correctly deferred. |
+
+**Strategic bet validation (from `tracking/AUDIT-2026-04-13.md`
+section "The Five Strategic Bets"):**
+
+* **Bet 1 (MoQ wins browser-origin live video)**: on track; facade
+  real, upstream churn absorbed, Cloudflare + Twitch remain the
+  only other production consumers.
+* **Bet 2 (Rust memory safety + perf is worth the ergonomic hit)**:
+  validated. 0 panic stubs, 1 debt comment across the tree, all
+  integration tests exercise real network I/O, no mocks.
+* **Bet 3 (unified fragment model projects cleanly)**: **strongly
+  validated by this session.** The archive observer consumes the
+  same `FragmentObserver::on_fragment` hook LL-HLS uses, with zero
+  modifications to the bridge, the observer signature, or any
+  other crate. That is the "publisher crates each end up under 500
+  lines" predicate from AUDIT section Bet 3. Four egress
+  projections (MoQ, WS fMP4, LL-HLS, WHEP) plus the archive
+  observer now share one producer side with zero special cases.
+* **Bet 4 (cross-node MoQ relay-of-relays)**: untested. Tier 3.
+* **Bet 5 (WASM filters + in-process AI agents)**: not started.
+  Tier 4, correctly deferred.
+
+**Competitive-matrix delta since `AUDIT-2026-04-13.md` was
+written** (pre-session 16). LVQR checkmarks gained:
+
+* **WHEP egress**: N -> Y (session 22).
+* **LL-HLS egress**: N -> Y (sessions 13 + 17).
+* **DVR scrub**: N -> Y (session 24).
+* **Archive index**: N -> Y (sessions 23 + 24).
+* **JWT auth**: P -> Y (feature-gated; wired through every entry
+  point including the new playback routes).
+
+Positions LVQR still cannot defend: any WebRTC ingest (no WHIP),
+HEVC / AV1 / Opus in the bridge path, DASH egress, ABR /
+transcoding, multi-node cluster, SDK surface beyond `@lvqr/core`,
+and a web admin UI.
+
+**Drift caught and either fixed or filed.**
+
+1. Session-24 HANDOFF + README both claim "73 test binaries, 298+
+   tests". Ground truth on `65cdf64` is **63 binaries, 302
+   tests**. Fixed in this commit. This is the second drift event
+   of session 24 (the first was the footgun-warning staleness
+   that `65cdf64` already closed); future sessions should re-run
+   `cargo test --workspace 2>&1 | grep -c "^running [0-9]\+ tests$"`
+   after any crate-level change and treat both the binary and
+   test counts as load-bearing in the status header.
+2. **No `benches/` anywhere in the workspace** despite Roadmap
+   decision naming `criterion` as validated and Tier 1 listing
+   benchmarks as a deliverable. Filed as a session-25 entry point
+   item. A single `lvqr-fragment::MoqTrackSink::push` bench + a
+   `lvqr-cmaf::build_moof_mdat` bench would catch 80 % of the
+   data-plane regression classes for near-zero effort.
+3. **`lvqr-archive` test contract placement**: the integration
+   test lives at `crates/lvqr-cli/tests/rtmp_archive_e2e.rs`, not
+   inside `crates/lvqr-archive/tests/`. When
+   `scripts/check_test_contract.sh` flips to strict mode and adds
+   `lvqr-archive` to `IN_SCOPE`, it will warn about a missing
+   integration slot. Forward-compatible risk; not urgent.
+4. **Playwright `tests/e2e/test-app.spec.ts`** is shell-only (66
+   lines, asserts page load + nav tab visibility). The file
+   comment pins "Tier 2 will extend the config to spawn a real
+   lvqr binary"; Tier 2 is largely done and the extension never
+   happened. Filed for a later session.
+5. `tracking/AUDIT-2026-04-13.md` feature matrix predates sessions
+   16-24 and is missing at least five checkmarks LVQR has gained
+   since. A refresh-in-place (not a rewrite) is a short docs
+   session when the next Tier 2 protocol lands.
+
+**Honest v1.0 gap.** The M1 milestone from Roadmap Tier 2.10 -- "a
+fresh user can `cargo install lvqr-cli`, run `lvqr serve --demo`,
+ingest from OBS via RTMP/WHIP/SRT/RTSP, and play back via HLS /
+LL-HLS / DASH / WHEP / MoQ in a browser" -- is blocked on
+`lvqr-whip`, `lvqr-srt`, `lvqr-rtsp`, `lvqr-dash`, and a `--demo`
+mode that self-signs certs and prints a public URL. Every other
+M1 component is real. Session 25's highest-leverage pick is
+`lvqr-whip` because it unblocks WebRTC ingest (the single
+largest column of N's in the feature matrix) and is a mirror of
+the existing `lvqr-whep` shape: str0m is already in the build,
+the fragment producer side is a few hundred lines.
 
 ### Recommended entry point (session 25)
 
-1. **`lvqr-wasm` deletion**. Mechanical one-commit removal of the
-   deprecated crate + its workspace member + any CI wasm job.
-   Unblocks a cleaner crate table in `README.md` and reduces the
-   "what ships" confusion the session-19 audit sweep flagged.
-2. **CORS restrictive default**. Replace
-   `CorsLayer::permissive()` in `crates/lvqr-cli/src/lib.rs` with
-   an allow-list default (admin origin + localhost) plus a
-   `--cors-allow-origin` flag. Breaking change; verify the
-   playwright test in `tests/e2e/test-app.spec.ts` does not
-   depend on permissive before flipping the default. Ship with a
-   release note. Now also covers the archive surface since
-   `/playback/*` sits under the same permissive layer.
-3. **Archive playlist rendering**. `GET /playback/{*broadcast}/
+Ordered by strategic leverage against the v1.0 M1 milestone, not
+by risk. The first three items each close a concrete hole in the
+competitive matrix; items 4-8 are infrastructure and hygiene
+that can slot in between feature sessions or when blocked.
+
+1. **`lvqr-whip` ingest (Tier 2.7)**. The single biggest hole in
+   the competitive matrix: "any WebRTC client can publish to
+   LVQR". `str0m` is already in the build and the existing
+   `lvqr-whep` `Str0mAnswerer` gives a shape to mirror. The
+   session should build a `WhipServer` axum router on
+   `--whip-port`, accept `POST /whip/{broadcast}` SDP offers,
+   run an `Rtc` through the same sans-IO poll loop, and turn
+   inbound RTP into `Fragment` values the RTMP bridge can
+   swallow via the same `FragmentObserver` / `RawSampleObserver`
+   surface that every other ingest uses. Budget: one full
+   session. Side effect: once WHIP is live, HEVC and Opus over
+   WebRTC automatically flow through the pipeline, so item 2
+   below partially closes for free.
+
+2. **HEVC end-to-end through the bridge (Tier 2.2 / 2.3
+   follow-on)**. `lvqr-codec::hevc` parses SPS and
+   `lvqr-cmaf::write_hevc_init_segment` writes a real `hev1`
+   init segment (x265 captures are pinned in the test suite).
+   The gap is that no ingest path emits HEVC `Fragment` values:
+   RTMP's FLV tag parser is AVC-only. Two viable closures: (a)
+   add enhanced-RTMP-HEVC support in `lvqr-ingest/remux` and
+   ship a matching FLV parser extension, or (b) wait for
+   `lvqr-whip` (item 1) and accept HEVC via WebRTC. Option (b)
+   is cheaper if item 1 lands first. Budget: one session if
+   item 1 has already landed; two if not.
+
+3. **`lvqr-dash` egress (Tier 2.6)**. Aligned CMAF segments are
+   already produced by `lvqr-cmaf`; the missing piece is a
+   typed MPD generator via `quick-xml`. Closes the last
+   mainstream egress protocol. Budget: one long session or two
+   short ones per the Roadmap's 1.5-week estimate. Unblocks a
+   real feature-matrix column.
+
+4. **Archive VOD playlist rendering**. `GET /playback/{*broadcast}/
    playlist.m3u8?from=&to=` that walks the archive rows and
-   renders a VOD HLS playlist with `#EXT-X-MAP` + one
-   `#EXTINF`/`#EXT-X-BYTERANGE` per row. Closes the HANDOFF-23
-   "or an LL-HLS playlist window" suggestion. Requires
-   `lvqr-hls` to grow a non-live / VOD builder (no
-   `PLAYLIST-TYPE:VOD` path today); budget one session for the
-   builder + one session for the integration.
-4. **HEVC+Opus end-to-end**. Highest-leverage Tier 2.3 follow-up.
-   Needs a real RTMP HEVC fixture and an Opus bridge path;
-   budget multi-session.
-5. **WHIP ingest**, **DASH egress**: each a full session of its
-   own.
+   renders a VOD HLS playlist with `EXT-X-PLAYLIST-TYPE:VOD`,
+   `EXT-X-MAP`, one `EXTINF` per row, and `EXT-X-ENDLIST`.
+   Requires `lvqr-hls` to grow a non-live builder (no
+   `PLAYLIST-TYPE:VOD` / `EXT-X-ENDLIST` path exists today; the
+   session-24 audit `grep` confirmed this). Budget: one session
+   for the VOD builder + one for the integration. Closes the
+   HANDOFF-23 "or an LL-HLS playlist window" suggestion.
+
+5. **Benchmark slots via `criterion`**. Add
+   `crates/lvqr-cmaf/benches/build_moof_mdat.rs` and
+   `crates/lvqr-fragment/benches/moq_track_sink.rs` as the
+   first two benches in the workspace. Roadmap decision lists
+   `criterion` as validated; no crate currently uses it. The
+   session-24 audit caught this drift; a 30 % throughput
+   regression on the data-plane hot path would currently go
+   unnoticed. Budget: half a session.
+
+6. **Fuzz slot catch-up** for the five in-scope crates that
+   `scripts/check_test_contract.sh` reports missing: `lvqr-record`,
+   `lvqr-moq`, `lvqr-fragment`, `lvqr-cmaf`, `lvqr-hls`. Each
+   needs one `fuzz_targets/*.rs` seeded from the conformance
+   corpus. Budget: one session to add all five plus a CI job
+   update.
+
+7. **`lvqr-wasm` deletion**. Mechanical one-commit removal of
+   the deprecated crate + its workspace member + any CI wasm
+   job. Unblocks a cleaner crate table in `README.md` and
+   reduces the "what ships" confusion the session-19 audit
+   sweep flagged. Budget: half a session.
+
+8. **CORS restrictive default**. Replace
+   `CorsLayer::permissive()` in `crates/lvqr-cli/src/lib.rs`
+   with an allow-list default (admin origin + localhost) plus
+   a `--cors-allow-origin` flag. Breaking change; verify the
+   playwright test in `tests/e2e/test-app.spec.ts` does not
+   depend on permissive before flipping the default. Ship with
+   a release note. Now also covers the archive surface since
+   `/playback/*` sits under the same permissive layer.
+
+**Deferred (not yet ready to start)**: `lvqr-srt` (libsrt FFI,
+weeks of work, gated on Tier 1 load infrastructure), `lvqr-rtsp`
+(hand-rolled state machine, weeks), cluster (Tier 3.1, four
+weeks, needs `lvqr-loadgen` first), all Tier 4 items (WASM
+filters, C2PA, federation, AI agents).
 
 ## Session 23 (2026-04-14): Tier 2.4 start -- lvqr-archive segment index
 

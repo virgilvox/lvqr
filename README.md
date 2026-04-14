@@ -55,10 +55,12 @@ segments by decode-time window:
   protected-auth test that exercises both the header and
   query-parameter bearer transports.
 
-**Working and tested** (73 test binaries workspace-wide, 298+
+**Working and tested** (63 test binaries workspace-wide, 302
 individual tests, 0 failures under the default feature set,
 `cargo clippy --workspace --all-targets -- -D warnings` clean,
-`cargo fmt --all --check` clean):
+`cargo fmt --all --check` clean; 0 `todo!()` / `unimplemented!()`
+macros and exactly one `TODO` comment in the entire `crates/`
+tree):
 
 - **RTMP ingest** via OBS / ffmpeg, parsed into `lvqr_cmaf::RawSample`
   values and routed through `lvqr_cmaf::build_moof_mdat`. The
