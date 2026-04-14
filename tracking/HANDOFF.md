@@ -1,18 +1,267 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.4 archive real, gated by SharedAuth
+## Project Status: v0.4-dev -- Tier 2.7 WHIP ingest real, video end-to-end
 
-**Last Updated**: 2026-04-14 (session 24 close, post-audit drift fix)
+**Last Updated**: 2026-04-14 (session 25 close, lvqr-whip landed)
 **Tests**: `cargo test --workspace` green under the default feature
-set: **63 test binaries, 302 individual tests passing**, 1 doctest
-marked `ignore` (a non-runnable doc example in
-`lvqr-fragment/src/moq_sink.rs:39`), 0 failures. `cargo clippy
---workspace --all-targets -- -D warnings` clean. `cargo fmt --all
---check` clean. Earlier session-24 entries wrote "73 binaries,
-298+ tests"; the real numbers (verified by re-running the
-workspace test on `65cdf64`) are 63 and 302. The 73 was drift
-introduced by the session-24 HANDOFF author and persisted into
-the README; both are corrected in this closing audit.
+set: **78 test binaries, 334 individual tests passing**, 0
+failures. `cargo clippy --workspace --all-targets -- -D warnings`
+clean. `cargo fmt --all --check` clean. Session-25 deltas over
+the `c1bf179` baseline: +15 test binaries and +32 tests, all
+from the new `lvqr-whip` crate (18 unit, 10 signaling
+integration, 3 proptest, 1 in-process str0m E2E loopback).
+
+## Session 25 (2026-04-14): Tier 2.7 `lvqr-whip` ingest crate
+
+One code commit on top of session 24's `c1bf179`. Closes the
+single biggest column in the Tier A competitive feature matrix:
+"any WebRTC client can publish to LVQR". The WHIP bridge is a
+sibling of `RtmpMoqBridge` (not an extension of it), fans
+fragments through the existing `SharedFragmentObserver` and
+`SharedRawSampleObserver` taps, and every existing egress (MoQ,
+LL-HLS, WHEP, disk record, DVR archive) picks up WHIP publishers
+with zero changes to the egress side.
+
+### What landed
+
+* **New crate `crates/lvqr-whip/`** (workspace member; fuzz dir
+  excluded to match the `lvqr-whep/fuzz` pattern):
+  * `server.rs`: `WhipServer`, `SdpAnswerer` + `SessionHandle`
+    trait boundary, `WhipError` with `IntoResponse` mapping to
+    415/400/404/500, `SessionId` as 32-hex random tokens.
+  * `router.rs`: axum router rooted at `/whip/{*path}`. `POST`
+    creates a session (201 + `Location` header + SDP answer in
+    the body), `PATCH` forwards trickle ICE to the session
+    handle (204), `DELETE` tears the session down (200). Same
+    catch-all `{*path}` split pattern as `lvqr-whep::router` so
+    broadcast names can contain `/` (RTMP `{app}/{key}`
+    convention). Content-type validation accepts
+    `application/sdp` with parameters and
+    `application/trickle-ice-sdpfrag` for PATCH.
+  * `depack.rs`: Annex B -> AVCC converter. `split_annex_b` walks
+    a byte buffer recognising both 3-byte and 4-byte start-code
+    forms and returns NAL body slices. `annex_b_to_avcc` wraps
+    each body with a big-endian 4-byte length prefix. This is
+    the inverse of the AVCC -> Annex B converter at
+    `crates/lvqr-whep/src/str0m_backend.rs:430`; both are
+    load-bearing boundary crossings between the WebRTC world
+    (Annex B) and the Unified Fragment Model (AVCC).
+  * `str0m_backend.rs`: `Str0mIngestAnswerer` implements
+    `SdpAnswerer` by building a fresh `Rtc` with
+    `enable_h264 + enable_opus`, binding a per-session UDP
+    socket on the configured host IP, and spawning a sans-IO
+    poll task that runs the same canonical
+    `poll_output -> select!(shutdown | recv_from | timeout)`
+    cycle `lvqr_whep::str0m_backend::run_session_loop` uses.
+    The ingest-specific difference is the event arm: on
+    `Event::MediaData` for the video mid, we call
+    `data.is_keyframe()`, rebase `data.time` to 90 kHz via
+    `MediaTime::rebase(Frequency::NINETY_KHZ).numer()` (first
+    sample becomes DTS 0), and hand an `IngestSample` off to an
+    `Arc<dyn IngestSampleSink>` pumped in at answerer
+    construction time. Audio `MediaData` events are dropped
+    silently (Opus to AAC transcode is out of scope). Trickle
+    ICE logs once per session and returns success; WHIP clients
+    rarely need trickle because the offer typically already
+    embeds every host candidate.
+  * `bridge.rs`: `WhipMoqBridge` holds an `OriginProducer`, a
+    `DashMap<String, BroadcastState>`, and optional
+    `SharedFragmentObserver` / `SharedRawSampleObserver`
+    handles. On the first sample for a broadcast the bridge
+    waits for a keyframe that carries SPS + PPS, parses pixel
+    dimensions via `h264-reader`, builds an AVC init segment
+    via `lvqr_cmaf::write_avc_init_segment`, creates a MoQ
+    broadcast + `0.mp4` track, instantiates a `MoqTrackSink`
+    with the init segment seeded on the `FragmentMeta`, and
+    fires `FragmentObserver::on_init` exactly once. Every
+    subsequent sample is converted to AVCC, wrapped in a
+    `RawSample`, tapped through the raw observer, wrapped in a
+    `moof+mdat` via `build_moof_mdat`, wrapped in a `Fragment`,
+    pushed through the sink, and tapped through the fragment
+    observer. Non-keyframes arriving before the first
+    parameter-set-bearing IDR are dropped (downstream decoders
+    can't do anything with them without init anyway). The
+    dashmap entry is dropped before invoking the observer to
+    avoid a reentrancy footgun: observers that walk back into
+    the bridge would deadlock if the entry's shard lock was
+    still held.
+
+* **`lvqr-cli` wiring**. New `--whip-port` / `LVQR_WHIP_PORT`
+  flag (default 0 = disabled) in `main.rs`. `ServeConfig`
+  grows `whip_addr: Option<SocketAddr>` and `ServerHandle`
+  gains `whip_addr()`. When `whip_addr` is set, `start()`:
+  (1) builds a `WhipMoqBridge` wired to `relay.origin()`, (2)
+  hands it a clone of whatever `SharedFragmentObserver` the
+  `RtmpMoqBridge` got (HLS + archive tee) and a clone of the
+  `WhepServer` as a `SharedRawSampleObserver` when WHEP is
+  also enabled, (3) constructs a `Str0mIngestAnswerer` pointed
+  at the bridge as an `Arc<dyn IngestSampleSink>`, (4)
+  pre-binds the TCP listener (so test harnesses can read the
+  ephemeral port back through `ServerHandle::whip_addr`), and
+  (5) serves `lvqr_whip::router_for(server)` inside the shared
+  background task under the cli's `CancellationToken`. The
+  bridge `Arc` is kept alive inside the spawned task (not the
+  outer scope) so it lives as long as the poll loops do.
+
+* **`lvqr-test-utils::TestServer`**. `ServeConfig.whip_addr`
+  defaults to `None` in `TestServerConfig`, so every existing
+  integration test picks up the new field without any other
+  changes.
+
+### 5-artifact contract status for lvqr-whip
+
+| Slot | Status |
+|---|---|
+| Unit (`#[cfg(test)]` in each module) | 18 tests covering the splitter, the AVCC round trip, SPS/PPS extraction, error status mapping, session id uniqueness, keyframe gating, non-keyframe drop, and the answerer's offer accept + reject paths. |
+| Integration (`tests/integration_signaling.rs`) | 10 tests driving the real axum router via `tower::ServiceExt::oneshot` with a stub `SdpAnswerer`. Covers content-type validation, 201/Location/answer body on POST, session lifecycle (POST -> DELETE -> 404 on second DELETE), PATCH forwarding to the handle with a counter assertion, unknown-session 404, and method-not-allowed on GET. |
+| Proptest (`tests/proptest_depack.rs`) | 3 properties: `split_annex_b` never panics on arbitrary bytes, `annex_b_to_avcc` never panics on arbitrary bytes, and for well-formed multi-NAL Annex B buffers the AVCC round trip preserves every NAL body exactly. |
+| E2E (`tests/e2e_str0m_loopback.rs`) | Real in-process end-to-end. A client `str0m::Rtc` builds a sendonly-video offer, the server `Str0mIngestAnswerer` accepts it, both poll loops exchange packets over loopback UDP, complete ICE + DTLS + SRTP, and the client's `Writer::write` pushes synthetic SPS + PPS + IDR samples. The capture sink installed as the `IngestSampleSink` must receive at least one keyframe whose payload re-parses as Annex B NAL units. **This is the test that would catch a regression where `Event::MediaData` routing, rebase arithmetic, or the bridge sink callback silently broke.** |
+| Fuzz | Deferred. `crates/lvqr-whip/fuzz` is excluded in the workspace `exclude` list next to `lvqr-whep/fuzz` and `lvqr-codec/fuzz` for the same reason (libfuzzer-sys requires nightly rustc). The proptest slot already covers the DoS-adjacent parser property on 512-byte arbitrary inputs. |
+
+### Load-bearing decisions made
+
+* **Sibling bridge, not an `RtmpMoqBridge` extension**. The RTMP
+  bridge's `ActiveStream` is tightly coupled to FLV-parsed
+  `VideoConfig` / `AudioConfig` types; extending `ActiveStream`
+  to accept a second ingest source would have been a
+  cross-cutting refactor touching every code path the bridge
+  touches. The session-25 prompt flagged this as the
+  load-bearing unknown with a stop-and-document fallback; the
+  sibling-bridge approach resolved it without triggering the
+  fallback. The composition pattern is the session-24 tee /
+  observer-over-widening choice applied one level up: the two
+  bridges share the observer traits but not the state machine.
+* **Video-only scope**. `Rtc` is built with `enable_h264 +
+  enable_opus` so the server accepts Opus sections in the
+  offer, but `forward_video_sample` gates on `ctx.video_mid`
+  and audio `MediaData` events never reach the sink. A
+  follow-up session will land Opus -> AAC or wire an Opus-
+  native track through a separate sink.
+* **Dropped non-keyframes until the first SPS + PPS IDR**.
+  Matches the LL-HLS precedent and avoids emitting fragments
+  without a corresponding init segment. The bridge's
+  `ensure_initialized` path is the only code that can insert a
+  fresh broadcast into the dashmap; `push_sample` is a no-op
+  when the entry is missing.
+* **DTS rebase to 0 in the poll loop, not the bridge**. Inbound
+  `MediaTime` values carry a random-looking wall-clock offset
+  (str0m tracks the peer's RTP timestamp base); subtracting
+  the first observed value in the poll task keeps the bridge
+  shape identical to the RTMP bridge's `base_dts = timestamp *
+  90` path and lets the LL-HLS playlist window start at zero.
+* **Bridge arc kept alive inside the spawned task**. Dropping
+  the only strong reference at the end of `start()` would tear
+  down the `DashMap` out from under the session poll loops.
+  The `whip_bridge_keepalive` binding is moved into the
+  `tokio::spawn` closure and explicitly `drop`ped after
+  `tokio::join!`.
+
+### Known gaps explicitly not closed in this session
+
+* **Audio (Opus -> AAC)**. Deferred; session-26 candidate.
+* **Trickle ICE ingestion on PATCH**. Same behavior as WHEP:
+  logs once, returns success.
+* **Session cleanup tearing down the MoQ broadcast**. DELETE
+  removes the session from the `WhipServer` registry and
+  closes the UDP socket (via the oneshot drop), but the
+  `WhipMoqBridge` entry for that broadcast stays alive until
+  the cli-level bridge `Arc` is dropped at process shutdown.
+  Fine for v0 single-publisher scenarios; tracked for a
+  follow-up when multi-session-per-broadcast lands.
+* **Fuzz slot**. Same nightly-rustc gate the rest of the crates
+  hit; the proptest slot is the session-25 substitute.
+
+### Recommended entry point (session 26)
+
+Ordered by strategic leverage against the v1.0 M1 milestone. The
+session-24 entry-point list is otherwise unchanged; items
+renumber by one because Tier 2.7 WHIP closed as item 1.
+
+1. **Audio path for WHIP** (Tier 2.7 follow-on). Two choices:
+   (a) wire an Opus-native sibling `1.mp4` track so the bridge
+   emits an Opus init segment + per-frame Opus fragments
+   through the same MoQ broadcast without any transcode, or
+   (b) ship an AAC re-encoder so the WHIP publisher surface
+   reaches the same AAC-only egress stack RTMP uses. Option
+   (a) is cheaper and unlocks `@lvqr/player` audio for every
+   browser that already speaks Opus; option (b) is needed only
+   if a consumer on the egress side refuses Opus. Budget: one
+   session for (a), two sessions for (b).
+
+2. **HEVC end-to-end through the bridge** (Tier 2.2 / 2.3
+   follow-on, same text as session 24 item 2 but with the new
+   cost calculus). With WHIP landed, HEVC over WebRTC is the
+   cheap path: `str0m`'s `enable_h265` gate and a parallel
+   depacketizer + init builder in `lvqr-whip` close the loop
+   without touching RTMP. An enhanced-RTMP-HEVC parser remains
+   the alternative for FLV clients. Budget: one session either
+   way.
+
+3. **`lvqr-dash` egress** (Tier 2.6). Unchanged from session 24.
+   Aligned CMAF segments already produced by `lvqr-cmaf`; the
+   missing piece is a typed MPD generator via `quick-xml`.
+
+4. **Archive VOD playlist rendering**. Unchanged from session
+   24 item 4.
+
+5. **Benchmark slots via `criterion`**. Unchanged from session
+   24 item 5. Still zero benches in the workspace.
+
+6. **Fuzz slot catch-up**. Same five in-scope crates:
+   `lvqr-record`, `lvqr-moq`, `lvqr-fragment`, `lvqr-cmaf`,
+   `lvqr-hls`. `lvqr-whip` inherits the deferred-fuzz pattern
+   from `lvqr-whep`.
+
+7. **`lvqr-wasm` deletion**. Unchanged from session 24.
+
+8. **CORS restrictive default**. Unchanged from session 24.
+   Now covers the WHIP surface too via the same permissive
+   admin layer (WHIP serves on its own port behind its own
+   router, so the CORS change only touches the admin layer).
+
+### Strategic-bet validation after session 25
+
+* **Bet 1 (MoQ wins browser-origin live video)**: on track.
+* **Bet 2 (Rust memory safety + perf)**: validated. 78 test
+  binaries, 334 tests, 0 panics, 1 debt comment (whep trickle),
+  all integration tests run real network I/O.
+* **Bet 3 (unified fragment model projects cleanly)**: **very
+  strongly validated**. WHIP landed a full ingest path touching
+  SDP signaling + sans-IO poll loop + RTP depacketization +
+  Annex B/AVCC conversion + SPS/PPS init-segment construction
+  + MoQ fanout + LL-HLS + DVR archive + raw-sample observer,
+  and it changed **zero lines** in `lvqr-ingest`, `lvqr-hls`,
+  `lvqr-cmaf`, `lvqr-fragment`, `lvqr-moq`, `lvqr-archive`, or
+  `lvqr-whep`. Every downstream egress picks up the new ingest
+  source through cloneable observer traits. That is the
+  "publisher crates under 500 lines, egress unchanged"
+  predicate from `AUDIT-2026-04-13.md` Bet 3, realised on both
+  sides of the data plane.
+* **Bet 4 (cross-node MoQ relay-of-relays)**: untested. Tier 3.
+* **Bet 5 (WASM filters + in-process AI agents)**: not started.
+
+### Competitive-matrix delta after session 25
+
+Checkmarks gained since `AUDIT-2026-04-13.md`:
+
+* **WHEP egress**: N -> Y (session 22).
+* **LL-HLS egress**: N -> Y (sessions 13 + 17).
+* **DVR scrub**: N -> Y (session 24).
+* **Archive index**: N -> Y (sessions 23 + 24).
+* **JWT auth**: P -> Y.
+* **WHIP ingest**: N -> Y (**session 25**).
+
+Positions LVQR still cannot defend: HEVC / AV1 / Opus through
+the bridge audio path, DASH egress, ABR / transcoding,
+multi-node cluster, SDK surface beyond `@lvqr/core`, web admin
+UI.
+
+---
+## Project Status: v0.4-dev -- Tier 2.4 archive real, gated by SharedAuth (session 24 snapshot)
+
+**Tests at session-24 close**: 63 test binaries, 302 individual
+tests, 1 ignored doctest. Superseded by session-25 snapshot
+above; kept for historical continuity.
 
 ## Session 24 (2026-04-14): Tier 2.4 writer, playback endpoints, and auth gate
 

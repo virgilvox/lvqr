@@ -55,7 +55,7 @@ segments by decode-time window:
   protected-auth test that exercises both the header and
   query-parameter bearer transports.
 
-**Working and tested** (63 test binaries workspace-wide, 302
+**Working and tested** (78 test binaries workspace-wide, 334
 individual tests, 0 failures under the default feature set,
 `cargo clippy --workspace --all-targets -- -D warnings` clean,
 `cargo fmt --all --check` clean; 0 `todo!()` / `unimplemented!()`
@@ -95,6 +95,27 @@ tree):
   (12 tests against the axum router via `tower::ServiceExt::oneshot`),
   and E2E (client `Rtc` + server `Str0mAnswerer` over loopback,
   asserts decoded `Event::MediaData` on the client side).
+- **WHIP video ingest** via `lvqr-whip`: `WhipServer`,
+  `SdpAnswerer` / `SessionHandle` trait boundary, `Str0mIngestAnswerer`
+  running the same sans-IO poll-loop shape as WHEP but in the
+  ingest direction (reading `Event::MediaData` instead of
+  writing through `Writer::write`), an Annex B -> AVCC
+  converter that is the inverse of the WHEP boundary
+  converter, and a `WhipMoqBridge` that lazily builds the AVC
+  init segment from the first keyframe's SPS + PPS and fans
+  every subsequent sample through the same
+  `SharedFragmentObserver` and `SharedRawSampleObserver`
+  instances the RTMP bridge uses. The bridge is a sibling of
+  `RtmpMoqBridge`, not an extension of it, so every existing
+  egress (MoQ, LL-HLS, WHEP, disk record, DVR archive) picks
+  up WHIP publishers with zero changes to the egress side.
+  Four-slot test coverage: 18 unit, 10 signaling integration
+  (axum `oneshot`), 3 proptest properties on the depacketizer
+  (never-panics + well-formed round trip), and an in-process
+  str0m E2E loopback that publishes real SPS + PPS + IDR
+  access units through ICE + DTLS + SRTP and asserts the
+  capture sink receives a keyframe. Enabled via
+  `--whip-port` / `LVQR_WHIP_PORT` (default 0 = disabled).
 - **WebSocket browser ingest + egress** via the `@lvqr/core` and
   `@lvqr/player` TypeScript packages plus the bundled `test-app/`.
 - **MoQ relay** (QUIC / WebTransport fanout) via `lvqr-relay`
