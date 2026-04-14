@@ -42,14 +42,20 @@ segments by decode-time window:
   (JSON array of overlapping rows, sorted by `start_dts`),
   `GET /playback/latest/{*broadcast}?track=` (single anchor row
   or 404), and `GET /playback/file/{*rel}` (raw fragment bytes
-  with a canonicalized path-traversal guard). Covered end-to-end
-  by `crates/lvqr-cli/tests/rtmp_archive_e2e.rs`, which publishes
-  a real RTMP stream into a temp archive dir and then walks the
-  redb file, the JSON API, the latest anchor, the file-serve
-  route, and a traversal-attack rejection before tearing the
-  server down.
+  with a canonicalized path-traversal guard). Every route
+  consults the shared `SharedAuth` provider: with
+  `NoopAuthProvider` the archive stays open, with
+  `--subscribe-token` or `--jwt-secret` set the archive inherits
+  the same credential as live subscribe. `Authorization: Bearer`
+  header and `?token=` query fallback are both honored. Covered
+  end-to-end by `crates/lvqr-cli/tests/rtmp_archive_e2e.rs`,
+  which publishes a real RTMP stream into a temp archive dir and
+  then walks the redb file, the JSON API, the latest anchor, the
+  file-serve route, a traversal-attack rejection, and a
+  protected-auth test that exercises both the header and
+  query-parameter bearer transports.
 
-**Working and tested** (73 test binaries workspace-wide, 297+
+**Working and tested** (73 test binaries workspace-wide, 298+
 individual tests, 0 failures under the default feature set,
 `cargo clippy --workspace --all-targets -- -D warnings` clean,
 `cargo fmt --all --check` clean):
@@ -133,11 +139,15 @@ individual tests, 0 failures under the default feature set,
   through the bridge is a later session.
 - CORS is `permissive()` by default. Tracked as Tier 3 hardening;
   tighten before public deployment.
-- The `/playback/*` archive surface is served on the admin port
-  and is open by default. Do not expose the admin port publicly
-  with `--archive-dir` set until a `--playback-auth` flag lands;
-  tracked in `tracking/HANDOFF.md` session-25 recommended entry
-  point item 1.
+- The `/playback/*` archive surface inherits the admin router's
+  permissive CORS default; browser clients on any origin can
+  read DVR segments when the server is unauthenticated. Set
+  `--subscribe-token` or `--jwt-secret` to gate the archive
+  behind the same credential as live subscribe; both the
+  `Authorization: Bearer` header and the `?token=` query
+  parameter are honored on every playback route. CORS
+  tightening is tracked in `tracking/HANDOFF.md` session-25
+  recommended entry point item 2.
 
 **Read before contributing:**
 

@@ -1,23 +1,26 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.4 archive writer + playback HTTP surface real
+## Project Status: v0.4-dev -- Tier 2.4 archive real, gated by SharedAuth
 
 **Last Updated**: 2026-04-14 (session 24 close)
 **Tests**: `cargo test --workspace` green under the default feature
-set: 73 test binaries, 297+ individual tests passing, 1 doctest
+set: 73 test binaries, 298+ individual tests passing, 1 doctest
 marked `ignore` (a non-runnable doc example in
 `lvqr-fragment/src/moq_sink.rs:39`), 0 failures. `cargo clippy
 --workspace --all-targets -- -D warnings` clean. `cargo fmt --all
 --check` clean.
 
-## Session 24 (2026-04-14): Tier 2.4 writer integration + playback endpoints
+## Session 24 (2026-04-14): Tier 2.4 writer, playback endpoints, and auth gate
 
-Three code commits plus two doc commits on top of session 23's
-baseline. Closes session-23 recommended items 1 and 2 in a single
-session: the archive index now has a real writer feeding it, a
-real JSON query surface reading it back, a real `latest` anchor
-endpoint, and a real byte-serving endpoint with a path-traversal
-guard. DVR scrub is end-to-end through a full RTMP publish.
+Four code commits plus two doc commits on top of session 23's
+baseline. Closes session-23 recommended items 1 and 2 **and** the
+admin-port exposure footgun that opening `/playback/*` would
+otherwise create. The archive index now has a real writer feeding
+it, a real JSON query surface reading it back, a real `latest`
+anchor, a real byte-serving endpoint with a path-traversal guard,
+**and** every playback route honors the same `SharedAuth`
+subscribe gate the WS relay uses. DVR scrub is end-to-end through
+a full RTMP publish under both open and token-protected auth.
 
 ### Commits
 
@@ -56,6 +59,34 @@ guard. DVR scrub is end-to-end through a full RTMP publish.
 * **4abc74c** -- docs: session 24 HANDOFF notes (this section's
   initial shape, later extended in-place by the drift-closure
   commit below).
+* **94586f9** -- Tier 2.4: playback surface honors SharedAuth
+  subscribe gate. `ArchiveState` grows an `auth: SharedAuth`
+  field; the three `/playback/*` handlers now extract a bearer
+  token via `Authorization: Bearer` (header) or `?token=`
+  (query fallback) and call `SharedAuth::check(AuthContext::
+  Subscribe{..})`. Denials return 401 and increment
+  `lvqr_auth_failures_total{entry="playback"}`. `file_handler`
+  derives its broadcast auth key from the first two path
+  components of `rel` via a new `broadcast_from_rel` helper
+  (layout is `<broadcast>/<track>/<seq>.m4s` where `track`
+  matches `N.mp4`), so a JWT with `sub:live/dvr` authorizes
+  every archived segment under that stream's subtree without
+  authorizing sibling streams. No new CLI flag: with
+  `NoopAuthProvider` the archive stays open (matching the LL-HLS
+  precedent); with `--subscribe-token` or `--jwt-secret` set,
+  the archive inherits the same credential as live subscribe.
+  New `playback_surface_honors_shared_auth` integration test
+  installs a `StaticAuthProvider` with `subscribe_token =
+  Some("s3cr3t")` and asserts: unauthenticated GETs on all
+  three routes return 401; authenticated GETs via header return
+  200 with populated bodies; the `?token=` fallback works for
+  all three routes; a wrong token still 401s. The pre-existing
+  `rtmp_publish_populates_archive_index` test runs under the
+  default `NoopAuthProvider` and still passes unchanged,
+  confirming the "open when auth is open" property.
+
+### Earlier session-24 commits (chronological)
+
 * **5ccfd97** -- Tier 2.4: archive file-serve endpoint with
   traversal guard. `GET /playback/file/{*rel}` on the admin router
   joins `rel` onto the configured archive directory, canonicalizes
@@ -137,15 +168,11 @@ stop-and-document fallback was not triggered.
   `lvqr-hls` playlist builder grows a non-live mode (no
   `EXT-X-PLAYLIST-TYPE:VOD` / `EXT-X-ENDLIST` support exists
   today; verified by grep over `crates/lvqr-hls/src/`).
-* **Archive authentication**. The playback surface is open **on
-  the same port as the admin router**, which means a deployment
-  that exposes the admin port publicly also exposes every
-  archived fragment. The LL-HLS precedent ("open by default")
-  only holds because `lvqr-hls` is on a separate `--hls-port`;
-  merging `/playback/*` onto the admin port is a new footgun.
-  A `--playback-auth` flag that reuses `SharedAuth::check(
-  AuthContext::Subscribe{..})` should land before the archive
-  ships in a default-on configuration.
+* **Archive CORS**. The playback surface inherits the admin
+  router's `CorsLayer::permissive()` default, so browser clients
+  on any origin can read DVR segments when auth is open. Tracked
+  alongside the admin CORS restrictive default in the session 25
+  entry point list.
 * **`lvqr-archive` crate-level integration test slot**. The
   real integration test lives in `crates/lvqr-cli/tests/
   rtmp_archive_e2e.rs`, not `crates/lvqr-archive/tests/`. The
@@ -159,33 +186,28 @@ stop-and-document fallback was not triggered.
 
 ### Cumulative commit range since session 19
 
-Sessions 20 through 24 landed eleven commits on top of `f50cc4f`:
+Sessions 20 through 24 landed thirteen commits on top of `f50cc4f`:
 `580d152`, `db9fd10`, `ddcb599`, `ed9c6e3`, `8f30e8f`, `c0d474f`,
-`cbffab9`, `939e743`, `7c84344`, `4abc74c`, `5ccfd97` (plus any
-session-24 doc drift-closure commits landed after this entry
-was written). `origin/main` tracks the most recent of these.
-Session 25 starts from there.
+`cbffab9`, `939e743`, `7c84344`, `4abc74c`, `5ccfd97`, `8fa06d6`,
+`94586f9`. `origin/main` is at `94586f9` plus any session-24
+drift-closure doc commits landed after this entry. Session 25
+starts from there.
 
 ### Recommended entry point (session 25)
 
-1. **Playback authentication**. Security-critical follow-up from
-   the archive landing. Wire the existing `SharedAuth::check(
-   AuthContext::Subscribe{..})` into the three `/playback/*`
-   handlers behind a `--playback-auth` flag (default-off to
-   preserve current behaviour, documented as "enable before
-   exposing the admin port publicly"). Budget: one session.
-2. **`lvqr-wasm` deletion**. Mechanical one-commit removal of the
+1. **`lvqr-wasm` deletion**. Mechanical one-commit removal of the
    deprecated crate + its workspace member + any CI wasm job.
    Unblocks a cleaner crate table in `README.md` and reduces the
    "what ships" confusion the session-19 audit sweep flagged.
-3. **CORS restrictive default**. Replace
+2. **CORS restrictive default**. Replace
    `CorsLayer::permissive()` in `crates/lvqr-cli/src/lib.rs` with
    an allow-list default (admin origin + localhost) plus a
    `--cors-allow-origin` flag. Breaking change; verify the
    playwright test in `tests/e2e/test-app.spec.ts` does not
    depend on permissive before flipping the default. Ship with a
-   release note.
-4. **Archive playlist rendering**. `GET /playback/{*broadcast}/
+   release note. Now also covers the archive surface since
+   `/playback/*` sits under the same permissive layer.
+3. **Archive playlist rendering**. `GET /playback/{*broadcast}/
    playlist.m3u8?from=&to=` that walks the archive rows and
    renders a VOD HLS playlist with `#EXT-X-MAP` + one
    `#EXTINF`/`#EXT-X-BYTERANGE` per row. Closes the HANDOFF-23
@@ -193,10 +215,10 @@ Session 25 starts from there.
    `lvqr-hls` to grow a non-live / VOD builder (no
    `PLAYLIST-TYPE:VOD` path today); budget one session for the
    builder + one session for the integration.
-5. **HEVC+Opus end-to-end**. Highest-leverage Tier 2.3 follow-up.
+4. **HEVC+Opus end-to-end**. Highest-leverage Tier 2.3 follow-up.
    Needs a real RTMP HEVC fixture and an Opus bridge path;
    budget multi-session.
-6. **WHIP ingest**, **DASH egress**: each a full session of its
+5. **WHIP ingest**, **DASH egress**: each a full session of its
    own.
 
 ## Session 23 (2026-04-14): Tier 2.4 start -- lvqr-archive segment index
