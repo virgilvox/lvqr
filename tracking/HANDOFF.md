@@ -1,13 +1,149 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.3 TrackCoalescer lands ffprobe-validated
+## Project Status: v0.4-dev -- Tier 2.3 producer+egress stack ready for CLI composition
 
-**Last Updated**: 2026-04-13 (session 9)
-**Tests**: 58 test binaries across the workspace, 236 individual
+**Last Updated**: 2026-04-13 (session 10 close / session 11 audit)
+**Tests**: 60 test binaries across the workspace, 241 individual
 tests (plus ~6300 generated proptest cases per run across the
 ingest, fragment, hevc, aac, cmaf-policy, and hls-manifest
 harnesses), all green. cargo clippy --workspace --all-targets --
 -D warnings is clean. cargo fmt --check is clean.
+Nine commits pushed across sessions 6-10 to `origin/main` at
+`c24fe51c9c277c281d2a08cbf712ba3e9db82257`.
+
+## Sessions 6-10 audit (2026-04-13, pre-session-11)
+
+Ran a structural audit before writing the session 11 kickoff
+prompt. Findings:
+
+1. **Tree health**. `cargo fmt --all --check`, `cargo clippy
+   --workspace --all-targets -- -D warnings`, and `cargo test
+   --workspace` all pass cleanly. 241 tests across 60 binaries.
+   Local HEAD matches `origin/main`. Working tree is clean.
+
+2. **Contract script drift**. `scripts/check_test_contract.sh`
+   had `lvqr-hls` commented out in the "will be enabled as they
+   land" section. Session 7 landed the crate and sessions 7-8
+   closed 4-of-5 slots. Fixed in the audit commit: `lvqr-hls`
+   moved into the `IN_SCOPE` list. The script now reports one
+   crate-level warning per session 10 expected open slot (fuzz
+   on lvqr-cmaf, lvqr-hls, lvqr-record, lvqr-moq, lvqr-fragment)
+   and nothing unexpected.
+
+3. **CONTRACT.md staleness**. `tests/CONTRACT.md` did not list
+   `lvqr-hls`, still named the `mediastreamvalidator` wrapper
+   and the kvazaar fixture as open items (both closed in
+   sessions 7 and 8 respectively), and did not mention the
+   coalescer conformance or the sample-segmenter integration
+   test. Rewritten in the audit commit to reflect the real
+   session 10 contract-slot state.
+
+4. **Producer wiring gap (intentional)**. `TrackCoalescer`,
+   `RawSample`, `SampleStream`, and `CmafSampleSegmenter` have
+   zero consumers in `lvqr-ingest` / `lvqr-cli` / any producer
+   crate. The raw-sample pipeline is fully tested inside
+   `lvqr-cmaf` via scripted `VecDeque`-backed streams but does
+   not yet drive a real ingest. This is expected; session 11 is
+   where the wiring lands. Flagged so future sessions do not
+   assume the pipeline is in production use.
+
+5. **Expect/unwrap in coalescer production paths**. Five
+   `.expect()` / `.unwrap()` calls in `crates/lvqr-cmaf/src/coalescer.rs`:
+   three are state-machine precondition enforcement (pending
+   implies partial_start / segment_start / pending_dts) and two
+   are `mp4-atom` encoder calls that can only fail on
+   structurally invalid `Moof` inputs. All are invariant-
+   protected; none take untrusted input. No action required
+   today but worth noting for future hardening.
+
+6. **CI coverage**. `.github/workflows/ci.yml` installs ffmpeg on
+   both Linux and macOS runners so every `ffprobe_bytes` check
+   runs for real. It does NOT install kvazaar (not needed, the
+   multi-sub-layer HEVC fixture is pinned bytes now) or
+   `mediastreamvalidator` (soft-skip handles absence). Contract
+   script still runs in Tier 1 educational mode; strict mode
+   flips on when the remaining fuzz slots are either closed or
+   documented as intentionally open.
+
+7. **Dependency graph snapshot**. `lvqr-hls` normal-deps
+   `lvqr-cmaf`. `lvqr-cmaf` dev-deps `lvqr-ingest` (for the
+   parity tests only). `lvqr-ingest` does NOT depend on
+   `lvqr-cmaf` in either direction today. Clean acyclic graph.
+   Session 11 item 2 (feature flag retirement) requires
+   `lvqr-ingest` to normal-dep `lvqr-cmaf`, which creates a
+   cycle with the current dev-dep direction. The fix is to
+   move `parity_avc_init.rs` and `parity_avc_segment.rs` out of
+   `lvqr-cmaf/tests/` and into a top-level workspace test
+   crate (or into `lvqr-ingest/tests/`) before flipping the
+   normal-dep direction. Documented here rather than in the
+   individual commits so session 11 does not trip on it.
+
+## Session 10 follow-ups (2026-04-13): TrackCoalescer pipeline
+
+Two commits landed between session 9 and the session 10 audit,
+closing the remaining tier-2.3 items that did not require touching
+the CLI composition root:
+
+1. **Coalescer parity gate against the hand-rolled writer**
+   (`crates/lvqr-cmaf/tests/parity_avc_segment.rs`, commit
+   `6d41c5a`). Drives the same six-sample batch through both
+   `lvqr_cmaf::TrackCoalescer` and
+   `lvqr_ingest::remux::fmp4::video_segment`, decodes both
+   `moof` boxes via `mp4_atom::Moof::decode`, and asserts every
+   playback-critical field matches: `mfhd` sequence number,
+   `tfhd` track id, `tfdt` base_media_decode_time, `trun`
+   entry count, per-sample duration/size/flags/cts offset, and
+   `data_offset` landing inside its own buffer. The two writers
+   produce media segments of **identical total size** for this
+   input (`cmaf=600, ingest=600, delta=0`), though not identical
+   bytes. A second test pins the intentional non-equality so a
+   future session cannot silently replace the structural gate
+   with a byte-equality assertion.
+
+2. **AAC audio coalescer ffprobe round trip**. Extended
+   `crates/lvqr-cmaf/tests/conformance_coalescer.rs` with an
+   AAC variant: 20 synthetic AAC frames (1024 ticks each, 128
+   bytes of zero payload) through a `TrackCoalescer` +
+   `CmafPolicy::AUDIO_48KHZ_DEFAULT`, concatenated with the
+   `write_aac_init_segment` output and fed to ffprobe 8.1.
+   ffprobe accepts. Both video and audio paths through the
+   coalescer now have real-encoder validation on top of the
+   structural unit tests.
+
+3. **SampleStream trait + CmafSampleSegmenter**
+   (`crates/lvqr-cmaf/src/sample.rs`, `crates/lvqr-cmaf/src/coalescer.rs`,
+   `crates/lvqr-cmaf/tests/integration_sample_segmenter.rs`,
+   commit `c24fe51`). Closes session 10 item 1 from the prior
+   HANDOFF: a pull-based trait `SampleStream` with
+   `next_sample()` returning `Pin<Box<dyn Future<Output =
+   Option<RawSample>> + Send>>` (boxed future instead of
+   async-fn-in-trait because Send bounds still require GAT
+   plumbing this crate does not need), and a
+   `CmafSampleSegmenter` type that owns a
+   `HashMap<TrackId, TrackCoalescer>`, routes incoming samples
+   into the right coalescer, queues the resulting chunks into a
+   ready buffer, and drains every coalescer's trailing pending
+   batch on stream exhaustion before returning `None`.
+
+   Integration tests cover a single-track ffprobe round trip
+   through the full pipeline (init segment + chunks concatenated
+   and accepted by ffprobe 8.1) and a multi-track routing test
+   that interleaves video (track 1) and audio (track 2) and
+   asserts both tracks produce chunks tagged with the correct
+   `"{track_id}.mp4"` string.
+
+### What session 10 did NOT land
+
+* **`lvqr-cli` HLS composition** -- the CLI serve path does not
+  yet expose an HLS axum binding. Blocker for `TestServer`
+  growing a real HLS address and for the loopback TCP E2E.
+* **Hand-rolled `video_segment` retirement** behind a feature
+  flag. Blocked on the dev-dep cycle surfaced by the audit
+  (item 7 above).
+* **First non-HLS egress crate** (WHEP / DASH / WHIP). Per the
+  audit list, this waits until the CLI composition lands so the
+  egress crates can be validated against a real end-to-end
+  pipeline rather than a standalone router harness.
 
 ## Session 9 additions (2026-04-13): raw-sample TrackCoalescer
 
@@ -1037,11 +1173,66 @@ should be aware of so nothing is discovered twice.
   reusing the x265 fixture already in
   `parse_sps_decodes_real_x265_single_sublayer` as the seed.
 
-## Recommended Tier 2.3 entry point (session 10)
+## Recommended Tier 2.3 entry point (session 11)
 
-Session 9 closed the big-ticket item from the session-9 list (the
-raw-sample `TrackCoalescer`). Session 10 inherits the two
-remaining items plus two follow-ups the coalescer surfaced.
+Session 10 closed every in-crate item from the session 10 list
+(parity gate, AAC coalescer round trip, sample segmenter). Session
+11 inherits the cross-crate items that require touching the CLI
+composition root and flipping dep directions. All three have real
+cross-crate blast radius, so scope carefully.
+
+1. **Break the `lvqr-cmaf <-> lvqr-ingest` dev-dep cycle** before
+   any session 11 work that requires `lvqr-ingest` to normal-dep
+   `lvqr-cmaf`. Option A: move `parity_avc_init.rs` and
+   `parity_avc_segment.rs` out of `crates/lvqr-cmaf/tests/` and
+   into a new top-level `tests/parity/` directory as a standalone
+   test crate that normal-deps both `lvqr-cmaf` and
+   `lvqr-ingest`. Option B: move the parity tests into
+   `crates/lvqr-ingest/tests/` as a dev-dep on `lvqr-cmaf`; this
+   reverses the current direction and sets up item 2 cleanly.
+   Pick option B unless option A turns up a better reason during
+   implementation.
+
+2. **Wire `lvqr-cli serve` to compose HLS**. Add an `--hls-addr`
+   flag to `ServeConfig`, have `lvqr_cli::start` spin up an axum
+   binding on that address with `HlsServer::router()`, and
+   adapt the RTMP bridge's fragment output into the `HlsServer`
+   push API via the pass-through `CmafSegmenter` (no coalescer
+   needed yet -- the bridge still emits pre-muxed `Fragment`
+   values). Day-one E2E: extend
+   `lvqr-test-utils::TestServer` with an `hls_url()` helper and
+   write a new integration test in `crates/lvqr-cli/tests/`
+   that publishes a real RTMP stream, fetches
+   `GET /playlist.m3u8`, and asserts the playlist contains the
+   ingested broadcast's segments. This is the canonical "can
+   LVQR serve HLS to a real HTTP client" proof.
+
+3. **Retire the hand-rolled
+   `lvqr-ingest::remux::fmp4::video_segment` writer behind a
+   feature flag**. Prerequisite: item 1 must be done so the
+   `lvqr-ingest` -> `lvqr-cmaf` normal-dep can be added. Then:
+   add a `cmaf-writer` feature on `lvqr-ingest` (default off
+   during the transition) that routes through
+   `lvqr_cmaf::TrackCoalescer::flush_pending` +
+   `lvqr_cmaf::build_moof_mdat` instead of the hand-rolled
+   `video_segment`. Flip the feature on in a CI matrix job so
+   both paths are exercised on every PR. When both are green on
+   main for a few sessions, flip the default to on, then delete
+   the hand-rolled writer in a later session.
+
+4. **Scope the first non-HLS egress crate**. Likely `lvqr-whep`
+   because WHEP is the simplest WebRTC-based subscribe path and
+   it slots cleanly onto `CmafChunk` (WHEP consumers see
+   `CmafChunk`s, not raw samples). Do NOT start implementation
+   until items 1-3 above land; otherwise the crate has no real
+   producer to validate against.
+
+Do NOT start `lvqr-dash`, `lvqr-whip`, `lvqr-srt`, `lvqr-rtsp`, or
+`lvqr-archive` this session. Every non-HLS egress crate is gated
+on the session 11 wiring above. Stay focused on closing the Tier
+2.3 loop before any new protocol crate begins.
+
+### Session 10 items from the prior HANDOFF (all closed)
 
 1. **Add `CmafSegmenter::from_sample_stream`** plus a `SampleStream`
    trait. Scaffold:
