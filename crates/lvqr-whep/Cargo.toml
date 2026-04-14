@@ -11,7 +11,16 @@ keywords = ["streaming", "webrtc", "whep", "rtp", "egress"]
 categories = ["multimedia", "network-programming"]
 
 [dependencies]
+axum = { workspace = true }
 bytes = { workspace = true }
+dashmap = { workspace = true }
+lvqr-cmaf = { workspace = true }
+lvqr-ingest = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
+tokio = { workspace = true, features = ["macros", "rt"] }
+tower = { workspace = true }

@@ -1660,8 +1660,17 @@ dependencies = [
 name = "lvqr-whep"
 version = "0.3.1"
 dependencies = [
+ "axum",
  "bytes",
+ "dashmap",
+ "lvqr-cmaf",
+ "lvqr-ingest",
  "proptest",
+ "rand 0.8.5",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
