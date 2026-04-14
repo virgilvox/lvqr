@@ -816,15 +816,17 @@ async fn ws_ingest_session(mut socket: WebSocket, state: WsRelayState, broadcast
                 }
                 video_seq += 1;
                 let base_dts = (timestamp as u64) * 90;
-                let sample = remux::VideoSample {
-                    data: payload,
-                    duration: 3000,
+                let sample = lvqr_cmaf::RawSample {
+                    track_id: 1,
+                    dts: base_dts,
                     cts_offset: 0,
+                    duration: 3000,
+                    payload,
                     keyframe: true,
                 };
                 if let Ok(mut group) = video_track.append_group() {
                     let _ = group.write_frame(init.clone());
-                    let seg = remux::build_video_segment(video_seq, base_dts, &[sample]);
+                    let seg = lvqr_cmaf::build_moof_mdat(video_seq, 1, base_dts, &[sample]);
                     let _ = group.write_frame(seg);
                     video_group = Some(group);
                 }
@@ -835,14 +837,16 @@ async fn ws_ingest_session(mut socket: WebSocket, state: WsRelayState, broadcast
                 }
                 video_seq += 1;
                 let base_dts = (timestamp as u64) * 90;
-                let sample = remux::VideoSample {
-                    data: payload,
-                    duration: 3000,
+                let sample = lvqr_cmaf::RawSample {
+                    track_id: 1,
+                    dts: base_dts,
                     cts_offset: 0,
+                    duration: 3000,
+                    payload,
                     keyframe: false,
                 };
                 if let Some(ref mut group) = video_group {
-                    let seg = remux::build_video_segment(video_seq, base_dts, &[sample]);
+                    let seg = lvqr_cmaf::build_moof_mdat(video_seq, 1, base_dts, &[sample]);
                     let _ = group.write_frame(seg);
                 }
             }

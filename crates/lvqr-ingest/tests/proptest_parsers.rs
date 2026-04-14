@@ -1,4 +1,4 @@
-//! Property tests for the FLV parser and fMP4 writer.
+//! Property tests for the FLV parser and fMP4 init writer.
 //!
 //! These tests enforce two invariants:
 //!
@@ -6,22 +6,19 @@
 //!    `parse_audio_tag`, and `extract_resolution` all accept attacker-shaped
 //!    byte slices without unwrap, slice, or arithmetic panics. Regressions
 //!    here would mean the RTMP ingest path can be crashed by a malicious
-//:    publisher.
+//!    publisher.
 //!
-//! 2. **fMP4 writer output is structurally well-formed.** Given any
-//!    plausible `VideoConfig` plus any plausible set of `VideoSample`s, the
-//!    writer produces a byte buffer whose top-level boxes have valid sizes
-//!    (no 0, no greater-than-buffer) and begin with known four-char codes.
-//!
-//! These are the first two of the 5-artifact test contract for the
-//! lvqr-ingest crate (see tests/CONTRACT.md at the repo root). The
-//! remaining three artifacts (cargo-fuzz target, integration test, E2E
-//! test, conformance test against ffprobe) land in separate Tier 1 tasks.
+//! 2. **fMP4 init writer output is structurally well-formed.** Given any
+//!    plausible `VideoConfig`, `video_init_segment_with_size` produces a
+//!    byte buffer whose top-level boxes have valid sizes (no 0, no
+//!    greater-than-buffer) and begin with known four-char codes. The
+//!    media-segment writer moved to `lvqr-cmaf` in session 14; its
+//!    proptest coverage lives in that crate.
 
 use bytes::Bytes;
 use lvqr_ingest::remux::{
-    AudioConfig, VideoConfig, VideoSample, extract_resolution, generate_catalog, parse_audio_tag, parse_video_tag,
-    video_init_segment_with_size, video_segment,
+    AudioConfig, VideoConfig, extract_resolution, generate_catalog, parse_audio_tag, parse_video_tag,
+    video_init_segment_with_size,
 };
 use proptest::prelude::*;
 
@@ -219,22 +216,6 @@ fn video_config_strategy() -> impl Strategy<Value = VideoConfig> {
         })
 }
 
-/// Generate a VideoSample with plausible size and duration bounds.
-fn video_sample_strategy() -> impl Strategy<Value = VideoSample> {
-    (
-        proptest::collection::vec(any::<u8>(), 8..512),
-        1u32..10_000,
-        -1000i32..1000,
-        any::<bool>(),
-    )
-        .prop_map(|(data, duration, cts_offset, keyframe)| VideoSample {
-            data: Bytes::from(data),
-            duration,
-            cts_offset,
-            keyframe,
-        })
-}
-
 /// Walk the top-level box list in an ISO BMFF buffer, asserting that every
 /// box has a plausible size field and a four-char type code that is
 /// strictly ASCII printable. Returns the list of type codes encountered.
@@ -286,18 +267,4 @@ proptest! {
         prop_assert_eq!(&boxes[0], b"ftyp");
     }
 
-    /// Media segments must contain a moof followed by an mdat and have all
-    /// top-level boxes well formed for any plausible sample list.
-    #[test]
-    fn video_segment_is_well_formed(
-        samples in proptest::collection::vec(video_sample_strategy(), 1..8),
-        base_dts in 0u64..1_000_000,
-        seq in 1u32..10_000,
-    ) {
-        let seg = video_segment(seq, base_dts, &samples);
-        prop_assert!(seg.len() >= 16);
-        let boxes = walk_top_level_boxes(&seg);
-        prop_assert!(boxes.contains(b"moof"), "segment missing moof");
-        prop_assert!(boxes.contains(b"mdat"), "segment missing mdat");
-    }
 }

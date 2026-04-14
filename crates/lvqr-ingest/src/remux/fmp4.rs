@@ -9,19 +9,6 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use super::flv::{AudioConfig, VideoConfig};
 
-/// A single video sample for inclusion in an fMP4 media segment.
-#[derive(Debug, Clone)]
-pub struct VideoSample {
-    /// AVCC-format NALU data (length-prefixed, same as FLV).
-    pub data: Bytes,
-    /// Duration in timescale ticks (90kHz for video).
-    pub duration: u32,
-    /// Composition time offset in timescale ticks.
-    pub cts_offset: i32,
-    /// Whether this is a sync sample (keyframe).
-    pub keyframe: bool,
-}
-
 // --- Box writing helpers ---
 
 fn write_box(buf: &mut BytesMut, box_type: &[u8; 4], f: impl FnOnce(&mut BytesMut)) {
@@ -399,139 +386,13 @@ pub fn audio_init_segment(config: &AudioConfig) -> Bytes {
 }
 
 // --- Media segment generation ---
-
-/// Build a video media segment (`moof + mdat`) for the bridge's
-/// per-frame ingest path.
-///
-/// Default build path delegates to the in-crate hand-rolled
-/// [`video_segment`] writer that has shipped since v0.1. With the
-/// `cmaf-writer` feature flag the build instead routes through
-/// [`lvqr_cmaf::build_moof_mdat`], which uses the `mp4-atom` typed
-/// encoder and unlocks HEVC / AV1 sample entries. Both paths are
-/// byte-divergent in fields that do not affect playback, but every
-/// playback-critical field
-/// (`mfhd.sequence_number`, `tfhd.track_id`, `tfdt`,
-/// `trun` durations / sizes / flags / cts offsets) matches; the
-/// parity gate at `crates/lvqr-ingest/tests/parity_avc_segment.rs`
-/// pins this. Both paths are exercised on every PR via a CI matrix
-/// job in `.github/workflows/ci.yml`.
-pub fn build_video_segment(sequence: u32, base_dts: u64, samples: &[VideoSample]) -> Bytes {
-    #[cfg(feature = "cmaf-writer")]
-    {
-        build_video_segment_via_cmaf(sequence, base_dts, samples)
-    }
-    #[cfg(not(feature = "cmaf-writer"))]
-    {
-        video_segment(sequence, base_dts, samples)
-    }
-}
-
-/// `cmaf-writer`-feature replacement for [`video_segment`]. Builds
-/// the per-sample [`lvqr_cmaf::RawSample`] vector from the
-/// hand-rolled [`VideoSample`] inputs and hands it to
-/// [`lvqr_cmaf::build_moof_mdat`]. Per-sample DTS is reconstructed
-/// by walking sample durations forward from `base_dts`, matching
-/// what the hand-rolled writer puts in `tfdt + trun`.
-#[cfg(feature = "cmaf-writer")]
-fn build_video_segment_via_cmaf(sequence: u32, base_dts: u64, samples: &[VideoSample]) -> Bytes {
-    let mut raws = Vec::with_capacity(samples.len());
-    let mut dts = base_dts;
-    for s in samples {
-        raws.push(lvqr_cmaf::RawSample {
-            track_id: 1,
-            dts,
-            cts_offset: s.cts_offset,
-            duration: s.duration,
-            payload: s.data.clone(),
-            keyframe: s.keyframe,
-        });
-        dts = dts.saturating_add(s.duration as u64);
-    }
-    lvqr_cmaf::build_moof_mdat(sequence, 1, base_dts, &raws)
-}
-
-/// Generate a video media segment (moof + mdat) containing one or more samples.
-pub fn video_segment(sequence: u32, base_dts: u64, samples: &[VideoSample]) -> Bytes {
-    if samples.is_empty() {
-        return Bytes::new();
-    }
-
-    let total_data_size: usize = samples.iter().map(|s| s.data.len()).sum();
-    let mut buf = BytesMut::with_capacity(256 + total_data_size);
-
-    // moof
-    let moof_start = buf.len();
-    write_box(&mut buf, b"moof", |buf| {
-        // mfhd
-        write_full_box(buf, b"mfhd", 0, 0, |buf| {
-            buf.put_u32(sequence);
-        });
-
-        // traf
-        write_box(buf, b"traf", |buf| {
-            // tfhd: default-base-is-moof flag (0x020000)
-            write_full_box(buf, b"tfhd", 0, 0x020000, |buf| {
-                buf.put_u32(1); // track_ID
-            });
-
-            // tfdt: baseMediaDecodeTime
-            write_full_box(buf, b"tfdt", 1, 0, |buf| {
-                buf.put_u64(base_dts);
-            });
-
-            // trun: sample_count, data_offset, per-sample: duration, size, flags, cts_offset
-            // flags: 0x000001 (data-offset) | 0x000100 (duration) | 0x000200 (size)
-            //      | 0x000400 (flags) | 0x000800 (cts offset)
-            // Version 1 for signed composition time offsets (B-frames can have negative CTS)
-            let trun_flags: u32 = 0x000001 | 0x000100 | 0x000200 | 0x000400 | 0x000800;
-            write_full_box(buf, b"trun", 1, trun_flags, |buf| {
-                buf.put_u32(samples.len() as u32);
-                // data_offset placeholder -- we'll fix this after writing moof
-                let data_offset_pos = buf.len();
-                buf.put_i32(0); // placeholder
-
-                for sample in samples {
-                    buf.put_u32(sample.duration);
-                    buf.put_u32(sample.data.len() as u32);
-                    let flags: u32 = if sample.keyframe {
-                        0x02000000 // is_leading=0, depends_on=2 (does NOT depend), is_depended_on=0, is_sync
-                    } else {
-                        0x01010000 // depends_on=1 (does depend), not sync
-                    };
-                    buf.put_u32(flags);
-                    buf.put_i32(sample.cts_offset);
-                }
-
-                // Fix data_offset: offset from moof_start to start of mdat payload
-                // We don't know mdat header size yet, but it's always 8 bytes (size + type)
-                // data_offset = (moof size) + 8 (mdat header)
-                // We'll fix this after writing the moof box
-                let _ = data_offset_pos; // used below after moof is complete
-            });
-        });
-    });
-
-    let moof_size = buf.len() - moof_start;
-    // data_offset = moof_size + 8 (mdat header)
-    let data_offset = (moof_size + 8) as i32;
-
-    // Find and fix the data_offset in trun
-    // The data_offset is at a known position within the trun box.
-    // trun structure: [4 size][4 type][4 full_box_header][4 sample_count][4 data_offset]...
-    // We need to find it. Let's search for the placeholder.
-    // Since we control the layout, the data_offset is the first i32 after sample_count in trun.
-    // We'll patch it by scanning for the trun box.
-    patch_trun_data_offset(&mut buf, moof_start, data_offset);
-
-    // mdat
-    write_box(&mut buf, b"mdat", |buf| {
-        for sample in samples {
-            buf.put_slice(&sample.data);
-        }
-    });
-
-    buf.freeze()
-}
+//
+// The hand-rolled video media-segment writer lived here through v0.3.
+// Session 14 removed it in favour of routing every per-frame RTMP video
+// payload straight through `lvqr_cmaf::build_moof_mdat`; the AVC parity
+// gate had kept the two paths aligned across sessions 7-13, and the
+// cmaf-writer default-on flip in session 12.2 completed the transition.
+// The audio media-segment writer below is unrelated and stays.
 
 /// Generate an audio media segment (moof + mdat) containing a single AAC frame.
 pub fn audio_segment(sequence: u32, base_dts: u64, duration: u32, data: &Bytes) -> Bytes {
@@ -736,58 +597,6 @@ mod tests {
     }
 
     #[test]
-    fn video_segment_structure() {
-        let samples = vec![VideoSample {
-            data: Bytes::from(vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00]),
-            duration: 3000,
-            cts_offset: 0,
-            keyframe: true,
-        }];
-
-        let seg = video_segment(1, 0, &samples);
-        assert!(!seg.is_empty());
-
-        // Should start with moof
-        assert_eq!(&seg[4..8], b"moof");
-
-        // Should have mdat after moof
-        let moof_size = u32::from_be_bytes([seg[0], seg[1], seg[2], seg[3]]) as usize;
-        assert_eq!(&seg[moof_size + 4..moof_size + 8], b"mdat");
-
-        // mdat should contain our NALU data
-        let mdat_size = u32::from_be_bytes([
-            seg[moof_size],
-            seg[moof_size + 1],
-            seg[moof_size + 2],
-            seg[moof_size + 3],
-        ]) as usize;
-        let mdat_payload = &seg[moof_size + 8..moof_size + mdat_size];
-        assert_eq!(mdat_payload, &[0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00]);
-    }
-
-    #[test]
-    fn video_segment_data_offset_correct() {
-        let samples = vec![VideoSample {
-            data: Bytes::from(vec![0x65, 0x88]),
-            duration: 3000,
-            cts_offset: 0,
-            keyframe: true,
-        }];
-
-        let seg = video_segment(1, 0, &samples);
-        let moof_size = u32::from_be_bytes([seg[0], seg[1], seg[2], seg[3]]) as usize;
-
-        // data_offset in trun should point to mdat payload (moof_size + 8)
-        // Find trun in the segment
-        let trun_needle = b"trun";
-        let trun_pos = seg.windows(4).position(|w| w == trun_needle).unwrap();
-        // data_offset is at trun_pos + 4 (past type) + 4 (full_box) + 4 (sample_count) = +12
-        let do_pos = trun_pos + 4 + 4 + 4;
-        let data_offset = i32::from_be_bytes([seg[do_pos], seg[do_pos + 1], seg[do_pos + 2], seg[do_pos + 3]]);
-        assert_eq!(data_offset as usize, moof_size + 8);
-    }
-
-    #[test]
     fn audio_segment_structure() {
         let data = Bytes::from(vec![0x01, 0x02, 0x03, 0x04]);
         let seg = audio_segment(1, 0, 1024, &data);
@@ -795,35 +604,5 @@ mod tests {
         assert_eq!(&seg[4..8], b"moof");
         let moof_size = u32::from_be_bytes([seg[0], seg[1], seg[2], seg[3]]) as usize;
         assert_eq!(&seg[moof_size + 4..moof_size + 8], b"mdat");
-    }
-
-    #[test]
-    fn video_segment_multiple_samples() {
-        let samples = vec![
-            VideoSample {
-                data: Bytes::from(vec![0x65, 0x88]),
-                duration: 3000,
-                cts_offset: 0,
-                keyframe: true,
-            },
-            VideoSample {
-                data: Bytes::from(vec![0x41, 0x9A, 0x00]),
-                duration: 3000,
-                cts_offset: 0,
-                keyframe: false,
-            },
-        ];
-
-        let seg = video_segment(1, 0, &samples);
-        let moof_size = u32::from_be_bytes([seg[0], seg[1], seg[2], seg[3]]) as usize;
-        let mdat_payload = &seg[moof_size + 8..];
-        // mdat should contain both samples' data concatenated
-        assert_eq!(mdat_payload, &[0x65, 0x88, 0x41, 0x9A, 0x00]);
-    }
-
-    #[test]
-    fn empty_samples_returns_empty() {
-        let seg = video_segment(1, 0, &[]);
-        assert!(seg.is_empty());
     }
 }

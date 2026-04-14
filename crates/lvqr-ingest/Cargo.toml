@@ -11,37 +11,16 @@ keywords = ["streaming", "rtmp", "ingest", "video"]
 categories = ["multimedia", "network-programming"]
 
 [features]
-default = ["rtmp", "cmaf-writer"]
+default = ["rtmp"]
 rtmp = ["dep:rml_rtmp"]
-# Route the bridge's per-frame video media segment through
-# `lvqr_cmaf::build_moof_mdat` instead of the in-crate hand-rolled
-# `remux::fmp4::video_segment` writer. Default ON as of session 12.2
-# (the hand-rolled path is on its way out; see `legacy-fmp4` below).
-# The Tier 2.3 transition is tracked in `tracking/HANDOFF.md`.
-cmaf-writer = ["dep:lvqr-cmaf"]
-# Marker feature for the in-crate hand-rolled fMP4 writer
-# (`remux::fmp4::video_segment` + its unit tests, the golden-file
-# regression suite, the proptest target, and the parity gate at
-# `tests/parity_avc_segment.rs`). The feature is always available on
-# this crate; its purpose is to provide a named anchor for the code
-# slated for deletion in the next session. The CI matrix job
-# `test-legacy-fmp4-path` still exercises the hand-rolled dispatch
-# path via `--no-default-features --features rtmp` so the code stays
-# honest until it is removed. No consumer should take a dependency on
-# this feature going forward.
-legacy-fmp4 = []
 
 [dependencies]
 lvqr-core = { workspace = true }
 lvqr-auth = { workspace = true }
 lvqr-codec = { workspace = true }
+lvqr-cmaf = { workspace = true }
 lvqr-moq = { workspace = true }
 lvqr-fragment = { workspace = true }
-# Optional: only pulled in when the `cmaf-writer` feature is on.
-# The dep direction is one-way (lvqr-ingest consumes lvqr-cmaf, not
-# the reverse); the parity tests at `tests/parity_avc_*.rs` keep
-# `lvqr-cmaf` as a dev-dep so the cycle stays broken.
-lvqr-cmaf = { workspace = true, optional = true }
 moq-lite = { workspace = true }
 
 # RTMP
@@ -69,12 +48,3 @@ tracing-subscriber = { workspace = true }
 proptest = "1"
 serde_json = { workspace = true }
 lvqr-test-utils = { workspace = true }
-# Dev-only: the AVC parity tests in `tests/parity_avc_init.rs` and
-# `tests/parity_avc_segment.rs` drive `lvqr-cmaf`'s mp4-atom-backed
-# writer side-by-side with the hand-rolled fMP4 writer in this crate
-# and structurally diff the decoded Moov / Moof trees. The dep
-# direction is one-way (lvqr-ingest as a dev consumer of lvqr-cmaf)
-# so the future `cmaf-writer` feature can normal-dep lvqr-cmaf
-# without creating a cycle.
-lvqr-cmaf = { workspace = true }
-mp4-atom = { version = "0.10", features = ["bytes"] }

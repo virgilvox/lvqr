@@ -19,20 +19,10 @@ name = "lvqr"
 path = "src/main.rs"
 
 [features]
-default = ["rtmp", "quinn-transport", "cmaf-writer"]
-full = ["rtmp", "quinn-transport", "cmaf-writer"]
+default = ["rtmp", "quinn-transport"]
+full = ["rtmp", "quinn-transport"]
 rtmp = ["lvqr-ingest/rtmp"]
 quinn-transport = ["lvqr-relay/quinn-transport"]
-# Forward-flag for `lvqr-ingest/cmaf-writer`. Enabled by default as of
-# session 12.2 alongside `lvqr-ingest`'s own default flip. The flag
-# stays exposed on `lvqr-cli` so the legacy CI job in
-# `.github/workflows/ci.yml` can drop it via
-# `--no-default-features --features rtmp,quinn-transport` and
-# exercise the in-crate hand-rolled fMP4 writer end-to-end until the
-# legacy path is removed. Requires `lvqr-ingest` to be pulled in with
-# `default-features = false` (see `[dependencies]`) so disabling this
-# flag truly disables the `cmaf-writer` dep edge on `lvqr-ingest`.
-cmaf-writer = ["lvqr-ingest/cmaf-writer"]
 
 [dependencies]
 lvqr-core = { workspace = true }
@@ -40,13 +30,7 @@ lvqr-relay = { workspace = true }
 lvqr-moq = { workspace = true }
 moq-lite = { workspace = true }
 lvqr-mesh = { workspace = true }
-# Session 12.2: declared inline rather than via `workspace = true` so
-# the `cmaf-writer`/`legacy-fmp4` feature forwarding can disable
-# `lvqr-ingest`'s defaults from this crate. Cargo disallows overriding
-# a workspace dep's `default-features` when the workspace inherits,
-# so the path dep is inlined here. Version stays pinned to the
-# workspace version to keep the graph consistent.
-lvqr-ingest = { version = "0.3.1", path = "../lvqr-ingest", default-features = false }
+lvqr-ingest = { workspace = true }
 lvqr-signal = { workspace = true }
 lvqr-admin = { workspace = true }
 lvqr-auth = { workspace = true, features = ["jwt"] }

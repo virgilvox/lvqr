@@ -1525,7 +1525,6 @@ dependencies = [
  "lvqr-test-utils",
  "metrics",
  "moq-lite",
- "mp4-atom",
  "proptest",
  "rml_rtmp",
  "serde_json",

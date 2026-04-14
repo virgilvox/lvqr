@@ -15,9 +15,8 @@ use tracing::{debug, info, warn};
 
 use crate::observer::SharedFragmentObserver;
 use crate::remux::{
-    AudioConfig, FlvAudioTag, FlvVideoTag, VideoConfig, VideoSample, audio_init_segment, audio_segment,
-    build_video_segment, extract_resolution, generate_catalog, parse_audio_tag, parse_video_tag,
-    video_init_segment_with_size,
+    AudioConfig, FlvAudioTag, FlvVideoTag, VideoConfig, audio_init_segment, audio_segment, extract_resolution,
+    generate_catalog, parse_audio_tag, parse_video_tag, video_init_segment_with_size,
 };
 use crate::rtmp::{AuthCallback, MediaCallback, RtmpConfig, RtmpServer, StreamCallback};
 
@@ -258,15 +257,17 @@ impl RtmpMoqBridge {
                     let duration_ticks = duration_ms * 90; // 90kHz timescale
                     let base_dts = (timestamp as u64) * 90;
 
-                    let sample = VideoSample {
-                        data: nalu_data,
-                        duration: duration_ticks,
+                    let sample = lvqr_cmaf::RawSample {
+                        track_id: 1,
+                        dts: base_dts,
                         cts_offset: cts * 90, // ms to 90kHz
+                        duration: duration_ticks,
+                        payload: nalu_data,
                         keyframe,
                     };
 
                     stream.video_seq += 1;
-                    let seg = build_video_segment(stream.video_seq, base_dts, &[sample]);
+                    let seg = lvqr_cmaf::build_moof_mdat(stream.video_seq, 1, base_dts, &[sample]);
 
                     // Build a Fragment and push it through the sink. On a
                     // keyframe the sink closes the previous group, opens a

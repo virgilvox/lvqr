@@ -60,6 +60,22 @@ fn flv_video_nalu(keyframe: bool, cts: i32, nalu_data: &[u8]) -> Bytes {
     Bytes::from(tag)
 }
 
+/// FLV AAC sequence header: codec id 10 (AAC), packet type 0, followed
+/// by a minimal AudioSpecificConfig for AAC-LC 44100 Hz stereo.
+fn flv_audio_seq_header() -> Bytes {
+    // AAC-LC (obj=2), sampling_frequency_index=4 (44100), channel=2
+    let b0: u8 = (2 << 3) | (4 >> 1);
+    let b1: u8 = (4 << 7) | (2 << 3);
+    Bytes::from(vec![0xAF, 0x00, b0, b1])
+}
+
+/// FLV AAC raw frame: codec id 10 (AAC), packet type 1, payload bytes.
+fn flv_audio_raw(aac_data: &[u8]) -> Bytes {
+    let mut tag = vec![0xAF, 0x01];
+    tag.extend_from_slice(aac_data);
+    Bytes::from(tag)
+}
+
 // =====================================================================
 // RTMP publish helpers (copied from rtmp_ws_e2e.rs verbatim)
 // =====================================================================
@@ -414,5 +430,155 @@ async fn rtmp_publish_reaches_multi_broadcast_hls_router() {
     // --- Clean shutdown. ---
     drop(_s1);
     drop(_s2);
+    server.shutdown().await.expect("shutdown");
+}
+
+/// Publish a video keyframe sequence plus an AAC sequence header and
+/// raw frame to `{app}/{key}` and return the open RTMP stream and
+/// session so the caller can hold them alive until the HTTP reads
+/// complete. The audio sequence header is sent before the first video
+/// keyframe so the bridge sees the AAC config at the same time the
+/// video init lands, which is how real publishers (OBS, ffmpeg)
+/// interleave the two track headers.
+async fn publish_video_with_audio(addr: SocketAddr, app: &str, key: &str) -> (TcpStream, ClientSession) {
+    let (mut rtmp_stream, mut session) = connect_and_publish(addr, app, key).await;
+
+    // Video sequence header.
+    let vseq = flv_video_seq_header();
+    let r = session.publish_video_data(vseq, RtmpTimestamp::new(0), false).unwrap();
+    send_result(&mut rtmp_stream, &r).await;
+
+    // Audio sequence header. The AAC-LC 44100/stereo ASC matches the
+    // `flv_audio_seq_header` helper above; the bridge's
+    // `parse_audio_tag` picks this up, constructs an audio init
+    // segment, and fires the HLS bridge's `on_init` hook with
+    // track id `1.mp4`, which in turn calls `ensure_audio(broadcast)`
+    // and registers the audio `HlsServer` on the `MultiHlsServer`.
+    let aseq = flv_audio_seq_header();
+    let r = session.publish_audio_data(aseq, RtmpTimestamp::new(0), false).unwrap();
+    send_result(&mut rtmp_stream, &r).await;
+
+    // First video keyframe at t=0.
+    let nalu = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
+    let kf0 = flv_video_nalu(true, 0, &nalu);
+    let r = session.publish_video_data(kf0, RtmpTimestamp::new(0), false).unwrap();
+    send_result(&mut rtmp_stream, &r).await;
+
+    // One raw AAC frame at t=0. A single audio fragment is enough to
+    // promote the audio HlsServer out of the `None` state in the
+    // MultiHlsServer entry for this broadcast; the master playlist
+    // then declares the audio rendition group.
+    let aac = flv_audio_raw(&[0u8; 64]);
+    let r = session.publish_audio_data(aac, RtmpTimestamp::new(0), false).unwrap();
+    send_result(&mut rtmp_stream, &r).await;
+
+    // Second video keyframe past the 2 s segment boundary so the video
+    // playlist closes its first segment and starts emitting `#EXT-X-PART:`
+    // lines the reader side can match on.
+    let kf1 = flv_video_nalu(true, 0, &nalu);
+    let r = session
+        .publish_video_data(kf1, RtmpTimestamp::new(2100), false)
+        .unwrap();
+    send_result(&mut rtmp_stream, &r).await;
+
+    // One more raw AAC frame close to the second video keyframe so the
+    // audio playlist has at least one chunk visible by the time the
+    // client reads.
+    let aac = flv_audio_raw(&[0u8; 64]);
+    let r = session
+        .publish_audio_data(aac, RtmpTimestamp::new(2100), false)
+        .unwrap();
+    send_result(&mut rtmp_stream, &r).await;
+
+    (rtmp_stream, session)
+}
+
+/// Real end-to-end: one RTMP broadcast publishing both video and audio
+/// reaches the LL-HLS master playlist with an EXT-X-MEDIA audio
+/// rendition declaration, the audio sub-playlist at `audio.m3u8`, and
+/// an audio init segment at `audio-init.mp4`. Closes the audio
+/// rendition path that session 13 landed through `integration_master.rs`
+/// by proving the same surface is reachable through a real RTMP
+/// publish, not just a router oneshot.
+#[tokio::test]
+async fn rtmp_publish_with_audio_reaches_master_playlist() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("lvqr=debug")
+        .with_test_writer()
+        .try_init();
+
+    let server = TestServer::start(TestServerConfig::default())
+        .await
+        .expect("start TestServer");
+    let rtmp_addr = server.rtmp_addr();
+    let hls_addr = server.hls_addr();
+
+    let (_s, _sess) = publish_video_with_audio(rtmp_addr, "live", "av").await;
+
+    // The observer path spawns one tokio task per fragment; give them
+    // a tick to land on the MultiHlsServer state before reading.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // --- Master playlist must declare the audio rendition. ---
+    let master_resp = http_get(hls_addr, "/hls/live/av/master.m3u8").await;
+    assert_eq!(master_resp.status, 200, "master GET status");
+    let master_body = std::str::from_utf8(&master_resp.body).expect("master body utf-8");
+    eprintln!("--- master.m3u8 ---\n{master_body}\n--- end ---");
+    assert!(
+        master_body.starts_with("#EXTM3U"),
+        "master missing #EXTM3U: {master_body}"
+    );
+    assert!(
+        master_body.contains("#EXT-X-MEDIA:"),
+        "master missing #EXT-X-MEDIA when audio is present: {master_body}"
+    );
+    assert!(
+        master_body.contains("TYPE=AUDIO"),
+        "master #EXT-X-MEDIA is not an audio rendition: {master_body}"
+    );
+    assert!(
+        master_body.contains("AUDIO=\"audio\""),
+        "master #EXT-X-STREAM-INF missing AUDIO= group reference: {master_body}"
+    );
+
+    // --- Audio sub-playlist must be served, not 404. ---
+    let audio_resp = http_get(hls_addr, "/hls/live/av/audio.m3u8").await;
+    assert_eq!(audio_resp.status, 200, "audio.m3u8 GET status");
+    let audio_body = std::str::from_utf8(&audio_resp.body).expect("audio body utf-8");
+    eprintln!("--- audio.m3u8 ---\n{audio_body}\n--- end ---");
+    assert!(
+        audio_body.starts_with("#EXTM3U"),
+        "audio playlist missing #EXTM3U: {audio_body}"
+    );
+    assert!(
+        audio_body.contains("#EXT-X-MAP:URI=\"audio-init.mp4\""),
+        "audio playlist missing #EXT-X-MAP for audio-init.mp4: {audio_body}"
+    );
+
+    // --- Audio init segment must be served and start with ftyp. ---
+    let audio_init_resp = http_get(hls_addr, "/hls/live/av/audio-init.mp4").await;
+    assert_eq!(audio_init_resp.status, 200, "audio-init.mp4 GET status");
+    assert!(
+        audio_init_resp.body.len() >= 8,
+        "audio-init body too short: {} bytes",
+        audio_init_resp.body.len()
+    );
+    assert_eq!(
+        &audio_init_resp.body[4..8],
+        b"ftyp",
+        "audio-init segment did not start with `ftyp`"
+    );
+
+    // --- Video playlist must still resolve on the same broadcast. ---
+    let video_resp = http_get(hls_addr, "/hls/live/av/playlist.m3u8").await;
+    assert_eq!(video_resp.status, 200, "video playlist GET status");
+    let video_body = std::str::from_utf8(&video_resp.body).expect("video body utf-8");
+    assert!(
+        video_body.contains("#EXT-X-MAP:URI=\"init.mp4\""),
+        "video playlist missing #EXT-X-MAP for init.mp4: {video_body}"
+    );
+
+    // --- Clean shutdown. ---
+    drop(_s);
     server.shutdown().await.expect("shutdown");
 }

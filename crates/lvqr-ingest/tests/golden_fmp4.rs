@@ -22,10 +22,7 @@
 //! the fMP4 writer.
 
 use bytes::Bytes;
-use lvqr_ingest::remux::{
-    AudioConfig, VideoConfig, VideoSample, audio_init_segment, audio_segment, video_init_segment_with_size,
-    video_segment,
-};
+use lvqr_ingest::remux::{AudioConfig, VideoConfig, audio_init_segment, audio_segment, video_init_segment_with_size};
 use lvqr_test_utils::ffprobe_bytes;
 use std::path::{Path, PathBuf};
 
@@ -96,44 +93,31 @@ fn video_init_segment_matches_golden() {
     assert_golden("video_init_h264_baseline_720p.mp4", &init);
 }
 
-#[test]
-fn video_keyframe_segment_matches_golden() {
-    // Deterministic one-sample keyframe segment at a fixed DTS.
-    let sample = VideoSample {
-        data: Bytes::from(vec![
-            0x00, 0x00, 0x00, 0x10, 0x65, 0x88, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00,
-        ]),
-        duration: 3000,
-        cts_offset: 0,
-        keyframe: true,
-    };
-    let seg = video_segment(1, 0, std::slice::from_ref(&sample));
-    assert_golden("video_segment_keyframe.mp4", &seg);
-}
-
 /// Concatenate the golden init segment and a deterministic keyframe
-/// media segment into a single fMP4 byte buffer and feed it to ffprobe.
-/// ffprobe must either accept the buffer (confirming the writer produces
-/// spec-compliant ISO BMFF) or be unavailable (soft-skip). Any "parsed
-/// but rejected" outcome fails the test.
+/// media segment produced by `lvqr_cmaf::build_moof_mdat` into a single
+/// fMP4 byte buffer and feed it to ffprobe. ffprobe must either accept
+/// the buffer (confirming the hand-rolled init writer still composes
+/// correctly with the cmaf media writer) or be unavailable (soft-skip).
 ///
 /// This is the conformance slot of the 5-artifact contract for the fMP4
-/// writer. If ffprobe rejects our output in CI, we broke the writer.
+/// init writer. The media-segment side moved to `lvqr-cmaf` in
+/// session 14; its own conformance coverage lives in that crate.
 #[test]
 fn ffprobe_accepts_concatenated_cmaf() {
     let config = golden_video_config();
     let init = video_init_segment_with_size(&config, 1280, 720);
-    let sample = VideoSample {
-        data: Bytes::from(vec![
+    let sample = lvqr_cmaf::RawSample {
+        track_id: 1,
+        dts: 0,
+        cts_offset: 0,
+        duration: 3000,
+        payload: Bytes::from(vec![
             0x00, 0x00, 0x00, 0x10, 0x65, 0x88, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00,
         ]),
-        duration: 3000,
-        cts_offset: 0,
         keyframe: true,
     };
-    let seg = video_segment(1, 0, std::slice::from_ref(&sample));
+    let seg = lvqr_cmaf::build_moof_mdat(1, 1, 0, std::slice::from_ref(&sample));
 
     let mut buf = Vec::with_capacity(init.len() + seg.len());
     buf.extend_from_slice(&init);
