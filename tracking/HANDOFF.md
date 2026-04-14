@@ -1,15 +1,173 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.3 producer+egress stack ready for CLI composition
+## Project Status: v0.4-dev -- Tier 2.3 RTMP -> LL-HLS pipeline serving real HTTP
 
-**Last Updated**: 2026-04-13 (session 10 close / session 11 audit)
-**Tests**: 60 test binaries across the workspace, 241 individual
+**Last Updated**: 2026-04-13 (session 11 close)
+**Tests**: 66 test binaries across the workspace, 242 individual
 tests (plus ~6300 generated proptest cases per run across the
 ingest, fragment, hevc, aac, cmaf-policy, and hls-manifest
-harnesses), all green. cargo clippy --workspace --all-targets --
--D warnings is clean. cargo fmt --check is clean.
-Nine commits pushed across sessions 6-10 to `origin/main` at
-`c24fe51c9c277c281d2a08cbf712ba3e9db82257`.
+harnesses), all green. `cargo clippy --workspace --all-targets --
+-D warnings` is clean for both the default feature set and the
+`cmaf-writer` matrix path. `cargo fmt --check` is clean.
+Eleven commits pushed across sessions 6-11 to `origin/main`.
+
+## Session 11 (2026-04-13): CLI HLS composition + `cmaf-writer` feature flag
+
+Session 11 closed every item from the "Recommended Tier 2.3 entry
+point (session 11)" work list below. Two commits land on top of
+`f83a280` (the session-10 audit + handoff refresh):
+
+1. **Dev-dep cycle broken** (item 1). Both `parity_avc_init.rs` and
+   `parity_avc_segment.rs` moved out of `crates/lvqr-cmaf/tests/`
+   and into `crates/lvqr-ingest/tests/`. `lvqr-cmaf` no longer
+   dev-deps `lvqr-ingest`; `lvqr-ingest` now dev-deps `lvqr-cmaf`
+   plus `mp4-atom = "0.10"` for the `Moof::decode` calls the parity
+   tests need. The dep direction is one-way, which is what session
+   11 item 3 requires. Both parity tests still pass byte-for-byte
+   identically to the session-10 baseline (sizes equal at 600 bytes,
+   bytes intentionally differ, structural fields match).
+
+2. **`lvqr-cli serve` composes HLS** (item 2). Three pieces:
+
+   * **`FragmentObserver` hook in `lvqr-ingest`**
+     (`crates/lvqr-ingest/src/observer.rs`). New trait with
+     `on_init(&self, broadcast, track, init: Bytes)` and
+     `on_fragment(&self, broadcast, track, fragment: &Fragment)`.
+     The bridge gets a builder method
+     `RtmpMoqBridge::with_observer(SharedFragmentObserver)` plus a
+     `set_observer` mutator. Both the video and audio paths fire
+     `on_init` when an init segment becomes available and
+     `on_fragment` after each `MoqTrackSink::push`. The bridge stays
+     HLS-agnostic; the trait is the only wire between RTMP ingest
+     and any non-MoQ consumer.
+
+   * **`HlsFragmentBridge` in `lvqr-cli`**
+     (`crates/lvqr-cli/src/hls.rs`). Implements
+     `FragmentObserver`. Uses `lvqr_cmaf::CmafPolicyState` directly
+     (re-exported from `lvqr-cmaf` this session) to classify each
+     fragment as `Partial` / `PartialIndependent` / `Segment`, then
+     spawns a tokio task per push that forwards the resulting
+     `CmafChunk` into a shared `HlsServer`. Single-rendition
+     today: the first broadcast that publishes a video track wins
+     and subsequent broadcasts have their fragments dropped (with a
+     `tracing::info!` at attach time so production operators see
+     it). Multi-broadcast routing is a follow-up; the integration
+     test publishes one broadcast so the limit is invisible at the
+     contract layer.
+
+   * **`ServeConfig.hls_addr` + `ServerHandle::hls_addr` /
+     `hls_url`** (`crates/lvqr-cli/src/lib.rs`). New optional
+     `hls_addr: Option<SocketAddr>` field on `ServeConfig`. When
+     set, `start()` builds an `HlsServer`, attaches an
+     `HlsFragmentBridge` observer to the RTMP bridge, pre-binds the
+     HLS TCP listener, and spins up a fourth `axum::serve` task
+     under the same shutdown token as the relay / RTMP / admin
+     subsystems. `ServerHandle` grows `hls_addr() ->
+     Option<SocketAddr>` and `hls_url(path: &str) -> Option<String>`
+     accessors. `lvqr-cli serve` gains a `--hls-port` /
+     `LVQR_HLS_PORT` flag (default `8888`, set to `0` to disable).
+     `TestServer` enables HLS by default and exposes `hls_addr` /
+     `hls_url` helpers; `TestServerConfig::without_hls()` turns the
+     surface off for tests that do not need it.
+
+   * **`crates/lvqr-cli/tests/rtmp_hls_e2e.rs`**. Real end-to-end
+     test: spin up a `TestServer`, RTMP-publish two keyframes
+     spaced 2.1 s apart through `rml_rtmp` so the segmenter's
+     default `VIDEO_90KHZ_DEFAULT` policy closes one full segment,
+     then drive a 30-line raw-TCP HTTP/1.1 client against
+     `/playlist.m3u8`, assert the body contains an `EXTM3U` header,
+     `EXT-X-VERSION:9`, `EXT-X-MAP`, and at least one
+     `#EXT-X-PART` URI, fetch one of those URIs and assert the
+     body starts with a `moof` box, then fetch `/init.mp4` and
+     assert the body starts with `ftyp`. Passed first run. The
+     intentional zero-new-deps choice (raw HTTP/1.1 vs. pulling
+     `reqwest` or `hyper-util`) keeps the dev-dep budget small.
+
+3. **`cmaf-writer` feature flag on `lvqr-ingest`** (item 3). New
+   default-off feature `cmaf-writer` on `lvqr-ingest` that pulls in
+   `lvqr-cmaf` as an optional normal dep. When the feature is on,
+   the bridge's per-frame video media segment is built via a new
+   `lvqr_ingest::remux::fmp4::build_video_segment` helper that
+   delegates to `lvqr_cmaf::build_moof_mdat` instead of the
+   hand-rolled `video_segment`. The hand-rolled path stays in
+   place under the default feature set so the parity gate keeps
+   working. `lvqr-cli` exposes a passthrough `cmaf-writer` feature
+   so `cargo test -p lvqr-cli --features cmaf-writer` flips both
+   crates in one shot. New `test-cmaf-writer` CI matrix job in
+   `.github/workflows/ci.yml` that builds `lvqr-cli` with the
+   feature on, runs `cargo test -p lvqr-ingest --features
+   cmaf-writer`, and runs `cargo test -p lvqr-cli --features
+   cmaf-writer` so both `rtmp_ws_e2e` and `rtmp_hls_e2e` exercise
+   the alternate writer end-to-end on every PR. Both E2E tests
+   pass under both writers locally.
+
+4. **`lvqr-whep` scoping doc** (item 4).
+   `crates/lvqr-whep/docs/design.md`. **No code, no Cargo.toml,
+   not a workspace member.** The directory contains exactly one
+   markdown file. Covers what WHEP needs from `CmafChunk` (path A:
+   consume `RawSample` via `SampleStream`, preferred; path B: parse
+   `mdat` on the wire, transitional shim), how the offer / trickle /
+   terminate signaling maps onto axum routes in the same shape as
+   `HlsServer::router`, the existing crates that get reused
+   (`lvqr-cmaf::SampleStream`, `lvqr-fragment`, the Fragment
+   Observer pattern, `lvqr-hls::server` as a routing template,
+   `lvqr-auth`, `lvqr-core::EventBus`), the new external dep
+   (`str0m`), the 5-artifact plan with concrete test file paths,
+   sequencing constraints (waits on bridge raw-sample emission via
+   either the `cmaf-writer` cutover or a sibling `RawSampleObserver`
+   hook), and four open questions for the implementation session.
+
+### What session 11 did NOT land
+
+* **Multi-broadcast HLS routing.** `HlsFragmentBridge` is
+  single-rendition / single-broadcast today. The router serves
+  one playlist; subsequent RTMP broadcasts are tracked but their
+  fragments are silently dropped. Adding a `/hls/{broadcast}/...`
+  prefix or one `HlsServer` per broadcast is a session-12 follow-up.
+* **Audio in HLS.** The `FragmentObserver::on_fragment` hook fires
+  for both `0.mp4` (video) and `1.mp4` (audio), but
+  `HlsFragmentBridge` only consumes video. Multi-track HLS (audio
+  rendition group) lands when multi-track HLS lands.
+* **`cmaf-writer` flipped to default-on.** Per the directive, the
+  feature is default-off this session. The CI matrix exercises
+  both paths; the default flips after the matrix has been green on
+  main for a few release cycles.
+* **Hand-rolled `video_segment` deletion.** Same gating as the
+  default flip. The parity gate at
+  `crates/lvqr-ingest/tests/parity_avc_segment.rs` keeps both
+  writers honest until the deletion lands.
+* **WHEP implementation.** Scoping only this session, per the
+  directive.
+
+### Contract slot status as of session 11
+
+| Crate          | proptest | fuzz | integration | E2E              | conformance |
+| lvqr-ingest    | yes      | yes  | yes         | yes              | yes         |
+| lvqr-codec     | yes      | yes  | yes         | via rtmp_ws_e2e  | yes (multi-sub-layer covered) |
+| lvqr-cmaf      | yes      | open | yes         | via rtmp_ws_e2e  | yes (AVC + HEVC + AAC init, AVC + AAC coalescer) |
+| lvqr-hls       | yes      | open | yes         | via oneshot + lvqr-cli rtmp_hls_e2e | soft-skip (mediastreamvalidator) |
+| lvqr-record    | yes      | open | yes         | workspace e2e    | yes         |
+| lvqr-moq       | yes      | open | yes         | via rtmp_ws_e2e  | n/a         |
+| lvqr-fragment  | yes      | open | yes         | via rtmp_ws_e2e  | n/a         |
+
+`lvqr-hls` E2E slot grew from "via oneshot" alone to "via oneshot
+plus lvqr-cli rtmp_hls_e2e". The `oneshot` test still runs every
+HLS handler over the axum service trait; the new `rtmp_hls_e2e`
+runs the same router over a real loopback TCP socket end-to-end
+from RTMP publish to HTTP GET.
+
+### Dependency graph snapshot (post-session-11)
+
+* `lvqr-cli` normal-deps `lvqr-cmaf`, `lvqr-hls`, `lvqr-fragment`
+  (added this session for the HLS bridge).
+* `lvqr-hls` normal-deps `lvqr-cmaf`.
+* `lvqr-ingest` normal-deps `lvqr-cmaf` ONLY when the `cmaf-writer`
+  feature is on (optional dep). The default feature set leaves the
+  dep edge absent.
+* `lvqr-ingest` dev-deps `lvqr-cmaf` + `mp4-atom` for the parity
+  tests (one-way, no cycle).
+* `lvqr-cmaf` no longer dev-deps anything in the producer side.
+* No other dep edges changed. Graph is still acyclic.
 
 ## Sessions 6-10 audit (2026-04-13, pre-session-11)
 
@@ -1173,13 +1331,84 @@ should be aware of so nothing is discovered twice.
   reusing the x265 fixture already in
   `parse_sps_decodes_real_x265_single_sublayer` as the seed.
 
-## Recommended Tier 2.3 entry point (session 11)
+## Recommended Tier 2.3 entry point (session 12)
+
+Session 11 closed every cross-crate item from the prior list (dep
+cycle, CLI HLS composition, `cmaf-writer` feature flag, WHEP
+scoping). Session 12 inherits the follow-ups that depend on either
+the new HLS pipeline being on `main` for a release cycle, or the
+WHEP scoping doc being ready to absorb implementation work.
+
+1. **Multi-broadcast HLS routing.** The `HlsFragmentBridge` shipped
+   in session 11 is intentionally single-rendition: only the first
+   broadcast that publishes a video track feeds the HLS server.
+   Production-grade routing requires either (a) a per-broadcast
+   `HlsServer` instance keyed by broadcast name with the axum
+   router demultiplexing under a `/hls/{broadcast}/...` prefix, or
+   (b) a multi-tenant `HlsServer` that grows broadcast-aware
+   routing internally. Option (a) keeps `lvqr-hls` simple and
+   matches the LL-HLS single-rendition mental model; option (b)
+   touches the manifest generator. Pick (a) unless option (b)
+   surfaces a clean reuse path during implementation. Update
+   `crates/lvqr-cli/tests/rtmp_hls_e2e.rs` to publish two
+   broadcasts and assert both playlists return distinct content.
+
+2. **Audio rendition group in HLS.** `FragmentObserver::on_fragment`
+   already fires for `1.mp4`. `HlsFragmentBridge` ignores it
+   today. The work is: extend `HlsFragmentBridge` to track a
+   second `CmafPolicyState` keyed on the audio track id; mount a
+   sibling `HlsServer` (or sibling per-track tracks inside one
+   server, depending on whether `lvqr-hls` learns rendition
+   groups) at `/hls/audio/playlist.m3u8`; update the integration
+   test to verify the audio playlist is fetchable and that an
+   `EXT-X-MEDIA:TYPE=AUDIO` master playlist points at it. The
+   scope is bigger than item 1 because it forces `lvqr-hls` to
+   learn `EXT-X-STREAM-INF` master-playlist generation. Plan
+   carefully before starting.
+
+3. **Begin `lvqr-whep` implementation.** The session 11 design doc
+   at `crates/lvqr-whep/docs/design.md` lays out a 5-artifact plan
+   with concrete test file paths plus four open questions. Start
+   by answering the four open questions in a 5-bullet design
+   reply, then create `crates/lvqr-whep/Cargo.toml`, register the
+   crate as a workspace member, and land item 1 of the 5-artifact
+   plan (proptest on the H.264 RTP packetizer) before any
+   networking code. **Prerequisite**: a `RawSampleObserver` hook on
+   `RtmpMoqBridge` so WHEP can subscribe to per-sample data
+   without re-parsing CmafChunks. The cleanest add is a sibling
+   trait method (or a new trait altogether) following the same
+   pattern as the session-11 `FragmentObserver`. Pick this only
+   if items 1 and 2 above are deferred or already in progress;
+   running all three in one session is too much surface area.
+
+4. **Flip `cmaf-writer` to default-on.** Once the
+   `test-cmaf-writer` matrix job has been green on `main` for at
+   least one release cycle (track in `tracking/HANDOFF.md` cycle
+   notes), flip `default = ["rtmp", "cmaf-writer"]` in
+   `crates/lvqr-ingest/Cargo.toml`. Keep the hand-rolled
+   `video_segment` writer in place under a `legacy-fmp4` feature
+   for one more cycle, then delete in a later session. The parity
+   gate at `crates/lvqr-ingest/tests/parity_avc_segment.rs`
+   becomes unnecessary at deletion time and should be removed in
+   the same commit.
+
+Session 12 should pick **at most two** of the four items above and
+land them cleanly. Items 1 and 4 are the safest pair to bundle.
+Items 2 and 3 each blow most of a session by themselves.
+
+Do NOT start `lvqr-dash`, `lvqr-whip`, `lvqr-srt`, `lvqr-rtsp`, or
+`lvqr-archive` this session. Every non-WHEP egress crate stays
+gated on the items above, plus eventually `lvqr-whep` itself
+landing as the proof point that the egress shape generalizes
+beyond HLS.
+
+## Recommended Tier 2.3 entry point (session 11, closed)
 
 Session 10 closed every in-crate item from the session 10 list
 (parity gate, AAC coalescer round trip, sample segmenter). Session
-11 inherits the cross-crate items that require touching the CLI
-composition root and flipping dep directions. All three have real
-cross-crate blast radius, so scope carefully.
+11 inherited the cross-crate items that required touching the CLI
+composition root and flipping dep directions. All four landed.
+The original work list is preserved here for historical reference:
 
 1. **Break the `lvqr-cmaf <-> lvqr-ingest` dev-dep cycle** before
    any session 11 work that requires `lvqr-ingest` to normal-dep
