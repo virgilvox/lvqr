@@ -24,17 +24,18 @@ validator is wired in.
 The contract applies to every crate under `crates/lvqr-{ingest,whip,whep,hls,dash,srt,rtsp,codec,cmaf,archive,moq,fragment,record}`. Pure library crates without a wire format or parser are exempt.
 
 Crates currently in scope (per `scripts/check_test_contract.sh` IN_SCOPE
-list) and their 5-artifact status as of 2026-04-13 (session 10 close):
+list) and their 5-artifact status as of 2026-04-14 (session 15 close):
 
 | Crate | proptest | fuzz | integration | E2E | conformance |
 |---|---|---|---|---|---|
-| lvqr-ingest (FLV, fMP4, RTMP) | yes (`tests/proptest_parsers.rs`) | yes (`fuzz/fuzz_targets/{parse_video_tag,parse_audio_tag}.rs`) | yes (`tests/rtmp_bridge_integration.rs`) | yes (`../lvqr-cli/tests/rtmp_ws_e2e.rs` plus `tests/e2e/test-app.spec.ts`) | golden + ffprobe (`tests/golden_fmp4.rs`) |
+| lvqr-ingest (FLV, fMP4 init, RTMP) | yes (`tests/proptest_parsers.rs`) | yes (`fuzz/fuzz_targets/{parse_video_tag,parse_audio_tag}.rs`) | yes (`tests/rtmp_bridge_integration.rs`) | yes (`../lvqr-cli/tests/rtmp_ws_e2e.rs` + `rtmp_hls_e2e.rs` with video+audio coverage, plus `tests/e2e/test-app.spec.ts`) | golden + ffprobe (`tests/golden_fmp4.rs`; init writer only, media writer retired in session 14) |
 | lvqr-record | yes (`tests/proptest_recorder.rs`) | open (pure helpers already proptest-covered) | yes (`tests/record_integration.rs`) | workspace `tests/e2e/` | yes (`tests/record_conformance.rs`) |
 | lvqr-moq | yes (`tests/proptest_facade.rs`) | open (pure value-type facade) | yes (`tests/integration_facade.rs`) | via `rtmp_ws_e2e` | n/a |
 | lvqr-fragment | yes (`tests/proptest_fragment.rs`) | open (pure value type) | yes (`tests/integration_moq_sink.rs`) | via `rtmp_ws_e2e` | n/a |
 | lvqr-codec | yes (`tests/proptest_{hevc,aac}.rs`) | yes (`fuzz/fuzz_targets/{parse_hevc_sps,parse_aac_asc,read_ue_v}.rs`) | yes (`tests/integration_codec.rs`) | via `rtmp_ws_e2e` | yes (`tests/conformance_codec.rs`; iterates the `lvqr-conformance` codec corpus including the kvazaar multi-sub-layer fixture) |
-| lvqr-cmaf | yes (`tests/proptest_policy.rs`) | open (no parser attack surface; consumes trusted `Bytes`) | yes (`tests/integration_segmenter.rs`, `tests/integration_sample_segmenter.rs`, `tests/parity_avc_init.rs`, `tests/parity_avc_segment.rs`) | via `rtmp_ws_e2e` | yes (`tests/conformance_init.rs` + `tests/conformance_coalescer.rs`; ffprobe-validated AVC + HEVC + AAC init segments and ffprobe-validated AVC + AAC coalescer media segments) |
-| lvqr-hls | yes (`tests/proptest_manifest.rs`) | open (no parser attack surface; renderer reads structured input) | yes (`tests/integration_builder.rs` + `tests/integration_server.rs` driving the axum router via `tower::ServiceExt::oneshot`) | via router oneshot; TCP loopback E2E lands with the `lvqr-cli` HLS composition | yes (`tests/conformance_manifest.rs`; Apple `mediastreamvalidator` soft-skip via `lvqr_test_utils::mediastreamvalidator_playlist`) |
+| lvqr-cmaf | yes (`tests/proptest_policy.rs`) | open (no parser attack surface; consumes trusted `Bytes`) | yes (`tests/integration_segmenter.rs`, `tests/integration_sample_segmenter.rs`; session 14 absorbed the former `parity_avc_*` gates in `lvqr-ingest`) | via `rtmp_ws_e2e` | yes (`tests/conformance_init.rs` + `tests/conformance_coalescer.rs`; ffprobe-validated AVC + HEVC + AAC init segments and ffprobe-validated AVC + AAC coalescer media segments) |
+| lvqr-hls | yes (`tests/proptest_manifest.rs`) | open (no parser attack surface; renderer reads structured input) | yes (`tests/integration_builder.rs` + `tests/integration_server.rs` + `tests/integration_master.rs` driving the axum router via `tower::ServiceExt::oneshot`) | via router oneshot + `lvqr-cli` `rtmp_hls_e2e.rs` (multi-broadcast + real RTMP audio coverage) | yes (`tests/conformance_manifest.rs`; Apple `mediastreamvalidator` soft-skip via `lvqr_test_utils::mediastreamvalidator_playlist`) |
+| lvqr-whep | yes (`tests/proptest_packetizer.rs`; H.264 RFC 6184 single-NAL + FU-A round-trip + never-panic) | open (offer SDP parser lands with the signaling layer) | open (signaling layer via `tower::ServiceExt::oneshot`) | open (`../lvqr-cli/tests/rtmp_whep_e2e.rs` once `str0m` lands) | open (cross-implementation against `simple-whep-client` soft-skip) |
 
 Gaps relative to the contract are tracked in the Tier 1/2 work list.
 Priorities closed in sessions 6 through 10:

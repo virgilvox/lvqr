@@ -1,17 +1,342 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.3 audio rendition group in LL-HLS
+## Project Status: v0.4-dev -- Tier 2.3 closed, `lvqr-whep` started
 
-**Last Updated**: 2026-04-13 (session 13 close)
-**Tests**: `cargo test --workspace` green under the cmaf-writer
-default: 67 test binaries, 251 individual tests, 0 failures.
-`cargo test -p lvqr-cli --no-default-features --features
-rtmp,quinn-transport --test rtmp_hls_e2e --test rtmp_ws_e2e`
-green on the legacy hand-rolled fMP4 writer path.
-`cargo clippy --workspace --all-targets -- -D warnings` clean on
-both the default and the `--no-default-features --features
-rtmp,quinn-transport` legacy configuration.
+**Last Updated**: 2026-04-14 (session 15 close)
+**Tests**: `cargo test --workspace` green under the default feature
+set: 68 test binaries, 254 individual tests, 0 failures. The
+`--no-default-features --features rtmp,quinn-transport` legacy
+configuration is retired along with the hand-rolled fMP4 writer; the
+`test-legacy-fmp4-path` CI matrix job was deleted in session 14.
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
 `cargo fmt --all --check` clean.
+
+## Session 15 (2026-04-14): begin `lvqr-whep` implementation
+
+Session 15 closed item 2 from the session-14 entry-point list by
+starting the WHEP egress implementation. No networking yet; this
+session lands the two pieces that have no dependency on `str0m` or
+axum so future sessions can iterate on signaling against a stable
+packetizer. Three files added, three files touched:
+
+1. **`crates/lvqr-ingest/src/observer.rs`**. New `RawSampleObserver`
+   sibling trait alongside the existing `FragmentObserver`, plus
+   `SharedRawSampleObserver = Arc<dyn RawSampleObserver>` and
+   `NoopRawSampleObserver`. The observer takes a
+   `&lvqr_cmaf::RawSample` and is fired from the bridge's video and
+   audio callback paths **before** the sample is muxed into an
+   fMP4 fragment. Consumers that need per-NAL AVCC or raw AAC bytes
+   subscribe here instead of re-parsing `CmafChunk` mdat bodies
+   downstream. The dep on `lvqr-cmaf` was already normal-dep via
+   session 14's deletion of the hand-rolled writer, so importing
+   `RawSample` into observer.rs is free.
+
+2. **`crates/lvqr-ingest/src/bridge.rs`**. `RtmpMoqBridge` gained a
+   `raw_observer: Option<SharedRawSampleObserver>` field plus
+   `with_raw_sample_observer` / `set_raw_sample_observer` builder
+   methods matching the existing `FragmentObserver` builders. In
+   the video callback, the already-constructed `lvqr_cmaf::RawSample`
+   (pre-`build_moof_mdat`) is handed to the observer as
+   `(broadcast, "0.mp4", &sample)`. In the audio callback, a fresh
+   `RawSample { track_id: 2, payload: aac_data.clone(), keyframe:
+   true, ... }` is built for the observer only (the existing
+   `audio_segment` mux path is unchanged); `aac_data.clone()` is a
+   `Bytes` refcount bump, not an allocation.
+
+3. **New crate `lvqr-whep`**. Registered as a workspace member in
+   `Cargo.toml` and exposed through the standard
+   `lvqr-whep = { version = "0.3.1", path = "crates/lvqr-whep" }`
+   workspace-dep entry. The crate ships:
+   * `Cargo.toml` with `bytes` as the only runtime dep and
+     `proptest` as a dev-dep. No `str0m`, no `axum`, no `tokio`
+     yet -- those land with the networking layer.
+   * `src/lib.rs` -- module-level doc note pointing at
+     `crates/lvqr-whep/docs/design.md` plus re-exports of
+     `H264Packetizer` and `H264RtpPayload` from the new `rtp`
+     module. STAP-A aggregation is explicitly called out as a v0.x
+     non-goal.
+   * `src/rtp.rs` -- stateless `H264Packetizer { mtu }` that walks
+     AVCC length-prefixed NAL sequences and emits RFC 6184 RTP
+     payloads (the bytes placed after the RTP fixed header; the
+     sender writes the header itself). Single-NAL-unit mode (§5.6)
+     for NALs that fit within the MTU budget; FU-A fragmentation
+     (§5.8) for oversized NALs with correct Start / End bit
+     handling across fragments and `is_start_of_frame` /
+     `is_end_of_frame` flags tracked across multi-NAL inputs so a
+     sender can map end-of-frame onto the RTP marker bit. The MTU
+     is clamped to a minimum of `FU_HEADER_SIZE + 1` so a
+     single-byte fragment is always representable; the default is
+     `DEFAULT_MTU = 1200` to match the `str0m` / Pion / libwebrtc
+     safe Ethernet budget.
+   * `split_avcc` helper that walks `[u32-be length][body]` tuples
+     and skips malformed entries silently: truncated length
+     prefixes, zero-length bodies, and length fields that overrun
+     the buffer all stop the walker cleanly without panicking. The
+     proptest slot below pins the never-panic property.
+   * `tests/proptest_packetizer.rs` -- the proptest slot of the
+     5-artifact contract. Four properties: (1) `packetize` never
+     panics on arbitrary bytes with arbitrary MTUs, (2) on
+     well-formed AVCC input every payload respects the MTU budget
+     and the start-of-frame / end-of-frame flags land on the first
+     and last packet only, (3) FU-A fragments round-trip back to
+     the original NAL body byte-for-byte after header
+     reconstruction, (4) single-NAL-unit mode emits a single
+     verbatim payload. 512 cases per property plus a persisted
+     regression file under
+     `tests/proptest_packetizer.proptest-regressions` pinning the
+     one degenerate case proptest found during initial development
+     (length-1 output slicing into `out[1..0]`).
+
+### Design decisions answered
+
+The session-11 design note at `crates/lvqr-whep/docs/design.md`
+lists four open questions. Session 15 picks:
+
+1. **Packetizer home**: private module `lvqr-whep::rtp`. Promote to
+   a standalone `lvqr-rtp` crate later when `lvqr-whip` needs the
+   inverse (depacketizer). No speculative abstraction.
+2. **Socket strategy**: one UDP socket per session for v0.x.
+   Simpler control flow over `str0m`'s sans-IO state machine, no
+   ICE-lite demux to write. Shared sockets become a perf-driven
+   refactor later.
+3. **WHEP bind**: new `--whep-addr` flag mirroring `--hls-port`,
+   default disabled (`Option<SocketAddr>`). Users opt in during the
+   v0.x cycle. Wiring the flag is deferred to the networking
+   session; session 15 does not touch `lvqr-cli`.
+4. **Token transport**: `Authorization: Bearer <token>` on the
+   offer POST only. The WS surface's query-param + subprotocol
+   fallbacks stay WS-specific; WHEP takes the standards-track
+   header path.
+
+### Verification run
+
+* `cargo test --workspace` -- 68 binaries, 254 individual tests,
+  0 failures. New binary: `lvqr-whep::tests::proptest_packetizer`
+  (4 proptest cases). The `lvqr-whep::rtp::tests` unit block adds
+  8 tests to the `lvqr-whep` lib binary.
+* `cargo clippy --workspace --all-targets -- -D warnings` clean.
+* `cargo fmt --all --check` clean.
+
+### What session 15 did NOT land
+
+* **No networking**. No `str0m` dep, no SDP offer/answer parser,
+  no axum router, no `WhepServer` state, no UDP socket task, no
+  ICE / DTLS handshake wiring, no `--whep-addr` CLI flag. The
+  signaling layer lands in the next session once the packetizer is
+  proven as a building block.
+* **Fuzz / integration / e2e / conformance slots**. Four of the
+  five contract slots for `lvqr-whep` are still open. They land
+  alongside the signaling layer so each closed slot has something
+  real to exercise. `crates/lvqr-whep/docs/design.md` §5 has the
+  full plan.
+* **HEVC / AV1 packetizer**. AVC-only for the first WHEP release,
+  matching the design-note non-goals.
+* **RawSampleObserver wiring in `lvqr-cli`**. The trait is
+  registered and the bridge fires it, but no consumer is attached
+  yet. A future WHEP server constructor calls
+  `RtmpMoqBridge::with_raw_sample_observer` to subscribe.
+* **Audio byte-sharing**. The raw-sample observer sees the AAC
+  access unit and the HLS path sees the same access unit re-muxed
+  into an fMP4 fragment; the two views are reference-counted
+  `Bytes` clones (cheap), not literally the same buffer. Not a
+  problem in v0.x; flagged here in case a future session tries
+  to share a single allocation across both paths.
+
+### Recommended entry point (session 16)
+
+The session-14 entry-point list is now closed: item 1 (deletion)
+and item 3 (audio E2E) landed in session 14; item 2 (WHEP start)
+landed in session 15. The natural session-16 picks are:
+
+1. **Bring up the WHEP signaling layer**. Add `str0m` as a
+   workspace dep, land `lvqr-whep::server::WhepServer` as an
+   `Arc<WhepState>` wrapping `DashMap<SessionId,
+   ActiveSubscriber>` and a handle to the `RawSample` tap, mount
+   an axum router under `/whep/{broadcast}` with the POST /
+   PATCH / DELETE handlers the design note specifies, and land
+   the integration slot
+   (`crates/lvqr-whep/tests/integration_signaling.rs`) via
+   `tower::ServiceExt::oneshot` against a synthetic SDP offer.
+   This is the entire session.
+2. **Wire `--whep-addr` in `lvqr-cli` and attach the
+   `RawSampleObserver`**. Small second commit once item 1 lands:
+   add the flag to `ServeArgs`, construct the `WhepServer` in
+   `lvqr_cli::start` when the flag is set, pass it as a
+   `RawSampleObserver` into `RtmpMoqBridge::with_raw_sample_observer`,
+   and mount the router on the configured axum binding.
+3. **Fuzz slot for the offer SDP parser**. Can land in the same
+   session as item 1 or immediately after. Seeds from the
+   webrtc-rs / Pion offer fixtures plus captured Chrome devtools
+   offers.
+
+Item 1 is the full session. Items 2 and 3 are follow-ups that
+assume item 1 landed first. E2E and conformance slots
+(`rtmp_whep_e2e.rs` + cross-implementation test against
+`simple-whep-client`) are session 17 or later: the E2E slot
+requires a working webrtc-rs client dep and the conformance slot
+needs `simple-whep-client` installed in CI, which today is not.
+
+### AUDIT-INTERNAL-2026-04-13 "Fix Plan for This Session" status
+
+All five items verified closed on main as of session 15:
+
+| Item | Status |
+|---|---|
+| 1. Validator for broadcast names in `lvqr-relay::parse_url_token` | **CLOSED** (`is_valid_broadcast_name` + unit tests in `server.rs`) |
+| 2. Defensive old-parent cleanup in `lvqr-mesh::reassign_peer` | **CLOSED** (live rebalance path retains old-parent children list correctly) |
+| 3. `--jwt-secret` CLI flag wired to `JwtAuthProvider` | **CLOSED** (`lvqr-cli::main::ServeArgs` + integration test in `crates/lvqr-cli/tests/auth_integration.rs`) |
+| 4. `lvqr-mesh/src/lib.rs` topology-planner disclaimer comment | **CLOSED** (lines 1-19) |
+| 5. Heartbeat theatrical test | **CLOSED** (`heartbeat_keeps_peer_alive` uses a real 1 s timeout) |
+
+Tracked-for-later items (still correctly deferred):
+
+* Delete `lvqr-core::{Registry, RingBuffer, GopCache}` dead code.
+  Needs verification that nothing in the Tier 2.3 data plane started
+  consuming them transitively. Low-risk cleanup; session 16 or 17.
+* Delete `lvqr-wasm`. Scheduled for v0.5.
+* Admin auth-failure metric / CORS restrict / rate limits. Tier 3.
+* `lvqr-signal` peer_id input validation. Tier 2 hardening, can
+  land opportunistically; the scope is one `validate_peer_id`
+  helper enforcing `^[A-Za-z0-9_-]{1,64}$` plus a 1-cap on
+  registrations per connection.
+* `lvqr-record` integration test via EventBus. Tier 1 follow-up;
+  non-trivial because the WS ingest handler is private in the
+  binary crate.
+
+## Session 14 (2026-04-14): delete hand-rolled fMP4 writer + RTMP audio E2E
+
+Session 14 closed items 1 and 3 from the session-13 entry-point
+list. Two logical landings in one commit (6d86214):
+
+### Item 1: retire `lvqr_ingest::remux::fmp4::video_segment`
+
+The hand-rolled video media-segment writer, its `VideoSample`
+adapter, its `build_video_segment` dispatch wrapper, and all its
+surrounding test + feature-flag scaffolding are gone. The
+`cmaf-writer` feature was default-on for a full release cycle
+(sessions 12.2 -> 13), the parity gate caught every drift in the
+transition, and the legacy path can be removed without risk.
+
+Files touched:
+
+* **`crates/lvqr-ingest/src/remux/fmp4.rs`**. Deleted: the
+  `VideoSample` struct, `video_segment` (the ~80-line hand-rolled
+  writer), `build_video_segment` (the feature-flag dispatch
+  wrapper), `build_video_segment_via_cmaf` (the cmaf-writer
+  branch), and the four unit tests (`video_segment_structure`,
+  `video_segment_data_offset_correct`, `video_segment_multiple_samples`,
+  `empty_samples_returns_empty`). Kept: `video_init_segment`,
+  `video_init_segment_with_size`, `audio_init_segment`,
+  `audio_segment`, `patch_trun_data_offset` (used by
+  `audio_segment`), `write_mpeg4_descriptor`, all the box-writing
+  helpers. The audio path is untouched; the handoff directive
+  explicitly carved out `audio_segment` as unrelated.
+
+* **`crates/lvqr-ingest/src/remux/mod.rs`**. Re-export list
+  pruned to `audio_init_segment, audio_segment,
+  video_init_segment, video_init_segment_with_size`.
+
+* **`crates/lvqr-ingest/src/bridge.rs`**. Video callback now
+  constructs `lvqr_cmaf::RawSample { track_id: 1, dts: base_dts,
+  cts_offset: cts * 90, duration: duration_ticks, payload: nalu_data,
+  keyframe }` and calls `lvqr_cmaf::build_moof_mdat(stream.video_seq,
+  1, base_dts, &[sample])` directly. No dispatch wrapper.
+
+* **`crates/lvqr-ingest/Cargo.toml`**. `default = ["rtmp"]`,
+  `cmaf-writer` feature removed, `legacy-fmp4` marker feature
+  removed, `lvqr-cmaf` flipped from optional dev-dep to normal
+  dep, `mp4-atom` dev-dep removed (was only used by the parity
+  gate).
+
+* **`crates/lvqr-cli/Cargo.toml`**. `lvqr-ingest` reverts from
+  the inline path dep (session 12.2's default-features escape
+  hatch) back to workspace inheritance. `cmaf-writer` forward
+  flag and the `full` feature definition both drop to
+  `["rtmp", "quinn-transport"]`.
+
+* **`crates/lvqr-cli/src/lib.rs`**. WS ingest handler's two
+  `remux::build_video_segment` call sites (keyframe branch +
+  delta branch) swapped for direct `lvqr_cmaf::RawSample` +
+  `lvqr_cmaf::build_moof_mdat` construction.
+
+* **Deleted**: `crates/lvqr-ingest/tests/parity_avc_init.rs`
+  (205 lines), `crates/lvqr-ingest/tests/parity_avc_segment.rs`
+  (220 lines), the fixture
+  `crates/lvqr-ingest/tests/fixtures/golden/video_segment_keyframe.mp4`.
+
+* **Pruned**: `crates/lvqr-ingest/tests/golden_fmp4.rs` dropped
+  the `video_keyframe_segment_matches_golden` test and rewrote
+  `ffprobe_accepts_concatenated_cmaf` to feed the init segment
+  plus a `lvqr_cmaf::build_moof_mdat`-produced media segment to
+  ffprobe. The audio conformance test
+  (`ffprobe_accepts_audio_init_and_frame`) is unchanged; it
+  still exercises the AAC path end-to-end.
+
+* **Pruned**: `crates/lvqr-ingest/tests/proptest_parsers.rs`
+  dropped the `video_segment_is_well_formed` proptest target and
+  the `video_sample_strategy` helper. The `video_init_segment_is_well_formed`
+  proptest is unchanged and still pins the init writer's
+  structural invariants.
+
+* **`.github/workflows/ci.yml`**. The `test-legacy-fmp4-path`
+  job is deleted wholesale. The main `test` matrix is now the
+  only test pipeline; there is no second feature-flag axis to
+  maintain.
+
+`cargo tree -p lvqr-cli -e normal` before and after confirms the
+dep graph stays sound: `lvqr-ingest` still reaches `lvqr-cmaf` as
+a normal dep, and `lvqr-cli` keeps its own direct dep on
+`lvqr-cmaf` for the WS ingest fallback.
+
+### Item 3: real RTMP-publish-with-audio E2E
+
+`crates/lvqr-cli/tests/rtmp_hls_e2e.rs` gained two FLV audio
+helpers (`flv_audio_seq_header`, `flv_audio_raw`) and a new test
+`rtmp_publish_with_audio_reaches_master_playlist` that:
+
+1. Spins up a `TestServer` with HLS enabled.
+2. Publishes a single broadcast (`live/av`) via real `rml_rtmp`:
+   video seq header, AAC seq header (AAC-LC 44100 stereo), first
+   keyframe at t=0, raw AAC frame at t=0, second keyframe at
+   t=2100 ms, second raw AAC frame at t=2100 ms.
+3. Fetches `/hls/live/av/master.m3u8` and asserts `#EXTM3U`,
+   `#EXT-X-MEDIA:` with `TYPE=AUDIO`, `#EXT-X-STREAM-INF` with
+   `AUDIO="audio"`.
+4. Fetches `/hls/live/av/audio.m3u8` and asserts `#EXTM3U` plus
+   `#EXT-X-MAP:URI="audio-init.mp4"`.
+5. Fetches `/hls/live/av/audio-init.mp4` and asserts the body
+   starts with `ftyp`.
+6. Fetches `/hls/live/av/playlist.m3u8` and asserts the video
+   playlist still references `init.mp4`.
+
+Passed first run. Closes the session-13 gap where the audio
+bridge was only exercised through a router oneshot
+(`integration_master.rs`), not through a real RTMP publish.
+
+### Known cosmetic issue flagged for follow-up
+
+The bridge's audio path writes the media segment at the AAC
+sample rate (44100 Hz via `audio_init_segment` + `audio_segment`)
+but `HlsFragmentBridge` pushes the chunk through the
+`AUDIO_48KHZ_DEFAULT` policy, so the emitted `#EXT-X-PART:DURATION`
+values are scaled by 48000 / 44100. The test output shows
+`DURATION=0.021333` for a 1024-sample AAC frame, which is
+`1024 / 48000` rather than the true `1024 / 44100`. Cosmetic
+only: routing and serving are correct, only the reported
+duration is off. A future session should either pick the audio
+policy from the actual sample rate or retire `audio_segment`
+alongside the video writer by routing AAC through
+`lvqr_cmaf::build_moof_mdat` with an audio-timescale policy.
+Tracked here so the next session catches it.
+
+### Verification run (session 14)
+
+* `cargo test --workspace` -- 67 binaries, 0 failures.
+* `cargo clippy --workspace --all-targets -- -D warnings` clean.
+* `cargo fmt --all --check` clean.
+* `cargo tree -p lvqr-cli -e normal` confirms `lvqr-cmaf`
+  reachable through both `lvqr-cli` directly and via
+  `lvqr-ingest`.
 
 ## Session 13 (2026-04-13): audio rendition group + master playlist
 
