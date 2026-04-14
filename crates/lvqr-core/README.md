@@ -1,30 +1,40 @@
 # lvqr-core
 
-Core data structures for LVQR (Live Video QUIC Relay).
+Shared cross-crate vocabulary for LVQR (Live Video QUIC Relay).
 
-- **RingBuffer**: Fixed-capacity circular buffer with `bytes::Bytes` ref-counted sharing for zero-copy fanout
-- **GopCache**: GOP (Group of Pictures) cache for late-join support with keyframe detection and LRU eviction
-- **Registry**: Subscriber registry using `tokio::sync::broadcast` for lock-free fanout to multiple subscribers
-- **Types**: StreamId, SubscriberId, TrackName, Frame, Gop, RelayStats
+After the Tier 2.1 fragment-model landing, the in-memory fanout types
+(`Registry`, `RingBuffer`, `GopCache`) that used to live here moved out
+of the crate: MoQ routing and fanout is now handled by `lvqr-moq` via
+`moq-lite::OriginProducer`, and cross-crate media exchange goes through
+`lvqr-fragment`. What remains in `lvqr-core` is the vocabulary the
+higher-tier crates share without pulling in a heavier dependency:
+
+- **Types**: `StreamId`, `SubscriberId`, `TrackName`, `Frame`,
+  `RelayStats` — small value types used as stable test and API
+  vocabulary.
+- **EventBus / RelayEvent**: lifecycle bus used by the RTMP bridge,
+  the WebSocket ingest session, and the recorder to coordinate
+  `BroadcastStarted` / `BroadcastStopped` events without polling.
+- **CoreError**: shared error type for the above.
 
 ## Usage
 
 ```rust
-use lvqr_core::{Registry, TrackName, Frame};
-use bytes::Bytes;
+use lvqr_core::{EventBus, RelayEvent, TrackName};
 
-let registry = Registry::new();
-let track = TrackName::new("live/my-stream");
+let bus = EventBus::new();
+let mut rx = bus.subscribe();
 
-// Subscribe
-let mut sub = registry.subscribe(&track);
+bus.emit(RelayEvent::BroadcastStarted {
+    name: "live/test".to_string(),
+});
 
-// Publish (zero-copy fanout to all subscribers)
-let frame = Frame::new(0, 0, true, Bytes::from_static(b"keyframe"));
-registry.publish(&track, frame);
+if let Ok(RelayEvent::BroadcastStarted { name }) = rx.recv().await {
+    println!("broadcast started: {name}");
+}
 
-// Receive
-let frame = sub.recv().await.unwrap();
+let track = TrackName::new("live/test");
+assert_eq!(track.as_str(), "live/test");
 ```
 
 ## License

@@ -157,6 +157,13 @@ async fn auth_middleware(State(auth): State<SharedAuth>, req: Request<axum::body
     let decision = auth.check(&AuthContext::Admin { token });
     if let AuthDecision::Deny { reason } = decision {
         tracing::debug!(reason = %reason, "admin request denied");
+        // Emit `lvqr_auth_failures_total{entry="admin"}` so brute-force
+        // admin-token attempts are visible to Prometheus scrapers on the
+        // same counter the RTMP / MoQ / WS ingest paths use. Without
+        // this, the admin surface was the only auth entry point that
+        // denied silently, which the internal audit flagged as a
+        // monitoring blind spot.
+        metrics::counter!("lvqr_auth_failures_total", "entry" => "admin").increment(1);
         return AdminError::Unauthorized(reason).into_response();
     }
     next.run(req).await
