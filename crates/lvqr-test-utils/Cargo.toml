@@ -21,3 +21,4 @@ tracing-subscriber = { workspace = true }
 rcgen = { workspace = true }
 rand = { workspace = true }
 anyhow = { workspace = true }
+tempfile = "3"

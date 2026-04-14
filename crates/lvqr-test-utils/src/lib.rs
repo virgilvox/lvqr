@@ -161,6 +161,119 @@ pub fn ffprobe_bytes(bytes: &[u8]) -> FfprobeResult {
     }
 }
 
+/// Outcome of running Apple `mediastreamvalidator` against an
+/// on-disk playlist.
+///
+/// `mediastreamvalidator` is part of Apple's free HLS Tools bundle
+/// (`https://developer.apple.com/download/all/?q=hls`). It is not on
+/// Homebrew and is not shipped in CI; tests should soft-skip when
+/// the binary is not available, just like [`FfprobeResult::Skipped`].
+#[derive(Debug)]
+pub enum MediaStreamValidatorResult {
+    /// Validator ran and accepted the playlist.
+    Ok,
+    /// Validator is not installed on this host. Tests treat this as
+    /// a soft skip so contributor laptops without the Apple HLS
+    /// Tools bundle do not break CI.
+    Skipped,
+    /// Validator ran and rejected the playlist.
+    Failed { stdout: String, exit_code: i32 },
+}
+
+impl MediaStreamValidatorResult {
+    pub fn is_ok(&self) -> bool {
+        matches!(self, Self::Ok)
+    }
+
+    pub fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped)
+    }
+
+    /// Panic unless the validator accepted the playlist. Skipped
+    /// runs print a warning but do not fail the test.
+    pub fn assert_accepted(self) {
+        match self {
+            Self::Ok => {}
+            Self::Skipped => {
+                eprintln!("mediastreamvalidator not installed; skipping Apple HLS validation");
+            }
+            Self::Failed { stdout, exit_code } => {
+                panic!("mediastreamvalidator rejected playlist: exit={exit_code}\n{stdout}");
+            }
+        }
+    }
+}
+
+/// Write a rendered HLS playlist plus its init segment and media
+/// segment byte blobs into a temporary directory, then invoke
+/// `mediastreamvalidator` against the playlist path.
+///
+/// `segments` is a slice of `(relative_path, bytes)` tuples. Every
+/// tuple is written verbatim into the temp dir so the playlist's
+/// `#EXT-X-MAP` / `#EXT-X-PART` / `#EXTINF` URIs resolve locally.
+/// The playlist itself is written as `<tmp>/playlist.m3u8`.
+///
+/// Returns `Skipped` if `mediastreamvalidator` is not on PATH. Tests
+/// should call `.assert_accepted()` on the result.
+pub fn mediastreamvalidator_playlist(
+    playlist: &str,
+    segments: &[(String, bytes::Bytes)],
+) -> MediaStreamValidatorResult {
+    if !is_on_path("mediastreamvalidator") {
+        return MediaStreamValidatorResult::Skipped;
+    }
+    use std::process::Command;
+
+    let tmp = match tempfile::tempdir() {
+        Ok(t) => t,
+        Err(e) => {
+            return MediaStreamValidatorResult::Failed {
+                stdout: format!("tempdir failed: {e}"),
+                exit_code: -1,
+            };
+        }
+    };
+    let playlist_path = tmp.path().join("playlist.m3u8");
+    if let Err(e) = std::fs::write(&playlist_path, playlist) {
+        return MediaStreamValidatorResult::Failed {
+            stdout: format!("write playlist failed: {e}"),
+            exit_code: -1,
+        };
+    }
+    for (rel, body) in segments {
+        let out = tmp.path().join(rel);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&out, body) {
+            return MediaStreamValidatorResult::Failed {
+                stdout: format!("write {rel} failed: {e}"),
+                exit_code: -1,
+            };
+        }
+    }
+    let output = match Command::new("mediastreamvalidator").arg(&playlist_path).output() {
+        Ok(o) => o,
+        Err(e) => {
+            return MediaStreamValidatorResult::Failed {
+                stdout: format!("spawn failed: {e}"),
+                exit_code: -1,
+            };
+        }
+    };
+    // mediastreamvalidator emits its verdict on stdout (not stderr)
+    // and exits zero even on warnings; a non-zero exit is the
+    // authoritative rejection signal.
+    if output.status.success() {
+        MediaStreamValidatorResult::Ok
+    } else {
+        MediaStreamValidatorResult::Failed {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+        }
+    }
+}
+
 fn is_on_path(name: &str) -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;

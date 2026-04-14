@@ -26,3 +26,4 @@ proptest = "1"
 tower = { workspace = true, features = ["util"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 http-body-util = "0.1"
+lvqr-test-utils = { workspace = true }
