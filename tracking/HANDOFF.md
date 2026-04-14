@@ -18,7 +18,7 @@ on: a redb-backed segment index that answers "give me every
 segment for (broadcast, track) whose decode extent overlaps
 [query_start, query_end)" in sorted order.
 
-### Commit
+### Commits
 
 * **c0d474f** -- New `crates/lvqr-archive/` crate. `SegmentRef`
   value type (broadcast, track, segment_seq, start_dts, end_dts,
@@ -36,6 +36,14 @@ segment for (broadcast, track) whose decode extent overlaps
   leading-segment inclusion when the query window starts inside
   a segment, track/broadcast boundary isolation, database reopen
   persistence, and duplicate-key idempotent overwrite.
+* **cbffab9** -- this HANDOFF entry.
+
+### Cumulative commit range since session 19
+
+Sessions 20 through 23 landed seven commits on top of `f50cc4f`:
+`580d152`, `db9fd10`, `ddcb599`, `ed9c6e3`, `8f30e8f`, `c0d474f`,
+`cbffab9`. `origin/main` is at `cbffab9`. Session 24 starts from
+there.
 
 ### Scope deliberately kept out of this session
 
