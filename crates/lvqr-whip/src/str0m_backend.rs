@@ -36,7 +36,7 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig}
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 
-use crate::bridge::{IngestSample, IngestSampleSink};
+use crate::bridge::{IngestAudioSample, IngestSample, IngestSampleSink};
 use crate::server::{SdpAnswerer, SessionHandle, WhipError};
 use lvqr_ingest::VideoCodec;
 
@@ -152,17 +152,32 @@ struct IngestCtx {
     /// Mid of the negotiated video media section, learned from
     /// `Event::MediaAdded`.
     video_mid: Option<str0m::media::Mid>,
+    /// Mid of the negotiated audio media section (Opus). Session
+    /// 29 added audio forwarding alongside the existing video
+    /// path; `None` when the WHIP publisher did not include an
+    /// audio section.
+    audio_mid: Option<str0m::media::Mid>,
     /// `true` once `Event::Connected` has fired. Samples that
     /// arrive before the connection is up are unreachable (str0m
     /// has no way to depacketize media before DTLS completes), so
     /// this flag exists mostly for logging.
     connected: bool,
-    /// First seen DTS in 90 kHz ticks. All emitted samples are
-    /// rebased to start at zero so the downstream fragment model
-    /// does not carry a random wall-clock offset.
+    /// First seen DTS in 90 kHz ticks for the video track. All
+    /// emitted video samples are rebased to start at zero so the
+    /// downstream fragment model does not carry a random
+    /// wall-clock offset.
     dts_base_90k: Option<u64>,
-    /// One-shot logging guard for the first successful sample.
+    /// First seen DTS in 48 kHz ticks for the audio track.
+    /// Rebased the same way as video but in the Opus sample
+    /// rate. Independent of `dts_base_90k` so the two tracks
+    /// land at their own zero epochs.
+    dts_base_48k: Option<u64>,
+    /// One-shot logging guard for the first successful video
+    /// sample.
     first_sample_logged: bool,
+    /// One-shot logging guard for the first successful audio
+    /// sample.
+    first_audio_logged: bool,
 }
 
 async fn run_session_loop(
@@ -265,17 +280,21 @@ fn handle_event(event: Event, ctx: &mut IngestCtx, broadcast: &str, sink: &dyn I
             ctx.video_mid = Some(added.mid);
             tracing::debug!(%broadcast, mid = ?added.mid, "whip media added: video");
         }
+        Event::MediaAdded(added) if matches!(added.kind, MediaKind::Audio) => {
+            ctx.audio_mid = Some(added.mid);
+            tracing::debug!(%broadcast, mid = ?added.mid, "whip media added: audio");
+        }
         Event::MediaAdded(added) => {
-            tracing::trace!(%broadcast, mid = ?added.mid, kind = ?added.kind, "whip media added: non-video");
+            tracing::trace!(%broadcast, mid = ?added.mid, kind = ?added.kind, "whip media added: other");
         }
         Event::MediaData(data) => {
-            if ctx.video_mid != Some(data.mid) {
-                // Non-video track (audio / data). Drop silently:
-                // an Opus-to-AAC transcoder is out of scope and the
-                // warn would spam once per audio frame.
-                return false;
+            if ctx.video_mid == Some(data.mid) {
+                forward_video_sample(data, ctx, broadcast, sink);
+            } else if ctx.audio_mid == Some(data.mid) {
+                forward_audio_sample(data, ctx, broadcast, sink);
+            } else {
+                // Unknown mid (data channel?). Drop silently.
             }
-            forward_video_sample(data, ctx, broadcast, sink);
         }
         _ => {}
     }
@@ -325,6 +344,68 @@ fn forward_video_sample(
         );
     }
     sink.on_sample(broadcast, sample);
+}
+
+/// Forward one depacketized Opus frame to the bridge via
+/// [`IngestSampleSink::on_audio_sample`].
+///
+/// Session 29 added this path so WHIP publishers negotiating
+/// Opus land audio in the MoQ broadcast alongside their video
+/// track. DTS is rebased to the first observed audio
+/// `MediaTime` rather than the video epoch so the two tracks
+/// have independent zero anchors -- MSE / MoQ subscribers
+/// align them via wall-clock presentation time, not via a
+/// shared track DTS, so an extra epoch does no harm.
+fn forward_audio_sample(
+    data: str0m::media::MediaData,
+    ctx: &mut IngestCtx,
+    broadcast: &str,
+    sink: &dyn IngestSampleSink,
+) {
+    if data.data.is_empty() {
+        return;
+    }
+    // Only accept Opus; reject any other audio codec (e.g. PCMA /
+    // PCMU fallback). We intentionally do not build a transcoder.
+    if data.params.spec().codec != Str0mCodec::Opus {
+        tracing::trace!(
+            %broadcast,
+            codec = ?data.params.spec().codec,
+            "whip: ignoring non-Opus audio sample",
+        );
+        return;
+    }
+    // str0m's `MediaTime` for an Opus track is in the 48 kHz
+    // clock domain; rebase to start at zero.
+    let abs = data.time.rebase(Frequency::FORTY_EIGHT_KHZ).numer();
+    let base = *ctx.dts_base_48k.get_or_insert(abs);
+    let dts_rebased = abs.saturating_sub(base);
+
+    // WebRTC Opus defaults to 20 ms per packet = 960 samples at
+    // 48 kHz. str0m does not expose the per-packet duration on
+    // `MediaData` in 0.18, so we default to the common value;
+    // subscribers tolerate a slightly-wrong `duration` in the
+    // `trun` box because MSE reconstructs the actual duration
+    // from the Opus packet itself.
+    const DEFAULT_OPUS_FRAME_TICKS: u32 = 960;
+
+    let payload = Bytes::copy_from_slice(&data.data);
+    let sample = IngestAudioSample {
+        dts_48k: dts_rebased,
+        duration_48k: DEFAULT_OPUS_FRAME_TICKS,
+        payload,
+    };
+
+    if !ctx.first_audio_logged {
+        ctx.first_audio_logged = true;
+        tracing::info!(
+            %broadcast,
+            dts = dts_rebased,
+            bytes = sample.payload.len(),
+            "whip: first opus sample forwarded to bridge",
+        );
+    }
+    sink.on_audio_sample(broadcast, sample);
 }
 
 /// Per-session handle produced by [`Str0mIngestAnswerer::create_session`].

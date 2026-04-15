@@ -15,8 +15,9 @@ use bytes::BytesMut;
 use lvqr_codec::aac::{AAC_SAMPLE_FREQUENCIES, AudioSpecificConfig, parse_asc};
 use lvqr_codec::hevc::HevcSps;
 use mp4_atom::{
-    Audio, Avc1, Avcc, Codec, Compressor, Dinf, Dref, Encode, Esds, FourCC, Ftyp, Hdlr, Hev1, HvcCArray, Hvcc, Mdhd,
-    Mdia, Minf, Moov, Mp4a, Mvex, Mvhd, Smhd, Stbl, Stco, Stsc, Stsd, Stsz, Stts, Tkhd, Trak, Trex, Url, Visual, Vmhd,
+    Audio, Avc1, Avcc, Codec, Compressor, Dinf, Dops, Dref, Encode, Esds, FourCC, Ftyp, Hdlr, Hev1, HvcCArray, Hvcc,
+    Mdhd, Mdia, Minf, Moov, Mp4a, Mvex, Mvhd, Opus as OpusEntry, Smhd, Stbl, Stco, Stsc, Stsd, Stsz, Stts, Tkhd, Trak,
+    Trex, Url, Visual, Vmhd,
     esds::{DecoderConfig, DecoderSpecific, EsDescriptor, SLConfig},
 };
 
@@ -591,6 +592,179 @@ fn build_mp4a(asc: &AudioSpecificConfig) -> Result<Mp4a, InitSegmentError> {
     })
 }
 
+/// Parameters needed to build an Opus init segment.
+///
+/// Session 29 added this writer so WHIP publishers negotiating
+/// Opus can land audio in the MoQ broadcast alongside their
+/// video track without a transcode. The shape intentionally
+/// carries only the three fields a real `dOps` box needs for the
+/// common mono/stereo WebRTC case; callers that need multi-
+/// stream / Ambisonic mappings would extend this with a
+/// `channel_mapping_family` / `stream_count` pair but no LVQR
+/// producer emits those today.
+#[derive(Debug, Clone)]
+pub struct OpusInitParams {
+    /// Output channel count. WebRTC Opus is almost always 1 or 2;
+    /// mp4-atom's `Dops` encoder only writes the
+    /// channel_mapping_family == 0 path, so anything above 2
+    /// here is a caller bug the writer will reject.
+    pub channel_count: u8,
+    /// Pre-skip in samples (48 kHz ticks). Carried verbatim from
+    /// the Opus encoder's `pre_skip` field, per ISO/IEC 14496-30.
+    /// A zero default is acceptable for WebRTC inbound because
+    /// the upstream encoder handles the initial silence skip on
+    /// the wire before it reaches LVQR.
+    pub pre_skip: u16,
+    /// The nominal sample rate of the input to the encoder, in
+    /// Hz. Opus itself always operates at 48 kHz internally; this
+    /// field is metadata only and `0` is accepted as "unknown".
+    pub input_sample_rate: u32,
+    /// Movie / media timescale. Per ISO/IEC 14496-30 the Opus
+    /// track timescale is 48 000 Hz regardless of encoder input
+    /// rate; this field exists so callers can override for test
+    /// fixtures but real producers pass 48_000 here.
+    pub timescale: u32,
+}
+
+/// Write an Opus init segment (`ftyp + moov` with an `Opus`
+/// sample entry + `dOps` box) into `buf`. Mirrors the AAC writer
+/// shape: a single audio trak with an `smhd` media header, a
+/// `mvex.trex` entry so fragmented samples that follow do not
+/// need per-sample defaults, and movie timescale locked to
+/// `params.timescale`.
+pub fn write_opus_init_segment(buf: &mut BytesMut, params: &OpusInitParams) -> Result<usize, InitSegmentError> {
+    let start = buf.len();
+
+    if params.channel_count == 0 || params.channel_count > 2 {
+        return Err(InitSegmentError::Encode(mp4_atom::Error::Unsupported(
+            "opus channel_count must be 1 or 2 for channel_mapping_family 0",
+        )));
+    }
+    if params.timescale > u16::MAX as u32 {
+        // ISO BMFF audio sample entry stores sample_rate as 16.16
+        // fixed point; 48 kHz fits comfortably but a pathological
+        // caller could pass 96+ kHz here. Reject rather than
+        // silently truncate, matching the AAC writer's behavior.
+        return Err(InitSegmentError::UnsupportedAacSampleRate(params.timescale));
+    }
+
+    let ftyp = Ftyp {
+        major_brand: FourCC::from(*b"isom"),
+        minor_version: 0,
+        compatible_brands: vec![
+            FourCC::from(*b"isom"),
+            FourCC::from(*b"iso6"),
+            FourCC::from(*b"msdh"),
+            FourCC::from(*b"msix"),
+        ],
+    };
+    ftyp.encode(buf)?;
+
+    let opus_entry = OpusEntry {
+        audio: Audio {
+            data_reference_index: 1,
+            channel_count: params.channel_count as u16,
+            sample_size: 16,
+            sample_rate: (params.timescale as u16).into(),
+        },
+        dops: Dops {
+            output_channel_count: params.channel_count,
+            pre_skip: params.pre_skip,
+            input_sample_rate: params.input_sample_rate,
+            output_gain: 0,
+        },
+        btrt: None,
+    };
+
+    let moov = Moov {
+        mvhd: Mvhd {
+            creation_time: 0,
+            modification_time: 0,
+            timescale: params.timescale,
+            duration: 0,
+            rate: 1.into(),
+            volume: 1.into(),
+            matrix: Default::default(),
+            next_track_id: 2,
+        },
+        meta: None,
+        mvex: Some(Mvex {
+            mehd: None,
+            trex: vec![Trex {
+                track_id: 1,
+                default_sample_description_index: 1,
+                default_sample_duration: 0,
+                default_sample_size: 0,
+                default_sample_flags: 0,
+            }],
+        }),
+        trak: vec![Trak {
+            tkhd: Tkhd {
+                creation_time: 0,
+                modification_time: 0,
+                track_id: 1,
+                duration: 0,
+                layer: 0,
+                alternate_group: 0,
+                enabled: true,
+                volume: 1.into(),
+                matrix: Default::default(),
+                width: 0.into(),
+                height: 0.into(),
+            },
+            edts: None,
+            meta: None,
+            mdia: Mdia {
+                mdhd: Mdhd {
+                    creation_time: 0,
+                    modification_time: 0,
+                    timescale: params.timescale,
+                    duration: 0,
+                    language: "und".into(),
+                },
+                hdlr: Hdlr {
+                    handler: FourCC::from(*b"soun"),
+                    name: "LVQR Opus".to_string(),
+                },
+                minf: Minf {
+                    vmhd: None,
+                    smhd: Some(Smhd::default()),
+                    dinf: Dinf {
+                        dref: Dref {
+                            urls: vec![Url::default()],
+                        },
+                    },
+                    stbl: Stbl {
+                        stsd: Stsd {
+                            codecs: vec![Codec::Opus(opus_entry)],
+                        },
+                        stts: Stts::default(),
+                        ctts: None,
+                        stss: None,
+                        stsc: Stsc::default(),
+                        stsz: Stsz::default(),
+                        stco: Some(Stco::default()),
+                        co64: None,
+                        sbgp: vec![],
+                        sgpd: vec![],
+                        subs: vec![],
+                        saio: vec![],
+                        saiz: vec![],
+                        cslg: None,
+                    },
+                    ..Default::default()
+                },
+            },
+            senc: None,
+            udta: None,
+        }],
+        udta: None,
+    };
+    moov.encode(buf)?;
+
+    Ok(buf.len() - start)
+}
+
 /// Decode an fMP4 init segment (ftyp + moov) and, from the first
 /// video sample entry, produce the ISO BMFF codec string the
 /// HLS/DASH master playlist needs to announce it.
@@ -828,6 +1002,68 @@ mod tests {
         // freq_index 4 = 44100 Hz per ISO/IEC 14496-3 Table 1.16.
         assert_eq!(ds.freq_index, 4);
         assert_eq!(ds.chan_conf, 2);
+    }
+
+    #[test]
+    fn opus_init_segment_starts_with_ftyp_and_contains_moov() {
+        let params = OpusInitParams {
+            channel_count: 2,
+            pre_skip: 0,
+            input_sample_rate: 48_000,
+            timescale: 48_000,
+        };
+        let mut buf = BytesMut::new();
+        let n = write_opus_init_segment(&mut buf, &params).expect("encode");
+        assert_eq!(n, buf.len());
+        assert_eq!(&buf[4..8], b"ftyp");
+        let ftyp_size = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        assert_eq!(&buf[ftyp_size + 4..ftyp_size + 8], b"moov");
+    }
+
+    #[test]
+    fn opus_init_segment_round_trips_through_mp4_atom() {
+        let params = OpusInitParams {
+            channel_count: 2,
+            pre_skip: 312,
+            input_sample_rate: 48_000,
+            timescale: 48_000,
+        };
+        let mut buf = BytesMut::new();
+        write_opus_init_segment(&mut buf, &params).expect("encode");
+
+        let mut cursor = std::io::Cursor::new(buf.as_ref());
+        let _ftyp = mp4_atom::Ftyp::decode(&mut cursor).expect("decode ftyp");
+        let moov = mp4_atom::Moov::decode(&mut cursor).expect("decode moov");
+        assert_eq!(moov.trak.len(), 1);
+        let codec = &moov.trak[0].mdia.minf.stbl.stsd.codecs[0];
+        let opus = match codec {
+            mp4_atom::Codec::Opus(o) => o,
+            other => panic!("expected Opus, got {:?}", std::mem::discriminant(other)),
+        };
+        assert_eq!(opus.audio.channel_count, 2);
+        assert_eq!(opus.audio.sample_size, 16);
+        assert_eq!(opus.dops.output_channel_count, 2);
+        assert_eq!(opus.dops.pre_skip, 312);
+        assert_eq!(opus.dops.input_sample_rate, 48_000);
+        assert_eq!(opus.dops.output_gain, 0);
+        assert_eq!(moov.mvhd.timescale, 48_000);
+    }
+
+    #[test]
+    fn opus_init_segment_rejects_invalid_channel_count() {
+        for bad in [0u8, 3, 6] {
+            let params = OpusInitParams {
+                channel_count: bad,
+                pre_skip: 0,
+                input_sample_rate: 48_000,
+                timescale: 48_000,
+            };
+            let mut buf = BytesMut::new();
+            assert!(
+                write_opus_init_segment(&mut buf, &params).is_err(),
+                "channel_count {bad} should be rejected"
+            );
+        }
     }
 
     #[test]

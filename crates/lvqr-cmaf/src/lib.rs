@@ -62,8 +62,8 @@ pub mod segmenter;
 pub use chunk::{CmafChunk, CmafChunkKind};
 pub use coalescer::{CmafSampleSegmenter, TrackCoalescer, build_moof_mdat};
 pub use init::{
-    AudioInitParams, HevcInitParams, InitSegmentError, VideoInitParams, detect_video_codec_string,
-    write_aac_init_segment, write_avc_init_segment, write_hevc_init_segment,
+    AudioInitParams, HevcInitParams, InitSegmentError, OpusInitParams, VideoInitParams, detect_video_codec_string,
+    write_aac_init_segment, write_avc_init_segment, write_hevc_init_segment, write_opus_init_segment,
 };
 pub use policy::{CmafPolicy, CmafPolicyState, PolicyDecision};
 pub use sample::{RawSample, SampleStream};

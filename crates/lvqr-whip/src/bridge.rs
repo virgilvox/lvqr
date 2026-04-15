@@ -32,7 +32,8 @@
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use lvqr_cmaf::{
-    HevcInitParams, RawSample, VideoInitParams, build_moof_mdat, write_avc_init_segment, write_hevc_init_segment,
+    HevcInitParams, OpusInitParams, RawSample, VideoInitParams, build_moof_mdat, write_avc_init_segment,
+    write_hevc_init_segment, write_opus_init_segment,
 };
 use lvqr_codec::hevc::{self as hevc_codec, HevcSps};
 use lvqr_fragment::{Fragment, FragmentFlags, FragmentMeta, MoqTrackSink};
@@ -68,16 +69,53 @@ pub struct IngestSample {
     pub annex_b: Bytes,
 }
 
+/// One inbound audio sample pumped from the `str0m` poll loop
+/// into the bridge.
+///
+/// WebRTC audio is Opus today. The payload is the opaque Opus
+/// frame bytes straight out of `Event::MediaData` -- str0m has
+/// already depacketized the RTP, there is no further framing to
+/// strip. The bridge wraps the bytes as a single mdat sample per
+/// Opus frame and fans them through the audio MoQ track.
+#[derive(Debug, Clone)]
+pub struct IngestAudioSample {
+    /// Decode timestamp in 48 kHz ticks (the Opus wire rate),
+    /// rebased so the first audio sample of a session reads zero.
+    /// Rebasing is the poll loop's responsibility.
+    pub dts_48k: u64,
+    /// Duration of the frame in 48 kHz ticks. WebRTC Opus
+    /// defaults to 20ms frames = 960 ticks; the poll loop passes
+    /// the real duration when str0m knows it.
+    pub duration_48k: u32,
+    /// Raw Opus packet bytes. Session 29 writes these into an
+    /// mdat sample verbatim; a future session may want to
+    /// re-frame long RTP bursts but today Opus is one-packet
+    /// per `MediaData` event.
+    pub payload: Bytes,
+}
+
 /// Contract between the WebRTC poll loop and any downstream
 /// consumer that wants to receive ingest samples. Implemented by
 /// [`WhipMoqBridge`] in production and by test stubs that only
 /// want to capture the flow for assertions.
 pub trait IngestSampleSink: Send + Sync + 'static {
-    /// Called once per depacketized access unit. The bridge
-    /// lazily constructs MoQ state on the first sample that
-    /// carries SPS + PPS for a fresh broadcast; samples that
-    /// arrive before the first keyframe are dropped.
+    /// Called once per depacketized video access unit. The
+    /// bridge lazily constructs MoQ state on the first sample
+    /// that carries parameter sets for a fresh broadcast;
+    /// samples that arrive before the first keyframe are dropped.
     fn on_sample(&self, broadcast: &str, sample: IngestSample);
+
+    /// Called once per depacketized audio (Opus) frame. Default
+    /// impl is a no-op so existing test sinks do not need to
+    /// grow a method; [`WhipMoqBridge`] overrides this to
+    /// lazily create an audio MoQ track on the first audio
+    /// frame after the video broadcast has been initialised.
+    ///
+    /// Audio samples that arrive before the first video
+    /// keyframe are dropped silently: the broadcast slot does
+    /// not exist yet and holding them back would just grow an
+    /// unbounded queue.
+    fn on_audio_sample(&self, _broadcast: &str, _sample: IngestAudioSample) {}
 }
 
 /// Drop-in [`IngestSampleSink`] that throws everything away.
@@ -94,10 +132,23 @@ impl IngestSampleSink for NoopIngestSampleSink {
 /// Constructed lazily on the first keyframe that carries SPS +
 /// PPS, torn down implicitly when the bridge itself is dropped.
 struct BroadcastState {
-    _broadcast: lvqr_moq::BroadcastProducer,
+    broadcast: lvqr_moq::BroadcastProducer,
     video_sink: MoqTrackSink,
     video_seq: u32,
     init_emitted: bool,
+    /// Optional audio sink. Lazily created on the first Opus
+    /// frame that arrives after the broadcast has a video track.
+    /// Kept as `Option` so broadcasts without audio (video-only
+    /// publishers) pay zero cost.
+    audio_sink: Option<MoqTrackSink>,
+    /// Per-broadcast audio fragment sequence, bumped on every
+    /// audio sample pushed through the sink. Starts at zero.
+    audio_seq: u32,
+    /// `true` once the bridge has called `on_init` for the audio
+    /// track; kept alongside `init_emitted` so the two tracks
+    /// have independent lifecycles and a late audio arrival does
+    /// not disturb the video path.
+    audio_init_emitted: bool,
 }
 
 /// Bridges WHIP inbound samples to a MoQ [`OriginProducer`] and
@@ -196,12 +247,80 @@ impl WhipMoqBridge {
         self.streams.insert(
             broadcast.to_string(),
             BroadcastState {
-                _broadcast: producer,
+                broadcast: producer,
                 video_sink,
                 video_seq: 0,
                 init_emitted: true,
+                audio_sink: None,
+                audio_seq: 0,
+                audio_init_emitted: false,
             },
         );
+        true
+    }
+
+    /// Ensure the broadcast has an audio MoQ track + Opus init
+    /// segment. Returns `true` iff the caller may push the audio
+    /// payload through the audio sink.
+    ///
+    /// Audio is lazy and driven by the first Opus frame: the
+    /// broadcast must already exist (video-first model), and
+    /// audio frames before that arrive get dropped by
+    /// [`Self::on_audio_sample`] with a one-shot debug log.
+    fn ensure_audio_initialized(&self, broadcast: &str) -> bool {
+        // Look up the existing broadcast. If there isn't one yet
+        // (audio arrived before video), drop the frame: the MoQ
+        // track requires a BroadcastProducer that only
+        // `ensure_initialized` (video path) creates.
+        let mut entry = match self.streams.get_mut(broadcast) {
+            Some(e) => e,
+            None => return false,
+        };
+        let state = entry.value_mut();
+        if state.audio_sink.is_some() {
+            return true;
+        }
+
+        // Create the Opus sibling track.
+        let audio_track = match state.broadcast.create_track(Track::new("1.mp4")) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(broadcast, error = ?e, "whip: failed to create MoQ audio track");
+                return false;
+            }
+        };
+
+        // Build the Opus init segment. 48 kHz / 2 channels is the
+        // WebRTC default; multi-stream layouts need a different
+        // dOps box and are out of scope for session 29.
+        let params = OpusInitParams {
+            channel_count: 2,
+            pre_skip: 0,
+            input_sample_rate: 48_000,
+            timescale: 48_000,
+        };
+        let mut buf = BytesMut::new();
+        if let Err(e) = write_opus_init_segment(&mut buf, &params) {
+            warn!(broadcast, error = ?e, "whip: failed to build Opus init segment; dropping audio");
+            return false;
+        }
+        let init = buf.freeze();
+
+        let mut audio_sink = MoqTrackSink::new(audio_track, FragmentMeta::new("Opus", 48_000));
+        audio_sink.set_init_segment(init.clone());
+        state.audio_sink = Some(audio_sink);
+        state.audio_init_emitted = true;
+        info!(broadcast, "whip: opus audio track initialized");
+
+        // Session 29 keeps audio on the MoQ track only. The HLS
+        // master playlist still advertises mp4a.40.2, WHEP
+        // negotiates Opus but currently ignores ingest audio,
+        // and the archive indexer treats every fragment
+        // uniformly. Firing the fragment observer for the Opus
+        // track would inject a second init segment into
+        // `HlsFragmentBridge` and the downstream HLS audio
+        // rendition builder still expects AAC; extending LL-HLS
+        // to serve Opus audio is session 30.
         true
     }
 
@@ -268,10 +387,10 @@ impl WhipMoqBridge {
 
 impl IngestSampleSink for WhipMoqBridge {
     fn on_sample(&self, broadcast: &str, sample: IngestSample) {
-        // Defensive: the poll loop only routes video via the
-        // `0.mp4` track convention, and audio is dropped upstream.
-        // Keep the warn slot so a misbehaving caller is obvious in
-        // logs without spamming.
+        // Defensive: empty payloads are either a str0m bug or a
+        // misbehaving caller; either way we can't do anything
+        // useful with a zero-length NAL buffer. Warn once so the
+        // cause is obvious without spamming logs.
         if sample.annex_b.is_empty() {
             if !self.audio_warn.swap(true, Ordering::Relaxed) {
                 warn!("whip: empty payload pumped through bridge (logging once)");
@@ -282,6 +401,72 @@ impl IngestSampleSink for WhipMoqBridge {
             return;
         }
         self.push_sample(broadcast, sample);
+    }
+
+    fn on_audio_sample(&self, broadcast: &str, sample: IngestAudioSample) {
+        if sample.payload.is_empty() {
+            debug!(broadcast, "whip: empty opus payload; dropping");
+            return;
+        }
+        if !self.ensure_audio_initialized(broadcast) {
+            // Broadcast not ready yet (video still waiting for the
+            // first parameter-set IDR) or Opus init writer
+            // rejected the params. Either way drop the frame.
+            return;
+        }
+        self.push_audio_sample(broadcast, sample);
+    }
+}
+
+impl WhipMoqBridge {
+    fn push_audio_sample(&self, broadcast: &str, sample: IngestAudioSample) {
+        let Some(mut entry) = self.streams.get_mut(broadcast) else {
+            return;
+        };
+        let state = entry.value_mut();
+        let Some(audio_sink) = state.audio_sink.as_mut() else {
+            return;
+        };
+        if !state.audio_init_emitted {
+            return;
+        }
+
+        // Build one `RawSample` for the Opus frame. track_id=2
+        // so the `moof` `traf` distinguishes it from the video
+        // track (track_id=1). DTS is in the track's own
+        // timescale (48 kHz); the downstream fragment model
+        // carries it verbatim.
+        let raw = RawSample {
+            track_id: 2,
+            dts: sample.dts_48k,
+            cts_offset: 0,
+            duration: sample.duration_48k,
+            payload: sample.payload,
+            keyframe: true,
+        };
+        state.audio_seq += 1;
+        let seq = state.audio_seq;
+        let dts = raw.dts;
+        let dur = raw.duration as u64;
+        let seg = build_moof_mdat(seq, 2, dts, std::slice::from_ref(&raw));
+
+        let frag = Fragment::new(
+            "1.mp4",
+            seq as u64,
+            0,
+            0,
+            dts,
+            dts,
+            dur,
+            FragmentFlags::KEYFRAME, // every opus frame is independently decodable
+            seg,
+        );
+        if let Err(e) = audio_sink.push(&frag) {
+            debug!(broadcast, error = ?e, "whip: moq audio sink push failed");
+        }
+        // Audio intentionally does NOT fire the fragment or
+        // raw-sample observer in session 29. See the comment in
+        // `ensure_audio_initialized` for the rationale.
     }
 }
 
@@ -560,5 +745,95 @@ mod tests {
         };
         bridge.on_sample("live/hevc", idr_only);
         assert_eq!(bridge.active_stream_count(), 0);
+    }
+
+    // --- Audio (Opus) coverage (session 29) ------------------------
+
+    fn avc_keyframe_sample() -> IngestSample {
+        // Same minimal fixture the happy-path H.264 AVC tests rely
+        // on: SPS + PPS + IDR, enough for the bridge to finish
+        // `build_avc_init` and create the broadcast.
+        let sps: &[u8] = &[
+            0x67, 0x42, 0x00, 0x1F, 0xD9, 0x40, 0x50, 0x04, 0xFB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+            0x03, 0x03, 0xC0, 0xF1, 0x83, 0x2A,
+        ];
+        let pps: &[u8] = &[0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0];
+        let idr: &[u8] = &[0x65, 0x88, 0x84, 0x40];
+        IngestSample {
+            dts_90k: 0,
+            keyframe: true,
+            codec: VideoCodec::H264,
+            annex_b: Bytes::from(build_annex_b(&[sps, pps, idr])),
+        }
+    }
+
+    #[tokio::test]
+    async fn opus_audio_sample_before_video_is_dropped() {
+        let origin = OriginProducer::new();
+        let bridge = WhipMoqBridge::new(origin);
+        // No video yet -> ensure_audio_initialized returns false
+        // because the broadcast has not been created. The bridge
+        // must not spontaneously create a video-less broadcast.
+        bridge.on_audio_sample(
+            "live/audio-first",
+            IngestAudioSample {
+                dts_48k: 0,
+                duration_48k: 960,
+                payload: Bytes::from_static(&[0x78, 0x01, 0x02]),
+            },
+        );
+        assert_eq!(bridge.active_stream_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn opus_audio_sample_after_video_initializes_audio_track() {
+        let origin = OriginProducer::new();
+        let bridge = WhipMoqBridge::new(origin);
+        // First land a video keyframe so the broadcast exists.
+        bridge.on_sample("live/audio-after-video", avc_keyframe_sample());
+        assert_eq!(bridge.active_stream_count(), 1);
+
+        // Now push an Opus frame. The bridge should lazily create
+        // the `1.mp4` audio track and build the Opus init segment.
+        bridge.on_audio_sample(
+            "live/audio-after-video",
+            IngestAudioSample {
+                dts_48k: 0,
+                duration_48k: 960,
+                payload: Bytes::from_static(&[0x78, 0x01, 0x02, 0x03]),
+            },
+        );
+
+        // The broadcast is still counted once -- audio does not
+        // create new broadcasts, only new tracks.
+        assert_eq!(bridge.active_stream_count(), 1);
+
+        // And a follow-up audio frame works through the already-
+        // initialized sink (idempotent ensure_audio_initialized).
+        bridge.on_audio_sample(
+            "live/audio-after-video",
+            IngestAudioSample {
+                dts_48k: 960,
+                duration_48k: 960,
+                payload: Bytes::from_static(&[0x79, 0x04, 0x05, 0x06]),
+            },
+        );
+        assert_eq!(bridge.active_stream_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn opus_empty_payload_is_dropped_silently() {
+        let origin = OriginProducer::new();
+        let bridge = WhipMoqBridge::new(origin);
+        bridge.on_sample("live/empty-audio", avc_keyframe_sample());
+        bridge.on_audio_sample(
+            "live/empty-audio",
+            IngestAudioSample {
+                dts_48k: 0,
+                duration_48k: 960,
+                payload: Bytes::new(),
+            },
+        );
+        assert_eq!(bridge.active_stream_count(), 1);
     }
 }

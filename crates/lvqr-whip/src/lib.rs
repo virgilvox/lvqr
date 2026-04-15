@@ -19,7 +19,7 @@ pub mod router;
 pub mod server;
 pub mod str0m_backend;
 
-pub use bridge::{IngestSample, IngestSampleSink, NoopIngestSampleSink, WhipMoqBridge};
+pub use bridge::{IngestAudioSample, IngestSample, IngestSampleSink, NoopIngestSampleSink, WhipMoqBridge};
 pub use depack::{annex_b_to_avcc, hevc_nal_type, split_annex_b};
 /// Re-export of the shared `VideoCodec` tag from `lvqr-ingest`.
 /// Session 28 moved the type to `lvqr-ingest::observer` so the
