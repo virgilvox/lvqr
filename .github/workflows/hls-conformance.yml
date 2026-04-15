@@ -25,16 +25,27 @@ env:
 # available the step logs the gap and the job falls back to an
 # ffmpeg-as-client compliance pass so the PR still gets a signal.
 #
-# `continue-on-error` stays on until the baseline is green. Once
-# `mediastreamvalidator` reports zero errors against the rtmp
-# fixture defined below, flip `continue-on-error` to `false` and
-# promote the job to a required check.
+# Session 33 flipped `continue-on-error` from `true` to `false`
+# after run 24480404358 against commit `6be52e2` produced a clean
+# artifact: ffmpeg-pull.log was empty (no 404s) and ffprobe
+# decoded 5 s of both H.264 video and AAC audio from the pulled
+# master playlist. The pre-session-33 baseline had a 404 on
+# `audio-seg-0.m4s` because `HlsServer::push_chunk_bytes` only
+# cached partial URIs; commit `76fc6a0` added a closed-segment
+# coalesce so plain HLS clients following `#EXTINF` links
+# resolve to real bytes. From session 33 onward any regression
+# in this ffmpeg client-pull path is a required-check failure.
+# `mediastreamvalidator` itself is still the preferred
+# authoritative signal but the macos-latest runner image does
+# not ship Apple HTTP Live Streaming Tools, so the current job
+# falls through to the soft-skip branch and the ffmpeg client-
+# pull carries the compliance read. Promotion to a true
+# validator-backed gate requires a self-hosted macOS runner.
 
 jobs:
   mediastreamvalidator:
     name: LL-HLS conformance (Apple mediastreamvalidator)
     runs-on: macos-latest
-    continue-on-error: true
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
