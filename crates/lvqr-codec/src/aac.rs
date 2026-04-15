@@ -133,8 +133,16 @@ fn read_sample_rate(r: &mut BitReader<'_>) -> Result<u32, CodecError> {
     let sfi = r.read_bits(4)? as u8;
     if sfi == 15 {
         let freq = r.read_bits(24)?;
-        if freq == 0 {
-            return Err(CodecError::MalformedAsc("explicit sample rate is zero"));
+        // Reject implausibly low explicit rates. The standard table
+        // bottoms out at 7350 Hz (`AAC_SAMPLE_FREQUENCIES[12]`), and
+        // no real-world AAC encoder produces anything below that;
+        // accepting rate=1 Hz just because the 24-bit field happened
+        // to decode that way lets attacker-shaped input through the
+        // codec parser and produces nonsense downstream (init
+        // segment timescale, LL-HLS partial duration reporting).
+        const MIN_PLAUSIBLE_HZ: u32 = 7350;
+        if freq < MIN_PLAUSIBLE_HZ {
+            return Err(CodecError::MalformedAsc("explicit sample rate below 7350 Hz"));
         }
         Ok(freq)
     } else {

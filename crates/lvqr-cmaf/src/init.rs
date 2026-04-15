@@ -591,6 +591,92 @@ fn build_mp4a(asc: &AudioSpecificConfig) -> Result<Mp4a, InitSegmentError> {
     })
 }
 
+/// Decode an fMP4 init segment (ftyp + moov) and, from the first
+/// video sample entry, produce the ISO BMFF codec string the
+/// HLS/DASH master playlist needs to announce it.
+///
+/// Returns:
+/// * `Some("avc1.PPCCLL")` for an `Avc1` entry, where `PP`,
+///   `CC`, and `LL` are the 2-digit hex of
+///   `avc_profile_indication`, `profile_compatibility`, and
+///   `avc_level_indication` parsed out of the `avcC` box.
+/// * `Some("hvc1.<profile_space_letter><profile_idc>.<compat_rev>.
+///   L<level_idc>.B0")` for a `Hev1` entry, where the
+///   compatibility flags are formatted as a reverse-bit-ordered
+///   hex value (the format DASH/HLS clients expect).
+/// * `None` if the input is not a parseable ftyp+moov, carries no
+///   video trak, or carries a sample entry type we do not yet
+///   stringify (AV1, VP9, codec-neutral, etc.).
+///
+/// The function is intended to be called once per broadcast at
+/// the moment the init segment lands (e.g. from
+/// `HlsServer::push_init`) and cached; it is cheap relative to
+/// the per-fragment path but not free (decodes the full moov).
+pub fn detect_video_codec_string(init: &[u8]) -> Option<String> {
+    use mp4_atom::Decode;
+
+    let mut cursor = std::io::Cursor::new(init);
+    mp4_atom::Ftyp::decode(&mut cursor).ok()?;
+    let moov = Moov::decode(&mut cursor).ok()?;
+    for trak in &moov.trak {
+        for codec in &trak.mdia.minf.stbl.stsd.codecs {
+            if let Some(s) = codec_string_for_codec(codec) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+fn codec_string_for_codec(codec: &Codec) -> Option<String> {
+    match codec {
+        Codec::Avc1(avc1) => Some(format!(
+            "avc1.{:02X}{:02X}{:02X}",
+            avc1.avcc.avc_profile_indication, avc1.avcc.profile_compatibility, avc1.avcc.avc_level_indication,
+        )),
+        Codec::Hev1(hev1) => Some(hvc1_codec_string(&hev1.hvcc)),
+        _ => None,
+    }
+}
+
+fn hvc1_codec_string(hvcc: &mp4_atom::Hvcc) -> String {
+    // Profile space letter: 0 -> "", 1 -> "A", 2 -> "B", 3 -> "C".
+    let space = match hvcc.general_profile_space {
+        1 => "A",
+        2 => "B",
+        3 => "C",
+        _ => "",
+    };
+    // Compatibility flags are reverse-bit-ordered then hex-
+    // encoded. ISO/IEC 14496-15 section E.3 pins this.
+    let compat = u32::from_be_bytes(hvcc.general_profile_compatibility_flags);
+    let compat_rev = compat.reverse_bits();
+    let tier = if hvcc.general_tier_flag { 'H' } else { 'L' };
+    // General constraint indicator flags: compress trailing-zero
+    // bytes to a single "B0" for the common case; a precise
+    // encoder would emit per-byte dot-separated values but every
+    // real HLS / DASH parser accepts the "B0" abbreviation for
+    // Main / Main 10 profiles without the constraint bits set.
+    let constraints_all_zero = hvcc.general_constraint_indicator_flags.iter().all(|b| *b == 0);
+    if constraints_all_zero {
+        format!(
+            "hvc1.{}{}.{:X}.{}{}.B0",
+            space, hvcc.general_profile_idc, compat_rev, tier, hvcc.general_level_idc,
+        )
+    } else {
+        let first_nonzero = hvcc
+            .general_constraint_indicator_flags
+            .iter()
+            .find(|b| **b != 0)
+            .copied()
+            .unwrap_or(0);
+        format!(
+            "hvc1.{}{}.{:X}.{}{}.{:02X}",
+            space, hvcc.general_profile_idc, compat_rev, tier, hvcc.general_level_idc, first_nonzero,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,20 +831,69 @@ mod tests {
     }
 
     #[test]
+    fn detect_video_codec_string_reports_avc1_from_avc_init() {
+        let params = VideoInitParams {
+            sps: SPS.to_vec(),
+            pps: PPS.to_vec(),
+            width: 1280,
+            height: 720,
+            timescale: 90_000,
+        };
+        let mut buf = BytesMut::new();
+        write_avc_init_segment(&mut buf, &params).expect("encode");
+        let got = detect_video_codec_string(&buf).expect("avc codec string");
+        // The fixture SPS reports profile_idc=0x42, compat=0x00,
+        // level_idc=0x1F. `{:02X}` upper-case hex keeps the string
+        // aligned with the "avc1.4200XX" convention real players
+        // emit in their `canPlayType` probes.
+        assert!(got.starts_with("avc1."), "got {got}");
+        assert_eq!(got, "avc1.42001F");
+    }
+
+    #[test]
+    fn detect_video_codec_string_reports_hvc1_from_hevc_init() {
+        let params = HevcInitParams {
+            vps: HEVC_VPS_X265.to_vec(),
+            sps: HEVC_SPS_X265_NAL.to_vec(),
+            pps: HEVC_PPS_X265.to_vec(),
+            sps_info: hevc_sps_x265_info(),
+            timescale: 90_000,
+        };
+        let mut buf = BytesMut::new();
+        write_hevc_init_segment(&mut buf, &params).expect("encode");
+        let got = detect_video_codec_string(&buf).expect("hevc codec string");
+        // x265 fixture: profile_space=0 -> "", profile_idc=1,
+        // compatibility_flags=0x60000000 reverse-bit-ordered ->
+        // 0x00000006 -> "6", tier_flag=false -> 'L',
+        // level_idc=60, constraints all zero -> "B0".
+        assert_eq!(got, "hvc1.1.6.L60.B0");
+    }
+
+    #[test]
+    fn detect_video_codec_string_returns_none_on_garbage() {
+        assert!(detect_video_codec_string(&[]).is_none());
+        assert!(detect_video_codec_string(&[0; 16]).is_none());
+        assert!(detect_video_codec_string(b"not a real mp4 init segment").is_none());
+    }
+
+    #[test]
     fn aac_init_rejects_non_indexable_sample_rate() {
-        // Explicit-frequency escape: 96000 Hz encoded via sfi=15 plus
-        // a 24-bit explicit frequency. parse_asc decodes the rate,
-        // but mp4-atom's DecoderSpecific can only store a 4-bit
-        // index, so the writer must refuse.
+        // Explicit-frequency escape: pick a rate outside the
+        // 13-entry indexable table so the writer hits the
+        // `UnsupportedAacSampleRate` branch. 11468 Hz is not in
+        // `AAC_SAMPLE_FREQUENCIES` and sits above the parser's
+        // 7350 Hz plausibility floor, so parse_asc decodes it
+        // cleanly and the writer is the one that refuses.
         //
-        // Actually 96000 IS in the indexable table (index 0). Pick a
-        // rate that is not: 11468 Hz is a well-known "custom" rate
-        // outside every standard frequency list.
+        // ASC layout: AOT=2 (5 bits) | sfi=15 (4 bits) |
+        // explicit_freq=0x002CCC (24 bits) | channel=2 (4 bits) |
+        // pad (3 bits) = 40 bits = 5 bytes. The previous fixture
+        // here (6 bytes) mispacked the bit positions and actually
+        // decoded to 1433 Hz; that slipped past the writer only
+        // because the lookup still failed regardless of the exact
+        // rate.
         let params = AudioInitParams {
-            // AOT=2 (00010), sfi=15 (1111), explicit=11468 (0x002CCC),
-            // channel=2 (0010), pad. Constructed by hand.
-            //   00010 1111 000000000010110011001100 0010 000
-            asc: vec![0x17, 0x80, 0x02, 0xCC, 0xC1, 0x00],
+            asc: vec![0x17, 0x80, 0x16, 0x66, 0x10],
             timescale: 11468,
         };
         let mut buf = BytesMut::new();
