@@ -7,6 +7,42 @@ closed-segment-bytes coalesce fix + lvqr-dash proptest harness).
 
 ## Session 33 close (2026-04-15)
 
+Eight concrete commits on top of the session-32 head. The session
+fixed the LL-HLS closed-segment-bytes cache bug the first
+`hls-conformance.yml` run surfaced, closed every open slot of
+the 5-artifact contract for `lvqr-dash`, hardened the MPD
+renderer's XML attribute escape path, verified the fix against
+a clean CI artifact, and flipped the workflow from advisory to
+required.
+
+### Verification
+
+Run 24480404358 (commit `6be52e2`, on a fresh macos-latest
+runner) produced a clean `hls-conformance-output` artifact:
+
+* `ffmpeg-pull.log` is empty -- no `audio-seg-0.m4s` 404.
+* `ffmpeg-pull.mp4` was created at 5 s length (ffmpeg was given
+  `-t 5` for the client-side pull).
+* `ffprobe.log` decodes 5.001 s of H.264 Constrained Baseline at
+  640x360 from the video stream and 4.922 s of AAC-LC 44.1 kHz
+  stereo from the audio stream. Both streams resolved through
+  the full master -> media playlist -> init -> segment pipeline,
+  which means the session-33 closed-segment coalesce in
+  `HlsServer::push_chunk_bytes` is feeding the client correctly.
+* `master.m3u8` / `playlist.m3u8` still carry the session-31
+  spec surface unchanged (EXT-X-INDEPENDENT-SEGMENTS,
+  EXT-X-SERVER-CONTROL with CAN-SKIP-UNTIL, EXT-X-PART-INF,
+  EXT-X-PRELOAD-HINT, EXT-X-RENDITION-REPORT).
+
+`mediastreamvalidator` itself still soft-skips -- the
+macos-latest runner image does not ship Apple HTTP Live
+Streaming Tools, so the ffmpeg client-pull is the only
+compliance read. A self-hosted macOS runner with HLS Tools
+pre-installed is the only path to a true validator-backed gate
+and is a future-session item.
+
+### Session 33 commit list
+
 Two concrete commits on top of the session-32 head:
 
 1. **LL-HLS closed-segment cache coalesce** (`76fc6a0`). Fixes
@@ -47,26 +83,54 @@ Two concrete commits on top of the session-32 head:
 (+6 from session 32: +1 regression test for the HLS fix and +5
 proptest cases for lvqr-dash), 0 failures, 1 ignored doctest.
 
+### Session 33 commits landed in session
+
+On top of the two originally-planned commits (`76fc6a0`,
+`810b334`), session 33 also landed:
+
+3. `2ae8caf` docs: session 33 close (self-describing)
+4. `6be52e2` Tier 2.6: golden conformance + fuzz skeleton for
+   `lvqr-dash`. Three byte-exact golden MPD fixtures plus a
+   libfuzzer skeleton closed the conformance + fuzz slots of
+   the 5-artifact contract.
+5. `ca1ceda` Tier 2.6: XML attribute escaping in `lvqr-dash`
+   MPD renderer. New `mpd::esc` helper wraps every
+   user-controlled attribute value with Cow-based entity
+   rewriting (`&` `<` `>` `"` `'`). Safe inputs hit the
+   borrowed fast path so production allocates nothing extra;
+   hostile codec strings crafted to inject via a closing `"`
+   are escaped. Three unit tests cover `esc` itself plus a
+   hostile-codecs-string round trip; the proptest harness now
+   generates codecs from `\\PC*` so every invariant runs
+   against 200 cases of adversarial string content; the fuzz
+   target asserts the previously-deferred one-`<MPD`-root
+   invariant on every iteration.
+6. `1956ee6` ci: flip `hls-conformance.yml` to required. See
+   the Verification block above.
+
 ### Session 34 entry point
 
-Primary scope: verify on a re-triggered `hls-conformance.yml`
-run that the ffmpeg client-pull path no longer 404s on
-`audio-seg-0.m4s`. If clean, flip `continue-on-error: true` to
-`false` in `.github/workflows/hls-conformance.yml` as a
-separate commit (so a future LL-HLS regression blocks
-merges). The `mediastreamvalidator` soft-skip path remains --
-promotion to a truly hard-required gate still requires a
-self-hosted macOS runner with Apple HTTP Live Streaming Tools
-pre-installed.
+Primary scope: LL-HLS sliding-window eviction for
+`PlaylistBuilder.segments`. Confirmed from `manifest.rs:461`
+that the builder appends segments forever without any
+eviction, so both the rendered playlist and the HlsState
+cache (including the new session-33 coalesced closed-segment
+bytes) grow unboundedly on long broadcasts. The fix lands
+behind a new `max_segments: Option<usize>` field on
+`PlaylistBuilderConfig` so existing tests stay green. On
+eviction the builder returns the set of dropped URIs (segment
+URI + every part URI) and `HlsServer::push_chunk_bytes` calls
+`cache.remove` for each one. Default value tbd (60 = 120 s
+at 2 s segments is the session-33 draft; needs a check that
+all existing tests pump fewer segments).
 
-Secondary scopes for session 34: the lvqr-dash fuzz target
-(pure-value renderer surface, but a libfuzzer harness over
-arbitrary `Mpd` bytes still catches edge cases in string
-escaping), LL-HLS VOD windows for DVR scrub, byte-range
-partials, and the eviction watermark so coalesced segment
-bytes get purged from the cache when the manifest drops the
-segment from its sliding window (no leak today, but observable
-memory growth on long-running broadcasts).
+Secondary scopes for session 34: `lvqr-dash` full XML
+escape-on-write verified against a real DASH-IF conformance
+reader once a self-hosted runner lands; LL-HLS VOD windows
+for DVR scrub; byte-range partials; promotion of the ffmpeg
+client-pull path to a self-hosted macos runner with Apple
+HTTP Live Streaming Tools so `mediastreamvalidator` becomes
+the primary signal.
 
 ## Session 32 close (2026-04-15)
 push of the session-26-through-31 backlog, Tier 2.6 lvqr-dash
