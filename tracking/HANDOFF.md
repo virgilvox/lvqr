@@ -5,13 +5,16 @@
 **Last Updated**: 2026-04-15 (session 31 close, WHIP Opus through
 LL-HLS fragment observer + mediastreamvalidator workflow)
 **Tests**: `cargo test --workspace` green under the default
-feature set: **82 test binaries, 361 individual tests passing**,
+feature set: **82 test binaries, 363 individual tests passing**,
 0 failures, 1 ignored doctest. `cargo clippy --workspace
 --all-targets -- -D warnings` clean. `cargo fmt --all --check`
 clean. Session-31 delta over session-30's `432290c` baseline:
-+1 test (new lvqr-whip recording-observer unit test proving
++3 tests (1 lvqr-whip recording-observer unit test proving
 `WhipMoqBridge` fires `FragmentObserver::on_init` +
-`on_fragment` for the `1.mp4` Opus track). No new test binaries.
+`on_fragment` for the `1.mp4` Opus track; 2 lvqr-hls manifest
+tests covering `EXT-X-PRELOAD-HINT` population through a
+segment boundary and across the audio-prefix config). No new
+test binaries.
 
 ## Session 31 close (2026-04-15)
 
@@ -93,6 +96,41 @@ Two concrete deliverables, each in its own commit, plus this docs pass.
   explicit carry-over item from session 30, now DONE.
 * Everything else in the maturity audit remains unchanged from
   the `432290c` baseline.
+
+3. **Tier 1 contract-script correction + whip fuzz target**
+   (`faa8d58`, `529ae8b`). Session-30 audit appendix claimed
+   the 5-artifact enforcement script was NOT STARTED; that
+   was stale. Promoted `lvqr-whip` + `lvqr-whep` into the
+   script's active `IN_SCOPE` list and added a new
+   `lvqr-whip-fuzz` skeleton (`fuzz/fuzz_targets/parse_annex_b.rs`)
+   that libfuzzes `split_annex_b` + `annex_b_to_avcc` +
+   `hevc_nal_type` over arbitrary bytes with a pointer-bounds
+   invariant. Wired both the new whip target and the
+   pre-existing-but-orphaned whep `parse_offer_sdp` target
+   into `.github/workflows/fuzz.yml` matrix so both now run
+   on every relevant PR + nightly.
+
+4. **Tier 2.5 LL-HLS media-playlist spec fixes** (`365b964`).
+   Two mechanical additions the conformance workflow's Apple
+   `mediastreamvalidator` is almost certain to flag on first
+   run:
+
+   * `EXT-X-INDEPENDENT-SEGMENTS` top-level tag. The builder
+     only closes a segment on a Segment-kind chunk, which
+     always carries a keyframe, so every closed segment is
+     genuinely independently decodable. The invariant was
+     already true; the playlist just never advertised it.
+   * `EXT-X-PRELOAD-HINT:TYPE=PART,URI="..."` emitted after
+     the trailing preliminary-part block. New
+     `Manifest::preload_hint_uri: Option<String>` field is
+     populated by `PlaylistBuilder::push` and
+     `close_pending_segment` via a new private
+     `next_part_uri()` helper that reuses the exact format
+     `push` uses for fresh parts. URIs advance through
+     `part-0-1` -> `part-0-2` -> `part-1-0` across a segment
+     boundary so a client polling immediately after the
+     boundary still sees a reachable URI. The audio prefix
+     (`audio-`) flows through the helper correctly.
 
 ### Session 32 entry point
 
