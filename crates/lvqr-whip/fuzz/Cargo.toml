@@ -1,0 +1,41 @@
+[package]
+name = "lvqr-whip-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+# Excluded from the main workspace because libfuzzer-sys requires nightly
+# rustc and sanitizer instrumentation that the stable workspace builds
+# cannot produce. Run with:
+#
+#   cargo +nightly fuzz run parse_annex_b
+#
+# Seeds for each target live under fuzz/corpus/<target>/ and can be
+# populated from real WebRTC capture dumps or from crash samples the
+# fuzzer finds. The `parse_annex_b` target hits the exact entry points
+# (`split_annex_b` + `annex_b_to_avcc`) that the `str0m` poll loop
+# runs on every `Event::MediaData` payload, so any crash found here is
+# a real reachable bug on the WHIP ingest surface.
+#
+# The proptest harness at `tests/proptest_depack.rs` already covers a
+# structured never-panic property for the same functions; libfuzzer
+# exercises the same code with unstructured mutation so the two
+# harnesses are complementary.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lvqr-whip = { path = ".." }
+
+[[bin]]
+name = "parse_annex_b"
+path = "fuzz_targets/parse_annex_b.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true

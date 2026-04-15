@@ -34,9 +34,14 @@ IN_SCOPE=(
     lvqr-codec
     lvqr-cmaf
     lvqr-hls
+    # Session 31: whip + whep are mature (H.264 + HEVC + Opus
+    # end-to-end, audit Tier 2.7 DONE). Archive has no in-crate
+    # tests/ directory yet (it is covered cross-crate by
+    # lvqr-cli/tests/rtmp_archive_e2e.rs); leave it commented
+    # until a session adds the in-crate slots.
+    lvqr-whip
+    lvqr-whep
     # Tier 2 crates below will be enabled as they land:
-    # lvqr-whip
-    # lvqr-whep
     # lvqr-dash
     # lvqr-srt
     # lvqr-rtsp
