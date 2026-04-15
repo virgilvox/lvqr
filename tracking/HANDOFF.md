@@ -1,16 +1,206 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- WHIP ingest carries HEVC end-to-end
+## Project Status: v0.4-dev -- LL-HLS master playlist is codec-aware
 
-**Last Updated**: 2026-04-14 (session 26 close, HEVC through WHIP)
-**Tests**: `cargo test --workspace` green under the default feature
-set: **79 test binaries, 339 individual tests passing**, 0
-failures, 1 ignored doctest. `cargo clippy --workspace --all-targets
--- -D warnings` clean. `cargo fmt --all --check` clean. Session-26
-deltas over the `fb9d2ac` baseline: +1 test binary and +5 tests, all
-from the new HEVC path in `lvqr-whip` (4 bridge unit tests +
-1 HEVC-specific str0m loopback E2E).
+**Last Updated**: 2026-04-14 (session 27 close, HEVC reaches LL-HLS + archive)
+**Tests**: `cargo test --workspace` green under the default
+feature set: **79 test binaries, 345 individual tests passing**,
+0 failures, 1 ignored doctest. `cargo clippy --workspace
+--all-targets -- -D warnings` clean. `cargo fmt --all --check`
+clean. Session-27 deltas over session-26's `9691744` baseline:
++6 tests (3 new `lvqr-cmaf` codec-detector unit tests, 3 new
+`lvqr-hls` master-playlist integration tests); `lvqr-codec`
+hardened (explicit AAC sample-rate floor).
 
+## Session 27 (2026-04-14): codec-aware LL-HLS for HEVC publishers
+
+Two code commits on top of session 26's `9691744`. Closes
+session-26 recommended entry-point item 1 for the HLS + archive
+half (WHEP is session 28). HEVC WHIP publishers now reach the
+LL-HLS master playlist and the DVR archive with the correct
+`CODECS="hvc1.1.6.L60.B0"` attribute in the variant stream,
+and the existing AVC path keeps its `avc1.PPCCLL` string but
+now computes it from the real init segment bytes instead of
+the session-13 hardcode. `lvqr-whip` drops its AVC-only
+fragment-observer guard; the raw-sample observer (WHEP) stays
+AVC-only pending session-28 WHEP H265 packetization.
+
+### Commits
+
+* **`37d243e`** -- `lvqr-codec: reject explicit AAC sample
+  rates below 7350 Hz`. Found by a proptest seed that decoded
+  `[87,128,0,0,128]` to a valid 1 Hz rate via the explicit 24-bit
+  escape path. The parser only rejected zero; anything else
+  slipped through and drove nonsense downstream (init segment
+  timescale, LL-HLS partial duration reporting). Tightened the
+  floor to 7350 Hz, the lowest `AAC_SAMPLE_FREQUENCIES` table
+  entry, matching the plausibility invariant `proptest_aac`
+  asserts. Also fixed a bit-packing bug in the existing
+  `lvqr-cmaf::init::tests::aac_init_rejects_non_indexable_sample_rate`
+  fixture that claimed to encode 11468 Hz but actually encoded
+  1433 Hz. Strictly a hardening commit -- unrelated to the
+  HEVC-through-HLS work, but it was blocking the workspace
+  green.
+
+* **`72970c6`** -- `Tier 2.7: codec-aware LL-HLS master
+  playlist for HEVC publishers`. The real session delivery.
+  See the "What landed" section below for the full breakdown.
+
+### What landed
+
+* **`lvqr-cmaf::detect_video_codec_string`**. New public
+  function in `crates/lvqr-cmaf/src/init.rs`. Decodes an
+  fMP4 init segment (ftyp + moov) via `mp4-atom`, walks the
+  first `Stsd` codec list, and returns the ISO BMFF codec
+  string the HLS / DASH master playlist needs to advertise:
+
+  * `Codec::Avc1(avc1)` -> `format!("avc1.{:02X}{:02X}{:02X}",
+    avcc.avc_profile_indication, avcc.profile_compatibility,
+    avcc.avc_level_indication)`. For the x264 Baseline @L3.1
+    fixture this produces `"avc1.42001F"`.
+  * `Codec::Hev1(hev1)` -> `hvc1.<space><profile>.<compat_rev
+    in hex>.<tier><level>.B0`. For the x265 Main @L2.0 fixture
+    this produces `"hvc1.1.6.L60.B0"`. The compatibility flags
+    are reverse-bit-ordered per ISO/IEC 14496-15 Annex E.3 --
+    the format every real MSE / hls.js / dash.js parser
+    expects. The trailing `.B0` abbreviation is the accepted
+    shorthand for the "all constraint bits zero" common case;
+    a non-zero constraint byte falls back to emitting the
+    first non-zero hex byte.
+  * Any other sample entry or parse failure -> `None`.
+
+* **`lvqr-hls::HlsServer`** grows a new
+  `video_codec_string: RwLock<Option<String>>` slot on
+  `HlsServerState`, populated inside `push_init` by a
+  `lvqr_cmaf::detect_video_codec_string(&bytes)` call and
+  re-read via a new public `video_codec_string()` accessor.
+  `handle_master_playlist` reads the video server's cache and
+  populates the variant's `CODECS="..."` attribute from it,
+  falling back to `avc1.640020` when no init segment has
+  arrived yet (so a client hitting master.m3u8 before the
+  first fragment still sees a syntactically valid variant).
+  Audio stays AAC-only in the string because the only live
+  audio path is RTMP + AAC; when WHIP audio lands with an
+  Opus sibling track, extend this with a parallel
+  `detect_audio_codec_string`.
+
+* **`lvqr-whip::WhipMoqBridge`** drops the AVC-only guard on
+  the fragment observer path in both `ensure_initialized`
+  and `push_sample`. HEVC publishers now fan through
+  `SharedFragmentObserver::on_init` + `on_fragment`, which
+  means the `HlsFragmentBridge` and `IndexingFragmentObserver`
+  both see HEVC fragments and treat them correctly: the HLS
+  bridge builds a CMAF policy matching the 90 kHz track
+  timescale and serves the init bytes verbatim through the
+  new `push_init` detector, while the archive observer writes
+  the fragment payload bytes to disk indifferently (the
+  codec has never mattered to archive). The raw-sample
+  observer (WHEP) still fires only for
+  `VideoCodec::H264`; threading a second H265 packetizer
+  through `lvqr-whep::str0m_backend` is session 28.
+
+### 5-artifact contract status for session 27
+
+| Slot | Status |
+|---|---|
+| Unit (`lvqr-cmaf::init::tests`) | +3 tests pinned against the real x264 Baseline + x265 Main fixtures: `detect_video_codec_string_reports_avc1_from_avc_init` asserts the exact string `"avc1.42001F"`; `detect_video_codec_string_reports_hvc1_from_hevc_init` asserts `"hvc1.1.6.L60.B0"`; `detect_video_codec_string_returns_none_on_garbage` covers the empty / zero / non-mp4 input paths. |
+| Integration (`lvqr-hls::integration_master`) | +3 tests driving the real `MultiHlsServer::router` via `tower::ServiceExt::oneshot`. `master_playlist_reports_avc1_codec_for_avc_init` pushes a real AVC init segment built via `write_avc_init_segment` and asserts the master advertises `CODECS="avc1.42001F"`. `master_playlist_reports_hvc1_codec_for_hevc_init` does the same for HEVC and additionally asserts the absence of an `avc1.` substring. `master_playlist_appends_aac_when_audio_rendition_exists` exercises the combined `"avc1.42001F,mp4a.40.2"` path with an audio rendition attached. |
+| Proptest | Unchanged; `parse_asc`'s plausibility invariant is now enforced by the parser floor so `proptest_aac` passes deterministically. |
+| Fuzz | Unchanged (still deferred for the same nightly-rustc reason). |
+| E2E | Not extended in this session: the existing `e2e_str0m_loopback_hevc` E2E proves the HEVC sample reaches the `WhipMoqBridge` capture sink, and the new lvqr-hls integration tests prove the master playlist is codec-aware. A combined "real WHIP HEVC publisher -> real LL-HLS master.m3u8 response" E2E is valuable but requires standing up both the WHIP server and the HLS server in the same test harness; that is a session-28 follow-up when the WHEP codec surface also needs the same end-to-end harness. |
+
+### Load-bearing decisions made
+
+* **Codec string detected at `push_init` time, not at every
+  master-playlist request**. Parsing a moov costs more than
+  formatting a cached string; doing it once per init segment
+  amortises across every client that hits master.m3u8. The
+  init segment is small (~400 bytes for AVC, ~450 for HEVC)
+  so the one-shot decode is cheap.
+* **No trait change to `FragmentObserver`**. The codec
+  discovery lives inside `lvqr-hls` via the init-byte decoder,
+  not as a new method on `FragmentObserver::on_init`. Keeping
+  the trait unchanged preserves Bet 3 (unified fragment model)
+  and means every other observer (archive, record, hypothetical
+  future consumers) keeps its codec-indifferent shape.
+* **ISO/IEC 14496-15 Annex E.3 bit-reversed compatibility
+  flags**. The less-common encoding but the one MSE / hls.js /
+  dash.js all accept. For the x265 fixture with
+  `general_profile_compatibility_flags = 0x60000000`, the
+  reverse-bit transform yields `0x00000006`, stringified as
+  `"6"` in the middle of `hvc1.1.6.L60.B0`. A DASH test suite
+  validator would accept either form; the reversed form is the
+  one browsers emit in their `canPlayType` probe responses,
+  so we match that.
+* **Fallback to `avc1.640020`, not `None`**. When no init has
+  been pushed yet, the master playlist still needs a CODECS
+  attribute (some players refuse the variant without one).
+  `avc1.640020` is the session-13 historical default and is
+  the right fallback for the dominant RTMP + AVC ingest path.
+  HEVC publishers hit the detector the moment their first
+  IRAP lands, so the fallback window is measured in
+  milliseconds.
+
+### Known gaps explicitly not closed in this session
+
+* **WHEP HEVC egress**. Same shape as item 1 on the session-27
+  recommended list: a parallel H265 packetizer path in
+  `lvqr-whep::str0m_backend` + SDP re-negotiation + a second
+  observer-tap guard lift in `lvqr-whip`. Budget: one session.
+* **Real end-to-end WHIP-HEVC-to-HLS-player harness**. The
+  integration tests prove the master playlist is correct; a
+  full harness that pipes a real client `Rtc` publisher
+  through the ingest bridge into the HLS server and then
+  reads master.m3u8 + init.mp4 + a media segment back over
+  HTTP is a multi-session test harness project.
+* **WHIP audio path (Opus sibling track or Opus->AAC re-
+  encode)**. Still pending from session-25 recommended item 1.
+* **CORS restrictive default, `lvqr-wasm` deletion, criterion
+  benches, fuzz catch-up**. All unchanged.
+
+### Recommended entry point (session 28)
+
+Ordered by strategic leverage against the v1.0 M1 milestone.
+
+1. **WHEP HEVC egress**. Closes the second half of the
+   session-27 recommended item 1. Work: a new
+   `lvqr-whep::str0m_backend` path for `Codec::H265`, an H265
+   Annex B -> AVCC converter (inverse of the HEVC
+   depacketizer `lvqr-whip::depack` already has), lifting the
+   raw-sample observer AVC-only guard in `WhipMoqBridge`, and
+   a loopback E2E. Budget: one session. Safari ships HEVC over
+   WebRTC natively; Chrome requires an experimental flag but
+   the negotiation path is the same.
+
+2. **WHIP audio path** (Tier 2.7 follow-on). Unchanged.
+
+3. **`lvqr-dash` egress** (Tier 2.6). Unchanged. Note that
+   the new `detect_video_codec_string` helper lands the first
+   piece of the DASH MPD generator's codec attribute; session
+   28 or 29 can share it.
+
+4. **Archive VOD playlist rendering**. Unchanged.
+
+5. **Benchmark slots via `criterion`**. Unchanged.
+
+6. **Fuzz slot catch-up**. Unchanged.
+
+7. **`lvqr-wasm` deletion**. Unchanged.
+
+8. **CORS restrictive default**. Unchanged.
+
+### Competitive-matrix delta after session 27
+
+Checkmarks gained:
+
+* **HEVC ingest via WebRTC** through to LL-HLS + archive:
+  Partial -> **Y** (MoQ + LL-HLS + archive). WHEP remains the
+  one egress crate where HEVC does not yet traverse; tracked
+  as session-28 item 1.
+* **Bug / hardening credit**: `lvqr-codec::aac::parse_asc`
+  explicit-frequency floor tightened.
+
+---
 ## Session 26 (2026-04-14): Tier 2.7 HEVC through the WHIP bridge
 
 One code change on top of session 25's `fb9d2ac`. Threads an
