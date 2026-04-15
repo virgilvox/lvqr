@@ -41,8 +41,12 @@ IN_SCOPE=(
     # until a session adds the in-crate slots.
     lvqr-whip
     lvqr-whep
+    # Session 32: lvqr-dash has server + bridge + integration +
+    # E2E coverage; proptest, fuzz, and external conformance
+    # slots are still open and surface here as educational
+    # warnings until a future session closes them.
+    lvqr-dash
     # Tier 2 crates below will be enabled as they land:
-    # lvqr-dash
     # lvqr-srt
     # lvqr-rtsp
     # lvqr-archive

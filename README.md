@@ -6,6 +6,29 @@
 
 A Rust binary that relays live video using QUIC/MoQ. Built on moq-lite for zero-copy fan-out from ingest to delivery.
 
+## Status (v0.4-dev, session 32 close)
+
+Session 32 closed Tier 2.6 `lvqr-dash`. The crate was at
+~25% after session 31 (typed MPD renderer only); session 32
+lands the `DashServer` + `MultiDashServer` axum router, the
+`DashFragmentBridge` `FragmentObserver` impl, the
+`--dash-port` (env `LVQR_DASH_PORT`) wiring into the
+`lvqr-cli` serve path, a `tower::ServiceExt::oneshot`-driven
+integration test for the router surface, and a real RTMP
+publish -> HTTP/1.1 pull E2E test for
+`/dash/{broadcast}/manifest.mpd` and its numbered segment URIs.
+Every existing RTMP and WHIP publisher now feeds MPEG-DASH
+without any per-protocol wiring because the fan-out goes
+through the same `FragmentObserver` tee the LL-HLS and
+archive observers sit on.
+
+The session-31 `hls-conformance.yml` job now runs on every
+push. macos-15-arm64 runners do not ship Apple HTTP Live
+Streaming Tools, so `mediastreamvalidator` soft-skips with a
+telemetry note and the ffmpeg client-side pull is the only
+compliance signal for now. Promotion to hard-required gates
+on a self-hosted runner path.
+
 ## Status (v0.4-dev, session 31 close)
 
 Session 31 closed the WHIP Opus -> LL-HLS fragment observer

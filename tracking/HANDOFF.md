@@ -1,19 +1,31 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- LL-HLS spec hardening + lvqr-dash skeleton
+## Project Status: v0.4-dev -- Tier 2.6 lvqr-dash closed
 
-**Last Updated**: 2026-04-15 (session 31 close after 15 commits:
-WHIP Opus closure, Apple mediastreamvalidator workflow, four
-LL-HLS spec fixes, Tier 1 contract/fuzz expansion, lvqr-dash
-MPD renderer skeleton)
+**Last Updated**: 2026-04-15 (session 32 close after 6 commits:
+push of the session-26-through-31 backlog, Tier 2.6 lvqr-dash
+DashServer + MultiDashServer + DashFragmentBridge + --dash-port
+wiring + integration router tests + RTMP->DASH E2E, 5-artifact
+contract promotion for lvqr-dash)
 
-**Branch head**: `a843f19`. Branch is 15 commits ahead of
-`origin/main`; **nothing has been pushed**. The first act of
-session 32 is to `git push` so `.github/workflows/hls-conformance.yml`
-can run on GitHub and produce the first Apple
-`mediastreamvalidator` baseline against real LVQR LL-HLS output.
+**Branch head**: session-32 close. Session 32 was the first
+session that pushed to origin/main: the session-26-through-31
+backlog (29 commits) landed at the top of the session,
+immediately followed by the Tier 2.6 finishing commits. The
+`.github/workflows/hls-conformance.yml` workflow ran for the
+first time and succeeded on macos-15-arm64; the Apple HTTP
+Live Streaming Tools (`mediastreamvalidator`) are not
+present on that runner image, so the workflow's soft-skip
+path fires and the ffmpeg client-pull is the only compliance
+read for now. That pull surfaced one real finding: the LL-HLS
+audio sub-playlist exposes closed-segment URIs
+(`audio-seg-0.m4s` and siblings) that return 404 because
+`HlsServer::push_chunk_bytes` only caches partial URIs rather
+than the coalesced closed-segment URI the manifest renderer
+lists under `#EXTINF`. See the session-33 entry point for
+the fix plan.
 **Tests**: `cargo test --workspace` green under the default
-feature set: **84 test binaries, 379 individual tests passing**,
+feature set: **86 test binaries, 395 individual tests passing**,
 0 failures, 1 ignored doctest. `cargo clippy --workspace
 --all-targets -- -D warnings` clean. `cargo fmt --all --check`
 clean. Session-31 delta over session-30's `432290c` baseline:
@@ -33,6 +45,183 @@ playlist spec floors and render-matches-skip-decision
 isomorphism; 6 lvqr-dash MPD unit tests covering the happy
 path, audio AdaptationSet emission, empty-state rejections,
 and the VOD static-type variant.
+
+## Session 32 close (2026-04-15)
+
+Six concrete commits, each in its own scope:
+
+1. **Push session 26-31 backlog** (force-of-habit first act).
+   29 commits that had been queued on the working branch
+   since before session 26 finally landed on `origin/main`
+   in one `git push`. The session-31 addition of the Apple
+   mediastreamvalidator workflow ran for the first time as
+   a consequence, and its output fed the triage below.
+
+2. **Tier 2.6 DashServer + MultiDashServer axum router**
+   (`33fcc44`). First half of the Tier 2.6 finishing
+   sequence. `crates/lvqr-dash/src/server.rs` lands a
+   per-broadcast state machine that mirrors the lvqr-hls
+   shape: `DashServer` owns video + audio init bytes + a
+   HashMap-keyed segment cache + a codec-string cache
+   parsed through `lvqr_cmaf::detect_*_codec_string` at
+   init time, and projects the state onto four routes:
+   `/manifest.mpd` (application/dash+xml), `/init-video.m4s`,
+   `/init-audio.m4s`, and `/{*uri}` dispatching
+   `seg-video-<n>.m4s` / `seg-audio-<n>.m4s` by numeric
+   parse. Pre-init codec fallback is the conservative
+   `avc1.640020` / `mp4a.40.2` pair the LL-HLS master
+   playlist already uses. `MultiDashServer` fans per-broadcast
+   `DashServer` instances under `/dash/{broadcast}/...` via
+   the same trailing-slash split the multi-HLS router uses
+   for `live/test`-style nested broadcast names. Seven new
+   unit tests bring the crate to 13.
+
+3. **Tier 2.6 DashFragmentBridge observer** (`6e70da3`).
+   `crates/lvqr-dash/src/bridge.rs` lands a
+   `FragmentObserver` impl that feeds the `MultiDashServer`.
+   Unlike `HlsFragmentBridge`, there is no `CmafPolicyState`
+   walk: the DASH live profile addresses whole segments via
+   SegmentTemplate `$Number$` URIs, so the bridge just
+   stamps a monotonic per-track counter onto every observed
+   fragment and pushes the payload bytes under that number.
+   The counter resets on every `on_init` for the same
+   broadcast so a republish (RTMP reconnect, WHIP session
+   rollover) restarts segment numbering at 1. Four unit
+   tests bring the crate to 17.
+
+4. **Tier 2.6 wire --dash-port into lvqr-cli serve path**
+   (`eace85c`). `ServeArgs` gains `--dash-port` (default 0,
+   env `LVQR_DASH_PORT`), `ServeConfig` gains
+   `dash_addr: Option<SocketAddr>`, and `start()` constructs
+   a `MultiDashServer` + `DashFragmentBridge` pair when
+   the field is `Some`, appends the bridge into the shared
+   `fragment_observers` tee so RTMP and WHIP publishers
+   both feed it, pre-binds the DASH TCP listener, and spawns
+   a dedicated axum server. `ServerHandle` grows
+   `dash_addr()` + `dash_url()` accessors and
+   `TestServerConfig` grows `with_dash()` plus
+   `TestServer::dash_addr()` / `dash_url()` for the
+   follow-on E2E test.
+
+5. **Tier 2.6 integration + E2E tests for lvqr-dash**
+   (`0ebf516`).
+   `crates/lvqr-dash/tests/integration_router.rs` drives the
+   axum router surface through `tower::ServiceExt::oneshot`
+   with four cases: single-broadcast av round trip,
+   404-before-any-push, 404-on-unknown-segment-number, and
+   multi-broadcast per-broadcast dispatch (including the
+   404 on unknown broadcast).
+   `crates/lvqr-cli/tests/rtmp_dash_e2e.rs` is the
+   TCP-loopback E2E counterpart: starts a `TestServer` with
+   `with_dash()`, publishes two keyframes via `rml_rtmp`
+   past the segmenter's 2 s boundary, then issues raw
+   HTTP/1.1 GETs to the DASH surface and asserts the
+   manifest renders with `type="dynamic"` plus the
+   `SegmentTemplate` URI, `init-video.m4s` starts with a
+   real `ftyp` box, `seg-video-1.m4s` starts with a `moof`
+   box, and an unknown broadcast returns 404. Brings the
+   workspace to 86 test binaries, 395 tests, still zero
+   failures and the one unchanged ignored doctest.
+
+6. **5-artifact contract promotion + docs** (this commit).
+   `scripts/check_test_contract.sh` promotes `lvqr-dash` into
+   the active `IN_SCOPE` list. The crate passes the
+   integration + E2E slots and surfaces warnings for the
+   still-open proptest, fuzz, and conformance slots (future
+   session). `tests/CONTRACT.md` grows a `lvqr-dash` row
+   matching the existing lvqr-hls structure. README +
+   HANDOFF + memory snapshots update to reflect the Tier 2.6
+   DONE flip.
+
+### Mediastreamvalidator triage (first CI run)
+
+The session-31 `hls-conformance.yml` workflow ran for the
+first time on the session-32 push. The runner image
+(`macos-15-arm64`) does not ship Apple HTTP Live Streaming
+Tools, so the workflow's `Locate mediastreamvalidator` step
+drops into the `mediastreamvalidator unavailable (soft gap)`
+branch and the ffmpeg client-pull is the only compliance
+signal. `/tmp/msv-out` uploaded as `hls-conformance-output`:
+
+* `master.m3u8`, `playlist.m3u8` -- captured cleanly. The
+  video playlist has 601 `#EXT-X-PART` lines, correct
+  `#EXT-X-MEDIA-SEQUENCE:0`, the session-31 spec tags
+  (`EXT-X-INDEPENDENT-SEGMENTS`, `EXT-X-SERVER-CONTROL` with
+  `CAN-SKIP-UNTIL=12.000`, `EXT-X-PART-INF`,
+  `EXT-X-PRELOAD-HINT`, `EXT-X-RENDITION-REPORT`).
+* `ffmpeg-pull.log` surfaces one real finding:
+  `http://127.0.0.1:8888/hls/live/test/audio-seg-0.m4s`
+  returns 404. Segments 6/7/8 of playlist 0 also 404. The
+  audio sub-playlist exposes closed-segment URIs under
+  `#EXTINF` lines, but `HlsServer::push_chunk_bytes` only
+  caches the *partial* URIs on push -- the coalesced
+  closed-segment URIs never get bytes stored in the cache.
+  This is a pre-existing LL-HLS bug not introduced in this
+  session; normal LL-HLS clients that fetch partials
+  directly do not hit it, but plain HLS clients (ffmpeg,
+  Safari fallback) do. See the session-33 entry point.
+* `ffprobe.log` shows the ffmpeg pull bailed because of the
+  audio 404 before getting to real conformance reads, so
+  the only compliance signal this run produces is the
+  session-31 synthetic-stub variant still running under
+  `cargo test --workspace`.
+
+Escalation path for hard-required promotion: either a
+self-hosted macOS runner with Apple HTTP Live Streaming
+Tools pre-installed, or mirror the `.pkg` into private
+storage and install it as a workflow step. Either lands
+after the session-33 closed-segment-bytes fix, so the
+ffmpeg-client read comes back green before the workflow is
+flipped to hard-required.
+
+### Maturity audit deltas
+
+* **Tier 2.6 `lvqr-dash`**: was PARTIAL ~25% at session-31
+  close, now DONE. Server + bridge + CLI wiring +
+  integration + E2E all shipped. Proptest / fuzz /
+  conformance slots remain open and surface in
+  `check_test_contract.sh` warnings.
+* **Tier 1 "Apple mediastreamvalidator in CI"**: still
+  PARTIAL. The workflow runs on every push but cannot
+  actually run `mediastreamvalidator` because the runner
+  image lacks it. Promotion to required gates on the
+  self-hosted escalation, which itself gates on the
+  closed-segment-bytes fix so the ffmpeg client-pull is
+  clean.
+* **Tier 2.5 LL-HLS**: still PARTIAL ~95% (spec surface
+  unchanged). Session 33 closes the closed-segment-bytes
+  cache bug the first CI run surfaced.
+
+### Session 33 entry point
+
+Primary scope: fix the LL-HLS closed-segment-bytes bug the
+first `hls-conformance.yml` run surfaced. The audio
+sub-playlist lists `audio-seg-<n>.m4s` URIs under `#EXTINF`
+lines, but the cache only holds `audio-part-<n>-<m>.m4s`
+URIs because `HlsServer::push_chunk_bytes` stores bytes
+keyed on the trailing preliminary_part URI only. The fix
+has two reasonable shapes:
+
+1. On `#EXTINF` segment close, coalesce the just-closed
+   segment's partials into a single CMAF blob and insert
+   it into the cache under the closed-segment URI. The
+   coalesce is just `bytes::Bytes::concat` over the
+   partials' `Bytes` values; the partials are already
+   aligned to a `moof` boundary.
+2. Or, resolve closed-segment URIs on demand in the router
+   by walking the manifest and concatenating the partials
+   for the requested `seq`.
+
+(1) is simpler but bloats the cache (every closed segment
+is stored twice). (2) is trickier but keeps the cache
+bounded. Session-33 commit A picks (1) and benchmarks the
+cache footprint; commit B is the axum route handler update
+that serves the cached bytes.
+
+Secondary scopes for session 33: the proptest + fuzz +
+external conformance slots for `lvqr-dash` that
+`check_test_contract.sh` is flagging, plus a DASH-IF
+conformance reader once the self-hosted runner lands.
 
 ## Session 31 close (2026-04-15)
 
