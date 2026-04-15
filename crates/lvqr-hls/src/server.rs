@@ -238,9 +238,20 @@ impl HlsServer {
     ///
     /// The chunk's URI is derived by the builder and used as the
     /// key in the segment / partial byte cache, so the rendered
-    /// playlist and the cached bytes always agree.
+    /// playlist and the cached bytes always agree. When this push
+    /// closes one or more segments (i.e. the builder's
+    /// `manifest.segments` length grows), their constituent parts
+    /// are coalesced into a single `Bytes` blob and inserted into
+    /// the cache under each newly-closed segment's rendered URI so
+    /// a plain HLS client (ffmpeg, Safari fallback) that walks the
+    /// `#EXTINF` lines rather than the `#EXT-X-PART` URIs still
+    /// resolves to real bytes. The pre-session-33 cache stored only
+    /// partial URIs, which made `GET /seg-<n>.m4s` a 404; the Apple
+    /// `mediastreamvalidator` soft-skip workflow surfaced this via
+    /// its ffmpeg client-side compliance pass.
     pub async fn push_chunk_bytes(&self, chunk: &CmafChunk, body: Bytes) -> Result<(), HlsError> {
         let mut builder = self.state.builder.write().await;
+        let prev_seg_len = builder.manifest().segments.len();
         builder.push(chunk)?;
         // The URI for the chunk just pushed is the last entry in
         // preliminary_parts (because `push` always appends the new
@@ -252,10 +263,12 @@ impl HlsServer {
             .last()
             .map(|p| p.uri.clone())
             .unwrap_or_default();
+        let coalesce_work = collect_coalesce_work(builder.manifest(), prev_seg_len);
         drop(builder);
         if !uri.is_empty() {
             self.state.cache.write().await.insert(uri, body);
         }
+        coalesce_closed_segments(&self.state, coalesce_work).await;
         self.state.notify.notify_waiters();
         Ok(())
     }
@@ -263,9 +276,17 @@ impl HlsServer {
     /// Force-close the currently open segment. Mirrors
     /// [`PlaylistBuilder::close_pending_segment`] and is exposed
     /// here so end-of-stream paths do not need to reach through the
-    /// server into the underlying builder.
+    /// server into the underlying builder. Applies the same
+    /// closed-segment-bytes coalesce [`Self::push_chunk_bytes`]
+    /// applies so a fetched `seg-<n>.m4s` is populated even for
+    /// the end-of-stream segment the force-close flushes.
     pub async fn close_pending_segment(&self) {
-        self.state.builder.write().await.close_pending_segment();
+        let mut builder = self.state.builder.write().await;
+        let prev_seg_len = builder.manifest().segments.len();
+        builder.close_pending_segment();
+        let coalesce_work = collect_coalesce_work(builder.manifest(), prev_seg_len);
+        drop(builder);
+        coalesce_closed_segments(&self.state, coalesce_work).await;
         self.state.notify.notify_waiters();
     }
 
@@ -283,6 +304,57 @@ impl HlsServer {
             .route("/init.mp4", get(handle_init))
             .route("/{*uri}", get(handle_uri))
             .with_state(state)
+    }
+}
+
+/// Snapshot of the `(closed_segment_uri, constituent_part_uris)`
+/// pairs for every segment in the manifest starting at `prev_seg_len`.
+/// Called after a `builder.push` / `close_pending_segment` call
+/// with `prev_seg_len` captured before the mutation, so anything
+/// at or beyond that index is by construction a segment that just
+/// closed. The cloned `String` vectors let the caller release the
+/// builder lock before taking the cache write lock, which avoids
+/// holding both at once.
+fn collect_coalesce_work(manifest: &crate::manifest::Manifest, prev_seg_len: usize) -> Vec<(String, Vec<String>)> {
+    if manifest.segments.len() <= prev_seg_len {
+        return Vec::new();
+    }
+    manifest.segments[prev_seg_len..]
+        .iter()
+        .map(|seg| (seg.uri.clone(), seg.parts.iter().map(|p| p.uri.clone()).collect()))
+        .collect()
+}
+
+/// For each `(seg_uri, part_uris)` pair, concatenate the cached
+/// bytes of every part URI and insert the resulting blob under
+/// `seg_uri`. Parts that are missing from the cache are skipped
+/// (which happens only when a partial was evicted from the
+/// sliding window before its segment closed, not in normal flow).
+/// Entirely empty results are not inserted so a stray
+/// force-close against an empty builder does not plant zero-byte
+/// bodies in the cache.
+async fn coalesce_closed_segments(state: &Arc<HlsState>, work: Vec<(String, Vec<String>)>) {
+    if work.is_empty() {
+        return;
+    }
+    let mut cache = state.cache.write().await;
+    for (seg_uri, part_uris) in work {
+        // Avoid re-coalescing a segment we already wrote (defensive
+        // against a future path that coalesces from multiple sites).
+        if cache.contains_key(&seg_uri) {
+            continue;
+        }
+        let total: usize = part_uris.iter().filter_map(|u| cache.get(u).map(|b| b.len())).sum();
+        if total == 0 {
+            continue;
+        }
+        let mut buf = bytes::BytesMut::with_capacity(total);
+        for pu in &part_uris {
+            if let Some(b) = cache.get(pu) {
+                buf.extend_from_slice(b);
+            }
+        }
+        cache.insert(seg_uri, buf.freeze());
     }
 }
 

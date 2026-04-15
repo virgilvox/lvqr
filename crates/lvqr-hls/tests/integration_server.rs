@@ -128,6 +128,59 @@ async fn playlist_init_and_segment_round_trip() {
 }
 
 #[tokio::test]
+async fn closed_segment_uri_serves_coalesced_bytes() {
+    // Regression test for the LL-HLS closed-segment-bytes cache
+    // bug surfaced by the first `hls-conformance.yml` CI run: the
+    // audio sub-playlist listed `audio-seg-0.m4s` under an
+    // `#EXTINF` line but `HlsServer::push_chunk_bytes` only cached
+    // partial URIs, so a plain HLS client (ffmpeg, Safari fallback)
+    // that followed the `#EXTINF` link got a 404. Session 33 fixes
+    // this by coalescing constituent part bytes into a single blob
+    // on every segment close. This test exercises the fix by
+    // pushing 10 partials plus one more Segment-kind chunk to
+    // close segment 0, then GET-ing `/seg-0.m4s` and asserting
+    // the body is the concatenation of the 10 pushed part bodies.
+    let server = HlsServer::new(PlaylistBuilderConfig::default());
+    server.push_init(Bytes::from_static(b"\x00init")).await;
+
+    let part_dur = 18_000u64;
+    let mut dts = 0u64;
+    let mut expected_seg0: Vec<u8> = Vec::new();
+    for i in 0..10 {
+        let kind = if i == 0 {
+            CmafChunkKind::Segment
+        } else {
+            CmafChunkKind::Partial
+        };
+        let body_bytes = format!("part-{i}-body").into_bytes();
+        expected_seg0.extend_from_slice(&body_bytes);
+        server
+            .push_chunk_bytes(&chunk(dts, part_dur, kind), Bytes::from(body_bytes))
+            .await
+            .unwrap();
+        dts += part_dur;
+    }
+    // One more Segment-kind push closes segment 0 into the
+    // rendered playlist; its bytes are the concat of the prior
+    // 10 part bodies we captured above.
+    server
+        .push_chunk_bytes(
+            &chunk(dts, part_dur, CmafChunkKind::Segment),
+            Bytes::from_static(b"seg1-part0"),
+        )
+        .await
+        .unwrap();
+
+    // The playlist now lists seg-0.m4s under an #EXTINF line; the
+    // cache must return the coalesced bytes for it.
+    let (status, ct, body) = get_body(&server, "/seg-0.m4s").await;
+    assert_eq!(status, StatusCode::OK, "GET /seg-0.m4s must succeed after close");
+    assert_eq!(ct, "video/iso.segment");
+    assert_eq!(body, expected_seg0, "coalesced bytes must equal concat of pushed parts");
+    assert!(!body.is_empty(), "coalesced segment body must be non-empty");
+}
+
+#[tokio::test]
 async fn init_returns_404_before_push() {
     let server = HlsServer::new(PlaylistBuilderConfig::default());
     let (status, _ct, _body) = get_body(&server, "/init.mp4").await;
