@@ -15,9 +15,11 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt;
-use lvqr_cmaf::{CmafChunk, CmafChunkKind};
+use lvqr_cmaf::{
+    CmafChunk, CmafChunkKind, HevcInitParams, VideoInitParams, write_avc_init_segment, write_hevc_init_segment,
+};
 use lvqr_hls::{MultiHlsServer, PlaylistBuilderConfig};
 use tower::ServiceExt;
 
@@ -180,4 +182,158 @@ async fn master_playlist_returns_404_for_unknown_broadcast() {
     let multi = MultiHlsServer::new(PlaylistBuilderConfig::default());
     let (status, _, _) = get(&multi, "/hls/live/ghost/master.m3u8").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// --- Session 27: codec string parsed from the pushed init segment
+// flows into the master playlist ---
+
+/// H.264 Baseline @L3.1 SPS + PPS pinned against the same fixture
+/// used by `lvqr-cmaf::init::tests`. Pushing a real AVC init
+/// segment through `HlsServer::push_init` exercises the
+/// `detect_video_codec_string` call site from end to end.
+const AVC_SPS: &[u8] = &[
+    0x67, 0x42, 0x00, 0x1F, 0xD9, 0x40, 0x50, 0x04, 0xFB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
+    0x03, 0xC0, 0xF1, 0x83, 0x2A,
+];
+const AVC_PPS: &[u8] = &[0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0];
+
+/// Real x265 HEVC Main 3.0 VPS + SPS + PPS, same corpus pin as
+/// `lvqr-cmaf::init::tests` and `lvqr-whip::bridge::tests`.
+const HEVC_VPS: &[u8] = &[
+    0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+    0x00, 0x3c, 0x95, 0x94, 0x09,
+];
+const HEVC_SPS: &[u8] = &[
+    0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0,
+    0x0a, 0x08, 0x0f, 0x16, 0x59, 0x59, 0x52, 0x93, 0x0b, 0xc0, 0x5a, 0x02, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00,
+    0x03, 0x00, 0x3c, 0x10,
+];
+const HEVC_PPS: &[u8] = &[0x44, 0x01, 0xc0, 0x73, 0xc1, 0x89];
+
+fn hevc_sps_x265_info() -> lvqr_codec::hevc::HevcSps {
+    lvqr_codec::hevc::HevcSps {
+        general_profile_space: 0,
+        general_tier_flag: false,
+        general_profile_idc: 1,
+        general_profile_compatibility_flags: 0x60000000,
+        general_level_idc: 60,
+        chroma_format_idc: 1,
+        pic_width_in_luma_samples: 320,
+        pic_height_in_luma_samples: 240,
+    }
+}
+
+#[tokio::test]
+async fn master_playlist_reports_avc1_codec_for_avc_init() {
+    let multi = MultiHlsServer::new(PlaylistBuilderConfig::default());
+    let video = multi.ensure_video("live/avc");
+    let mut buf = BytesMut::new();
+    write_avc_init_segment(
+        &mut buf,
+        &VideoInitParams {
+            sps: AVC_SPS.to_vec(),
+            pps: AVC_PPS.to_vec(),
+            width: 1280,
+            height: 720,
+            timescale: 90_000,
+        },
+    )
+    .expect("write avc init");
+    video.push_init(buf.freeze()).await;
+    video
+        .push_chunk_bytes(
+            &video_chunk(0, 180_000, CmafChunkKind::Segment),
+            Bytes::from_static(b"video-chunk-0"),
+        )
+        .await
+        .unwrap();
+
+    let (status, _, body) = get(&multi, "/hls/live/avc/master.m3u8").await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.contains("CODECS=\"avc1.42001F\""),
+        "master should advertise avc1.42001F for this fixture: {body}"
+    );
+}
+
+#[tokio::test]
+async fn master_playlist_reports_hvc1_codec_for_hevc_init() {
+    let multi = MultiHlsServer::new(PlaylistBuilderConfig::default());
+    let video = multi.ensure_video("live/hevc");
+    let mut buf = BytesMut::new();
+    write_hevc_init_segment(
+        &mut buf,
+        &HevcInitParams {
+            vps: HEVC_VPS.to_vec(),
+            sps: HEVC_SPS.to_vec(),
+            pps: HEVC_PPS.to_vec(),
+            sps_info: hevc_sps_x265_info(),
+            timescale: 90_000,
+        },
+    )
+    .expect("write hevc init");
+    video.push_init(buf.freeze()).await;
+    video
+        .push_chunk_bytes(
+            &video_chunk(0, 180_000, CmafChunkKind::Segment),
+            Bytes::from_static(b"video-chunk-0"),
+        )
+        .await
+        .unwrap();
+
+    let (status, _, body) = get(&multi, "/hls/live/hevc/master.m3u8").await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.contains("CODECS=\"hvc1.1.6.L60.B0\""),
+        "master should advertise hvc1 for this HEVC fixture: {body}"
+    );
+    assert!(
+        !body.contains("avc1."),
+        "master should not fall back to avc1 when init is HEVC: {body}"
+    );
+}
+
+#[tokio::test]
+async fn master_playlist_appends_aac_when_audio_rendition_exists() {
+    let multi = MultiHlsServer::new(PlaylistBuilderConfig::default());
+    let video = multi.ensure_video("live/avc-aac");
+    let mut buf = BytesMut::new();
+    write_avc_init_segment(
+        &mut buf,
+        &VideoInitParams {
+            sps: AVC_SPS.to_vec(),
+            pps: AVC_PPS.to_vec(),
+            width: 1280,
+            height: 720,
+            timescale: 90_000,
+        },
+    )
+    .unwrap();
+    video.push_init(buf.freeze()).await;
+    video
+        .push_chunk_bytes(
+            &video_chunk(0, 180_000, CmafChunkKind::Segment),
+            Bytes::from_static(b"v"),
+        )
+        .await
+        .unwrap();
+    let audio = multi.ensure_audio("live/avc-aac", 48_000);
+    audio.push_init(Bytes::from_static(b"audio-init")).await;
+    audio
+        .push_chunk_bytes(
+            &audio_chunk(0, 96_000, CmafChunkKind::Segment),
+            Bytes::from_static(b"a"),
+        )
+        .await
+        .unwrap();
+
+    let (status, _, body) = get(&multi, "/hls/live/avc-aac/master.m3u8").await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.contains("CODECS=\"avc1.42001F,mp4a.40.2\""),
+        "master should combine detected video codec with AAC for the audio rendition: {body}"
+    );
 }

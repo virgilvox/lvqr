@@ -77,7 +77,7 @@ use axum::{
     routing::get,
 };
 use bytes::Bytes;
-use lvqr_cmaf::CmafChunk;
+use lvqr_cmaf::{CmafChunk, detect_video_codec_string};
 use tokio::sync::{Notify, RwLock};
 
 use crate::manifest::{HlsError, PlaylistBuilder, PlaylistBuilderConfig};
@@ -101,6 +101,14 @@ const BLOCK_TIMEOUT_MULTIPLIER: u32 = 3;
 struct HlsState {
     builder: RwLock<PlaylistBuilder>,
     init_segment: RwLock<Option<Bytes>>,
+    /// ISO BMFF codec string parsed out of the init segment at
+    /// [`HlsServer::push_init`] time (e.g. `"avc1.42001F"` or
+    /// `"hvc1.1.6.L60.B0"`). `None` until an init segment has
+    /// been pushed or when the init bytes cannot be parsed. The
+    /// master-playlist handler reads this to populate the
+    /// `CODECS="..."` attribute so HEVC publishers no longer
+    /// advertise an `avc1` codec and vice versa.
+    video_codec_string: RwLock<Option<String>>,
     /// URI -> bytes. Keys are emitted by `PlaylistBuilder` so they
     /// match what the rendered playlist points at. We keep a single
     /// flat map for both segments and partials; the router does not
@@ -135,6 +143,7 @@ impl HlsServer {
             state: Arc::new(HlsState {
                 builder: RwLock::new(builder),
                 init_segment: RwLock::new(None),
+                video_codec_string: RwLock::new(None),
                 cache: RwLock::new(HashMap::new()),
                 notify: Notify::new(),
                 target_duration_secs,
@@ -145,9 +154,27 @@ impl HlsServer {
     /// Publish the init segment. Idempotent: subsequent calls
     /// overwrite, which is the right thing to do when the producer
     /// resets (e.g. after an RTMP reconnect on the same broadcast).
+    ///
+    /// Also re-parses the init bytes through
+    /// [`detect_video_codec_string`] so the master-playlist handler
+    /// has a correct `CODECS="..."` attribute for AVC **and** HEVC
+    /// publishers. Audio-only HLS servers (the AAC sibling inside
+    /// [`MultiHlsServer`]) will see `None` here because an AAC
+    /// init segment has no video sample entry; the master handler
+    /// handles that case by only filling in the video codec slot.
     pub async fn push_init(&self, bytes: Bytes) {
+        let detected = detect_video_codec_string(&bytes);
+        *self.state.video_codec_string.write().await = detected;
         *self.state.init_segment.write().await = Some(bytes);
         self.state.notify.notify_waiters();
+    }
+
+    /// Read the cached video codec string parsed out of the
+    /// init segment at [`Self::push_init`] time. `None` when no
+    /// init segment has arrived yet or the sample entry is not
+    /// one we stringify (e.g. AAC-only init).
+    pub async fn video_codec_string(&self) -> Option<String> {
+        self.state.video_codec_string.read().await.clone()
     }
 
     /// Push a chunk plus its wire-ready bytes. Returns an error iff
@@ -538,12 +565,13 @@ async fn handle_multi_get(
 }
 
 async fn handle_master_playlist(multi: &MultiHlsServer, broadcast: &str) -> Response {
-    if multi.video(broadcast).is_none() {
+    let Some(video) = multi.video(broadcast) else {
         return (StatusCode::NOT_FOUND, format!("unknown broadcast {broadcast}")).into_response();
-    }
+    };
     let mut master = crate::master::MasterPlaylist::default();
     let audio_group_id = "audio";
-    if multi.audio(broadcast).is_some() {
+    let has_audio = multi.audio(broadcast).is_some();
+    if has_audio {
         master.renditions.push(crate::master::MediaRendition {
             rendition_type: crate::master::MediaRenditionType::Audio,
             group_id: audio_group_id.into(),
@@ -554,16 +582,32 @@ async fn handle_master_playlist(multi: &MultiHlsServer, broadcast: &str) -> Resp
             language: None,
         });
     }
+    // Video codec string comes from the init segment parsed at
+    // `push_init` time via `lvqr_cmaf::detect_video_codec_string`.
+    // Falls back to the session-13 default when no init segment
+    // has arrived yet so a client hitting master.m3u8 before the
+    // first fragment still sees a syntactically valid variant.
+    let video_codec = video
+        .video_codec_string()
+        .await
+        .unwrap_or_else(|| "avc1.640020".to_string());
+    // Audio stays AAC-LC because RTMP (the only current audio
+    // publisher) carries AAC. When WHIP audio lands with Opus as
+    // a sibling track, extend this with a parallel
+    // `detect_audio_codec_string` path.
+    let codecs = if has_audio {
+        format!("{video_codec},mp4a.40.2")
+    } else {
+        video_codec
+    };
     master.variants.push(crate::master::VariantStream {
-        // Session 13 ships no real bandwidth / codecs estimation;
-        // emit a plausible H.264 baseline + AAC-LC string plus a
-        // conservative bitrate so a player can pick the variant up
-        // without complaining. Real values will come from the
-        // producer-side catalog once the codec parsers land.
+        // Session 13 shipped a flat 2.5 Mbps estimate; leaving it
+        // unchanged because bandwidth discovery still requires a
+        // producer-side catalog that the bridge does not emit yet.
         bandwidth_bps: 2_500_000,
-        codecs: "avc1.640020,mp4a.40.2".into(),
+        codecs,
         resolution: None,
-        audio_group: multi.audio(broadcast).is_some().then(|| audio_group_id.to_string()),
+        audio_group: has_audio.then(|| audio_group_id.to_string()),
         uri: "playlist.m3u8".into(),
     });
     let body = master.render();

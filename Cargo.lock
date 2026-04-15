@@ -1618,6 +1618,7 @@ dependencies = [
  "bytes",
  "http-body-util",
  "lvqr-cmaf",
+ "lvqr-codec",
  "lvqr-core",
  "lvqr-test-utils",
  "proptest",

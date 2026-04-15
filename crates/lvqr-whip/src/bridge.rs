@@ -111,7 +111,6 @@ struct BroadcastState {
     video_sink: MoqTrackSink,
     video_seq: u32,
     init_emitted: bool,
-    codec: VideoCodec,
 }
 
 /// Bridges WHIP inbound samples to a MoQ [`OriginProducer`] and
@@ -195,16 +194,15 @@ impl WhipMoqBridge {
         video_sink.set_init_segment(init.clone());
         info!(broadcast, width, height, ?codec, "whip: broadcast initialized");
 
-        // Fire observer taps only for AVC publishers. The LL-HLS,
-        // WHEP, and archive surfaces currently hard-code `avc1` in
-        // their respective sample-entry / master-playlist paths;
-        // forwarding HEVC init bytes through them would advertise
-        // a wrong codec string. HEVC reaches MoQ subscribers only
-        // until those surfaces grow a real codec dispatch (tracked
-        // for session 27).
-        if matches!(codec, VideoCodec::H264)
-            && let Some(obs) = self.observer.as_ref()
-        {
+        // Session 27 lifted the AVC-only guard on the fragment
+        // observer: `lvqr-hls::HlsServer::push_init` now parses
+        // the init bytes via `lvqr_cmaf::detect_video_codec_string`
+        // and emits the correct `CODECS="..."` attribute in the
+        // master playlist, and `lvqr-archive`'s indexing observer
+        // is codec-indifferent (it stores the bytes verbatim).
+        // The raw-sample observer (WHEP) is still AVC-only because
+        // WHEP's str0m backend hard-codes the H.264 packetizer.
+        if let Some(obs) = self.observer.as_ref() {
             obs.on_init(broadcast, "0.mp4", 90_000, init);
         }
 
@@ -215,7 +213,6 @@ impl WhipMoqBridge {
                 video_sink,
                 video_seq: 0,
                 init_emitted: true,
-                codec,
             },
         );
         true
@@ -254,7 +251,6 @@ impl WhipMoqBridge {
         if !state.init_emitted {
             return;
         }
-        let codec = state.codec;
         state.video_seq += 1;
         let seq = state.video_seq;
         let dts = raw.dts;
@@ -275,9 +271,10 @@ impl WhipMoqBridge {
         // value lock across a potentially reentrant call is a
         // deadlock footgun.
         drop(entry);
-        if matches!(codec, VideoCodec::H264)
-            && let Some(obs) = self.observer.as_ref()
-        {
+        // Fragment observer (HLS + archive) fires for both codecs
+        // after session 27. See the matching note in
+        // `ensure_initialized` for the rationale.
+        if let Some(obs) = self.observer.as_ref() {
             obs.on_fragment(broadcast, "0.mp4", &frag);
         }
     }
