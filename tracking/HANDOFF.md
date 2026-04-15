@@ -112,25 +112,68 @@ On top of the two originally-planned commits (`76fc6a0`,
 
 Primary scope: LL-HLS sliding-window eviction for
 `PlaylistBuilder.segments`. Confirmed from `manifest.rs:461`
-that the builder appends segments forever without any
-eviction, so both the rendered playlist and the HlsState
-cache (including the new session-33 coalesced closed-segment
-bytes) grow unboundedly on long broadcasts. The fix lands
-behind a new `max_segments: Option<usize>` field on
-`PlaylistBuilderConfig` so existing tests stay green. On
-eviction the builder returns the set of dropped URIs (segment
-URI + every part URI) and `HlsServer::push_chunk_bytes` calls
-`cache.remove` for each one. Default value tbd (60 = 120 s
-at 2 s segments is the session-33 draft; needs a check that
-all existing tests pump fewer segments).
+that the builder's `close_pending_segment` calls
+`self.manifest.segments.push(seg)` with no eviction path,
+and no caller truncates the vector later. Both the rendered
+playlist and the `HlsState` cache (including the session-33
+coalesced closed-segment bytes) therefore grow unboundedly
+on long broadcasts. A 24 h stream at the default 2 s target
+duration produces ~43 200 segments, each holding ~10 parts;
+memory use scales linearly without bound.
 
-Secondary scopes for session 34: `lvqr-dash` full XML
-escape-on-write verified against a real DASH-IF conformance
-reader once a self-hosted runner lands; LL-HLS VOD windows
-for DVR scrub; byte-range partials; promotion of the ffmpeg
-client-pull path to a self-hosted macos runner with Apple
-HTTP Live Streaming Tools so `mediastreamvalidator` becomes
-the primary signal.
+Planned commits:
+
+**Commit A** -- `manifest.rs`: add
+`max_segments: Option<usize>` to `PlaylistBuilderConfig`
+(default `None` for backwards compat), add an
+`evicted_uris: Vec<String>` buffer field to `PlaylistBuilder`,
+and a `drain_evicted_uris(&mut self) -> Vec<String>` method
+that empties it. Modify `close_pending_segment` so that after
+the `push(seg)` call, when `config.max_segments.is_some_and(|m| segments.len() > m)`,
+drain the overflow from the front of `segments` and push
+every dropped `segment.uri` plus every `part.uri` inside that
+segment into `evicted_uris`. Unit tests in the `tests` module
+at the bottom of `manifest.rs`: construct a builder with
+`max_segments = Some(3)`, push 6 Segment-kind chunks,
+assert `segments.len() == 3`, assert `segments.first().sequence == 3`,
+assert `drain_evicted_uris()` returned the expected URIs
+for the three dropped segments (`seg-0.m4s`, `seg-1.m4s`,
+`seg-2.m4s`) plus each drained segment's parts, and assert
+`EXT-X-MEDIA-SEQUENCE:3` in the rendered manifest.
+
+**Commit B** -- `server.rs`: inside `push_chunk_bytes` and
+`close_pending_segment`, after the existing `builder.push` /
+`builder.close_pending_segment` call (and before the builder
+lock is released), also collect `drain_evicted_uris()` into
+the same work stash that already carries the coalesce list.
+After dropping the builder lock, under the cache write lock,
+call `cache.remove(&uri)` for every drained URI. Integration
+test in `tests/integration_server.rs`: construct an
+`HlsServer` with `max_segments = Some(3)`, push 6 full
+segments through `push_chunk_bytes`, assert that
+`GET /seg-0.m4s` returns 404 (coalesced bytes evicted from
+cache), `GET /seg-3.m4s` returns non-empty (latest retained
+segment resolves), and the rendered playlist shows
+`EXT-X-MEDIA-SEQUENCE:3` via a `GET /playlist.m3u8`.
+
+**Commit C** -- `lvqr-cli/src/lib.rs`: flip the
+`MultiHlsServer::new(PlaylistBuilderConfig::default())` call
+to a configured one with `max_segments = Some(60)` (120 s
+history at 2 s target duration, roughly matching the DVR
+scrub depth the archive path already supports). No test
+update needed; existing tests use `PlaylistBuilderConfig::default()`
+directly and stay at `None`.
+
+**Commit D** -- docs: session 34 close, HANDOFF, memory.
+
+Secondary scopes for session 34 if budget allows:
+LL-HLS VOD windows for DVR scrub; byte-range partials;
+promotion of the ffmpeg client-pull path to a self-hosted
+macOS runner with Apple HTTP Live Streaming Tools so
+`mediastreamvalidator` becomes the primary signal
+(currently the workflow soft-skips because macos-latest
+runner images do not ship the tool, and the ffmpeg pull is
+the only compliance read).
 
 ## Session 32 close (2026-04-15)
 push of the session-26-through-31 backlog, Tier 2.6 lvqr-dash
