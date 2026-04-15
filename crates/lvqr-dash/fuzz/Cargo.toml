@@ -1,0 +1,38 @@
+[package]
+name = "lvqr-dash-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+# Excluded from the main workspace because libfuzzer-sys requires
+# nightly rustc and sanitizer instrumentation that the stable
+# workspace builds cannot produce. Run with:
+#
+#   cargo +nightly fuzz run render_mpd
+#
+# Seeds for each target live under fuzz/corpus/<target>/ and can be
+# populated from real MPD strings or from crash samples the fuzzer
+# finds. The `render_mpd` target interprets the input as the
+# `codecs` attribute of a single-Representation MPD and renders,
+# covering the attribute-string escape path that the proptest
+# harness at `tests/proptest_mpd.rs` deliberately does not exercise
+# (the proptest pins codecs to safe values; libfuzzer takes the
+# unstructured mutation side of the same surface).
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lvqr-dash = { path = ".." }
+
+[[bin]]
+name = "render_mpd"
+path = "fuzz_targets/render_mpd.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true
