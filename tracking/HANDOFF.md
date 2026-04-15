@@ -12,6 +12,149 @@ clean. Session-30 delta over session-29's `7d72ba7` baseline:
 lvqr-hls Opus master-playlist integration test, 1 new WHEP Opus
 loopback E2E); +1 test binary.
 
+## Maturity audit -- what is left to v1.0 (session 30 follow-up)
+
+Written after session 30 closed to calibrate the next 10-12
+sessions against `tracking/ROADMAP.md`. Status values against
+the roadmap's five tiers: **DONE**, **PARTIAL**, **NOT STARTED**.
+Where a tier item is DONE in spirit but lacks CI / test /
+interop validation, that's called out explicitly because the
+difference between "the code exists" and "v1.0 can ship it"
+is almost always a test harness gap, not a code gap.
+
+### Tier 0 -- Fix the Audit Findings: DONE
+
+Every item in the roadmap's Tier 0 list closed by session 19 at
+the latest. The two historically-deferred items
+(full `IngestProtocol` dispatch from the CLI, MoQ auth path
+split) have not regressed but also have not been revisited;
+neither blocks anything in Tier 1+.
+
+### Tier 1 -- Test Infrastructure: PARTIAL (~55%)
+
+| Item | Status | Notes |
+|---|---|---|
+| `lvqr-conformance` crate skeleton | DONE | Scaffold only; no crate pulls it as a dep yet beyond the kvazaar HEVC fixture and the ffprobe helper. |
+| `lvqr-loadgen` crate | NOT STARTED | The data-plane load generator for concurrent subscriber sessions, byte-rate measurement, stall tracking, OTLP emission. Required for the M1 benchmark story. |
+| `lvqr-chaos` crate | NOT STARTED | Fault injection (drop / reorder / delay / partition). Not blocking v1.0 but required for the 24h soak rig. |
+| Proptest harnesses for every parser | PARTIAL | FLV, fMP4, AAC, HEVC SPS, WHEP RTP packetizer, WHIP depack all have proptests. Missing: MoQ wire messages, HLS playlist round-trip, catalog. |
+| `cargo-fuzz` targets + nightly runner | DONE | `.github/workflows/fuzz.yml` runs libFuzzer targets on nightly rustc; PR + nightly cadences both wired. |
+| `TestServer` in `lvqr-test-utils` | DONE | Used by five `lvqr-cli` integration tests (rtmp_hls_e2e, rtmp_archive_e2e, auth_integration, and smoke). |
+| `testcontainers` fixtures (MinIO, etc.) | NOT STARTED | Archive-to-S3 upload story needs this. Not blocking because local-disk archive already works. |
+| Playwright E2E suite at `tests/e2e/` | PARTIAL | Directory exists with `test-app.spec.ts`. `.github/workflows/e2e.yml` wired. Needs end-to-end coverage of WHIP publish + LL-HLS play + WHEP play cases. |
+| ffprobe validation in CI | DONE | ffmpeg installed in the Linux + macOS jobs; the golden-fMP4 test exercises a real validator. |
+| MediaMTX comparison harness | NOT STARTED | Blocks M1 "LVQR is structurally equivalent to MediaMTX" claim. One-session project once Tier 2.5 LL-HLS is frozen. |
+| 24-hour soak rig | NOT STARTED | Nightly job that runs `lvqr-loadgen` against a long-lived server, asserts no memory / FD / gauge drift. Required for M2. |
+| 5-artifact CI enforcement script | NOT STARTED | `tests/CONTRACT.md` documents the contract; nothing greps PRs for missing slots. Two-hour scripting project. |
+| Golden-file regression corpus | PARTIAL | fMP4 writer has goldens; LL-HLS and master-playlist goldens don't exist yet. |
+| `cargo audit` in CI | DONE | `.github/workflows/ci.yml` runs cargo audit on every PR. |
+| Apple `mediastreamvalidator` in CI | NOT STARTED | Required for the Tier 2.5 "spec-compliant LL-HLS" claim. |
+
+Bottom line on Tier 1: the foundations that blocked Tier 2
+progress are all done. The items still open are **benchmarking
+and conformance gates**, not basic test ability. Nothing in
+this list blocks feature work, but several items block the M1
+release claim ("LVQR is measurably equivalent or better than
+MediaMTX / MediaMTX-style servers").
+
+### Tier 2 -- Unified Data Plane + Protocol Parity: PARTIAL (~70%)
+
+| Sub-tier | Scope | Status | Notes |
+|---|---|---|---|
+| 2.1 | `lvqr-moq` facade + `lvqr-fragment` | DONE | The single most important call in the entire roadmap is closed. Both H.264 + HEVC video and Opus audio ride the unified model end-to-end. |
+| 2.2 | `lvqr-codec` | PARTIAL | AAC (hardened with proptest + 7350 Hz floor), HEVC SPS, H.264 SPS all shipped. VP9 and AV1 parsers not started. Opus is opaque (no parser needed for passthrough); a `codec_string` generator would be nice-to-have. |
+| 2.3 | `lvqr-cmaf` segmenter | DONE | AVC, HEVC, AAC, and Opus init writers all ship with unit tests and mp4-atom round-trip validation. `CmafPolicy`, `TrackCoalescer`, `build_moof_mdat` all in place. AV1 / VP9 init writers deferred alongside 2.2. |
+| 2.4 | `lvqr-archive` | DONE | redb segment index, on-disk segments, HTTP playback surface (`/playback/*`), traversal guard, `SharedAuth` gate. S3 upload via `object_store` is NOT STARTED but roadmap's "optional" slot. |
+| 2.5 | `lvqr-hls` + LL-HLS | PARTIAL (~85%) | Blocking reload, partials, master playlist with codec-aware CODECS, audio rendition group, multi-broadcast routing all done. **Open**: VOD windows for archive scrub in the HLS surface, `EXT-X-RENDITION-REPORT`, `EXT-X-PRELOAD-HINT`, byte-range addressing for partials. Apple `mediastreamvalidator` has never been run against our output. |
+| 2.6 | `lvqr-dash` | NOT STARTED | Aligned CMAF segments already exist; the missing piece is a typed MPD generator via `quick-xml`. Can reuse `detect_video_codec_string` and `detect_audio_codec_string` from session 27/30. Budget: one session. |
+| 2.7 | WHIP + WHEP | DONE | H.264, H.265, and Opus all ride end-to-end in both directions. The only loose thread is the WHIP Opus -> LL-HLS fragment observer fanout, session-31 item 1 (half-day follow-up). |
+| 2.8 | `lvqr-srt` | NOT STARTED | libsrt FFI, MPEG-TS demuxer, broadcast-encoder interop. Roadmap calls this ~2.5 weeks. One of the two "cut if Tier 2 blows its budget" candidates. |
+| 2.9 | `lvqr-rtsp` server | NOT STARTED | Hand-rolled state machine + `retina` for RTSP-pull. The other cut candidate. |
+| 2.10 | CLI single-binary default (M1 gate) | PARTIAL | RTMP + WHIP + WHEP + HLS + MoQ already wire up in one `lvqr serve` invocation. SRT + RTSP would round out the "all protocols at once" claim. `lvqr serve --demo` flag does not exist yet. |
+
+### Tier 3 -- Cluster, Archive UI, Operational: NOT STARTED
+
+Zero progress. Every item is deferred:
+
+* **3.1 Cluster (chitchat + cross-node MoQ relay-of-relays)** -- the Bet 4 validation slot. Untested.
+* **3.2 DVR scrub UI** -- the archive exists, the `lvqr-archive::SegmentIndex` can serve time-range queries via `/playback/*`, but no HLS/DASH VOD window binding exists and no player UI surfaces it.
+* **3.3 Webhook + OAuth2 + signed URLs** -- the `AuthProvider` trait has noop / static / JWT impls. Webhook, OAuth2/JWKS, and HMAC signed-URL providers all NOT STARTED.
+* **3.4 Observability (OTLP + Grafana + Alertmanager)** -- Prometheus metrics exist, OTLP exporter and dashboards do not.
+* **3.5 Hot config reload (notify-rs + SIGHUP)** -- NOT STARTED. The `--config` flag was removed in the readiness audit because the loader did not exist; no config file plumbing has landed since.
+* **3.6 Captions / WebVTT + SCTE-35 passthrough** -- NOT STARTED.
+* **3.7 Stream key lifecycle + admin API expansion** -- NOT STARTED.
+
+### Tier 4 -- Differentiation Moats: NOT STARTED
+
+None of the Tier 4 moats have even a prototype:
+
+* **4.1 io_uring datapath** (Linux-only, feature-flagged) -- NOT STARTED.
+* **4.2 WASM per-fragment filters** (wasmtime host, single-filter pipeline) -- NOT STARTED.
+* **4.3 C2PA signed media** (c2pa-rs at finalization) -- NOT STARTED.
+* **4.4 Cross-cluster federation** -- NOT STARTED.
+* **4.5 In-process AI agents** (whisper.cpp captions) -- NOT STARTED.
+* **4.6 Server-side transcoding** (gstreamer-rs bridge, ABR ladder) -- NOT STARTED.
+* **4.7 Latency SLO scheduling** -- NOT STARTED.
+* **4.8 One-token-all-protocols** -- NOT STARTED.
+
+### Tier 5 -- Ecosystem: NOT STARTED
+
+Nothing from the ecosystem tier is built:
+
+* Helm chart -- NOT STARTED.
+* Kubernetes operator (`lvqr-operator`) -- NOT STARTED.
+* Terraform module -- NOT STARTED.
+* Web admin UI -- NOT STARTED (the brutalist `test-app/` is the only thing remotely like it).
+* iOS / Swift SDK -- NOT STARTED.
+* Android / Kotlin SDK -- NOT STARTED.
+* Go SDK -- NOT STARTED.
+* Rust client SDK (`bindings/rust/`) -- NOT STARTED.
+* Docs site -- NOT STARTED.
+* Tutorial videos -- NOT STARTED.
+
+The JS side has `@lvqr/core` + `@lvqr/player` skeletons; the
+Python admin client exists in `bindings/python/` (per README).
+
+### Carry-over internal tech debt (from AUDIT-INTERNAL-2026-04-13 + subsequent sessions)
+
+Items that are not tier items but block a clean v1.0 release:
+
+1. **`lvqr-wasm` deletion**. Deprecated in v0.3; still a workspace member + a CI workflow build target. Removing it is a small cleanup but the CI workflow step lingers.
+2. **CORS restrictive default**. `lvqr-admin` uses `CorsLayer::permissive()`; the `/playback/*` archive surface and the admin API both inherit it. Needs to be gated behind a `--cors-origin` flag before a public-internet deployment.
+3. **`lvqr-mesh` media relay**. The tree topology planner ships; the actual DataChannel fanout that would make the mesh useful has never been implemented. The admin API reports "offload percentage" which today is intended, not actual. Flagged as Tier 4 and accurately labeled in the README.
+4. **JWT integration test** (not just unit test). The `lvqr-cli::auth_integration` test covers the static-token path end-to-end; the JWT path is only covered by lvqr-auth unit tests.
+5. **Criterion benchmarks**. The roadmap says fanout, fragment build, and archive scan should have criterion slots. Workspace has **zero** benches. Blocks any honest "X ns per op" marketing claim and blocks the M2 "published benchmarks vs MediaMTX" milestone.
+6. **MoQ session auth publish-vs-subscribe split**. Tier 0 documented this as deferred to moq-native upstream. Still open.
+7. **Track name convention is stringly-typed**. `"0.mp4"` / `"1.mp4"` literals appear in 6+ crates. A `TrackId` newtype would make the "kind by track name" invariant compiler-checked.
+8. **WHIP Opus -> LL-HLS fragment observer**. Session-30 open item: `WhipMoqBridge::push_audio_sample` fires the raw-sample observer (WHEP) but not the fragment observer (LL-HLS + archive). Half-day follow-up to fully close the WHIP audio story end-to-end.
+9. **Real-browser HEVC + Opus interop smoke**. The loopback E2Es prove the byte pipelines work; running against Safari / flag-enabled Chromium / Firefox is a deployment-validation step that hasn't happened.
+
+### Gap summary by strategic weight
+
+Roughly in the order a focused engineer should burn them down
+to hit the M1 milestone (`lvqr serve --demo` is real and
+defensible vs MediaMTX):
+
+1. **LL-HLS spec-compliance gates** (Tier 2.5 follow-up): Apple `mediastreamvalidator` in CI, MediaMTX comparison harness, VOD window for DVR scrub. Blocks the "LVQR LL-HLS is actually compliant" claim.
+2. **`lvqr-dash` egress** (Tier 2.6): one session, reuses existing CMAF segments + codec detectors. Closes the DASH column in the competitive matrix.
+3. **Criterion benches + soak rig** (Tier 1 follow-up): blocks M2. One focused session each.
+4. **Observability OTLP + Grafana dashboard pack** (Tier 3.4): blocks any production deployment evaluation.
+5. **Webhook / OAuth2 / signed URLs** (Tier 3.3): blocks the "production auth" story; webhook is the cheapest path since it just POSTs `AuthContext` to a URL.
+6. **SRT + RTSP** (Tier 2.8 / 2.9): the last two missing ingest protocols for M1 "single binary, all protocols". Can be cut if the budget slips.
+7. **Hot config reload + stream key lifecycle** (Tier 3.5 / 3.7): ergonomics for operators.
+8. **Helm + Kubernetes operator** (Tier 5): unlocks multi-node deployment stories for M3.
+9. **Tier 4 differentiators**: none are on the critical path to v1.0. Each is its own ~3-week MVP capped block and should not start until M1 is green.
+10. **SDKs (iOS / Android / Go / Rust)**: M5 material. Skip entirely until the server story is stable.
+
+**Honest estimate of remaining work to v1.0 (M1 gate):**
+roughly **6-10 focused sessions** for items 1-3 above, another
+**8-12 sessions** for items 4-6, and a further **5-8 sessions**
+of hygiene / cleanup / documentation. Total ~20-30 sessions to
+a shippable v1.0-rc1, assuming no tier blowouts. Matches the
+roadmap's "one focused engineer, 18-24 months" estimate.
+
+---
+
 ## Session 30 (2026-04-15): Opus through LL-HLS and WHEP
 
 One code commit on top of session 29's `7d72ba7`. Closes
