@@ -321,15 +321,20 @@ impl WhipMoqBridge {
         state.audio_init_emitted = true;
         info!(broadcast, "whip: opus audio track initialized");
 
-        // Session 29 keeps audio on the MoQ track only. The HLS
-        // master playlist still advertises mp4a.40.2, WHEP
-        // negotiates Opus but currently ignores ingest audio,
-        // and the archive indexer treats every fragment
-        // uniformly. Firing the fragment observer for the Opus
-        // track would inject a second init segment into
-        // `HlsFragmentBridge` and the downstream HLS audio
-        // rendition builder still expects AAC; extending LL-HLS
-        // to serve Opus audio is session 30.
+        // Session 31: fire the fragment observer's `on_init` for
+        // the Opus track so `HlsFragmentBridge::ensure_audio` wires
+        // up a 48 kHz audio rendition whose init segment carries
+        // the `dOps` box, and so the archive indexer picks up the
+        // audio track alongside video. `detect_audio_codec_string`
+        // on the HLS side (session 30) picks "Opus" out of the init
+        // bytes so the master playlist's `CODECS` attribute is
+        // correct without any extra signalling here. Release the
+        // DashMap entry before the observer call to avoid the same
+        // reentrancy footgun the video path already guards against.
+        drop(entry);
+        if let Some(obs) = self.observer.as_ref() {
+            obs.on_init(broadcast, "1.mp4", 48_000, init);
+        }
         true
     }
 
@@ -474,19 +479,25 @@ impl WhipMoqBridge {
             debug!(broadcast, error = ?e, "whip: moq audio sink push failed");
         }
 
-        // Session 30: fire the raw-sample observer for audio so
-        // the WHEP egress can forward Opus to subscribers that
-        // negotiated Opus on their side (same-codec passthrough,
-        // no transcode). The fragment observer is still skipped
-        // for audio because LL-HLS audio rendition picks up the
-        // Opus track via a dedicated `ensure_audio_opus` path
-        // (session 30) rather than the generic `on_fragment`
-        // fanout. Release the dashmap entry before the observer
-        // call to avoid the reentrancy footgun the video path
-        // already guards against.
+        // Release the DashMap entry before invoking observers:
+        // they may themselves reach back into the bridge, and
+        // holding a value lock across a reentrant call is a
+        // deadlock footgun. The video path already guards against
+        // this.
         drop(entry);
+        // Raw-sample observer (WHEP): forwards Opus frames to
+        // subscribers that negotiated Opus on their side (same-
+        // codec passthrough, no transcode). Session 30.
         if let Some(obs) = self.raw_observer.as_ref() {
             obs.on_raw_sample(broadcast, "1.mp4", MediaCodec::Opus, &raw);
+        }
+        // Fragment observer (LL-HLS + archive): session 31 closed
+        // the last loose thread in the WHIP audio story. The HLS
+        // audio rendition is codec-agnostic above the init
+        // segment, so Opus fragments fan out through the same
+        // `HlsFragmentBridge` path AAC already uses.
+        if let Some(obs) = self.observer.as_ref() {
+            obs.on_fragment(broadcast, "1.mp4", &frag);
         }
     }
 }
@@ -840,6 +851,96 @@ mod tests {
             },
         );
         assert_eq!(bridge.active_stream_count(), 1);
+    }
+
+    /// Recording fragment observer used to prove that session-31's
+    /// Opus fanout fires `on_init` + `on_fragment` for the `1.mp4`
+    /// audio track with the right init bytes and timescale.
+    #[derive(Default)]
+    struct RecordingObserver {
+        init_calls: std::sync::Mutex<Vec<(String, String, u32, Bytes)>>,
+        frag_calls: std::sync::Mutex<Vec<(String, String, u64, u64)>>,
+    }
+
+    impl lvqr_ingest::FragmentObserver for RecordingObserver {
+        fn on_init(&self, broadcast: &str, track: &str, timescale: u32, init: Bytes) {
+            self.init_calls
+                .lock()
+                .unwrap()
+                .push((broadcast.to_string(), track.to_string(), timescale, init));
+        }
+        fn on_fragment(&self, broadcast: &str, track: &str, fragment: &Fragment) {
+            self.frag_calls.lock().unwrap().push((
+                broadcast.to_string(),
+                track.to_string(),
+                fragment.dts,
+                fragment.duration,
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn opus_audio_fires_fragment_observer_on_init_and_fragment() {
+        let origin = OriginProducer::new();
+        let obs = std::sync::Arc::new(RecordingObserver::default());
+        let shared: lvqr_ingest::SharedFragmentObserver = obs.clone();
+        let bridge = WhipMoqBridge::new(origin).with_observer(shared);
+
+        bridge.on_sample("live/opus-obs", avc_keyframe_sample());
+        bridge.on_audio_sample(
+            "live/opus-obs",
+            IngestAudioSample {
+                dts_48k: 0,
+                duration_48k: 960,
+                payload: Bytes::from_static(&[0x78, 0x01, 0x02, 0x03]),
+            },
+        );
+        bridge.on_audio_sample(
+            "live/opus-obs",
+            IngestAudioSample {
+                dts_48k: 960,
+                duration_48k: 960,
+                payload: Bytes::from_static(&[0x78, 0x04, 0x05, 0x06]),
+            },
+        );
+
+        let inits = obs.init_calls.lock().unwrap().clone();
+        // One video init (`0.mp4`, 90 kHz) + one audio init
+        // (`1.mp4`, 48 kHz). The audio init must be non-empty and
+        // start with an `ftyp` box -- the Opus init segment writer
+        // emits a standard CMAF init layout that
+        // `detect_audio_codec_string` can then parse.
+        assert_eq!(inits.len(), 2, "expected one video + one audio init");
+        let audio_init = inits
+            .iter()
+            .find(|(_, track, _, _)| track == "1.mp4")
+            .expect("audio init must fire");
+        assert_eq!(audio_init.0, "live/opus-obs");
+        assert_eq!(audio_init.2, 48_000, "opus track timescale is 48 kHz");
+        assert!(!audio_init.3.is_empty(), "opus init bytes must be non-empty");
+        // The mp4 `ftyp` box is at offset 4; the 4-byte box header
+        // length precedes it. This is a cheap shape assertion that
+        // the bridge handed real CMAF init bytes to the observer,
+        // not a placeholder.
+        assert_eq!(&audio_init.3[4..8], b"ftyp", "opus init must be a CMAF ftyp box");
+        // Route the same bytes through `detect_audio_codec_string`
+        // to prove the HLS master playlist will resolve "Opus".
+        assert_eq!(
+            lvqr_cmaf::detect_audio_codec_string(&audio_init.3).as_deref(),
+            Some("opus"),
+            "opus init must be recognised by detect_audio_codec_string"
+        );
+
+        let frags = obs.frag_calls.lock().unwrap().clone();
+        // One video fragment (from the H.264 keyframe) + two audio
+        // fragments (one per Opus frame). The audio fragment DTS
+        // values must monotonically advance in 48 kHz ticks.
+        let audio_frags: Vec<_> = frags.iter().filter(|(_, t, _, _)| t == "1.mp4").collect();
+        assert_eq!(audio_frags.len(), 2, "expected two opus fragments");
+        assert_eq!(audio_frags[0].2, 0);
+        assert_eq!(audio_frags[0].3, 960);
+        assert_eq!(audio_frags[1].2, 960);
+        assert_eq!(audio_frags[1].3, 960);
     }
 
     #[tokio::test]

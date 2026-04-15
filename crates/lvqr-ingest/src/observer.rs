@@ -57,7 +57,6 @@ pub enum MediaCodec {
     Opus,
 }
 
-
 /// Shared, dynamically-dispatched fragment observer handle.
 pub type SharedFragmentObserver = Arc<dyn FragmentObserver>;
 
