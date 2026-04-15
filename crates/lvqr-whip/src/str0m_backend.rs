@@ -29,13 +29,14 @@ use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use str0m::change::{SdpAnswer, SdpOffer};
+use str0m::format::Codec as Str0mCodec;
 use str0m::media::{Frequency, MediaKind};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 
-use crate::bridge::{IngestSample, IngestSampleSink};
+use crate::bridge::{IngestSample, IngestSampleSink, VideoCodec};
 use crate::server::{SdpAnswerer, SessionHandle, WhipError};
 
 /// Shared configuration for the str0m-backed answerer.
@@ -102,6 +103,7 @@ impl SdpAnswerer for Str0mIngestAnswerer {
 
         let mut rtc = RtcConfig::new()
             .enable_h264(true)
+            .enable_h265(true)
             .enable_opus(true)
             .build(Instant::now());
 
@@ -288,6 +290,14 @@ fn forward_video_sample(
     if data.data.is_empty() {
         return;
     }
+    let codec = match data.params.spec().codec {
+        Str0mCodec::H264 => VideoCodec::H264,
+        Str0mCodec::H265 => VideoCodec::H265,
+        other => {
+            tracing::trace!(%broadcast, codec = ?other, "whip: ignoring non-H26x video sample");
+            return;
+        }
+    };
     let keyframe = data.is_keyframe();
     let dts_90k_abs = data.time.rebase(Frequency::NINETY_KHZ).numer();
     let dts_base = *ctx.dts_base_90k.get_or_insert(dts_90k_abs);
@@ -298,6 +308,7 @@ fn forward_video_sample(
     let sample = IngestSample {
         dts_90k: dts_rebased,
         keyframe,
+        codec,
         annex_b: payload.freeze(),
     };
 
@@ -305,6 +316,7 @@ fn forward_video_sample(
         ctx.first_sample_logged = true;
         tracing::info!(
             %broadcast,
+            ?codec,
             keyframe,
             dts = dts_rebased,
             bytes = sample.annex_b.len(),

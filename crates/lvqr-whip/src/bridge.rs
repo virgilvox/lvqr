@@ -14,22 +14,50 @@
 //! record, DVR archive) picks up WHIP ingest with zero changes to
 //! the egress side.
 //!
-//! Scope of session 25: video-only, H.264 only, one MoQ track per
-//! broadcast (`0.mp4`). Audio will land in a follow-up session
-//! alongside an Opus path; HEVC follows once `Rtc::enable_h265` is
-//! stable in str0m. Rejection is explicit: audio samples are
-//! dropped with a one-shot warn rather than silently lost.
+//! Scope of session 25 (H.264): video-only, one MoQ track per
+//! broadcast (`0.mp4`). Session 26 extends this bridge to accept
+//! HEVC publishers through the same track slot, distinguished per
+//! broadcast via the [`VideoCodec`] tag carried on every
+//! [`IngestSample`]. HEVC publishers land in the MoQ broadcast
+//! only; the LL-HLS / WHEP / DVR-archive observer taps fire solely
+//! for H.264 publishers because the downstream egress crates
+//! currently hard-code `avc1` in the master playlist and WHEP
+//! packetizer — threading the codec through is tracked as a
+//! session-27 follow-up.
+//!
+//! Audio rejection is still explicit: Opus samples are dropped
+//! with a one-shot warn rather than silently lost.
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
-use lvqr_cmaf::{RawSample, VideoInitParams, build_moof_mdat, write_avc_init_segment};
+use lvqr_cmaf::{
+    HevcInitParams, RawSample, VideoInitParams, build_moof_mdat, write_avc_init_segment, write_hevc_init_segment,
+};
+use lvqr_codec::hevc::{self as hevc_codec, HevcSps};
 use lvqr_fragment::{Fragment, FragmentFlags, FragmentMeta, MoqTrackSink};
 use lvqr_ingest::{SharedFragmentObserver, SharedRawSampleObserver};
 use lvqr_moq::{OriginProducer, Track};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
-use crate::depack::{AVC_NAL_TYPE_PPS, AVC_NAL_TYPE_SPS, annex_b_to_avcc, split_annex_b};
+use crate::depack::{
+    AVC_NAL_TYPE_PPS, AVC_NAL_TYPE_SPS, HEVC_NAL_TYPE_PPS, HEVC_NAL_TYPE_SPS, HEVC_NAL_TYPE_VPS, annex_b_to_avcc,
+    hevc_nal_type, split_annex_b,
+};
+
+/// Which video codec an [`IngestSample`] carries.
+///
+/// Learned from `MediaData::params.spec().codec` inside the
+/// `str0m` poll loop and stamped on every sample the bridge sees.
+/// Used here to branch between `write_avc_init_segment` and
+/// `write_hevc_init_segment` on the first keyframe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoCodec {
+    /// H.264 / AVC. SPS + PPS carry the init metadata.
+    H264,
+    /// H.265 / HEVC. VPS + SPS + PPS carry the init metadata.
+    H265,
+}
 
 /// One inbound sample pumped from the `str0m` poll loop into the
 /// bridge.
@@ -45,8 +73,10 @@ pub struct IngestSample {
     /// loop's responsibility, not the bridge's.
     pub dts_90k: u64,
     /// True iff this sample can start a new independent decoder
-    /// state (IDR for H.264).
+    /// state (IDR for H.264 / HEVC keyframe NAL type).
     pub keyframe: bool,
+    /// Which video codec this sample carries.
+    pub codec: VideoCodec,
     /// Annex B framed NAL payload.
     pub annex_b: Bytes,
 }
@@ -81,6 +111,7 @@ struct BroadcastState {
     video_sink: MoqTrackSink,
     video_seq: u32,
     init_emitted: bool,
+    codec: VideoCodec,
 }
 
 /// Bridges WHIP inbound samples to a MoQ [`OriginProducer`] and
@@ -130,7 +161,7 @@ impl WhipMoqBridge {
     /// `get_mut` borrow cannot be upgraded into a `&mut`
     /// simultaneously with a fresh `insert`; doing the init work
     /// in two hops keeps the borrow scopes clean.
-    fn ensure_initialized(&self, broadcast: &str, annex_b: &[u8], keyframe: bool) -> bool {
+    fn ensure_initialized(&self, broadcast: &str, codec: VideoCodec, annex_b: &[u8], keyframe: bool) -> bool {
         if self.streams.contains_key(broadcast) {
             return true;
         }
@@ -141,35 +172,13 @@ impl WhipMoqBridge {
             return false;
         }
 
-        // Extract SPS + PPS from the keyframe. WebRTC clients
-        // typically prepend them to every IDR access unit, so we
-        // expect both to be present on the first keyframe we see.
-        let (sps, pps) = extract_sps_pps(annex_b);
-        let (Some(sps), Some(pps)) = (sps, pps) else {
-            debug!(
-                broadcast,
-                "whip: first keyframe missing SPS/PPS; waiting for a parameter-set-bearing IDR"
-            );
+        let built = match codec {
+            VideoCodec::H264 => build_avc_init(broadcast, annex_b),
+            VideoCodec::H265 => build_hevc_init(broadcast, annex_b),
+        };
+        let Some((codec_fourcc, init, width, height)) = built else {
             return false;
         };
-        let (width, height) = parse_sps_dims(&sps).unwrap_or((0, 0));
-
-        let params = VideoInitParams {
-            sps: sps.clone(),
-            pps: pps.clone(),
-            width,
-            height,
-            timescale: 90_000,
-        };
-        let mut buf = BytesMut::new();
-        match write_avc_init_segment(&mut buf, &params) {
-            Ok(_) => {}
-            Err(e) => {
-                warn!(broadcast, error = ?e, "whip: failed to build AVC init segment; dropping sample");
-                return false;
-            }
-        }
-        let init = buf.freeze();
 
         let Some(mut producer) = self.origin.create_broadcast(broadcast) else {
             warn!(broadcast, "whip: origin refused to create broadcast (duplicate?)");
@@ -182,11 +191,20 @@ impl WhipMoqBridge {
                 return false;
             }
         };
-        let mut video_sink = MoqTrackSink::new(video_track, FragmentMeta::new("avc1", 90_000));
+        let mut video_sink = MoqTrackSink::new(video_track, FragmentMeta::new(codec_fourcc, 90_000));
         video_sink.set_init_segment(init.clone());
-        info!(broadcast, width, height, "whip: broadcast initialized");
+        info!(broadcast, width, height, ?codec, "whip: broadcast initialized");
 
-        if let Some(obs) = self.observer.as_ref() {
+        // Fire observer taps only for AVC publishers. The LL-HLS,
+        // WHEP, and archive surfaces currently hard-code `avc1` in
+        // their respective sample-entry / master-playlist paths;
+        // forwarding HEVC init bytes through them would advertise
+        // a wrong codec string. HEVC reaches MoQ subscribers only
+        // until those surfaces grow a real codec dispatch (tracked
+        // for session 27).
+        if matches!(codec, VideoCodec::H264)
+            && let Some(obs) = self.observer.as_ref()
+        {
             obs.on_init(broadcast, "0.mp4", 90_000, init);
         }
 
@@ -197,6 +215,7 @@ impl WhipMoqBridge {
                 video_sink,
                 video_seq: 0,
                 init_emitted: true,
+                codec,
             },
         );
         true
@@ -219,7 +238,12 @@ impl WhipMoqBridge {
             keyframe: sample.keyframe,
         };
 
-        if let Some(obs) = self.raw_observer.as_ref() {
+        // Raw-sample observer is WHEP's RTP packetizer tap, which
+        // only speaks H.264. Skip HEVC publishers here for the
+        // same reason the init path skips the fragment observer.
+        if matches!(sample.codec, VideoCodec::H264)
+            && let Some(obs) = self.raw_observer.as_ref()
+        {
             obs.on_raw_sample(broadcast, "0.mp4", &raw);
         }
 
@@ -230,6 +254,7 @@ impl WhipMoqBridge {
         if !state.init_emitted {
             return;
         }
+        let codec = state.codec;
         state.video_seq += 1;
         let seq = state.video_seq;
         let dts = raw.dts;
@@ -250,7 +275,9 @@ impl WhipMoqBridge {
         // value lock across a potentially reentrant call is a
         // deadlock footgun.
         drop(entry);
-        if let Some(obs) = self.observer.as_ref() {
+        if matches!(codec, VideoCodec::H264)
+            && let Some(obs) = self.observer.as_ref()
+        {
             obs.on_fragment(broadcast, "0.mp4", &frag);
         }
     }
@@ -268,11 +295,77 @@ impl IngestSampleSink for WhipMoqBridge {
             }
             return;
         }
-        if !self.ensure_initialized(broadcast, &sample.annex_b, sample.keyframe) {
+        if !self.ensure_initialized(broadcast, sample.codec, &sample.annex_b, sample.keyframe) {
             return;
         }
         self.push_sample(broadcast, sample);
     }
+}
+
+/// Build the AVC init segment bytes from the first SPS+PPS-bearing
+/// IDR access unit. Returns `None` if the expected parameter sets
+/// are missing or the init writer rejects them.
+fn build_avc_init(broadcast: &str, annex_b: &[u8]) -> Option<(&'static str, Bytes, u16, u16)> {
+    let (sps, pps) = extract_sps_pps(annex_b);
+    let (Some(sps), Some(pps)) = (sps, pps) else {
+        debug!(
+            broadcast,
+            "whip: first keyframe missing SPS/PPS; waiting for a parameter-set-bearing IDR"
+        );
+        return None;
+    };
+    let (width, height) = parse_avc_sps_dims(&sps).unwrap_or((0, 0));
+
+    let params = VideoInitParams {
+        sps,
+        pps,
+        width,
+        height,
+        timescale: 90_000,
+    };
+    let mut buf = BytesMut::new();
+    if let Err(e) = write_avc_init_segment(&mut buf, &params) {
+        warn!(broadcast, error = ?e, "whip: failed to build AVC init segment; dropping sample");
+        return None;
+    }
+    Some(("avc1", buf.freeze(), width, height))
+}
+
+/// Build the HEVC init segment bytes from the first VPS+SPS+PPS-
+/// bearing IRAP access unit. Returns `None` if any parameter set
+/// is missing, the SPS parser rejects it, or the init writer
+/// rejects the params.
+fn build_hevc_init(broadcast: &str, annex_b: &[u8]) -> Option<(&'static str, Bytes, u16, u16)> {
+    let HevcParamSets { vps, sps, pps } = extract_hevc_params(annex_b);
+    let (Some(vps), Some(sps), Some(pps)) = (vps, sps, pps) else {
+        debug!(
+            broadcast,
+            "whip: first HEVC keyframe missing VPS/SPS/PPS; waiting for a complete parameter-set IRAP"
+        );
+        return None;
+    };
+    let sps_info: HevcSps = match hevc_codec::parse_sps(&sps) {
+        Ok(v) => v,
+        Err(e) => {
+            debug!(broadcast, error = ?e, "whip: HEVC SPS parse failed; dropping sample");
+            return None;
+        }
+    };
+    let width = sps_info.pic_width_in_luma_samples as u16;
+    let height = sps_info.pic_height_in_luma_samples as u16;
+    let params = HevcInitParams {
+        vps,
+        sps,
+        pps,
+        sps_info,
+        timescale: 90_000,
+    };
+    let mut buf = BytesMut::new();
+    if let Err(e) = write_hevc_init_segment(&mut buf, &params) {
+        warn!(broadcast, error = ?e, "whip: failed to build HEVC init segment; dropping sample");
+        return None;
+    }
+    Some(("hvc1", buf.freeze(), width, height))
 }
 
 /// Pull SPS + PPS NAL units out of an Annex B access unit.
@@ -301,11 +394,46 @@ fn extract_sps_pps(annex_b: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     (sps, pps)
 }
 
-/// Decode SPS NAL bytes to pixel dimensions using `h264-reader`.
-/// Mirrors `lvqr_ingest::remux::flv::extract_resolution`; copied
-/// here rather than re-exported to keep `lvqr-whip` decoupled from
-/// the ingest crate's FLV parser.
-fn parse_sps_dims(sps: &[u8]) -> Option<(u16, u16)> {
+/// Triple of HEVC parameter-set NAL bodies recovered from a
+/// single IRAP access unit. Each slot is `None` until the matching
+/// NAL unit type is observed.
+#[derive(Default)]
+struct HevcParamSets {
+    vps: Option<Vec<u8>>,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+}
+
+/// Pull HEVC VPS + SPS + PPS NAL units out of an Annex B access
+/// unit. HEVC NAL unit types live in bits 6..=1 of the first byte
+/// (see [`crate::depack::hevc_nal_type`]).
+fn extract_hevc_params(annex_b: &[u8]) -> HevcParamSets {
+    let mut out = HevcParamSets::default();
+    for nal in split_annex_b(annex_b) {
+        let Some(t) = hevc_nal_type(nal) else {
+            continue;
+        };
+        match t {
+            HEVC_NAL_TYPE_VPS => {
+                out.vps.get_or_insert_with(|| nal.to_vec());
+            }
+            HEVC_NAL_TYPE_SPS => {
+                out.sps.get_or_insert_with(|| nal.to_vec());
+            }
+            HEVC_NAL_TYPE_PPS => {
+                out.pps.get_or_insert_with(|| nal.to_vec());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Decode AVC SPS NAL bytes to pixel dimensions using
+/// `h264-reader`. Mirrors `lvqr_ingest::remux::flv::extract_resolution`;
+/// copied here rather than re-exported to keep `lvqr-whip`
+/// decoupled from the ingest crate's FLV parser.
+fn parse_avc_sps_dims(sps: &[u8]) -> Option<(u16, u16)> {
     if sps.len() < 2 {
         return None;
     }
@@ -362,6 +490,7 @@ mod tests {
         let delta = IngestSample {
             dts_90k: 0,
             keyframe: false,
+            codec: VideoCodec::H264,
             annex_b: Bytes::from(build_annex_b(&[&[0x41, 0x00][..]])),
         };
         bridge.on_sample("live/test", delta);
@@ -375,9 +504,78 @@ mod tests {
         let idr_only = IngestSample {
             dts_90k: 0,
             keyframe: true,
+            codec: VideoCodec::H264,
             annex_b: Bytes::from(build_annex_b(&[&[0x65, 0x88, 0x84][..]])),
         };
         bridge.on_sample("live/test", idr_only);
+        assert_eq!(bridge.active_stream_count(), 0);
+    }
+
+    // --- HEVC-specific coverage (session 26) -----------------------
+
+    /// Real x265 HEVC Main 3.0 VPS/SPS/PPS bytes (NAL body, no
+    /// start code). Pinned to the same capture used by
+    /// `lvqr-cmaf::init::tests` so the two writers agree on what a
+    /// valid IRAP looks like. If x265 is updated and these bytes
+    /// drift, the cmaf conformance test catches it first.
+    const HEVC_VPS: &[u8] = &[
+        0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00,
+        0x03, 0x00, 0x3c, 0x95, 0x94, 0x09,
+    ];
+    const HEVC_SPS: &[u8] = &[
+        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c,
+        0xa0, 0x0a, 0x08, 0x0f, 0x16, 0x59, 0x59, 0x52, 0x93, 0x0b, 0xc0, 0x5a, 0x02, 0x00, 0x00, 0x03, 0x00, 0x02,
+        0x00, 0x00, 0x03, 0x00, 0x3c, 0x10,
+    ];
+    const HEVC_PPS: &[u8] = &[0x44, 0x01, 0xc0, 0x73, 0xc1, 0x89];
+    /// Synthetic HEVC IDR_W_RADL NAL (type 19). Two-byte NAL
+    /// header followed by a one-byte slice body stand-in; the
+    /// bridge only needs to find the SPS-derived dimensions, not
+    /// decode the slice.
+    const HEVC_IDR: &[u8] = &[0x26, 0x01, 0xAF];
+
+    #[test]
+    fn extracts_hevc_params_from_access_unit() {
+        let buf = build_annex_b(&[HEVC_VPS, HEVC_SPS, HEVC_PPS, HEVC_IDR]);
+        let out = extract_hevc_params(&buf);
+        assert_eq!(out.vps.as_deref(), Some(HEVC_VPS));
+        assert_eq!(out.sps.as_deref(), Some(HEVC_SPS));
+        assert_eq!(out.pps.as_deref(), Some(HEVC_PPS));
+    }
+
+    #[test]
+    fn hevc_missing_vps_returns_none() {
+        let buf = build_annex_b(&[HEVC_SPS, HEVC_PPS, HEVC_IDR]);
+        let out = extract_hevc_params(&buf);
+        assert!(out.vps.is_none());
+    }
+
+    #[tokio::test]
+    async fn hevc_keyframe_with_full_parameter_sets_initializes_broadcast() {
+        let origin = OriginProducer::new();
+        let bridge = WhipMoqBridge::new(origin);
+        let keyframe = IngestSample {
+            dts_90k: 0,
+            keyframe: true,
+            codec: VideoCodec::H265,
+            annex_b: Bytes::from(build_annex_b(&[HEVC_VPS, HEVC_SPS, HEVC_PPS, HEVC_IDR])),
+        };
+        bridge.on_sample("live/hevc", keyframe);
+        assert_eq!(bridge.active_stream_count(), 1);
+        assert_eq!(bridge.stream_names(), vec!["live/hevc".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn hevc_keyframe_missing_parameter_sets_is_dropped() {
+        let origin = OriginProducer::new();
+        let bridge = WhipMoqBridge::new(origin);
+        let idr_only = IngestSample {
+            dts_90k: 0,
+            keyframe: true,
+            codec: VideoCodec::H265,
+            annex_b: Bytes::from(build_annex_b(&[HEVC_IDR])),
+        };
+        bridge.on_sample("live/hevc", idr_only);
         assert_eq!(bridge.active_stream_count(), 0);
     }
 }

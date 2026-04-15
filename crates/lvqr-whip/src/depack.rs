@@ -30,6 +30,26 @@ pub const AVC_NAL_TYPE_SPS: u8 = 7;
 /// AVC NAL unit type: picture parameter set.
 pub const AVC_NAL_TYPE_PPS: u8 = 8;
 
+/// HEVC NAL unit type: video parameter set.
+pub const HEVC_NAL_TYPE_VPS: u8 = 32;
+/// HEVC NAL unit type: sequence parameter set.
+pub const HEVC_NAL_TYPE_SPS: u8 = 33;
+/// HEVC NAL unit type: picture parameter set.
+pub const HEVC_NAL_TYPE_PPS: u8 = 34;
+
+/// Extract the HEVC NAL unit type (`nal_unit_type`) from a NAL
+/// body. Returns `None` if the slice is shorter than the 2-byte
+/// HEVC NAL header.
+///
+/// HEVC NAL header layout (ITU-T H.265 7.3.1.2):
+///   `forbidden_zero_bit(1) nal_unit_type(6) nuh_layer_id(6)
+///    nuh_temporal_id_plus1(3)`
+///
+/// The type lives in bits 6..=1 of the first byte.
+pub fn hevc_nal_type(nal: &[u8]) -> Option<u8> {
+    nal.first().map(|b| (b >> 1) & 0x3f)
+}
+
 /// Walk an Annex B byte buffer and return the NAL unit bodies
 /// (without their start codes).
 ///

@@ -1803,6 +1803,7 @@ dependencies = [
  "dashmap",
  "h264-reader",
  "lvqr-cmaf",
+ "lvqr-codec",
  "lvqr-fragment",
  "lvqr-ingest",
  "lvqr-moq",

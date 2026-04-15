@@ -19,8 +19,8 @@ pub mod router;
 pub mod server;
 pub mod str0m_backend;
 
-pub use bridge::{IngestSample, IngestSampleSink, NoopIngestSampleSink, WhipMoqBridge};
-pub use depack::{annex_b_to_avcc, split_annex_b};
+pub use bridge::{IngestSample, IngestSampleSink, NoopIngestSampleSink, VideoCodec, WhipMoqBridge};
+pub use depack::{annex_b_to_avcc, hevc_nal_type, split_annex_b};
 pub use router::router as router_for;
 pub use server::{SdpAnswerer, SessionHandle, SessionId, WhipError, WhipServer};
 pub use str0m_backend::{Str0mIngestAnswerer, Str0mIngestConfig, Str0mIngestSessionHandle};
