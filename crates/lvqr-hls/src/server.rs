@@ -196,6 +196,42 @@ impl HlsServer {
         self.state.audio_codec_string.read().await.clone()
     }
 
+    /// Return the current `(last_msn, last_part)` position of this
+    /// rendition, matching the LL-HLS `EXT-X-RENDITION-REPORT`
+    /// definition: "the Media Sequence Number of the Media Segment
+    /// containing the last Partial Segment" and its index.
+    ///
+    /// * When the builder has pending partials in an open segment:
+    ///   `last_msn` is the sequence the open segment will carry
+    ///   once it closes, and `last_part` is the zero-based index of
+    ///   the trailing partial.
+    /// * When only closed segments exist: `last_msn` is the
+    ///   sequence of the most recent closed segment, and
+    ///   `last_part` is the index of its trailing partial.
+    /// * Before any chunk has been pushed: `None`.
+    ///
+    /// Used by [`MultiHlsServer`]'s router to populate the
+    /// sibling-rendition `EXT-X-RENDITION-REPORT` tag in each
+    /// rendition's media playlist so a client that polls one
+    /// rendition can discover the others' live position without an
+    /// extra round trip.
+    pub async fn current_rendition_position(&self) -> Option<(u64, Option<u32>)> {
+        let builder = self.state.builder.read().await;
+        let m = builder.manifest();
+        if !m.preliminary_parts.is_empty() {
+            let open_seq = m.segments.last().map(|s| s.sequence + 1).unwrap_or(0);
+            Some((open_seq, Some((m.preliminary_parts.len() - 1) as u32)))
+        } else if let Some(last) = m.segments.last() {
+            if last.parts.is_empty() {
+                Some((last.sequence, None))
+            } else {
+                Some((last.sequence, Some((last.parts.len() - 1) as u32)))
+            }
+        } else {
+            None
+        }
+    }
+
     /// Push a chunk plus its wire-ready bytes. Returns an error iff
     /// the underlying [`PlaylistBuilder`] refuses the chunk (zero
     /// duration, non-monotonic DTS, etc.).
@@ -258,11 +294,52 @@ struct BlockingReloadQuery {
     hls_part: Option<u32>,
 }
 
+/// One sibling-rendition report block to append to a rendered
+/// media playlist as an `#EXT-X-RENDITION-REPORT` tag. Populated
+/// by [`handle_multi_get`] from the sibling [`HlsServer`]'s
+/// [`HlsServer::current_rendition_position`] read. The
+/// single-broadcast router at [`HlsServer::router`] always passes
+/// an empty slice.
+#[derive(Debug, Clone)]
+struct RenditionReport {
+    uri: String,
+    last_msn: u64,
+    last_part: Option<u32>,
+}
+
+/// Append `#EXT-X-RENDITION-REPORT` lines to a rendered playlist
+/// body. The spec lets the tag appear anywhere in a playlist; we
+/// emit it at the end, after the preload hint, so a client walking
+/// the body top-down encounters it after it has seen every segment,
+/// partial, and preload hint in the current rendition.
+fn append_rendition_reports(body: &mut String, reports: &[RenditionReport]) {
+    for r in reports {
+        use std::fmt::Write as _;
+        let _ = write!(
+            body,
+            "#EXT-X-RENDITION-REPORT:URI=\"{}\",LAST-MSN={}",
+            r.uri, r.last_msn
+        );
+        if let Some(part) = r.last_part {
+            let _ = write!(body, ",LAST-PART={part}");
+        }
+        body.push('\n');
+    }
+}
+
 /// Render the playlist response for an [`HlsState`], honouring the
 /// LL-HLS blocking reload semantic. Shared between the single-broadcast
 /// router and the [`MultiHlsServer`] router so the blocking behaviour
-/// lives in exactly one place.
-async fn render_playlist(state: &Arc<HlsState>, hls_msn: Option<u64>, hls_part: Option<u32>) -> Response {
+/// lives in exactly one place. `reports` carries any sibling-rendition
+/// reports [`handle_multi_get`] computed before calling this function;
+/// it is empty for the single-broadcast router where there is no
+/// sibling.
+async fn render_playlist(
+    state: &Arc<HlsState>,
+    hls_msn: Option<u64>,
+    hls_part: Option<u32>,
+    reports: &[RenditionReport],
+) -> Response {
     let timeout = Duration::from_secs((state.target_duration_secs * BLOCK_TIMEOUT_MULTIPLIER).max(1) as u64);
     let deadline = tokio::time::Instant::now() + timeout;
 
@@ -286,14 +363,18 @@ async fn render_playlist(state: &Arc<HlsState>, hls_msn: Option<u64>, hls_part: 
         };
         if ready {
             let builder = state.builder.read().await;
-            let body = builder.manifest().render();
+            let mut body = builder.manifest().render();
+            drop(builder);
+            append_rendition_reports(&mut body, reports);
             return ([(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")], body).into_response();
         }
         let notified = state.notify.notified();
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             let builder = state.builder.read().await;
-            let body = builder.manifest().render();
+            let mut body = builder.manifest().render();
+            drop(builder);
+            append_rendition_reports(&mut body, reports);
             return (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
@@ -322,7 +403,9 @@ async fn render_uri(state: &Arc<HlsState>, uri: &str) -> Response {
 }
 
 async fn handle_playlist(State(state): State<Arc<HlsState>>, Query(q): Query<BlockingReloadQuery>) -> Response {
-    render_playlist(&state, q.hls_msn, q.hls_part).await
+    // Single-broadcast router has no sibling renditions; the
+    // multi-broadcast router handles that path.
+    render_playlist(&state, q.hls_msn, q.hls_part, &[]).await
 }
 
 async fn handle_init(State(state): State<Arc<HlsState>>) -> Response {
@@ -562,10 +645,10 @@ async fn handle_multi_get(
     let video = multi.video(broadcast);
     let audio = multi.audio(broadcast);
     let (server_opt, video_uri): (Option<HlsServer>, bool) = match tail {
-        "playlist.m3u8" | "init.mp4" => (video, true),
-        "audio.m3u8" | "audio-init.mp4" => (audio, false),
-        other if other.starts_with("audio-") => (audio, false),
-        _ => (video, true),
+        "playlist.m3u8" | "init.mp4" => (video.clone(), true),
+        "audio.m3u8" | "audio-init.mp4" => (audio.clone(), false),
+        other if other.starts_with("audio-") => (audio.clone(), false),
+        _ => (video.clone(), true),
     };
     let Some(server) = server_opt else {
         let which = if video_uri { "video" } else { "audio" };
@@ -577,10 +660,46 @@ async fn handle_multi_get(
     };
     let state = server.state.clone();
     match tail {
-        "playlist.m3u8" | "audio.m3u8" => render_playlist(&state, q.hls_msn, q.hls_part).await,
+        "playlist.m3u8" | "audio.m3u8" => {
+            // Build a sibling-rendition report so a client polling
+            // the video playlist discovers the audio rendition's
+            // live position without an extra round trip, and vice
+            // versa. The sibling is whichever rendition we are NOT
+            // currently rendering. Read the sibling's position
+            // before taking the target rendition's lock inside
+            // `render_playlist` so the two reads stay unordered --
+            // eventual consistency is acceptable per the LL-HLS
+            // spec ("as up-to-date as the Playlist that contains
+            // it").
+            let reports = if video_uri {
+                build_sibling_reports(audio.as_ref(), "audio.m3u8").await
+            } else {
+                build_sibling_reports(video.as_ref(), "playlist.m3u8").await
+            };
+            render_playlist(&state, q.hls_msn, q.hls_part, &reports).await
+        }
         "init.mp4" | "audio-init.mp4" => render_init(&state).await,
         other => render_uri(&state, other).await,
     }
+}
+
+/// Build a one-element rendition report slice for a sibling
+/// rendition, or an empty slice if the sibling does not exist or
+/// has not yet seen any chunks. `sibling_uri` is the URI the target
+/// playlist should use to reference the sibling (relative to the
+/// broadcast's HLS base).
+async fn build_sibling_reports(sibling: Option<&HlsServer>, sibling_uri: &str) -> Vec<RenditionReport> {
+    let Some(s) = sibling else {
+        return Vec::new();
+    };
+    let Some((last_msn, last_part)) = s.current_rendition_position().await else {
+        return Vec::new();
+    };
+    vec![RenditionReport {
+        uri: sibling_uri.to_string(),
+        last_msn,
+        last_part,
+    }]
 }
 
 async fn handle_master_playlist(multi: &MultiHlsServer, broadcast: &str) -> Response {

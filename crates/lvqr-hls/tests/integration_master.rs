@@ -145,6 +145,95 @@ async fn master_playlist_includes_audio_rendition_when_both_tracks_present() {
 }
 
 #[tokio::test]
+async fn media_playlists_carry_sibling_rendition_reports() {
+    // Video + audio both publishing. Each media playlist must
+    // declare an `#EXT-X-RENDITION-REPORT` pointing at the sibling
+    // with that sibling's current (LAST-MSN, LAST-PART). Session
+    // 31 addition on top of the session-13 multi-rendition router.
+    let multi = MultiHlsServer::new(PlaylistBuilderConfig::default());
+
+    // Video: one segment chunk at sequence 0.
+    let video = multi.ensure_video("live/rr");
+    video.push_init(Bytes::from_static(b"video-init")).await;
+    video
+        .push_chunk_bytes(
+            &video_chunk(0, 180_000, CmafChunkKind::Segment),
+            Bytes::from_static(b"video-chunk-0"),
+        )
+        .await
+        .unwrap();
+
+    // Audio: two partial chunks in the open segment so LAST-PART
+    // resolves to a distinct non-zero index that cannot be faked.
+    let audio = multi.ensure_audio("live/rr", 48_000);
+    audio.push_init(Bytes::from_static(b"audio-init")).await;
+    audio
+        .push_chunk_bytes(
+            &audio_chunk(0, 96_000, CmafChunkKind::Segment),
+            Bytes::from_static(b"audio-chunk-0"),
+        )
+        .await
+        .unwrap();
+    audio
+        .push_chunk_bytes(
+            &audio_chunk(96_000, 96_000, CmafChunkKind::Partial),
+            Bytes::from_static(b"audio-chunk-1"),
+        )
+        .await
+        .unwrap();
+
+    // Video playlist: report points at audio.m3u8 at the audio
+    // open segment (msn 0) with LAST-PART=1 (two partials, indices
+    // 0 and 1 in the open segment).
+    let (status, _, body) = get(&multi, "/hls/live/rr/playlist.m3u8").await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.contains("#EXT-X-RENDITION-REPORT:URI=\"audio.m3u8\",LAST-MSN=0,LAST-PART=1"),
+        "video playlist should report audio sibling at (0, 1); got:\n{body}"
+    );
+
+    // Audio playlist: report points at playlist.m3u8 at the video
+    // open segment (next msn is 1 because the one segment-kind
+    // push put a pending part in the open segment, so LAST-MSN
+    // still reads 1, LAST-PART=0).
+    let (status, _, body) = get(&multi, "/hls/live/rr/audio.m3u8").await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.contains("#EXT-X-RENDITION-REPORT:URI=\"playlist.m3u8\""),
+        "audio playlist should report video sibling; got:\n{body}"
+    );
+}
+
+#[tokio::test]
+async fn media_playlist_skips_rendition_report_when_sibling_absent() {
+    // Video-only broadcast: the video media playlist must NOT
+    // emit a rendition-report line because there is no sibling to
+    // report. Guards against regressing to the video-only path
+    // where `build_sibling_reports` would otherwise emit a dangling
+    // report for an audio.m3u8 route that does not resolve.
+    let multi = MultiHlsServer::new(PlaylistBuilderConfig::default());
+    let video = multi.ensure_video("live/video-rr-only");
+    video.push_init(Bytes::from_static(b"video-init")).await;
+    video
+        .push_chunk_bytes(
+            &video_chunk(0, 180_000, CmafChunkKind::Segment),
+            Bytes::from_static(b"video-chunk-0"),
+        )
+        .await
+        .unwrap();
+
+    let (status, _, body) = get(&multi, "/hls/live/video-rr-only/playlist.m3u8").await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        !body.contains("#EXT-X-RENDITION-REPORT"),
+        "video-only playlist should not emit a rendition report: {body}"
+    );
+}
+
+#[tokio::test]
 async fn master_playlist_omits_audio_when_only_video_has_published() {
     let multi = MultiHlsServer::new(PlaylistBuilderConfig::default());
 
