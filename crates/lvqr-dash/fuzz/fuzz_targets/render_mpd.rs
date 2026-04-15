@@ -14,13 +14,20 @@
 //! codecs to safe values; this libfuzzer target takes the
 //! unstructured-mutation side of the same surface.
 //!
-//! Invariant asserted: `Mpd::render` never panics on any utf8
-//! codecs string. Stronger invariants (exactly one `<MPD ...>` root
-//! tag, no attribute-boundary injection) are deliberately NOT
-//! asserted here because the current hand-rolled renderer does
-//! not XML-escape attribute values yet; adding those invariants
-//! requires shipping an escape-on-write path first, tracked as a
-//! future-session item in `tracking/HANDOFF.md`.
+//! Invariants asserted:
+//!
+//! 1. `Mpd::render` never panics on any utf8 codecs string.
+//! 2. When `render` returns `Ok`, the output contains exactly one
+//!    `<MPD ` opening tag and one `</MPD>` closing tag regardless
+//!    of what the fuzzer stuffs into the codecs attribute. Before
+//!    the session-33 escape path this invariant was not safe to
+//!    assert because a crafted codecs string like `"/><foo` would
+//!    have broken the MPD root; the escape helper in
+//!    `mpd::esc` now makes it hold unconditionally.
+//! 3. The adaptation-set count in the output matches the one in
+//!    the input (this MPD has exactly one), so any fuzzer-chosen
+//!    content that accidentally produced a second `<AdaptationSet`
+//!    tag would trip the assertion.
 
 use libfuzzer_sys::fuzz_target;
 use lvqr_dash::{AdaptationSet, Mpd, MpdType, Period, Representation, SegmentTemplate};
@@ -65,7 +72,10 @@ fuzz_target!(|data: &[u8]| {
         }],
     };
 
-    // The only invariant the current renderer strictly guarantees
-    // is panic-freedom. Any crash here is a real bug.
-    let _ = mpd.render();
+    let Ok(xml) = mpd.render() else { return };
+    // Stronger invariants: the fuzzed codecs string must not be
+    // able to tear the MPD root apart.
+    assert_eq!(xml.matches("<MPD ").count(), 1);
+    assert_eq!(xml.matches("</MPD>").count(), 1);
+    assert_eq!(xml.matches("<AdaptationSet ").count(), 1);
 });

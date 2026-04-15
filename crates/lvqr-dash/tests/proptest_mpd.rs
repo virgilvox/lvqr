@@ -31,16 +31,22 @@ fn arb_mpd_type() -> impl Strategy<Value = MpdType> {
 }
 
 fn arb_representation() -> impl Strategy<Value = Representation> {
+    // The `codecs` generator is deliberately unrestricted ("\\PC*"
+    // = any printable unicode) so the proptest exercises the XML
+    // attribute-escape path the session-33 `esc` helper landed
+    // for. Pre-escape, a generator containing `"` or `<` would
+    // have broken the `<AdaptationSet ` count invariant below.
     (
         1u32..100,
+        "\\PC*",
         1u32..10_000_000,
         prop::option::of(240u32..3840),
         prop::option::of(240u32..2160),
         prop::option::of(8_000u32..192_000),
     )
-        .prop_map(|(id_n, bw, w, h, sr)| Representation {
+        .prop_map(|(id_n, codecs, bw, w, h, sr)| Representation {
             id: format!("rep-{id_n}"),
-            codecs: "avc1.640020".into(),
+            codecs,
             bandwidth_bps: bw,
             width: w,
             height: h,

@@ -41,8 +41,43 @@
 //! build the struct from observed init + segment state (future
 //! `DashServer`) and call [`Mpd::render`] per manifest request.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use thiserror::Error;
+
+/// Escape a string for inclusion as an XML attribute value.
+///
+/// Replaces the five XML special characters with their entity
+/// references: `&` -> `&amp;`, `<` -> `&lt;`, `>` -> `&gt;`,
+/// `"` -> `&quot;`, `'` -> `&apos;`. Strings that contain none
+/// of these are returned as a zero-cost `Cow::Borrowed`, so the
+/// common-case hit (all ASCII-safe ISO BMFF codec strings,
+/// fixed URIs, etc.) allocates nothing.
+///
+/// This is deliberately applied at the single serialization
+/// boundary rather than sanitized at construction time because
+/// `lvqr-dash` public structs are still typed with `String` and
+/// a future session may want to accept unicode names or lang
+/// tags that contain characters the upstream producer cannot
+/// strip. Keeping the escape inline means the public API cannot
+/// drift out of sync with the renderer.
+fn esc(s: &str) -> Cow<'_, str> {
+    if !s.bytes().any(|b| matches!(b, b'<' | b'>' | b'&' | b'"' | b'\'')) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
 
 /// Result type for MPD construction. Render itself is infallible;
 /// the error type exists so future growing constraints (e.g. a
@@ -114,8 +149,8 @@ impl SegmentTemplate {
         let _ = writeln!(
             out,
             r#"{pad}<SegmentTemplate initialization="{init}" media="{media}" startNumber="{sn}" duration="{dur}" timescale="{ts}"/>"#,
-            init = self.initialization,
-            media = self.media,
+            init = esc(&self.initialization),
+            media = esc(&self.media),
             sn = self.start_number,
             dur = self.duration,
             ts = self.timescale,
@@ -161,8 +196,8 @@ impl Representation {
         let _ = write!(
             out,
             r#"{pad}<Representation id="{id}" codecs="{codecs}" bandwidth="{bw}""#,
-            id = self.id,
-            codecs = self.codecs,
+            id = esc(&self.id),
+            codecs = esc(&self.codecs),
             bw = self.bandwidth_bps,
         );
         if let Some(w) = self.width {
@@ -220,11 +255,11 @@ impl AdaptationSet {
             out,
             r#"{pad}<AdaptationSet id="{id}" mimeType="{mt}" contentType="{ct}" segmentAlignment="true""#,
             id = self.id,
-            mt = self.mime_type,
-            ct = self.content_type,
+            mt = esc(&self.mime_type),
+            ct = esc(&self.content_type),
         );
         if let Some(lang) = &self.lang {
-            let _ = write!(out, r#" lang="{lang}""#);
+            let _ = write!(out, r#" lang="{lang}""#, lang = esc(lang));
         }
         out.push_str(">\n");
         self.segment_template.write(out, indent + 1);
@@ -261,8 +296,8 @@ impl Period {
         let _ = writeln!(
             out,
             r#"{pad}<Period id="{id}" start="{start}">"#,
-            id = self.id,
-            start = self.start
+            id = esc(&self.id),
+            start = esc(&self.start)
         );
         for set in &self.adaptation_sets {
             set.write(out, indent + 1)?;
@@ -312,9 +347,9 @@ impl Mpd {
             out,
             r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="{ty}" profiles="{profiles}" minBufferTime="{mbt}" minimumUpdatePeriod="{mup}">"#,
             ty = self.mpd_type.as_str(),
-            profiles = self.profiles,
-            mbt = self.min_buffer_time,
-            mup = self.minimum_update_period,
+            profiles = esc(&self.profiles),
+            mbt = esc(&self.min_buffer_time),
+            mup = esc(&self.minimum_update_period),
         );
         for period in &self.periods {
             period.write(&mut out, 1)?;
@@ -474,6 +509,40 @@ mod tests {
         let mut mpd = live_mpd_with_video();
         mpd.periods[0].adaptation_sets[0].representations.clear();
         assert!(matches!(mpd.render(), Err(DashError::EmptyAdaptationSet)));
+    }
+
+    #[test]
+    fn esc_is_zero_copy_on_safe_input() {
+        let s = "avc1.640028";
+        match esc(s) {
+            Cow::Borrowed(b) => assert_eq!(b, s),
+            Cow::Owned(_) => panic!("esc should not allocate for safe input"),
+        }
+    }
+
+    #[test]
+    fn esc_escapes_all_five_xml_specials() {
+        let out = esc("a\"b<c>d&e'f");
+        assert_eq!(&*out, "a&quot;b&lt;c&gt;d&amp;e&apos;f");
+    }
+
+    #[test]
+    fn hostile_codecs_string_does_not_break_xml_root() {
+        // Codec strings come from lvqr_cmaf::detect_*_codec_string
+        // parsing publisher-provided init segments. A crafted init
+        // that decoded into `"/><foo` would have torn the MPD root
+        // element apart before the session-33 escape path landed.
+        let mut mpd = live_mpd_with_video();
+        mpd.periods[0].adaptation_sets[0].representations[0].codecs = "\"/><injection\"".into();
+        let xml = mpd.render().expect("render should succeed with hostile codecs");
+        // Exactly one <MPD ...> root and one </MPD>.
+        assert_eq!(xml.matches("<MPD ").count(), 1);
+        assert_eq!(xml.matches("</MPD>").count(), 1);
+        // The injection payload is escaped, not parsed as markup.
+        assert!(
+            xml.contains(r#"codecs="&quot;/&gt;&lt;injection&quot;""#),
+            "codecs attribute not escaped correctly:\n{xml}"
+        );
     }
 
     #[test]
