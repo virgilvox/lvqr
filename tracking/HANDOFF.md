@@ -1,17 +1,186 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- HEVC reaches every egress including WHEP
+## Project Status: v0.4-dev -- WHIP publisher surface is audio+video
 
-**Last Updated**: 2026-04-15 (session 28 close, HEVC through WHEP)
+**Last Updated**: 2026-04-15 (session 29 close, Opus through WHIP)
 **Tests**: `cargo test --workspace` green under the default
-feature set: **80 test binaries, 346 individual tests passing**,
+feature set: **81 test binaries, 354 individual tests passing**,
 0 failures, 1 ignored doctest. `cargo clippy --workspace
 --all-targets -- -D warnings` clean. `cargo fmt --all --check`
-clean. Session-28 delta over session-27's `9c69319` baseline:
-+1 test (the new `lvqr-whep::e2e_str0m_loopback_hevc` loopback),
-plus the `RawSampleObserver::on_raw_sample` signature widening
-across `lvqr-ingest`, `lvqr-whip`, and `lvqr-whep`.
+clean. Session-29 delta over session-28's `5306977` baseline:
++7 tests (3 lvqr-cmaf Opus writer unit, 3 lvqr-whip bridge
+Opus unit, 1 new Opus loopback E2E); +1 test binary. Also
+includes a post-session-28 audit hardening commit (`9292208`)
+that pinned a deterministic regression for the session-27 AAC
+floor and refreshed three stale module-doc comments.
 
+## Session 29 (2026-04-15): Opus-native audio through the WHIP bridge
+
+One code commit on top of session 28's `5306977` plus an
+interleaved audit commit (`9292208`). Closes session-28
+recommended entry-point item 1 (WHIP audio path). WHIP
+publishers negotiating Opus now land an audio track on the MoQ
+broadcast alongside their video without any transcode, with a
+proper `Opus` sample entry + `dOps` init segment and a
+sibling `1.mp4` MoQ track. This is option (a) from the
+session-25 recommendation -- the cheap path that unlocks
+browser audio for every Opus-capable MoQ subscriber without
+standing up an AAC encoder.
+
+### What landed
+
+* **`lvqr-cmaf::write_opus_init_segment` + `OpusInitParams`**
+  in `crates/lvqr-cmaf/src/init.rs`. Emits the standard
+  ISO/IEC 14496-30 `Opus` sample entry with an embedded
+  `dOps` box (`mp4-atom` 0.10 supports both). Channel counts
+  are constrained to the `channel_mapping_family == 0` path
+  (1 or 2 channels); anything else is rejected as
+  `InitSegmentError::Encode(Unsupported(..))` because
+  `mp4-atom`'s `Dops` encoder only writes the simple mapping.
+  Timescale is 48_000 by convention -- Opus always runs at
+  that rate internally and MSE players expect the track
+  timescale to match.
+
+* **`lvqr-whip::IngestAudioSample`** new public struct in
+  `crates/lvqr-whip/src/bridge.rs`: `{ dts_48k, duration_48k,
+  payload: Bytes }`. Separate from the video
+  [`IngestSample`] because the video type carries
+  `VideoCodec` + keyframe flags that have no analog on the
+  audio side, and unifying the two would force every sink
+  impl to branch.
+
+* **`IngestSampleSink::on_audio_sample`** new trait method
+  with a default no-op implementation so existing test
+  sinks (the H.264 and HEVC E2E loopback sinks) do not need
+  to grow a method. `WhipMoqBridge` overrides this to lazily
+  create a `1.mp4` MoQ audio track on the first Opus frame
+  that arrives after the broadcast has been initialized via
+  a video keyframe. Audio-before-video is dropped silently:
+  the broadcast slot doesn't exist yet, and holding audio
+  back would grow an unbounded queue.
+
+* **`BroadcastState`** grew three audio fields (`audio_sink`,
+  `audio_seq`, `audio_init_emitted`). Also renamed the
+  previously-unused `_broadcast` field to `broadcast` since
+  `ensure_audio_initialized` calls `create_track("1.mp4")`
+  on the existing `BroadcastProducer`. The two tracks share
+  one `BroadcastProducer` / one MoQ fanout connection but
+  carry independent sequence numbers and init states.
+
+* **`lvqr-whip::str0m_backend`** gained an `audio_mid` slot on
+  `IngestCtx`, a `dts_base_48k` rebase anchor (independent
+  of `dts_base_90k` so the two tracks have their own zero
+  epochs), and a new `forward_audio_sample` path. The
+  `handle_event` match arm for `Event::MediaData` now
+  branches on `video_mid` vs `audio_mid` and routes to the
+  matching forwarder. Non-Opus audio codecs (PCMA / PCMU
+  fallback) are dropped with a trace log.
+  `MediaTime::rebase(Frequency::FORTY_EIGHT_KHZ)` is the
+  boundary-crossing 48 kHz rebase.
+
+* **Observer fanout intentionally stays video-only** for
+  audio in session 29. The fragment observer (LL-HLS +
+  archive) and raw-sample observer (WHEP) do not fire for
+  audio samples. Rationale: LL-HLS audio rendition builder
+  in `MultiHlsServer::ensure_audio` is hardcoded to AAC, and
+  the master playlist still advertises `mp4a.40.2` for the
+  audio portion (session 27 made the video codec
+  dynamic but left audio as a follow-up). WHEP negotiates
+  Opus on the subscriber side but currently drops ingest
+  audio entirely because the RTMP path produces AAC and
+  there's no AAC->Opus transcoder. Threading codec-aware
+  audio egress through LL-HLS (server advertises `opus` in
+  master CODECS and serves an Opus init segment) and WHEP
+  (forward Opus through to subscribers without a transcode)
+  is **session 30**.
+
+### 5-artifact contract status for session 29
+
+| Slot | Status |
+|---|---|
+| Unit (`lvqr-cmaf::init::tests`) | +3 tests pinning the Opus writer: `opus_init_segment_starts_with_ftyp_and_contains_moov` (smoke), `opus_init_segment_round_trips_through_mp4_atom` (decode-side verification that `Codec::Opus` round-trips through mp4-atom with the pre_skip / channel_count / timescale the writer emits), `opus_init_segment_rejects_invalid_channel_count` (0, 3, 6 all rejected). |
+| Unit (`lvqr-whip::bridge::tests`) | +3 tests for the bridge audio path: `opus_audio_sample_before_video_is_dropped` pins the video-first ordering invariant, `opus_audio_sample_after_video_initializes_audio_track` walks the happy path twice to prove `ensure_audio_initialized` is idempotent, and `opus_empty_payload_is_dropped_silently` pins the empty-frame guard. |
+| Integration | No new integration slot. The signaling path is codec-agnostic; audio negotiation is exercised through `str0m::sdp_api::accept_offer` which the E2E already covers. |
+| Proptest | No new proptest slot. The Opus frame bytes are opaque at this layer (no parser that needs a never-panic property), and the existing `lvqr-whip::proptest_depack` tests cover the length-prefixed framing. |
+| Fuzz | Still deferred. |
+| E2E | **New**: `tests/e2e_str0m_loopback_opus.rs`. Client `Rtc` builds an offer carrying **both** a video (H.264) and an audio (Opus) section, server answerer accepts, both poll loops complete ICE + DTLS + SRTP, client writes synthetic H.264 SPS/PPS/IDR through the video writer AND synthetic 10-byte "Opus" packets through the audio writer every 20 ms, and the server's capture sink (impls both `on_sample` and `on_audio_sample`) asserts at least one sample in each slot. Completes in ~0.19s on loopback. |
+
+### Load-bearing decisions made
+
+* **Sibling track on the same `BroadcastProducer`**, not a
+  separate broadcast. MoQ subscribers reach the audio track
+  by subscribing to `1.mp4` on the existing broadcast; they
+  do not need to discover a parallel broadcast name. The
+  `BroadcastState.broadcast` (previously `_broadcast`) stays
+  alive to host both tracks. One network fanout, two logical
+  tracks.
+* **Audio rebase to a separate 48 kHz zero epoch**, not the
+  video 90 kHz epoch divided down. Mixing them would require
+  a common wall-clock anchor and synchronous arrival which
+  str0m does not guarantee. MSE / MoQ subscribers align the
+  two tracks via presentation-time metadata, not via shared
+  DTS, so independent epochs are correct and simpler.
+* **`IngestSampleSink::on_audio_sample` default no-op**.
+  Keeps the existing three E2E test sinks source-compatible
+  without a breaking trait change. Tests that only care
+  about video (the H.264 + HEVC loopbacks) inherit the
+  default; tests that care about audio (the new Opus
+  loopback) override both methods.
+* **Video-first ordering invariant**. Audio-before-video
+  drops rather than buffers. The alternative (buffer audio,
+  replay after video init) would require an unbounded queue
+  and a late-dispatch code path; the failure mode of audio
+  dropping at the very start of a publish is bounded and
+  obvious.
+* **Opus frame duration defaulted to 960 ticks (20 ms)**.
+  str0m's 0.18 `MediaData` does not expose the per-packet
+  duration, and WebRTC Opus defaults to 20 ms PTIME so the
+  default is correct for every real publisher. A slightly
+  wrong `duration` in the `trun` box is cosmetically wrong
+  but functionally harmless -- MSE decoders reconstruct the
+  actual Opus frame duration from the packet body itself.
+
+### Known gaps explicitly not closed in this session
+
+* **LL-HLS audio rendition for Opus**. Still AAC-only in the
+  master playlist. Session 30.
+* **WHEP Opus forwarding**. Session 30. The subscriber-side
+  Opus pt exists (session 28 enabled it), but WHEP currently
+  drops ingest audio in `Str0mSessionHandle::on_raw_sample`
+  with a warn-once on the `1.mp4` track.
+* **DASH egress**, archive VOD playlist, criterion benches,
+  fuzz catch-up, lvqr-wasm deletion, CORS restrictive
+  default. All unchanged.
+
+### Recommended entry point (session 30)
+
+1. **Opus through LL-HLS and WHEP**. Now that the publisher
+   side can produce Opus, plumb it through the two remaining
+   egress paths: LL-HLS (thread an audio codec string through
+   the master playlist + handle Opus init in the audio
+   `HlsServer`) and WHEP (forward Opus ingest samples to
+   subscribers that negotiated Opus; same-codec passthrough,
+   no transcode). Budget: one session.
+2. **`lvqr-dash` egress** (Tier 2.6). Unchanged.
+3. **Real-browser HEVC + Opus interop smoke**. Unchanged.
+4. **Archive VOD playlist rendering**. Unchanged.
+5. **Benchmark slots via `criterion`**. Unchanged.
+6. **Fuzz slot catch-up**. Unchanged.
+7. **`lvqr-wasm` deletion**. Unchanged.
+8. **CORS restrictive default**. Unchanged.
+
+### Competitive-matrix delta after session 29
+
+Checkmarks gained:
+
+* **WHIP audio ingest (Opus)**: N -> **Partial**. MoQ
+  subscribers receive Opus alongside video; LL-HLS and WHEP
+  audio fanout still pending.
+* **Codec-honest WHIP publisher surface**: H.264 video,
+  H.265 video, and Opus audio all reach MoQ subscribers
+  natively without a transcode.
+
+---
 ## Session 28 (2026-04-15): HEVC through the WHEP egress path
 
 One code commit on top of session 27's `9c69319`. Closes
