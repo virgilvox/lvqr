@@ -196,3 +196,83 @@ async fn blocking_reload_waits_for_target_media_sequence() {
     assert!(text.contains("seg-0.m4s"));
     assert!(text.contains("seg-1.m4s"));
 }
+
+#[tokio::test]
+async fn delta_playlist_returns_ext_x_skip_for_long_enough_window() {
+    // Drive the `_HLS_skip=YES` query through the real axum router
+    // and prove the response body contains an `#EXT-X-SKIP` tag.
+    // 10 segments * 2 s each = 20 s total; default
+    // CAN-SKIP-UNTIL=12 s; the delta walk emits 3 skipped
+    // segments and keeps 7.
+    let server = HlsServer::new(PlaylistBuilderConfig::default());
+    server.push_init(Bytes::from_static(b"init")).await;
+    for i in 0..10u64 {
+        let dts = i * 180_000;
+        server
+            .push_chunk_bytes(
+                &chunk(dts, 180_000, CmafChunkKind::Segment),
+                Bytes::from(format!("seg-{i}-body").into_bytes()),
+            )
+            .await
+            .unwrap();
+    }
+    // Force-close the last pending segment so all 10 segments
+    // appear in `manifest.segments` and the delta walk can see the
+    // full 20 s of closed duration. Without this, the last
+    // Segment-kind chunk would sit in `preliminary_parts` and the
+    // delta window would only run against 9 closed segments.
+    server.close_pending_segment().await;
+
+    let (status, ct, body) = get_body(&server, "/playlist.m3u8?_HLS_skip=YES").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ct, "application/vnd.apple.mpegurl");
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        text.contains("#EXT-X-SKIP:SKIPPED-SEGMENTS=3"),
+        "delta playlist missing EXT-X-SKIP:\n{text}"
+    );
+    assert!(text.contains("CAN-SKIP-UNTIL=12.000"), "body:\n{text}");
+    // The first three segment URIs are absent; the fourth (index 3)
+    // is the first kept segment.
+    assert!(!text.contains("seg-0.m4s"));
+    assert!(!text.contains("seg-2.m4s"));
+    assert!(text.contains("seg-3.m4s"));
+    assert!(text.contains("seg-9.m4s"));
+
+    // Same playlist without the directive is the full variant.
+    let (status, _, body) = get_body(&server, "/playlist.m3u8").await;
+    assert_eq!(status, StatusCode::OK);
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(!text.contains("#EXT-X-SKIP"), "full variant must not skip:\n{text}");
+    assert!(text.contains("seg-0.m4s"));
+}
+
+#[tokio::test]
+async fn delta_playlist_ignores_skip_when_below_spec_floor() {
+    // A short playlist (6 s total) sits below the 6 * TARGETDURATION
+    // floor so the server MUST NOT emit a delta regardless of the
+    // query. Assert the body is identical to the full variant.
+    let server = HlsServer::new(PlaylistBuilderConfig::default());
+    server.push_init(Bytes::from_static(b"init")).await;
+    for i in 0..3u64 {
+        let dts = i * 180_000;
+        server
+            .push_chunk_bytes(
+                &chunk(dts, 180_000, CmafChunkKind::Segment),
+                Bytes::from(format!("seg-{i}-body").into_bytes()),
+            )
+            .await
+            .unwrap();
+    }
+
+    let (status, _, body) = get_body(&server, "/playlist.m3u8?_HLS_skip=YES").await;
+    assert_eq!(status, StatusCode::OK);
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        !text.contains("#EXT-X-SKIP"),
+        "short playlist must ignore _HLS_skip directive:\n{text}"
+    );
+    // Every segment must be present.
+    assert!(text.contains("seg-0.m4s"));
+    assert!(text.contains("seg-1.m4s"));
+}
