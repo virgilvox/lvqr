@@ -203,15 +203,15 @@ impl DashServer {
         a.segments.insert(seq, bytes);
     }
 
-    fn video_init(&self) -> Option<Bytes> {
+    pub(crate) fn video_init(&self) -> Option<Bytes> {
         self.state.video.lock().expect("dash video lock poisoned").init.clone()
     }
 
-    fn audio_init(&self) -> Option<Bytes> {
+    pub(crate) fn audio_init(&self) -> Option<Bytes> {
         self.state.audio.lock().expect("dash audio lock poisoned").init.clone()
     }
 
-    fn video_segment(&self, seq: u64) -> Option<Bytes> {
+    pub(crate) fn video_segment(&self, seq: u64) -> Option<Bytes> {
         self.state
             .video
             .lock()
@@ -221,7 +221,7 @@ impl DashServer {
             .cloned()
     }
 
-    fn audio_segment(&self, seq: u64) -> Option<Bytes> {
+    pub(crate) fn audio_segment(&self, seq: u64) -> Option<Bytes> {
         self.state
             .audio
             .lock()

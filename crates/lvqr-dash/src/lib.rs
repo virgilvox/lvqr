@@ -54,8 +54,10 @@
 //!    follows the SegmentTemplate to the next segment URI, and
 //!    fetches the segment via chunked-transfer HTTP/1.1.
 
+pub mod bridge;
 pub mod mpd;
 pub mod server;
 
+pub use bridge::DashFragmentBridge;
 pub use mpd::{AdaptationSet, DashError, Mpd, MpdType, Period, Representation, SegmentTemplate, render_mpd};
 pub use server::{DashConfig, DashServer, MultiDashServer};
