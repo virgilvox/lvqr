@@ -6,7 +6,7 @@
 
 A Rust binary that relays live video using QUIC/MoQ. Built on moq-lite for zero-copy fan-out from ingest to delivery.
 
-## Status (v0.4-dev, session 24 close)
+## Status (v0.4-dev, session 26 close)
 
 **Tier 2.3 data plane is closed and Tier 2.4 archive is live.** Real
 end-to-end coverage across three browser-facing egress paths lands
@@ -55,7 +55,7 @@ segments by decode-time window:
   protected-auth test that exercises both the header and
   query-parameter bearer transports.
 
-**Working and tested** (78 test binaries workspace-wide, 334
+**Working and tested** (79 test binaries workspace-wide, 339
 individual tests, 0 failures under the default feature set,
 `cargo clippy --workspace --all-targets -- -D warnings` clean,
 `cargo fmt --all --check` clean; 0 `todo!()` / `unimplemented!()`
@@ -101,20 +101,25 @@ tree):
   ingest direction (reading `Event::MediaData` instead of
   writing through `Writer::write`), an Annex B -> AVCC
   converter that is the inverse of the WHEP boundary
-  converter, and a `WhipMoqBridge` that lazily builds the AVC
-  init segment from the first keyframe's SPS + PPS and fans
-  every subsequent sample through the same
+  converter, and a `WhipMoqBridge` that lazily builds an AVC
+  **or HEVC** init segment from the first parameter-set-bearing
+  IRAP and fans every subsequent sample through the
   `SharedFragmentObserver` and `SharedRawSampleObserver`
-  instances the RTMP bridge uses. The bridge is a sibling of
-  `RtmpMoqBridge`, not an extension of it, so every existing
-  egress (MoQ, LL-HLS, WHEP, disk record, DVR archive) picks
-  up WHIP publishers with zero changes to the egress side.
-  Four-slot test coverage: 18 unit, 10 signaling integration
-  (axum `oneshot`), 3 proptest properties on the depacketizer
-  (never-panics + well-formed round trip), and an in-process
-  str0m E2E loopback that publishes real SPS + PPS + IDR
-  access units through ICE + DTLS + SRTP and asserts the
-  capture sink receives a keyframe. Enabled via
+  taps for H.264 publishers (observer fanout is AVC-only;
+  HEVC publishers reach MoQ subscribers via the `0.mp4`
+  track but bypass LL-HLS / WHEP / archive until those
+  surfaces grow codec-aware sample entries in session 27).
+  Both codecs share the sibling-bridge pattern and the
+  `VideoCodec` tag on `IngestSample` picks the init path.
+  Five-artifact test coverage: 22 unit (including 4 HEVC
+  tests for VPS/SPS/PPS extraction + broadcast init), 10
+  signaling integration (axum `oneshot`), 3 proptest
+  properties on the depacketizer (never-panics + well-formed
+  round trip), plus two in-process str0m E2E loopbacks -- one
+  H.264 keyframe loopback and one HEVC keyframe loopback that
+  uses real x265 VPS/SPS/PPS bytes and asserts the capture
+  sink receives an HEVC-tagged keyframe through ICE + DTLS +
+  SRTP + str0m's H265 packetizer pair. Enabled via
   `--whip-port` / `LVQR_WHIP_PORT` (default 0 = disabled).
 - **WebSocket browser ingest + egress** via the `@lvqr/core` and
   `@lvqr/player` TypeScript packages plus the bundled `test-app/`.

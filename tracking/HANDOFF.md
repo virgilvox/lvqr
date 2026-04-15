@@ -1,16 +1,182 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.7 WHIP ingest real, video end-to-end
+## Project Status: v0.4-dev -- WHIP ingest carries HEVC end-to-end
 
-**Last Updated**: 2026-04-14 (session 25 close, lvqr-whip landed)
+**Last Updated**: 2026-04-14 (session 26 close, HEVC through WHIP)
 **Tests**: `cargo test --workspace` green under the default feature
-set: **78 test binaries, 334 individual tests passing**, 0
-failures. `cargo clippy --workspace --all-targets -- -D warnings`
-clean. `cargo fmt --all --check` clean. Session-25 deltas over
-the `c1bf179` baseline: +15 test binaries and +32 tests, all
-from the new `lvqr-whip` crate (18 unit, 10 signaling
-integration, 3 proptest, 1 in-process str0m E2E loopback).
+set: **79 test binaries, 339 individual tests passing**, 0
+failures, 1 ignored doctest. `cargo clippy --workspace --all-targets
+-- -D warnings` clean. `cargo fmt --all --check` clean. Session-26
+deltas over the `fb9d2ac` baseline: +1 test binary and +5 tests, all
+from the new HEVC path in `lvqr-whip` (4 bridge unit tests +
+1 HEVC-specific str0m loopback E2E).
 
+## Session 26 (2026-04-14): Tier 2.7 HEVC through the WHIP bridge
+
+One code change on top of session 25's `fb9d2ac`. Threads an
+HEVC code path through the `WhipMoqBridge` so any WebRTC
+publisher negotiating H.265 now lands a MoQ broadcast with a
+real `hev1` sample entry, using the same sibling-bridge shape
+that WHIP/H.264 uses. Zero lines changed in `lvqr-ingest`,
+`lvqr-hls`, `lvqr-whep`, `lvqr-archive`, `lvqr-cmaf`, or
+`lvqr-moq`: the HEVC path reuses `write_hevc_init_segment`
+(already in `lvqr-cmaf` since session 6) and
+`lvqr_codec::hevc::parse_sps` unchanged.
+
+### What landed
+
+* **`lvqr-whip/src/depack.rs`** grew three HEVC NAL-type
+  constants (`HEVC_NAL_TYPE_VPS = 32`, `SPS = 33`, `PPS = 34`)
+  plus a `hevc_nal_type()` helper that extracts the 6-bit
+  `nal_unit_type` field from an HEVC NAL header. `split_annex_b`
+  is codec-agnostic and was not modified.
+
+* **`lvqr-whip/src/bridge.rs`** gained a public
+  `VideoCodec { H264, H265 }` enum stamped on every
+  `IngestSample`, a new `BroadcastState.codec` field, a
+  codec-aware `ensure_initialized` dispatch, and two new
+  builder helpers `build_avc_init` + `build_hevc_init`. The
+  HEVC path walks the first keyframe for VPS + SPS + PPS via
+  `extract_hevc_params`, parses the SPS through
+  `lvqr_codec::hevc::parse_sps` for pixel dimensions +
+  profile/tier/level, and calls
+  `lvqr_cmaf::write_hevc_init_segment`. The MoQ track fourcc
+  on the `FragmentMeta` is `"hvc1"` for HEVC and `"avc1"` for
+  H.264.
+
+* **`lvqr-whip/src/str0m_backend.rs`** now calls
+  `RtcConfig::new().enable_h264(true).enable_h265(true).enable_opus(true)`
+  so the answerer accepts both video codecs in the SDP offer,
+  and `forward_video_sample` reads
+  `data.params.spec().codec` to map from str0m's negotiated
+  payload type back to our `VideoCodec` tag before handing
+  the sample off to the bridge. Non-H26x video codecs are
+  skipped at this boundary with a trace-level log.
+
+* **Observer fanout is intentionally AVC-only**. HEVC
+  publishers do **not** fire the `SharedFragmentObserver`
+  (LL-HLS + archive tee) or the `SharedRawSampleObserver`
+  (WHEP) paths in session 26. Both downstream surfaces
+  currently hard-code `avc1.640020` in their respective
+  master-playlist / packetizer code and would advertise a
+  wrong codec string if given HEVC init bytes. The HEVC path
+  reaches **MoQ subscribers only** via `origin.create_broadcast
+  -> 0.mp4`. Threading codec-aware HLS + WHEP is explicitly
+  carried forward as a session-27 follow-up.
+
+* **CLI / test-utils wiring**. No changes needed: the CLI
+  already routes HEVC-capable `Str0mIngestAnswerer` through
+  the same `WhipMoqBridge`. HEVC publishers reach the same
+  `--whip-port` as H.264.
+
+### 5-artifact contract status for lvqr-whip (HEVC delta)
+
+| Slot | Status |
+|---|---|
+| Unit | +4 tests in `src/bridge.rs::tests` covering VPS/SPS/PPS extraction from a real x265 IRAP, the missing-VPS drop path, happy-path HEVC broadcast initialization, and missing-parameter-set keyframe drop. |
+| Integration | Unchanged (10 signaling tests in `tests/integration_signaling.rs`). Signaling is codec-agnostic. |
+| Proptest | Unchanged (3 properties in `tests/proptest_depack.rs`). Depacketizer walks arbitrary bytes and HEVC NAL types share the same start-code framing. |
+| E2E | **New**: `tests/e2e_str0m_loopback_hevc.rs`. Builds a client `Rtc` with **only** `enable_h265(true)` so the negotiated m=video has exactly one payload type, writes real x265 VPS/SPS/PPS + a synthetic IDR_W_RADL NAL through `Writer::write` on every tick, and asserts the capture sink on the server side receives a keyframe whose `codec == VideoCodec::H265` and whose payload re-parses as HEVC NAL units. This is the assertion that would catch a regression in the `data.params.spec().codec` lookup, the HEVC init builder, or str0m's H265 packetizer/depacketizer pair. |
+| Fuzz | Still deferred (same nightly-rustc gate as H.264 path). |
+
+### Load-bearing decisions made
+
+* **One MoQ track per broadcast, codec on the track metadata**.
+  HEVC publishers still land on the `0.mp4` track slot so every
+  downstream MoQ subscriber keeps the same track naming
+  convention. Multi-track publishers (simulcast / AV1 fallback)
+  would extend this with `1.mp4`, `2.mp4`; not needed yet.
+
+* **Codec learned from `MediaData.params.spec().codec`, not
+  from sniffing the NAL header**. str0m's SDP negotiation
+  already pins the payload type to a single codec; trusting
+  the negotiated value is cheaper and more robust than
+  pattern-matching the NAL header byte layout, which differs
+  between H.264 (1-byte header, nal_unit_type in low 5 bits)
+  and HEVC (2-byte header, nal_unit_type in bits 6..=1 of the
+  first byte).
+
+* **HEVC skips the fragment + raw-sample observers, AVC fires
+  them**. Honest scoping: introducing HEVC to LL-HLS / WHEP /
+  archive requires threading a codec string through each
+  egress crate's sample-entry / master-playlist / packetizer
+  paths, which would widen the session-26 blast radius far
+  beyond `lvqr-whip`. Leaving the observer taps AVC-only
+  preserves session 25's Bet-3 invariant that WHIP changes
+  touch zero lines in egress crates.
+
+* **x265 fixture bytes duplicated in `bridge.rs::tests` and
+  `tests/e2e_str0m_loopback_hevc.rs`**. Same pattern
+  `lvqr-cmaf::init::tests` uses; the conformance fixture at
+  `crates/lvqr-conformance/fixtures/codec/hevc-sps-x265-main-320x240.bin`
+  is the source of truth, and if x265 output drifts, the
+  cmaf conformance test catches it first.
+
+### Known gaps explicitly not closed in this session
+
+* **HEVC through LL-HLS / WHEP / archive**. Carried to session
+  27. `lvqr-hls::server.rs` hard-codes `"avc1.640020,mp4a.40.2"`
+  in the master playlist codecs attribute; threading a real
+  codec string through the master playlist builder is the
+  first step. `lvqr-whep::str0m_backend` similarly hard-codes
+  H.264 RTP packetization; WHEP egress for HEVC requires a
+  second packetizer path and SDP re-negotiation.
+
+* **Audio path for WHIP (Opus/AAC)**. Still deferred (was
+  session-25 entry point item 1, now still pending).
+
+* **Session cleanup tearing down the MoQ broadcast**. Same
+  as session 25: DELETE tears down the UDP socket but the
+  `WhipMoqBridge` entry stays alive until CLI shutdown.
+
+### Recommended entry point (session 27)
+
+Ordered by strategic leverage against the v1.0 M1 milestone.
+Items renumber by one where session 26 closed them.
+
+1. **HEVC through LL-HLS + WHEP + archive**. The
+   publisher-side piece just landed; the egress-side piece is
+   the real competitive win. Scope: thread a codec string
+   through `lvqr-hls::MasterPlaylistConfig` and
+   `lvqr-whep::str0m_backend` per-broadcast, and remove the
+   AVC-only observer guards in `WhipMoqBridge::ensure_initialized`
+   + `push_sample`. Budget: one session for HLS, one session
+   for WHEP (since WHEP needs a parallel H265 packetizer path
+   and browser support varies; Safari supports HEVC-over-WebRTC
+   natively, Chrome behind an experimental flag).
+
+2. **Audio path for WHIP** (Tier 2.7 follow-on). Unchanged
+   from session-25 recommended item 1. Still Opus-native
+   sibling `1.mp4` track as the cheap option; AAC re-encode
+   as the expensive alternative.
+
+3. **`lvqr-dash` egress** (Tier 2.6). Unchanged from session
+   25 item 3.
+
+4. **Archive VOD playlist rendering**. Unchanged.
+
+5. **Benchmark slots via `criterion`**. Unchanged.
+
+6. **Fuzz slot catch-up**. Unchanged.
+
+7. **`lvqr-wasm` deletion**. Unchanged.
+
+8. **CORS restrictive default**. Unchanged.
+
+### Competitive-matrix delta after session 26
+
+Checkmarks gained:
+
+* **HEVC ingest via WebRTC**: N -> Partial (MoQ subscribers
+  only; HLS / WHEP / archive still AVC-only, tracked for
+  session 27).
+
+Positions LVQR still cannot defend: HEVC through the egress
+chain, AV1, Opus through the bridge audio path, DASH egress,
+ABR / transcoding, multi-node cluster, SDK surface beyond
+`@lvqr/core`, web admin UI.
+
+---
 ## Session 25 (2026-04-14): Tier 2.7 `lvqr-whip` ingest crate
 
 One code commit on top of session 24's `c1bf179`. Closes the
