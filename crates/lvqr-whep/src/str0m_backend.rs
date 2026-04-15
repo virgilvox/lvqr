@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use lvqr_cmaf::RawSample;
+use lvqr_ingest::VideoCodec;
 use str0m::change::{SdpAnswer, SdpOffer};
 use str0m::format::Codec;
 use str0m::media::{MediaKind, MediaTime, Mid, Pt};
@@ -128,6 +129,7 @@ impl SdpAnswerer for Str0mAnswerer {
 
         let mut rtc = RtcConfig::new()
             .enable_h264(true)
+            .enable_h265(true)
             .enable_opus(true)
             .build(Instant::now());
 
@@ -181,8 +183,15 @@ impl SdpAnswerer for Str0mAnswerer {
 enum SessionMsg {
     /// A video sample ready to hand to `Writer::write`. `payload` is
     /// the AVCC-framed bytes straight from the ingest bridge; the
-    /// poll task converts to Annex B before calling str0m.
-    Video { payload: Bytes, dts: u64, keyframe: bool },
+    /// poll task converts to Annex B before calling str0m. `codec`
+    /// picks which negotiated `Pt` the sample is routed through
+    /// (session 28 added H265 alongside the existing H264 path).
+    Video {
+        payload: Bytes,
+        dts: u64,
+        keyframe: bool,
+        codec: VideoCodec,
+    },
 }
 
 /// Poll-task-local state captured across iterations. The task is
@@ -194,9 +203,16 @@ struct SessionCtx {
     /// `Event::MediaAdded`. `None` until the event arrives.
     video_mid: Option<Mid>,
     /// Negotiated H.264 payload type for the video mid, resolved
-    /// lazily from `Writer::payload_params` the first time we have
-    /// a mid and need a pt.
-    video_pt: Option<Pt>,
+    /// lazily from `Writer::payload_params`. `None` when the
+    /// client did not include H.264 in its offer.
+    video_pt_h264: Option<Pt>,
+    /// Negotiated H.265 payload type for the video mid, resolved
+    /// the same way. `None` when the client did not include H.265
+    /// in its offer (common: Chrome without the experimental
+    /// flag, Firefox). Session 28 added this slot so HEVC
+    /// publishers can reach a matching WHEP subscriber through
+    /// the same poll loop as H.264 subscribers.
+    video_pt_h265: Option<Pt>,
     /// True once `Event::Connected` has fired. Samples that arrive
     /// before this point are dropped rather than written.
     connected: bool,
@@ -205,6 +221,12 @@ struct SessionCtx {
     write_error_logged: bool,
     /// One-shot logging guard for the first successful write.
     first_write_logged: bool,
+    /// One-shot logging guard: log the first sample whose codec
+    /// was not present in the negotiated payload params. After
+    /// the warn fires, subsequent unmatched samples are dropped
+    /// silently so a mismatched publisher/subscriber pairing
+    /// does not spam the log.
+    unmatched_codec_logged: bool,
 }
 
 /// Run the sans-IO `Rtc` state machine forward.
@@ -256,20 +278,29 @@ async fn run_session_loop(
             }
         };
 
-        // Lazily resolve the H.264 `Pt` the first time both the
-        // video mid is known and we still have no pt. Doing this
-        // outside `poll_output` avoids borrowing conflicts and
-        // keeps the resolution near the place that consumes the
-        // pt.
-        if ctx.video_pt.is_none()
+        // Lazily resolve the negotiated `Pt` values the first
+        // time both the video mid is known and at least one slot
+        // is still empty. Doing this outside `poll_output`
+        // avoids borrowing conflicts and keeps the resolution
+        // near the place that consumes the pt. Session 28
+        // resolves H.264 and H.265 in the same pass so a single
+        // subscriber can handle either codec if the client
+        // offered both.
+        if (ctx.video_pt_h264.is_none() || ctx.video_pt_h265.is_none())
             && let Some(mid) = ctx.video_mid
             && let Some(writer) = rtc.writer(mid)
         {
             for params in writer.payload_params() {
-                if params.spec().codec == Codec::H264 {
-                    ctx.video_pt = Some(params.pt());
-                    tracing::debug!(%broadcast, pt = ?params.pt(), "resolved video pt");
-                    break;
+                match params.spec().codec {
+                    Codec::H264 if ctx.video_pt_h264.is_none() => {
+                        ctx.video_pt_h264 = Some(params.pt());
+                        tracing::debug!(%broadcast, pt = ?params.pt(), "resolved h264 pt");
+                    }
+                    Codec::H265 if ctx.video_pt_h265.is_none() => {
+                        ctx.video_pt_h265 = Some(params.pt());
+                        tracing::debug!(%broadcast, pt = ?params.pt(), "resolved h265 pt");
+                    }
+                    _ => {}
                 }
             }
         }
@@ -285,8 +316,8 @@ async fn run_session_loop(
             }
             msg = samples.recv() => {
                 match msg {
-                    Some(SessionMsg::Video { payload, dts, keyframe }) => {
-                        if let Err(()) = write_video_sample(&mut rtc, &mut ctx, &broadcast, payload, dts, keyframe) {
+                    Some(SessionMsg::Video { payload, dts, keyframe, codec }) => {
+                        if let Err(()) = write_video_sample(&mut rtc, &mut ctx, &broadcast, payload, dts, keyframe, codec) {
                             // `write_video_sample` logged already.
                         }
                     }
@@ -368,6 +399,7 @@ fn write_video_sample(
     payload: Bytes,
     dts: u64,
     keyframe: bool,
+    codec: VideoCodec,
 ) -> Result<(), ()> {
     if !ctx.connected {
         // Writes before Connected are dropped by str0m anyway. Skip
@@ -377,7 +409,19 @@ fn write_video_sample(
     let Some(mid) = ctx.video_mid else {
         return Ok(());
     };
-    let Some(pt) = ctx.video_pt else {
+    let pt = match codec {
+        VideoCodec::H264 => ctx.video_pt_h264,
+        VideoCodec::H265 => ctx.video_pt_h265,
+    };
+    let Some(pt) = pt else {
+        if !ctx.unmatched_codec_logged {
+            ctx.unmatched_codec_logged = true;
+            tracing::warn!(
+                %broadcast,
+                ?codec,
+                "whep: publisher codec not present in subscriber offer; dropping samples"
+            );
+        }
         return Ok(());
     };
 
@@ -485,7 +529,7 @@ impl SessionHandle for Str0mSessionHandle {
         Ok(())
     }
 
-    fn on_raw_sample(&self, track: &str, sample: &RawSample) {
+    fn on_raw_sample(&self, track: &str, codec: VideoCodec, sample: &RawSample) {
         // Track convention matches `lvqr-ingest::FragmentObserver`:
         // `0.mp4` is video, `1.mp4` is audio. Anything else is a
         // future track we do not know how to write yet.
@@ -502,6 +546,7 @@ impl SessionHandle for Str0mSessionHandle {
             payload: sample.payload.clone(),
             dts: sample.dts,
             keyframe: sample.keyframe,
+            codec,
         };
         // Ignore send failure: the task has exited and we will be
         // dropped soon. Nothing useful for the caller to do.
@@ -714,9 +759,9 @@ mod tests {
             payload: B::from(avcc_video),
             keyframe: true,
         };
-        handle.on_raw_sample("0.mp4", &sample); // video path
-        handle.on_raw_sample("1.mp4", &sample); // audio path, warn-once
-        handle.on_raw_sample("1.mp4", &sample); // audio path, already warned
+        handle.on_raw_sample("0.mp4", VideoCodec::H264, &sample); // video path
+        handle.on_raw_sample("1.mp4", VideoCodec::H264, &sample); // audio path, warn-once
+        handle.on_raw_sample("1.mp4", VideoCodec::H264, &sample); // audio path, already warned
 
         // Give the poll task a beat to absorb the sample. No assert:
         // the point is that none of the above panic, and the

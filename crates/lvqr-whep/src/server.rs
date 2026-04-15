@@ -20,7 +20,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use dashmap::DashMap;
 use lvqr_cmaf::RawSample;
-use lvqr_ingest::RawSampleObserver;
+use lvqr_ingest::{RawSampleObserver, VideoCodec};
 use rand::RngCore;
 use std::sync::Arc;
 
@@ -126,7 +126,13 @@ pub trait SessionHandle: Send + Sync + 'static {
     /// session subscribed to that broadcast. A real implementation
     /// delegates to the RTP packetizer and pushes the resulting
     /// payloads through the `str0m::Rtc` state machine.
-    fn on_raw_sample(&self, track: &str, sample: &RawSample);
+    ///
+    /// `codec` is the video codec the upstream bridge stamped on
+    /// the sample; the session uses it to pick the matching
+    /// `str0m::Pt` for `Writer::write`. Audio samples carry the
+    /// default variant and the implementation must not branch on
+    /// it for audio tracks.
+    fn on_raw_sample(&self, track: &str, codec: VideoCodec, sample: &RawSample);
 }
 
 /// Concrete SDP answerer contract. Separating this from the
@@ -199,11 +205,11 @@ impl WhepServer {
 /// `broadcast -> Vec<SessionId>` index if the session fanout cost
 /// shows up in profiling.
 impl RawSampleObserver for WhepServer {
-    fn on_raw_sample(&self, broadcast: &str, track: &str, sample: &RawSample) {
+    fn on_raw_sample(&self, broadcast: &str, track: &str, codec: VideoCodec, sample: &RawSample) {
         for entry in self.state.sessions.iter() {
             let session = entry.value();
             if session.broadcast == broadcast {
-                session.handle.on_raw_sample(track, sample);
+                session.handle.on_raw_sample(track, codec, sample);
             }
         }
     }

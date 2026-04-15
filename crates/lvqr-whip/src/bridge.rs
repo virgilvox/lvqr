@@ -35,7 +35,7 @@ use lvqr_cmaf::{
 };
 use lvqr_codec::hevc::{self as hevc_codec, HevcSps};
 use lvqr_fragment::{Fragment, FragmentFlags, FragmentMeta, MoqTrackSink};
-use lvqr_ingest::{SharedFragmentObserver, SharedRawSampleObserver};
+use lvqr_ingest::{SharedFragmentObserver, SharedRawSampleObserver, VideoCodec};
 use lvqr_moq::{OriginProducer, Track};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
@@ -44,20 +44,6 @@ use crate::depack::{
     AVC_NAL_TYPE_PPS, AVC_NAL_TYPE_SPS, HEVC_NAL_TYPE_PPS, HEVC_NAL_TYPE_SPS, HEVC_NAL_TYPE_VPS, annex_b_to_avcc,
     hevc_nal_type, split_annex_b,
 };
-
-/// Which video codec an [`IngestSample`] carries.
-///
-/// Learned from `MediaData::params.spec().codec` inside the
-/// `str0m` poll loop and stamped on every sample the bridge sees.
-/// Used here to branch between `write_avc_init_segment` and
-/// `write_hevc_init_segment` on the first keyframe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VideoCodec {
-    /// H.264 / AVC. SPS + PPS carry the init metadata.
-    H264,
-    /// H.265 / HEVC. VPS + SPS + PPS carry the init metadata.
-    H265,
-}
 
 /// One inbound sample pumped from the `str0m` poll loop into the
 /// bridge.
@@ -235,13 +221,12 @@ impl WhipMoqBridge {
             keyframe: sample.keyframe,
         };
 
-        // Raw-sample observer is WHEP's RTP packetizer tap, which
-        // only speaks H.264. Skip HEVC publishers here for the
-        // same reason the init path skips the fragment observer.
-        if matches!(sample.codec, VideoCodec::H264)
-            && let Some(obs) = self.raw_observer.as_ref()
-        {
-            obs.on_raw_sample(broadcast, "0.mp4", &raw);
+        // Raw-sample observer (WHEP). Session 28 lifted the
+        // AVC-only guard: the observer signature now carries a
+        // codec tag so the WHEP session backend can pick the
+        // matching `str0m::Pt` for the negotiated codec.
+        if let Some(obs) = self.raw_observer.as_ref() {
+            obs.on_raw_sample(broadcast, "0.mp4", sample.codec, &raw);
         }
 
         let Some(mut entry) = self.streams.get_mut(broadcast) else {

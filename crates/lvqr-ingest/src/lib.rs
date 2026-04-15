@@ -13,7 +13,7 @@ pub mod remux;
 pub use error::IngestError;
 pub use observer::{
     FragmentObserver, NoopFragmentObserver, NoopRawSampleObserver, RawSampleObserver, SharedFragmentObserver,
-    SharedRawSampleObserver,
+    SharedRawSampleObserver, VideoCodec,
 };
 pub use protocol::IngestProtocol;
 

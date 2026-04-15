@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use lvqr_cmaf::RawSample;
+use lvqr_ingest::VideoCodec;
 use lvqr_whep::{SdpAnswerer, SessionHandle, Str0mAnswerer, Str0mConfig};
 use str0m::change::SdpAnswer;
 use str0m::media::{Direction, MediaKind};
@@ -236,7 +237,7 @@ async fn spam_video_samples(handle: Arc<dyn SessionHandle>) {
     tokio::time::sleep(Duration::from_millis(100)).await;
     loop {
         let sample = build_fake_h264_sample(dts);
-        handle.on_raw_sample("0.mp4", &sample);
+        handle.on_raw_sample("0.mp4", VideoCodec::H264, &sample);
         dts += frame_ticks;
         // Tight cadence: 20ms instead of 33ms so the test does not
         // sit idle while DTLS finishes. The server's Writer absorbs

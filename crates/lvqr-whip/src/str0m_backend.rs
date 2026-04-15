@@ -36,8 +36,9 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig}
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 
-use crate::bridge::{IngestSample, IngestSampleSink, VideoCodec};
+use crate::bridge::{IngestSample, IngestSampleSink};
 use crate::server::{SdpAnswerer, SessionHandle, WhipError};
+use lvqr_ingest::VideoCodec;
 
 /// Shared configuration for the str0m-backed answerer.
 ///

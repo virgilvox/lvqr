@@ -18,6 +18,32 @@ use lvqr_cmaf::RawSample;
 use lvqr_fragment::Fragment;
 use std::sync::Arc;
 
+/// Which video codec a [`RawSample`] carries.
+///
+/// Stamped on every [`RawSampleObserver::on_raw_sample`] call by
+/// the producing bridge. The RTMP bridge (`lvqr_ingest::RtmpMoqBridge`)
+/// always emits `H264` because FLV-over-RTMP is AVC-only in
+/// LVQR today; the WHIP bridge (`lvqr_whip::WhipMoqBridge`) emits
+/// the codec the `str0m` answerer negotiated for the session. The
+/// WHEP egress uses this to pick the matching `str0m::Pt` when
+/// writing the sample through the `Writer`, so a single WHEP
+/// subscriber can cleanly pass HEVC or AVC through the same
+/// poll loop depending on what the publisher sent.
+///
+/// Audio samples go through the same observer hook but AAC is
+/// the only audio LVQR handles end-to-end; callers pass any
+/// variant and the audio path in `lvqr-whep` ignores the codec
+/// tag. A later Opus sibling track will introduce a separate
+/// `AudioCodec` type rather than overloading this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoCodec {
+    /// H.264 / AVC (default for all pre-session-28 callers).
+    #[default]
+    H264,
+    /// H.265 / HEVC.
+    H265,
+}
+
 /// Shared, dynamically-dispatched fragment observer handle.
 pub type SharedFragmentObserver = Arc<dyn FragmentObserver>;
 
@@ -65,8 +91,13 @@ pub trait FragmentObserver: Send + Sync {
 pub trait RawSampleObserver: Send + Sync {
     /// Called for every video / audio sample the bridge receives,
     /// in DTS order per track. `track` follows the same `0.mp4` /
-    /// `1.mp4` convention [`FragmentObserver`] uses.
-    fn on_raw_sample(&self, broadcast: &str, track: &str, sample: &RawSample);
+    /// `1.mp4` convention [`FragmentObserver`] uses. `codec`
+    /// identifies the video codec carried on the sample payload so
+    /// codec-aware consumers (notably the `lvqr-whep` WHEP
+    /// egress) can pick the matching `str0m::Pt` without having
+    /// to sniff NAL headers. Audio samples carry the default
+    /// value and the audio path must not branch on it.
+    fn on_raw_sample(&self, broadcast: &str, track: &str, codec: VideoCodec, sample: &RawSample);
 }
 
 /// Drop-in fragment observer that does nothing. Useful as a default
@@ -82,5 +113,5 @@ impl FragmentObserver for NoopFragmentObserver {
 pub struct NoopRawSampleObserver;
 
 impl RawSampleObserver for NoopRawSampleObserver {
-    fn on_raw_sample(&self, _broadcast: &str, _track: &str, _sample: &RawSample) {}
+    fn on_raw_sample(&self, _broadcast: &str, _track: &str, _codec: VideoCodec, _sample: &RawSample) {}
 }

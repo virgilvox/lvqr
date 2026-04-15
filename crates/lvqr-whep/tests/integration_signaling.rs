@@ -25,7 +25,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use lvqr_cmaf::RawSample;
-use lvqr_ingest::RawSampleObserver;
+use lvqr_ingest::{RawSampleObserver, VideoCodec};
 use lvqr_whep::{SdpAnswerer, SessionHandle, WhepError, WhepServer};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -85,7 +85,7 @@ impl SessionHandle for CountingHandle {
         Ok(())
     }
 
-    fn on_raw_sample(&self, _track: &str, _sample: &RawSample) {
+    fn on_raw_sample(&self, _track: &str, _codec: VideoCodec, _sample: &RawSample) {
         self.sample_count.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -432,10 +432,10 @@ async fn raw_sample_observer_routes_only_to_subscribed_sessions() {
         keyframe: true,
     };
 
-    server.on_raw_sample("live/one", "0.mp4", &sample);
-    server.on_raw_sample("live/one", "0.mp4", &sample);
-    server.on_raw_sample("live/two", "0.mp4", &sample);
-    server.on_raw_sample("live/three", "0.mp4", &sample); // unsubscribed
+    server.on_raw_sample("live/one", "0.mp4", VideoCodec::H264, &sample);
+    server.on_raw_sample("live/one", "0.mp4", VideoCodec::H264, &sample);
+    server.on_raw_sample("live/two", "0.mp4", VideoCodec::H264, &sample);
+    server.on_raw_sample("live/three", "0.mp4", VideoCodec::H264, &sample); // unsubscribed
 
     assert_eq!(hits_one.load(Ordering::SeqCst), 2);
     assert_eq!(hits_two.load(Ordering::SeqCst), 1);
