@@ -18,7 +18,8 @@ use axum::http::{Request, StatusCode, header};
 use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt;
 use lvqr_cmaf::{
-    CmafChunk, CmafChunkKind, HevcInitParams, VideoInitParams, write_avc_init_segment, write_hevc_init_segment,
+    CmafChunk, CmafChunkKind, HevcInitParams, OpusInitParams, VideoInitParams, write_avc_init_segment,
+    write_hevc_init_segment, write_opus_init_segment,
 };
 use lvqr_hls::{MultiHlsServer, PlaylistBuilderConfig};
 use tower::ServiceExt;
@@ -292,6 +293,64 @@ async fn master_playlist_reports_hvc1_codec_for_hevc_init() {
     assert!(
         !body.contains("avc1."),
         "master should not fall back to avc1 when init is HEVC: {body}"
+    );
+}
+
+#[tokio::test]
+async fn master_playlist_reports_opus_codec_when_audio_rendition_has_opus_init() {
+    let multi = MultiHlsServer::new(PlaylistBuilderConfig::default());
+    // Video side: AVC, as a baseline.
+    let video = multi.ensure_video("live/opus-audio");
+    let mut video_buf = BytesMut::new();
+    write_avc_init_segment(
+        &mut video_buf,
+        &VideoInitParams {
+            sps: AVC_SPS.to_vec(),
+            pps: AVC_PPS.to_vec(),
+            width: 1280,
+            height: 720,
+            timescale: 90_000,
+        },
+    )
+    .unwrap();
+    video.push_init(video_buf.freeze()).await;
+    video
+        .push_chunk_bytes(
+            &video_chunk(0, 180_000, CmafChunkKind::Segment),
+            Bytes::from_static(b"v"),
+        )
+        .await
+        .unwrap();
+
+    // Audio side: push a real Opus init segment.
+    let audio = multi.ensure_audio("live/opus-audio", 48_000);
+    let mut audio_buf = BytesMut::new();
+    write_opus_init_segment(
+        &mut audio_buf,
+        &OpusInitParams {
+            channel_count: 2,
+            pre_skip: 0,
+            input_sample_rate: 48_000,
+            timescale: 48_000,
+        },
+    )
+    .unwrap();
+    audio.push_init(audio_buf.freeze()).await;
+    audio
+        .push_chunk_bytes(&audio_chunk(0, 960, CmafChunkKind::Segment), Bytes::from_static(b"a"))
+        .await
+        .unwrap();
+
+    let (status, _, body) = get(&multi, "/hls/live/opus-audio/master.m3u8").await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.contains("CODECS=\"avc1.42001F,opus\""),
+        "master should advertise avc1 + opus when audio init is Opus: {body}"
+    );
+    assert!(
+        !body.contains("mp4a.40.2"),
+        "master should not fall back to mp4a when audio init is Opus: {body}"
     );
 }
 

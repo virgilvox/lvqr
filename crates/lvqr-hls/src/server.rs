@@ -77,7 +77,7 @@ use axum::{
     routing::get,
 };
 use bytes::Bytes;
-use lvqr_cmaf::{CmafChunk, detect_video_codec_string};
+use lvqr_cmaf::{CmafChunk, detect_audio_codec_string, detect_video_codec_string};
 use tokio::sync::{Notify, RwLock};
 
 use crate::manifest::{HlsError, PlaylistBuilder, PlaylistBuilderConfig};
@@ -109,6 +109,14 @@ struct HlsState {
     /// `CODECS="..."` attribute so HEVC publishers no longer
     /// advertise an `avc1` codec and vice versa.
     video_codec_string: RwLock<Option<String>>,
+    /// Audio codec string parsed out of the audio init segment
+    /// the same way (e.g. `"mp4a.40.2"` for AAC-LC or `"opus"`
+    /// for Opus). Populated alongside `video_codec_string` in
+    /// [`HlsServer::push_init`]; for a video-only `HlsServer`
+    /// this stays `None` and the master-playlist handler uses
+    /// it only when a parallel audio server exists on the same
+    /// broadcast.
+    audio_codec_string: RwLock<Option<String>>,
     /// URI -> bytes. Keys are emitted by `PlaylistBuilder` so they
     /// match what the rendered playlist points at. We keep a single
     /// flat map for both segments and partials; the router does not
@@ -144,6 +152,7 @@ impl HlsServer {
                 builder: RwLock::new(builder),
                 init_segment: RwLock::new(None),
                 video_codec_string: RwLock::new(None),
+                audio_codec_string: RwLock::new(None),
                 cache: RwLock::new(HashMap::new()),
                 notify: Notify::new(),
                 target_duration_secs,
@@ -156,15 +165,19 @@ impl HlsServer {
     /// resets (e.g. after an RTMP reconnect on the same broadcast).
     ///
     /// Also re-parses the init bytes through
-    /// [`detect_video_codec_string`] so the master-playlist handler
-    /// has a correct `CODECS="..."` attribute for AVC **and** HEVC
-    /// publishers. Audio-only HLS servers (the AAC sibling inside
-    /// [`MultiHlsServer`]) will see `None` here because an AAC
-    /// init segment has no video sample entry; the master handler
-    /// handles that case by only filling in the video codec slot.
+    /// [`detect_video_codec_string`] and
+    /// [`detect_audio_codec_string`] so the master-playlist
+    /// handler has a correct `CODECS="..."` attribute for AVC,
+    /// HEVC, AAC, **and** Opus publishers. A video-only
+    /// `HlsServer` populates the video slot; the audio sibling
+    /// inside a [`MultiHlsServer`] populates the audio slot; a
+    /// single init segment carrying both tracks would populate
+    /// both, which is harmless.
     pub async fn push_init(&self, bytes: Bytes) {
-        let detected = detect_video_codec_string(&bytes);
-        *self.state.video_codec_string.write().await = detected;
+        let video = detect_video_codec_string(&bytes);
+        let audio = detect_audio_codec_string(&bytes);
+        *self.state.video_codec_string.write().await = video;
+        *self.state.audio_codec_string.write().await = audio;
         *self.state.init_segment.write().await = Some(bytes);
         self.state.notify.notify_waiters();
     }
@@ -175,6 +188,12 @@ impl HlsServer {
     /// one we stringify (e.g. AAC-only init).
     pub async fn video_codec_string(&self) -> Option<String> {
         self.state.video_codec_string.read().await.clone()
+    }
+
+    /// Read the cached audio codec string parsed out of the
+    /// init segment. Returns `None` for a video-only server.
+    pub async fn audio_codec_string(&self) -> Option<String> {
+        self.state.audio_codec_string.read().await.clone()
     }
 
     /// Push a chunk plus its wire-ready bytes. Returns an error iff
@@ -570,7 +589,8 @@ async fn handle_master_playlist(multi: &MultiHlsServer, broadcast: &str) -> Resp
     };
     let mut master = crate::master::MasterPlaylist::default();
     let audio_group_id = "audio";
-    let has_audio = multi.audio(broadcast).is_some();
+    let audio_server = multi.audio(broadcast);
+    let has_audio = audio_server.is_some();
     if has_audio {
         master.renditions.push(crate::master::MediaRendition {
             rendition_type: crate::master::MediaRenditionType::Audio,
@@ -591,12 +611,22 @@ async fn handle_master_playlist(multi: &MultiHlsServer, broadcast: &str) -> Resp
         .video_codec_string()
         .await
         .unwrap_or_else(|| "avc1.640020".to_string());
-    // Audio stays AAC-LC because RTMP (the only current audio
-    // publisher) carries AAC. When WHIP audio lands with Opus as
-    // a sibling track, extend this with a parallel
-    // `detect_audio_codec_string` path.
+    // Audio codec string is pulled the same way from the audio
+    // sibling server's cached init-segment decode. Session 30
+    // added `detect_audio_codec_string` and the parallel
+    // `audio_codec_string()` accessor; the fallback is the
+    // pre-session-30 hardcode (`mp4a.40.2`) so a client hitting
+    // master.m3u8 before the audio init lands still sees a
+    // syntactically valid variant.
+    let audio_codec = match audio_server {
+        Some(audio) => audio
+            .audio_codec_string()
+            .await
+            .unwrap_or_else(|| "mp4a.40.2".to_string()),
+        None => String::new(),
+    };
     let codecs = if has_audio {
-        format!("{video_codec},mp4a.40.2")
+        format!("{video_codec},{audio_codec}")
     } else {
         video_codec
     };

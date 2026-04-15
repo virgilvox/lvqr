@@ -20,7 +20,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use dashmap::DashMap;
 use lvqr_cmaf::RawSample;
-use lvqr_ingest::{RawSampleObserver, VideoCodec};
+use lvqr_ingest::{MediaCodec, RawSampleObserver};
 use rand::RngCore;
 use std::sync::Arc;
 
@@ -132,7 +132,7 @@ pub trait SessionHandle: Send + Sync + 'static {
     /// `str0m::Pt` for `Writer::write`. Audio samples carry the
     /// default variant and the implementation must not branch on
     /// it for audio tracks.
-    fn on_raw_sample(&self, track: &str, codec: VideoCodec, sample: &RawSample);
+    fn on_raw_sample(&self, track: &str, codec: MediaCodec, sample: &RawSample);
 }
 
 /// Concrete SDP answerer contract. Separating this from the
@@ -205,7 +205,7 @@ impl WhepServer {
 /// `broadcast -> Vec<SessionId>` index if the session fanout cost
 /// shows up in profiling.
 impl RawSampleObserver for WhepServer {
-    fn on_raw_sample(&self, broadcast: &str, track: &str, codec: VideoCodec, sample: &RawSample) {
+    fn on_raw_sample(&self, broadcast: &str, track: &str, codec: MediaCodec, sample: &RawSample) {
         for entry in self.state.sessions.iter() {
             let session = entry.value();
             if session.broadcast == broadcast {

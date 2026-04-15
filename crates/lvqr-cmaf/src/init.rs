@@ -813,6 +813,45 @@ fn codec_string_for_codec(codec: &Codec) -> Option<String> {
     }
 }
 
+/// Decode an fMP4 init segment (ftyp + moov) and, from the first
+/// audio sample entry, produce the ISO BMFF codec string the
+/// HLS/DASH master playlist needs to announce it.
+///
+/// Returns:
+/// * `Some("mp4a.40.<object_type>")` for an `Mp4a` entry, where
+///   `object_type` is read out of the `esds` descriptor.
+/// * `Some("opus")` for an `Opus` entry.
+/// * `None` on parse failure, missing audio trak, or a sample
+///   entry type we do not stringify.
+///
+/// Sibling of [`detect_video_codec_string`] (session 27); added
+/// in session 30 so the LL-HLS master playlist can advertise
+/// Opus audio renditions for WHIP publishers without hardcoding
+/// AAC.
+pub fn detect_audio_codec_string(init: &[u8]) -> Option<String> {
+    use mp4_atom::Decode;
+
+    let mut cursor = std::io::Cursor::new(init);
+    mp4_atom::Ftyp::decode(&mut cursor).ok()?;
+    let moov = Moov::decode(&mut cursor).ok()?;
+    for trak in &moov.trak {
+        for codec in &trak.mdia.minf.stbl.stsd.codecs {
+            if let Some(s) = audio_codec_string_for_codec(codec) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+fn audio_codec_string_for_codec(codec: &Codec) -> Option<String> {
+    match codec {
+        Codec::Mp4a(mp4a) => Some(format!("mp4a.40.{}", mp4a.esds.es_desc.dec_config.dec_specific.profile)),
+        Codec::Opus(_) => Some("opus".to_string()),
+        _ => None,
+    }
+}
+
 fn hvc1_codec_string(hvcc: &mp4_atom::Hvcc) -> String {
     // Profile space letter: 0 -> "", 1 -> "A", 2 -> "B", 3 -> "C".
     let space = match hvcc.general_profile_space {
@@ -1110,6 +1149,55 @@ mod tests {
         assert!(detect_video_codec_string(&[]).is_none());
         assert!(detect_video_codec_string(&[0; 16]).is_none());
         assert!(detect_video_codec_string(b"not a real mp4 init segment").is_none());
+    }
+
+    #[test]
+    fn detect_audio_codec_string_reports_opus_from_opus_init() {
+        let params = OpusInitParams {
+            channel_count: 2,
+            pre_skip: 312,
+            input_sample_rate: 48_000,
+            timescale: 48_000,
+        };
+        let mut buf = BytesMut::new();
+        write_opus_init_segment(&mut buf, &params).expect("encode");
+        assert_eq!(detect_audio_codec_string(&buf).as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn detect_audio_codec_string_reports_mp4a_from_aac_init() {
+        // The 2-byte AAC-LC 44.1 kHz stereo ASC used elsewhere in
+        // this module. AOT=2 -> "mp4a.40.2".
+        let params = AudioInitParams {
+            asc: vec![0x12, 0x10],
+            timescale: 44_100,
+        };
+        let mut buf = BytesMut::new();
+        write_aac_init_segment(&mut buf, &params).expect("encode");
+        assert_eq!(detect_audio_codec_string(&buf).as_deref(), Some("mp4a.40.2"));
+    }
+
+    #[test]
+    fn detect_audio_codec_string_returns_none_on_garbage() {
+        assert!(detect_audio_codec_string(&[]).is_none());
+        assert!(detect_audio_codec_string(b"not a real mp4 init segment").is_none());
+    }
+
+    #[test]
+    fn detect_audio_codec_string_returns_none_on_video_only_init() {
+        // An AVC init segment has no audio sample entry, so the
+        // detector should return None rather than finding the
+        // video codec by accident.
+        let params = VideoInitParams {
+            sps: SPS.to_vec(),
+            pps: PPS.to_vec(),
+            width: 1280,
+            height: 720,
+            timescale: 90_000,
+        };
+        let mut buf = BytesMut::new();
+        write_avc_init_segment(&mut buf, &params).expect("encode");
+        assert!(detect_audio_codec_string(&buf).is_none());
     }
 
     #[test]

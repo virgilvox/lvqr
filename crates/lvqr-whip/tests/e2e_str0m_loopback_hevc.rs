@@ -9,7 +9,7 @@
 //! scans for Annex B start codes and emits FU or AP RTP packets,
 //! the server's `Str0mIngestAnswerer` depacketizes them through
 //! its own poll loop, and `forward_video_sample` stamps the
-//! incoming sample with `VideoCodec::H265` based on
+//! incoming sample with `MediaCodec::H265` based on
 //! `data.params.spec().codec`. The capture sink we install asserts
 //! that at least one keyframe sample arrived and carries the H265
 //! tag.
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use lvqr_whip::{IngestSample, IngestSampleSink, SdpAnswerer, Str0mIngestAnswerer, Str0mIngestConfig, VideoCodec};
+use lvqr_whip::{IngestSample, IngestSampleSink, MediaCodec, SdpAnswerer, Str0mIngestAnswerer, Str0mIngestConfig};
 use str0m::change::SdpAnswer;
 use str0m::format::Codec;
 use str0m::media::{Direction, MediaKind, MediaTime, Mid, Pt};
@@ -234,7 +234,7 @@ async fn server_receives_hevc_video_from_client_publisher() {
         .expect("expected at least one HEVC keyframe sample");
     assert_eq!(
         kf.codec,
-        VideoCodec::H265,
+        MediaCodec::H265,
         "keyframe should be tagged with the negotiated HEVC codec; got {:?}",
         kf.codec
     );

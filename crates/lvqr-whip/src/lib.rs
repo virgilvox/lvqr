@@ -21,11 +21,13 @@ pub mod str0m_backend;
 
 pub use bridge::{IngestAudioSample, IngestSample, IngestSampleSink, NoopIngestSampleSink, WhipMoqBridge};
 pub use depack::{annex_b_to_avcc, hevc_nal_type, split_annex_b};
-/// Re-export of the shared `VideoCodec` tag from `lvqr-ingest`.
+/// Re-export of the shared `MediaCodec` tag from `lvqr-ingest`.
 /// Session 28 moved the type to `lvqr-ingest::observer` so the
 /// raw-sample observer trait and every bridge downstream can
-/// agree on one name.
-pub use lvqr_ingest::VideoCodec;
+/// agree on one name; session 30 renamed it from `VideoCodec`
+/// and added audio variants (Aac, Opus) so WHEP can route
+/// audio samples to the matching `str0m::Pt`.
+pub use lvqr_ingest::MediaCodec;
 pub use router::router as router_for;
 pub use server::{SdpAnswerer, SessionHandle, SessionId, WhipError, WhipServer};
 pub use str0m_backend::{Str0mIngestAnswerer, Str0mIngestConfig, Str0mIngestSessionHandle};

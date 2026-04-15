@@ -38,7 +38,7 @@ use tokio::sync::oneshot;
 
 use crate::bridge::{IngestAudioSample, IngestSample, IngestSampleSink};
 use crate::server::{SdpAnswerer, SessionHandle, WhipError};
-use lvqr_ingest::VideoCodec;
+use lvqr_ingest::MediaCodec;
 
 /// Shared configuration for the str0m-backed answerer.
 ///
@@ -311,8 +311,8 @@ fn forward_video_sample(
         return;
     }
     let codec = match data.params.spec().codec {
-        Str0mCodec::H264 => VideoCodec::H264,
-        Str0mCodec::H265 => VideoCodec::H265,
+        Str0mCodec::H264 => MediaCodec::H264,
+        Str0mCodec::H265 => MediaCodec::H265,
         other => {
             tracing::trace!(%broadcast, codec = ?other, "whip: ignoring non-H26x video sample");
             return;

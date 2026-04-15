@@ -16,7 +16,7 @@
 //!
 //! Scope of session 25 (H.264): video-only, one MoQ track per
 //! broadcast (`0.mp4`). Session 26 added HEVC publishers through
-//! the same track slot, distinguished via the [`VideoCodec`] tag
+//! the same track slot, distinguished via the [`MediaCodec`] tag
 //! carried on every [`IngestSample`]. Session 27 made LL-HLS
 //! codec-aware via `lvqr_cmaf::detect_video_codec_string` so the
 //! fragment observer (HLS + archive) fans HEVC fragments without
@@ -37,7 +37,7 @@ use lvqr_cmaf::{
 };
 use lvqr_codec::hevc::{self as hevc_codec, HevcSps};
 use lvqr_fragment::{Fragment, FragmentFlags, FragmentMeta, MoqTrackSink};
-use lvqr_ingest::{SharedFragmentObserver, SharedRawSampleObserver, VideoCodec};
+use lvqr_ingest::{MediaCodec, SharedFragmentObserver, SharedRawSampleObserver};
 use lvqr_moq::{OriginProducer, Track};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
@@ -64,7 +64,7 @@ pub struct IngestSample {
     /// state (IDR for H.264 / HEVC keyframe NAL type).
     pub keyframe: bool,
     /// Which video codec this sample carries.
-    pub codec: VideoCodec,
+    pub codec: MediaCodec,
     /// Annex B framed NAL payload.
     pub annex_b: Bytes,
 }
@@ -198,7 +198,7 @@ impl WhipMoqBridge {
     /// `get_mut` borrow cannot be upgraded into a `&mut`
     /// simultaneously with a fresh `insert`; doing the init work
     /// in two hops keeps the borrow scopes clean.
-    fn ensure_initialized(&self, broadcast: &str, codec: VideoCodec, annex_b: &[u8], keyframe: bool) -> bool {
+    fn ensure_initialized(&self, broadcast: &str, codec: MediaCodec, annex_b: &[u8], keyframe: bool) -> bool {
         if self.streams.contains_key(broadcast) {
             return true;
         }
@@ -210,8 +210,17 @@ impl WhipMoqBridge {
         }
 
         let built = match codec {
-            VideoCodec::H264 => build_avc_init(broadcast, annex_b),
-            VideoCodec::H265 => build_hevc_init(broadcast, annex_b),
+            MediaCodec::H264 => build_avc_init(broadcast, annex_b),
+            MediaCodec::H265 => build_hevc_init(broadcast, annex_b),
+            MediaCodec::Aac | MediaCodec::Opus => {
+                // Audio codecs never reach the video init path.
+                // `IngestSample` only carries video samples; an
+                // audio codec here is a caller bug, not a
+                // runtime condition, but dropping the sample is
+                // strictly correct and avoids a panic.
+                debug!(broadcast, ?codec, "whip: audio codec on video sample path; dropping");
+                return false;
+            }
         };
         let Some((codec_fourcc, init, width, height)) = built else {
             return false;
@@ -464,9 +473,21 @@ impl WhipMoqBridge {
         if let Err(e) = audio_sink.push(&frag) {
             debug!(broadcast, error = ?e, "whip: moq audio sink push failed");
         }
-        // Audio intentionally does NOT fire the fragment or
-        // raw-sample observer in session 29. See the comment in
-        // `ensure_audio_initialized` for the rationale.
+
+        // Session 30: fire the raw-sample observer for audio so
+        // the WHEP egress can forward Opus to subscribers that
+        // negotiated Opus on their side (same-codec passthrough,
+        // no transcode). The fragment observer is still skipped
+        // for audio because LL-HLS audio rendition picks up the
+        // Opus track via a dedicated `ensure_audio_opus` path
+        // (session 30) rather than the generic `on_fragment`
+        // fanout. Release the dashmap entry before the observer
+        // call to avoid the reentrancy footgun the video path
+        // already guards against.
+        drop(entry);
+        if let Some(obs) = self.raw_observer.as_ref() {
+            obs.on_raw_sample(broadcast, "1.mp4", MediaCodec::Opus, &raw);
+        }
     }
 }
 
@@ -658,7 +679,7 @@ mod tests {
         let delta = IngestSample {
             dts_90k: 0,
             keyframe: false,
-            codec: VideoCodec::H264,
+            codec: MediaCodec::H264,
             annex_b: Bytes::from(build_annex_b(&[&[0x41, 0x00][..]])),
         };
         bridge.on_sample("live/test", delta);
@@ -672,7 +693,7 @@ mod tests {
         let idr_only = IngestSample {
             dts_90k: 0,
             keyframe: true,
-            codec: VideoCodec::H264,
+            codec: MediaCodec::H264,
             annex_b: Bytes::from(build_annex_b(&[&[0x65, 0x88, 0x84][..]])),
         };
         bridge.on_sample("live/test", idr_only);
@@ -725,7 +746,7 @@ mod tests {
         let keyframe = IngestSample {
             dts_90k: 0,
             keyframe: true,
-            codec: VideoCodec::H265,
+            codec: MediaCodec::H265,
             annex_b: Bytes::from(build_annex_b(&[HEVC_VPS, HEVC_SPS, HEVC_PPS, HEVC_IDR])),
         };
         bridge.on_sample("live/hevc", keyframe);
@@ -740,7 +761,7 @@ mod tests {
         let idr_only = IngestSample {
             dts_90k: 0,
             keyframe: true,
-            codec: VideoCodec::H265,
+            codec: MediaCodec::H265,
             annex_b: Bytes::from(build_annex_b(&[HEVC_IDR])),
         };
         bridge.on_sample("live/hevc", idr_only);
@@ -762,7 +783,7 @@ mod tests {
         IngestSample {
             dts_90k: 0,
             keyframe: true,
-            codec: VideoCodec::H264,
+            codec: MediaCodec::H264,
             annex_b: Bytes::from(build_annex_b(&[sps, pps, idr])),
         }
     }

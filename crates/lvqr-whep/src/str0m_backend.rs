@@ -28,7 +28,7 @@
 //! both `h264` and `h265`, `SessionCtx` stores parallel
 //! `video_pt_h264` / `video_pt_h265` slots resolved in one sweep
 //! over `Writer::payload_params`, and `write_video_sample`
-//! receives the incoming sample's [`lvqr_ingest::VideoCodec`] tag
+//! receives the incoming sample's [`lvqr_ingest::MediaCodec`] tag
 //! (carried through `SessionMsg::Video.codec`) and picks the
 //! matching pt. A sample whose codec is not in the negotiated
 //! payload params -- e.g. an HEVC publisher fanning out to a
@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use lvqr_cmaf::RawSample;
-use lvqr_ingest::VideoCodec;
+use lvqr_ingest::MediaCodec;
 use str0m::change::{SdpAnswer, SdpOffer};
 use str0m::format::Codec;
 use str0m::media::{MediaKind, MediaTime, Mid, Pt};
@@ -203,7 +203,7 @@ enum SessionMsg {
         payload: Bytes,
         dts: u64,
         keyframe: bool,
-        codec: VideoCodec,
+        codec: MediaCodec,
     },
 }
 
@@ -215,6 +215,11 @@ struct SessionCtx {
     /// Mid of the negotiated video media section, learned from
     /// `Event::MediaAdded`. `None` until the event arrives.
     video_mid: Option<Mid>,
+    /// Mid of the negotiated audio media section. Session 30
+    /// added this slot so WHIP publishers sending Opus can
+    /// reach a matching WHEP subscriber through the same poll
+    /// loop.
+    audio_mid: Option<Mid>,
     /// Negotiated H.264 payload type for the video mid, resolved
     /// lazily from `Writer::payload_params`. `None` when the
     /// client did not include H.264 in its offer.
@@ -226,6 +231,12 @@ struct SessionCtx {
     /// publishers can reach a matching WHEP subscriber through
     /// the same poll loop as H.264 subscribers.
     video_pt_h265: Option<Pt>,
+    /// Negotiated Opus payload type for the audio mid. `None`
+    /// when the client did not include Opus in its offer
+    /// (uncommon: every major browser supports Opus by default).
+    /// Session 30 added this slot so WHIP Opus publishers can
+    /// fan out audio to WHEP subscribers without transcoding.
+    audio_pt_opus: Option<Pt>,
     /// True once `Event::Connected` has fired. Samples that arrive
     /// before this point are dropped rather than written.
     connected: bool,
@@ -317,6 +328,22 @@ async fn run_session_loop(
                 }
             }
         }
+        // Parallel sweep for the audio mid. Session 30 added
+        // this block so an Opus publisher reaches a subscriber
+        // that offered Opus without the session backend having
+        // to care about codec ordering in the SDP negotiation.
+        if ctx.audio_pt_opus.is_none()
+            && let Some(mid) = ctx.audio_mid
+            && let Some(writer) = rtc.writer(mid)
+        {
+            for params in writer.payload_params() {
+                if params.spec().codec == Codec::Opus {
+                    ctx.audio_pt_opus = Some(params.pt());
+                    tracing::debug!(%broadcast, pt = ?params.pt(), "resolved opus pt");
+                    break;
+                }
+            }
+        }
 
         let now = Instant::now();
         let sleep_dur = wait_until.saturating_duration_since(now).max(Duration::from_millis(0));
@@ -330,8 +357,8 @@ async fn run_session_loop(
             msg = samples.recv() => {
                 match msg {
                     Some(SessionMsg::Video { payload, dts, keyframe, codec }) => {
-                        if let Err(()) = write_video_sample(&mut rtc, &mut ctx, &broadcast, payload, dts, keyframe, codec) {
-                            // `write_video_sample` logged already.
+                        if let Err(()) = write_sample(&mut rtc, &mut ctx, &broadcast, payload, dts, keyframe, codec) {
+                            // `write_sample` logged already.
                         }
                     }
                     None => {
@@ -398,33 +425,69 @@ fn absorb_event(event: &Event, ctx: &mut SessionCtx, broadcast: &str) {
             ctx.video_mid = Some(added.mid);
             tracing::debug!(%broadcast, mid = ?added.mid, "media added: video");
         }
+        Event::MediaAdded(added) if matches!(added.kind, MediaKind::Audio) => {
+            ctx.audio_mid = Some(added.mid);
+            tracing::debug!(%broadcast, mid = ?added.mid, "media added: audio");
+        }
         Event::MediaAdded(added) => {
-            tracing::trace!(%broadcast, mid = ?added.mid, kind = ?added.kind, "media added: non-video");
+            tracing::trace!(%broadcast, mid = ?added.mid, kind = ?added.kind, "media added: other");
         }
         _ => {}
     }
 }
 
-fn write_video_sample(
+/// Write one sample (video or audio) through the negotiated
+/// `str0m::Writer`. Session 30 generalised this from the old
+/// `write_video_sample` so Opus audio can flow through the same
+/// poll loop that H.264 / H.265 video already uses.
+///
+/// Video codecs go through `avcc_to_annex_b` because str0m's
+/// H.264 / H.265 packetizers scan for Annex B start codes. Audio
+/// codecs (Opus) are opaque payloads: str0m's Opus packetizer
+/// emits one RTP packet per `Writer::write` call without framing
+/// inspection, so the AVCC buffer we received from the bridge
+/// passes through unchanged.
+fn write_sample(
     rtc: &mut Rtc,
     ctx: &mut SessionCtx,
     broadcast: &str,
     payload: Bytes,
     dts: u64,
-    keyframe: bool,
-    codec: VideoCodec,
+    _keyframe: bool,
+    codec: MediaCodec,
 ) -> Result<(), ()> {
     if !ctx.connected {
-        // Writes before Connected are dropped by str0m anyway. Skip
-        // them explicitly to avoid building the Annex B buffer.
         return Ok(());
     }
-    let Some(mid) = ctx.video_mid else {
-        return Ok(());
+
+    // Route to the matching mid + pt + clock domain based on
+    // the incoming sample's codec tag.
+    let (mid, pt, rtp_freq) = match codec {
+        MediaCodec::H264 => (ctx.video_mid, ctx.video_pt_h264, str0m::media::Frequency::NINETY_KHZ),
+        MediaCodec::H265 => (ctx.video_mid, ctx.video_pt_h265, str0m::media::Frequency::NINETY_KHZ),
+        MediaCodec::Opus => (
+            ctx.audio_mid,
+            ctx.audio_pt_opus,
+            str0m::media::Frequency::FORTY_EIGHT_KHZ,
+        ),
+        MediaCodec::Aac => {
+            // RTMP ingest is AAC-only. There's no in-tree
+            // AAC -> Opus transcoder, so WHEP drops these
+            // samples here. Warn once per session so a
+            // misconfigured RTMP-to-WHEP flow is obvious in
+            // the logs without spamming.
+            if !ctx.unmatched_codec_logged {
+                ctx.unmatched_codec_logged = true;
+                tracing::warn!(
+                    %broadcast,
+                    "whep: AAC audio publisher -> Opus-only subscriber surface; dropping audio (no transcoder)",
+                );
+            }
+            return Ok(());
+        }
     };
-    let pt = match codec {
-        VideoCodec::H264 => ctx.video_pt_h264,
-        VideoCodec::H265 => ctx.video_pt_h265,
+    let Some(mid) = mid else {
+        return Ok(());
     };
     let Some(pt) = pt else {
         if !ctx.unmatched_codec_logged {
@@ -438,23 +501,32 @@ fn write_video_sample(
         return Ok(());
     };
 
-    let annex_b = avcc_to_annex_b(&payload);
-    if annex_b.is_empty() {
-        tracing::trace!(%broadcast, "avcc->annex_b produced empty output; dropping sample");
-        return Ok(());
-    }
+    // Video codecs need AVCC -> Annex B. Audio codecs pass
+    // through unchanged (Opus bytes are opaque).
+    let bytes: Vec<u8> = match codec {
+        MediaCodec::H264 | MediaCodec::H265 => {
+            let annex_b = avcc_to_annex_b(&payload);
+            if annex_b.is_empty() {
+                tracing::trace!(%broadcast, "avcc->annex_b produced empty output; dropping sample");
+                return Ok(());
+            }
+            annex_b
+        }
+        MediaCodec::Opus => payload.to_vec(),
+        MediaCodec::Aac => unreachable!("AAC handled above"),
+    };
 
     let Some(writer) = rtc.writer(mid) else {
         return Ok(());
     };
 
     let wallclock = Instant::now();
-    let rtp_time = MediaTime::new(dts, str0m::media::Frequency::NINETY_KHZ);
-    match writer.write(pt, wallclock, rtp_time, annex_b) {
+    let rtp_time = MediaTime::new(dts, rtp_freq);
+    match writer.write(pt, wallclock, rtp_time, bytes) {
         Ok(()) => {
             if !ctx.first_write_logged {
                 ctx.first_write_logged = true;
-                tracing::info!(%broadcast, keyframe, dts, "first video sample written to str0m");
+                tracing::info!(%broadcast, ?codec, dts, "first sample written to str0m");
             }
             Ok(())
         }
@@ -542,15 +614,18 @@ impl SessionHandle for Str0mSessionHandle {
         Ok(())
     }
 
-    fn on_raw_sample(&self, track: &str, codec: VideoCodec, sample: &RawSample) {
+    fn on_raw_sample(&self, track: &str, codec: MediaCodec, sample: &RawSample) {
         // Track convention matches `lvqr-ingest::FragmentObserver`:
         // `0.mp4` is video, `1.mp4` is audio. Anything else is a
-        // future track we do not know how to write yet.
-        if track != "0.mp4" {
+        // future track slot we do not know how to write yet.
+        // Session 30 removed the old hard-drop on non-video
+        // tracks; the codec tag is now authoritative and
+        // `write_sample` routes audio through the Opus mid.
+        if track != "0.mp4" && track != "1.mp4" {
             if !self.audio_warned.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     track = %track,
-                    "whep audio/other-track write not wired; dropping samples (AAC->Opus transcode is out of scope)",
+                    "whep unknown-track write; dropping samples (only 0.mp4/1.mp4 wired)",
                 );
             }
             return;
@@ -772,9 +847,9 @@ mod tests {
             payload: B::from(avcc_video),
             keyframe: true,
         };
-        handle.on_raw_sample("0.mp4", VideoCodec::H264, &sample); // video path
-        handle.on_raw_sample("1.mp4", VideoCodec::H264, &sample); // audio path, warn-once
-        handle.on_raw_sample("1.mp4", VideoCodec::H264, &sample); // audio path, already warned
+        handle.on_raw_sample("0.mp4", MediaCodec::H264, &sample); // video path
+        handle.on_raw_sample("1.mp4", MediaCodec::H264, &sample); // audio path, warn-once
+        handle.on_raw_sample("1.mp4", MediaCodec::H264, &sample); // audio path, already warned
 
         // Give the poll task a beat to absorb the sample. No assert:
         // the point is that none of the above panic, and the

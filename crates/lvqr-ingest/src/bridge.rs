@@ -296,7 +296,7 @@ impl RtmpMoqBridge {
                         // HEVC-over-RTMP (enhanced-RTMP) lives in a
                         // later session. The codec tag is therefore
                         // constant here, unlike the WHIP bridge.
-                        obs.on_raw_sample(&stream_name, "0.mp4", crate::VideoCodec::H264, &sample);
+                        obs.on_raw_sample(&stream_name, "0.mp4", crate::MediaCodec::H264, &sample);
                     }
 
                     stream.video_seq += 1;
@@ -387,11 +387,13 @@ impl RtmpMoqBridge {
                             payload: aac_data.clone(),
                             keyframe: true,
                         };
-                        // Audio sample: codec tag is defaulted.
-                        // Consumers must not branch on it; a later
-                        // Opus sibling track will introduce a
-                        // dedicated audio-codec type.
-                        obs.on_raw_sample(&stream_name, "1.mp4", crate::VideoCodec::default(), &sample);
+                        // RTMP audio is always AAC in LVQR today.
+                        // Session 30 introduced the `Aac` variant
+                        // on `MediaCodec` so this call no longer
+                        // needs a placeholder value; downstream
+                        // consumers can correctly distinguish
+                        // RTMP-sourced AAC from WHIP-sourced Opus.
+                        obs.on_raw_sample(&stream_name, "1.mp4", crate::MediaCodec::Aac, &sample);
                     }
 
                     let seg = audio_segment(stream.audio_seq, base_dts, duration, &aac_data);

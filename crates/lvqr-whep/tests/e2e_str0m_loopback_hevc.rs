@@ -7,7 +7,7 @@
 //! its side after session 28, so the negotiation picks H.265
 //! because that is the only overlap. The test then pushes real
 //! x265 Main VPS + SPS + PPS + IDR access units into the WHEP
-//! session handle with `VideoCodec::H265`. str0m's
+//! session handle with `MediaCodec::H265`. str0m's
 //! `H265Packetizer` sees the Annex B buffer that
 //! `avcc_to_annex_b` produced (length-prefixed AVCC in -> Annex
 //! B with 0x00000001 start codes out, same path as the H.264
@@ -21,7 +21,7 @@
 //!   HEVC payload type.
 //! * The codec-aware `video_pt_h264` / `video_pt_h265` resolution
 //!   inside `SessionCtx` populates the H.265 slot.
-//! * `write_video_sample` routes `VideoCodec::H265` samples
+//! * `write_video_sample` routes `MediaCodec::H265` samples
 //!   through the H.265 pt, not the H.264 pt.
 //! * The server's H.265 packetizer path produces RTP that the
 //!   client's H.265 depacketizer accepts.
@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use lvqr_cmaf::RawSample;
-use lvqr_ingest::VideoCodec;
+use lvqr_ingest::MediaCodec;
 use lvqr_whep::{SdpAnswerer, SessionHandle, Str0mAnswerer, Str0mConfig};
 use str0m::change::SdpAnswer;
 use str0m::media::{Direction, MediaKind};
@@ -217,7 +217,7 @@ async fn spam_hevc_samples(handle: Arc<dyn SessionHandle>) {
     tokio::time::sleep(Duration::from_millis(100)).await;
     loop {
         let sample = build_fake_hevc_sample(dts);
-        handle.on_raw_sample("0.mp4", VideoCodec::H265, &sample);
+        handle.on_raw_sample("0.mp4", MediaCodec::H265, &sample);
         dts += frame_ticks;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
