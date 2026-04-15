@@ -1609,6 +1609,7 @@ dependencies = [
  "lvqr-cmaf",
  "lvqr-fragment",
  "lvqr-ingest",
+ "proptest",
  "thiserror 2.0.18",
  "tokio",
  "tower",
