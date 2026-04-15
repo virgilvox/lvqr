@@ -5,6 +5,11 @@ name: Fuzz
 #   - crates/lvqr-ingest/fuzz: RTMP/FLV parsers.
 #   - crates/lvqr-codec/fuzz: HEVC SPS + AAC AudioSpecificConfig
 #     parsers plus the shared BitReader exp-Golomb decoder.
+#   - crates/lvqr-whep/fuzz: str0m SdpOffer parser (the first byte
+#     a WHEP server runs over an attacker-controlled body).
+#   - crates/lvqr-whip/fuzz: Annex B -> AVCC depack (the first
+#     byte a WHIP bridge runs over str0m `Event::MediaData`
+#     payloads). Added in session 31.
 #
 # Two cadences:
 #
@@ -29,6 +34,10 @@ on:
       - "crates/lvqr-ingest/fuzz/**"
       - "crates/lvqr-codec/src/**"
       - "crates/lvqr-codec/fuzz/**"
+      - "crates/lvqr-whep/src/**"
+      - "crates/lvqr-whep/fuzz/**"
+      - "crates/lvqr-whip/src/**"
+      - "crates/lvqr-whip/fuzz/**"
       - ".github/workflows/fuzz.yml"
   schedule:
     # 07:00 UTC daily. Low-contention window for Linux runners.
@@ -60,6 +69,10 @@ jobs:
             fuzz_dir: crates/lvqr-codec/fuzz
           - target: read_ue_v
             fuzz_dir: crates/lvqr-codec/fuzz
+          - target: parse_offer_sdp
+            fuzz_dir: crates/lvqr-whep/fuzz
+          - target: parse_annex_b
+            fuzz_dir: crates/lvqr-whip/fuzz
     steps:
       - uses: actions/checkout@v4
 
