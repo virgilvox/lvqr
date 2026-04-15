@@ -6,7 +6,7 @@
 
 A Rust binary that relays live video using QUIC/MoQ. Built on moq-lite for zero-copy fan-out from ingest to delivery.
 
-## Status (v0.4-dev, session 29 close)
+## Status (v0.4-dev, session 30 close)
 
 **Tier 2.3 data plane is closed and Tier 2.4 archive is live.** Real
 end-to-end coverage across three browser-facing egress paths lands
@@ -55,7 +55,7 @@ segments by decode-time window:
   protected-auth test that exercises both the header and
   query-parameter bearer transports.
 
-**Working and tested** (81 test binaries workspace-wide, 354
+**Working and tested** (82 test binaries workspace-wide, 360
 individual tests, 0 failures under the default feature set,
 `cargo clippy --workspace --all-targets -- -D warnings` clean,
 `cargo fmt --all --check` clean; 0 `todo!()` / `unimplemented!()`

@@ -1,19 +1,197 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- WHIP publisher surface is audio+video
+## Project Status: v0.4-dev -- Opus end-to-end across every audio egress
 
-**Last Updated**: 2026-04-15 (session 29 close, Opus through WHIP)
+**Last Updated**: 2026-04-15 (session 30 close, Opus through LL-HLS + WHEP)
 **Tests**: `cargo test --workspace` green under the default
-feature set: **81 test binaries, 354 individual tests passing**,
+feature set: **82 test binaries, 360 individual tests passing**,
 0 failures, 1 ignored doctest. `cargo clippy --workspace
 --all-targets -- -D warnings` clean. `cargo fmt --all --check`
-clean. Session-29 delta over session-28's `5306977` baseline:
-+7 tests (3 lvqr-cmaf Opus writer unit, 3 lvqr-whip bridge
-Opus unit, 1 new Opus loopback E2E); +1 test binary. Also
-includes a post-session-28 audit hardening commit (`9292208`)
-that pinned a deterministic regression for the session-27 AAC
-floor and refreshed three stale module-doc comments.
+clean. Session-30 delta over session-29's `7d72ba7` baseline:
++6 tests (4 lvqr-cmaf detect_audio_codec_string unit tests, 1
+lvqr-hls Opus master-playlist integration test, 1 new WHEP Opus
+loopback E2E); +1 test binary.
 
+## Session 30 (2026-04-15): Opus through LL-HLS and WHEP
+
+One code commit on top of session 29's `7d72ba7`. Closes
+session-29 recommended entry-point item 1. WHIP Opus publishers
+now reach **both** LL-HLS subscribers (via a codec-aware
+master playlist CODECS attribute) and WHEP subscribers (via a
+same-codec Opus passthrough on the existing `Str0mAnswerer`
+poll loop). With this, every egress path now honours Opus
+audio end-to-end from a WHIP publisher.
+
+### What landed
+
+* **`VideoCodec` -> `MediaCodec` rename** in
+  `lvqr-ingest::observer`. The original enum was introduced in
+  session 26 with only `H264` / `H265` variants; session 30
+  added `Aac` + `Opus` so the observer signaling carries real
+  audio codec information. The new name is accurate (it covers
+  audio and video) and the type alias back-compat was briefly
+  left in place and then deleted once the rename cascaded
+  through every call site in the workspace. Default is still
+  `H264` so pre-session-28 code paths that did not pass an
+  explicit codec keep their original shape.
+
+* **RTMP bridge** now stamps `MediaCodec::Aac` on audio
+  samples (was `VideoCodec::default()`, which resolved to
+  H264 -- cosmetically wrong but harmless because WHEP
+  dropped the AAC track on the track-name guard anyway).
+  Session 30 makes this explicit.
+
+* **WHIP bridge** `push_audio_sample` now fires the
+  `SharedRawSampleObserver` with `MediaCodec::Opus`. Session
+  29 deliberately skipped this because WHEP still hard-coded
+  the H.264 packetizer; session 30 lifts that restriction.
+
+* **WHEP `Str0mAnswerer`** grew parallel `audio_mid` /
+  `audio_pt_opus` slots on `SessionCtx`. `absorb_event` learns
+  the audio mid from `Event::MediaAdded { kind: Audio }`. The
+  pt resolution sweep adds a `Codec::Opus` arm populating the
+  audio pt slot. The old `write_video_sample` was generalised
+  to `write_sample` with a codec-aware route:
+  * `MediaCodec::H264` / `H265` -> video mid + `avcc_to_annex_b`
+    + `Frequency::NINETY_KHZ`.
+  * `MediaCodec::Opus` -> audio mid + raw payload bytes (Opus
+    is opaque to str0m's packetizer) + `Frequency::FORTY_EIGHT_KHZ`.
+  * `MediaCodec::Aac` -> warn-once drop (no AAC -> Opus
+    transcoder). This keeps the RTMP publisher / WHEP
+    subscriber pair from spamming logs when a user
+    accidentally mixes RTMP ingest with a WHEP subscriber.
+  `Str0mSessionHandle::on_raw_sample` now accepts track
+  `"1.mp4"` alongside `"0.mp4"` and routes both through the
+  shared `SessionMsg::Video` channel (name retained for
+  continuity but carries audio too now).
+
+* **`lvqr-cmaf::detect_audio_codec_string`** new sibling of
+  the session-27 video detector. Walks a moov and returns
+  `"opus"` for `Codec::Opus` or `"mp4a.40.<aot>"` for
+  `Codec::Mp4a`. Returns `None` on parse failure, missing
+  audio trak, or an unrecognised audio sample entry.
+
+* **`lvqr-hls::HlsServer`** grew a cached
+  `audio_codec_string: RwLock<Option<String>>` populated by
+  `push_init` alongside the existing `video_codec_string`.
+  A new accessor `video.audio_codec_string().await` mirrors
+  the video one. `handle_master_playlist` reads the audio
+  string from the audio sibling server (`multi.audio(broadcast)`)
+  and folds it into the variant's `CODECS="..."` attribute.
+  Falls back to `"mp4a.40.2"` when the audio init has not been
+  decoded, matching the pre-session-30 default so a client
+  hitting master.m3u8 mid-setup still sees a syntactically
+  valid variant.
+
+### 5-artifact contract status for session 30
+
+| Slot | Status |
+|---|---|
+| Unit (`lvqr-cmaf::init::tests`) | +4 tests pinning the audio detector: `detect_audio_codec_string_reports_opus_from_opus_init` (round-trip through the new Opus writer -> detector, expects `"opus"`), `..._reports_mp4a_from_aac_init` (round-trip through the AAC writer, expects `"mp4a.40.2"` for the pinned `[0x12, 0x10]` ASC), `..._returns_none_on_garbage` (empty + invalid bytes), and `..._returns_none_on_video_only_init` (an AVC init must not match the audio detector path). |
+| Integration (`lvqr-hls::integration_master`) | +1 test: `master_playlist_reports_opus_codec_when_audio_rendition_has_opus_init`. Pushes a real Opus init segment into `ensure_audio("live/opus-audio", 48_000)` and asserts the master playlist advertises `CODECS="avc1.42001F,opus"` with no `mp4a.40.2` fallback. |
+| Proptest | No new proptest slot. Opus payload bytes are opaque at the observer layer (no parser needs a never-panic property); the existing depacketizer proptest continues to cover the codec-agnostic framing. |
+| Fuzz | Still deferred. |
+| E2E (`lvqr-whep`) | **New**: `tests/e2e_str0m_loopback_opus.rs`. Client Rtc built with `enable_opus(true)` only (no video) and a recvonly audio mid; sanity-asserts the SDP answer contains an "opus" rtpmap substring so a str0m regression is immediately visible; pumps synthetic 10-byte Opus "frames" through `Str0mSessionHandle::on_raw_sample` with track `"1.mp4"` and `MediaCodec::Opus`; waits on the client poll loop for `Event::MediaData` frames decrypted out of str0m's Opus RTP pipeline. Completes in ~0.16s on loopback. |
+
+### Load-bearing decisions made
+
+* **Rename rather than parallel enum**. The alternative (keep
+  `VideoCodec` + add `AudioCodec` + widen the observer
+  signature again) would have duplicated the H264/H265 vs
+  Aac/Opus machinery and required two separate match arms at
+  every WHEP route point. One enum with 4 variants is simpler
+  to reason about and matches the mental model "this is the
+  codec of whatever sample is on this track".
+* **Opus is opaque to the packetizer**. Unlike H.264 / H.265
+  (which need AVCC -> Annex B conversion before str0m's
+  packetizer can find NAL boundaries), Opus RTP is one-packet-
+  per-frame (RFC 7587) with no intra-frame framing. WHEP's
+  `write_sample` passes the Opus bytes through unchanged.
+* **AAC on the WHEP write path drops, not errors**. A
+  misconfigured pairing (RTMP publisher with AAC audio and a
+  WHEP subscriber that negotiated Opus) would otherwise spam
+  the error log. The fix is on the publisher / subscriber
+  side; WHEP warns once and drops subsequent AAC samples for
+  the session. The video portion of the stream continues to
+  work normally.
+* **Audio codec string fallback to `"mp4a.40.2"`**. When a
+  client hits master.m3u8 before the first audio init
+  segment has landed, the fallback string has to be _some_
+  syntactically valid AAC codec so players don't reject the
+  variant. Pre-session-30 that string was hardcoded; session
+  30 keeps it as the fallback because RTMP + AAC is still the
+  dominant audio publisher in practice.
+* **Shared `SessionMsg::Video` channel carries audio too**.
+  Adding a second channel variant would have been cleaner but
+  introduced a channel-selection branch in
+  `Str0mSessionHandle::on_raw_sample` that bought nothing -- the
+  codec tag on the message is already enough to pick the
+  right pt / mid / clock in `write_sample`. The name is kept
+  for source continuity; a future session can rename it.
+
+### Known gaps explicitly not closed in this session
+
+* **LL-HLS audio media playlist for Opus**. The master
+  playlist now advertises `opus` in its CODECS attribute, and
+  the audio `HlsServer` serves Opus init bytes through
+  `init.mp4`, but the audio media playlist itself still uses
+  the existing `PlaylistBuilder` which was tuned for AAC
+  partial durations. Opus frames are 20 ms (960 ticks at
+  48 kHz) so the `#EXT-X-PART:DURATION` values are still
+  correct; no divergence observed yet. A real browser
+  interop test would confirm this.
+* **WHIP Opus through `lvqr-hls::HlsFragmentBridge`**. The
+  WHIP bridge's `push_audio_sample` fires the raw-sample
+  observer (WHEP) but still skips the fragment observer (HLS
+  + archive). That means a WHIP Opus publisher currently
+  reaches WHEP subscribers and MoQ subscribers but not
+  LL-HLS; the HLS path still only serves Opus if some other
+  producer feeds an Opus-init `ensure_audio` server. The
+  integration test exercises the detector via a direct
+  `audio.push_init()` call rather than end-to-end from a
+  WHIP publisher. Closing this is a small follow-up -- fire
+  the fragment observer from `push_audio_sample` and verify
+  `HlsFragmentBridge` routes it sensibly.
+* **`lvqr-dash` egress**, archive VOD playlist, criterion
+  benches, fuzz catch-up, `lvqr-wasm` deletion, CORS
+  restrictive default, real-browser interop smoke. All
+  unchanged.
+
+### Recommended entry point (session 31)
+
+1. **WHIP Opus -> LL-HLS end-to-end**. Wire the fragment
+   observer from `WhipMoqBridge::push_audio_sample` and
+   confirm via a combined E2E (WHIP publisher -> LL-HLS
+   master.m3u8 + audio.m3u8 + audio segments). This turns
+   the current session-30 integration test from "direct
+   `ensure_audio` push" to "real WHIP publisher drives the
+   audio rendition".
+2. **`lvqr-dash` egress** (Tier 2.6). Reuse both
+   `detect_video_codec_string` and `detect_audio_codec_string`
+   for `<Representation codecs="..."/>`.
+3. **Real-browser HEVC + Opus interop smoke**. Unchanged.
+4. **Archive VOD playlist rendering**. Unchanged.
+5. **Benchmark slots via `criterion`**. Unchanged.
+6. **Fuzz slot catch-up**. Unchanged.
+7. **`lvqr-wasm` deletion**. Unchanged.
+8. **CORS restrictive default**. Unchanged.
+
+### Competitive-matrix delta after session 30
+
+Checkmarks gained:
+
+* **WHIP audio -> WHEP egress (Opus passthrough)**: N -> **Y**.
+  Same-codec forwarding with no transcode; a single WHEP
+  subscriber can receive Opus from a WHIP publisher.
+* **LL-HLS audio codec advertisement**: hardcoded -> **dynamic**.
+  Master playlist advertises `opus` or `mp4a.40.<aot>` based
+  on the real init segment bytes.
+* **WHIP audio ingest (Opus)**: Partial -> **Y** for MoQ +
+  WHEP; **Partial** for LL-HLS (master playlist + audio init
+  done, end-to-end WHIP -> LL-HLS audio fragment fanout is
+  session 31 item 1).
+
+---
 ## Session 29 (2026-04-15): Opus-native audio through the WHIP bridge
 
 One code commit on top of session 28's `5306977` plus an
