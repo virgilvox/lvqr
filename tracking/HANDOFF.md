@@ -5,22 +5,26 @@
 **Last Updated**: 2026-04-15 (session 31 close, WHIP Opus through
 LL-HLS fragment observer + mediastreamvalidator workflow)
 **Tests**: `cargo test --workspace` green under the default
-feature set: **82 test binaries, 371 individual tests passing**,
+feature set: **84 test binaries, 379 individual tests passing**,
 0 failures, 1 ignored doctest. `cargo clippy --workspace
 --all-targets -- -D warnings` clean. `cargo fmt --all --check`
 clean. Session-31 delta over session-30's `432290c` baseline:
-+11 tests (1 lvqr-whip recording-observer unit test proving
-`WhipMoqBridge` fires `FragmentObserver::on_init` +
-`on_fragment` for the `1.mp4` Opus track; 2 lvqr-hls manifest
-tests covering `EXT-X-PRELOAD-HINT` population through a
-segment boundary and across the audio-prefix config; 2
-lvqr-hls integration tests covering `EXT-X-RENDITION-REPORT`
-sibling-rendition emission in the multi-broadcast router; 4
-lvqr-hls manifest tests covering `CAN-SKIP-UNTIL` +
-`EXT-X-SKIP` delta-playlist decision logic across the spec
-floors; 2 lvqr-hls integration tests covering `_HLS_skip=YES`
-directive routing through the axum router). No new test
-binaries.
++19 tests, +2 test binaries. Breakdown: 1 lvqr-whip
+recording-observer unit test proving `WhipMoqBridge` fires
+`FragmentObserver::on_init` + `on_fragment` for the `1.mp4`
+Opus track; 2 lvqr-hls manifest tests covering
+`EXT-X-PRELOAD-HINT` population through a segment boundary
+and across the audio-prefix config; 2 lvqr-hls integration
+tests covering `EXT-X-RENDITION-REPORT` sibling-rendition
+emission in the multi-broadcast router; 4 lvqr-hls manifest
+tests covering `CAN-SKIP-UNTIL` + `EXT-X-SKIP` delta-playlist
+decision logic across the spec floors; 2 lvqr-hls integration
+tests covering `_HLS_skip=YES` directive routing through the
+axum router; 2 lvqr-hls proptest invariants covering delta
+playlist spec floors and render-matches-skip-decision
+isomorphism; 6 lvqr-dash MPD unit tests covering the happy
+path, audio AdaptationSet emission, empty-state rejections,
+and the VOD static-type variant.
 
 ## Session 31 close (2026-04-15)
 
@@ -108,6 +112,10 @@ Two concrete deliverables, each in its own commit, plus this docs pass.
   `EXT-X-SKIP` delta-playlist support for the `_HLS_skip=YES`
   directive (`aab6156`, `6b63da1`). Still open: LL-HLS VOD
   windows for DVR scrub, byte-range addressing for partials.
+* **Tier 2.6 `lvqr-dash`**: was NOT STARTED, now PARTIAL ~25%.
+  Commit `3aefa5f` lands the crate skeleton + typed MPD
+  renderer + 6 unit tests. The `DashServer` / axum router /
+  `DashFragmentBridge` observer impl land in a follow-up.
 * Everything else in the maturity audit remains unchanged from
   the `432290c` baseline.
 
@@ -123,6 +131,38 @@ Two concrete deliverables, each in its own commit, plus this docs pass.
    pre-existing-but-orphaned whep `parse_offer_sdp` target
    into `.github/workflows/fuzz.yml` matrix so both now run
    on every relevant PR + nightly.
+
+7. **Tier 2.6 `lvqr-dash` MPD renderer** (`3aefa5f`). First
+   concrete step on the Tier 2.6 DASH egress budget the
+   roadmap calls a "one-session project". This commit lands
+   the crate skeleton + typed MPD renderer; the HTTP server
+   (`DashServer`, `MultiDashServer`, axum router,
+   `DashFragmentBridge` `FragmentObserver` impl) is a
+   follow-up session so this commit can be reviewed in
+   isolation.
+
+   Architecture deliberately mirrors `lvqr-hls`: same
+   `FragmentObserver` contract, same multi-broadcast shape,
+   same reuse of `lvqr_cmaf::detect_video_codec_string` /
+   `detect_audio_codec_string` so H.264 / HEVC / AAC / Opus
+   publishers all surface the right codec attribute without
+   any DASH-specific detection. The difference is the
+   on-the-wire manifest format: an MPD XML document with a
+   `Period` → `AdaptationSet` → `Representation` →
+   `SegmentTemplate` hierarchy.
+
+   Scope choices: live profile only (`type="dynamic"` with
+   `$Number$` addressing); hand-written XML rather than a
+   `quick-xml` serializer to keep the crate
+   dependency-light and the output byte-stable for golden
+   tests; no bandwidth discovery (conservative 2.5 Mbps /
+   128 kbps hardcodes, like the LL-HLS master playlist).
+
+   Six unit tests: full-skeleton happy path; audio
+   AdaptationSet with `lang="en"` appended to a video MPD;
+   empty-period / empty-MPD / empty-AdaptationSet rejections
+   (typed `DashError` instead of panic); VOD static-type
+   variant rendering `type="static"` instead of `dynamic`.
 
 6. **Tier 2.5 CAN-SKIP-UNTIL + EXT-X-SKIP delta playlists**
    (`aab6156`, `6b63da1`). Fourth LL-HLS spec fix, closing
@@ -282,7 +322,7 @@ MediaMTX / MediaMTX-style servers").
 | 2.3 | `lvqr-cmaf` segmenter | DONE | AVC, HEVC, AAC, and Opus init writers all ship with unit tests and mp4-atom round-trip validation. `CmafPolicy`, `TrackCoalescer`, `build_moof_mdat` all in place. AV1 / VP9 init writers deferred alongside 2.2. |
 | 2.4 | `lvqr-archive` | DONE | redb segment index, on-disk segments, HTTP playback surface (`/playback/*`), traversal guard, `SharedAuth` gate. S3 upload via `object_store` is NOT STARTED but roadmap's "optional" slot. |
 | 2.5 | `lvqr-hls` + LL-HLS | PARTIAL (~95%) | Blocking reload, partials, master playlist with codec-aware CODECS, audio rendition group, multi-broadcast routing, `EXT-X-INDEPENDENT-SEGMENTS`, `EXT-X-PRELOAD-HINT`, `EXT-X-RENDITION-REPORT`, `CAN-SKIP-UNTIL`, and `EXT-X-SKIP` / `_HLS_skip=YES` delta playlists all done. **Open**: VOD windows for archive scrub in the HLS surface, byte-range addressing for partials. Apple `mediastreamvalidator` workflow landed in session 31 (`e2698f9`) but has not had its first baseline run yet -- promotion to required and triage of findings is the session-32 entry point. |
-| 2.6 | `lvqr-dash` | NOT STARTED | Aligned CMAF segments already exist; the missing piece is a typed MPD generator via `quick-xml`. Can reuse `detect_video_codec_string` and `detect_audio_codec_string` from session 27/30. Budget: one session. |
+| 2.6 | `lvqr-dash` | PARTIAL (~25%, session 31) | MPD renderer skeleton landed in `3aefa5f`: `Mpd`, `Period`, `AdaptationSet`, `Representation`, `SegmentTemplate`, `MpdType`, `DashError` types plus `Mpd::render()` producing the `urn:mpeg:dash:profile:isoff-live:2011` live profile XML (hand-written to avoid a `quick-xml` dependency and keep the output byte-stable for golden tests). Six unit tests green including happy-path live MPD, audio AdaptationSet with `lang`, empty-MPD/empty-period/empty-set rejections, and the VOD static-type variant. **Open**: `DashServer` + `MultiDashServer` + axum router, `DashFragmentBridge` observer impl, `lvqr-cli` `--dash-port` flag, 5-artifact contract scope admission. |
 | 2.7 | WHIP + WHEP | DONE | H.264, H.265, and Opus all ride end-to-end in both directions. Session 31 closed the last open thread: `WhipMoqBridge` now fires `FragmentObserver::on_init` + `on_fragment` for the `1.mp4` Opus track so LL-HLS audio renditions and the archive tee pick up WHIP audio automatically. |
 | 2.8 | `lvqr-srt` | NOT STARTED | libsrt FFI, MPEG-TS demuxer, broadcast-encoder interop. Roadmap calls this ~2.5 weeks. One of the two "cut if Tier 2 blows its budget" candidates. |
 | 2.9 | `lvqr-rtsp` server | NOT STARTED | Hand-rolled state machine + `retina` for RTSP-pull. The other cut candidate. |
