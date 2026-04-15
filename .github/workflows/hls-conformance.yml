@@ -1,0 +1,189 @@
+name: LL-HLS Conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Apple `mediastreamvalidator` is the reference LL-HLS compliance
+# checker. MediaMTX and OvenMediaEngine both gate releases on it;
+# until this workflow exists we had never run it against LVQR's
+# LL-HLS output, which means every "spec-compliant LL-HLS" claim
+# was unverified. See tracking/HANDOFF.md "Maturity audit" for the
+# rationale and the critical path to M1.
+#
+# The job is intentionally macOS-only: `mediastreamvalidator` ships
+# only with Apple's HTTP Live Streaming Tools, which are not
+# redistributable through brew or apt. A best-effort install step
+# tries both `xcrun` (which succeeds when the tools are already on
+# the runner image) and a brew cask fallback; if neither is
+# available the step logs the gap and the job falls back to an
+# ffmpeg-as-client compliance pass so the PR still gets a signal.
+#
+# `continue-on-error` stays on until the baseline is green. Once
+# `mediastreamvalidator` reports zero errors against the rtmp
+# fixture defined below, flip `continue-on-error` to `false` and
+# promote the job to a required check.
+
+jobs:
+  mediastreamvalidator:
+    name: LL-HLS conformance (Apple mediastreamvalidator)
+    runs-on: macos-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: hls-conformance-v1
+
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - name: Locate mediastreamvalidator
+        id: msv_locate
+        run: |
+          set +e
+          FOUND=""
+          if command -v mediastreamvalidator >/dev/null 2>&1; then
+            FOUND="$(command -v mediastreamvalidator)"
+          elif xcrun --find mediastreamvalidator >/dev/null 2>&1; then
+            FOUND="$(xcrun --find mediastreamvalidator)"
+          fi
+          if [ -z "$FOUND" ]; then
+            echo "mediastreamvalidator not present on this runner image" >&2
+            echo "msv_path=" >> "$GITHUB_OUTPUT"
+          else
+            echo "found mediastreamvalidator at: $FOUND"
+            echo "msv_path=$FOUND" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build lvqr-cli (release)
+        run: cargo build -p lvqr-cli --release
+
+      - name: Prepare artifact directory
+        run: mkdir -p /tmp/msv-out
+
+      - name: Start lvqr serve in background
+        run: |
+          set -euo pipefail
+          ./target/release/lvqr serve \
+            --port 4443 \
+            --rtmp-port 1935 \
+            --admin-port 18080 \
+            --hls-port 8888 \
+            --whip-port 0 \
+            --whep-port 0 \
+            > /tmp/msv-out/lvqr-serve.log 2>&1 &
+          echo $! > /tmp/lvqr-serve.pid
+          # Wait for the HLS port to bind. `nc -z` exits 0 once the
+          # listener is up; 20 * 0.5s = 10s budget which is plenty
+          # on a cold GitHub runner.
+          for i in $(seq 1 20); do
+            if nc -z 127.0.0.1 8888 2>/dev/null; then
+              echo "lvqr serve HLS port is ready"
+              break
+            fi
+            sleep 0.5
+          done
+
+      - name: Push synthetic RTMP fixture with ffmpeg
+        run: |
+          set -euo pipefail
+          # Canonical fixture: 20 seconds of 640x360@30fps H.264
+          # baseline with AAC-LC 44.1 kHz stereo. Keyframe every
+          # second (g=30) keeps partial/segment boundaries
+          # deterministic for the validator's timing checks.
+          ffmpeg -hide_banner -loglevel warning \
+            -re \
+            -f lavfi -i testsrc=size=640x360:rate=30 \
+            -f lavfi -i sine=frequency=440:sample_rate=44100 \
+            -c:v libx264 -preset ultrafast -tune zerolatency \
+            -profile:v baseline -level 3.1 -pix_fmt yuv420p \
+            -g 30 -keyint_min 30 -sc_threshold 0 \
+            -c:a aac -b:a 128k -ac 2 \
+            -t 20 \
+            -f flv rtmp://127.0.0.1:1935/live/test 2>&1 | tee /tmp/msv-out/ffmpeg-publish.log
+
+      - name: Give the playlist time to finalize
+        run: sleep 3
+
+      - name: Capture master + media playlists
+        run: |
+          set +e
+          curl -sS -o /tmp/msv-out/master.m3u8 http://127.0.0.1:8888/hls/live/test/master.m3u8
+          curl -sS -o /tmp/msv-out/playlist.m3u8 http://127.0.0.1:8888/hls/live/test/playlist.m3u8
+          echo "--- master.m3u8 ---"
+          cat /tmp/msv-out/master.m3u8 || true
+          echo "--- playlist.m3u8 ---"
+          cat /tmp/msv-out/playlist.m3u8 || true
+
+      - name: Run mediastreamvalidator
+        id: msv_run
+        if: steps.msv_locate.outputs.msv_path != ''
+        run: |
+          set +e
+          "${{ steps.msv_locate.outputs.msv_path }}" \
+            -O /tmp/msv-out \
+            http://127.0.0.1:8888/hls/live/test/master.m3u8 \
+            2>&1 | tee /tmp/msv-out/mediastreamvalidator.log
+          RC=${PIPESTATUS[0]}
+          echo "mediastreamvalidator exit code: $RC"
+          exit "$RC"
+
+      - name: mediastreamvalidator unavailable (soft gap)
+        if: steps.msv_locate.outputs.msv_path == ''
+        run: |
+          echo "mediastreamvalidator is not installed on this runner image." >&2
+          echo "The ffmpeg-client compliance pass below is the only conformance" >&2
+          echo "signal for this run. See tracking/HANDOFF.md maturity audit for" >&2
+          echo "the escalation path (download Apple HTTP Live Streaming Tools" >&2
+          echo "and cache them on a self-hosted runner)." >&2
+          exit 0
+
+      - name: ffmpeg client-side compliance pass
+        if: always()
+        run: |
+          set +e
+          # Second cheap validator: pull the master playlist back
+          # through ffmpeg as an HLS client and remux to fMP4. Any
+          # structural break in the playlist (bad part timing,
+          # missing init, mismatched codecs) causes ffmpeg to
+          # refuse the stream. Runs even if mediastreamvalidator
+          # fails so the artifact always carries an independent
+          # read of the same surface.
+          ffmpeg -hide_banner -loglevel warning \
+            -i http://127.0.0.1:8888/hls/live/test/master.m3u8 \
+            -c copy -t 5 /tmp/msv-out/ffmpeg-pull.mp4 \
+            2>&1 | tee /tmp/msv-out/ffmpeg-pull.log
+          PULL_RC=${PIPESTATUS[0]}
+          ffprobe -v error -show_streams /tmp/msv-out/ffmpeg-pull.mp4 \
+            2>&1 | tee /tmp/msv-out/ffprobe.log
+          PROBE_RC=${PIPESTATUS[0]}
+          echo "ffmpeg pull exit: $PULL_RC; ffprobe exit: $PROBE_RC"
+          # Don't fail the step on the ffmpeg pull for now; the
+          # authoritative signal is mediastreamvalidator when it's
+          # available, and this exists to provide a weaker backup
+          # signal when it isn't.
+
+      - name: Stop lvqr serve
+        if: always()
+        run: |
+          if [ -f /tmp/lvqr-serve.pid ]; then
+            kill "$(cat /tmp/lvqr-serve.pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload conformance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hls-conformance-output
+          path: /tmp/msv-out
+          if-no-files-found: warn
+          retention-days: 14
