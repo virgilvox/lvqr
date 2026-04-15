@@ -1,9 +1,17 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- WHIP Opus closed end-to-end, Apple validator CI job landed
+## Project Status: v0.4-dev -- LL-HLS spec hardening + lvqr-dash skeleton
 
-**Last Updated**: 2026-04-15 (session 31 close, WHIP Opus through
-LL-HLS fragment observer + mediastreamvalidator workflow)
+**Last Updated**: 2026-04-15 (session 31 close after 15 commits:
+WHIP Opus closure, Apple mediastreamvalidator workflow, four
+LL-HLS spec fixes, Tier 1 contract/fuzz expansion, lvqr-dash
+MPD renderer skeleton)
+
+**Branch head**: `a843f19`. Branch is 15 commits ahead of
+`origin/main`; **nothing has been pushed**. The first act of
+session 32 is to `git push` so `.github/workflows/hls-conformance.yml`
+can run on GitHub and produce the first Apple
+`mediastreamvalidator` baseline against real LVQR LL-HLS output.
 **Tests**: `cargo test --workspace` green under the default
 feature set: **84 test binaries, 379 individual tests passing**,
 0 failures, 1 ignored doctest. `cargo clippy --workspace
@@ -246,27 +254,116 @@ Two concrete deliverables, each in its own commit, plus this docs pass.
 
 ### Session 32 entry point
 
-Push the branch so `hls-conformance.yml` runs on GitHub;
-capture the first `mediastreamvalidator` baseline. Session 31
-pre-emptively closed the four live-playlist spec items most
+Two concrete pieces of work, in priority order:
+
+**Step 1 -- Push the branch and triage the validator baseline**
+(variable scope, do first so the CI run can churn in parallel
+with Step 2).
+
+The branch is 15 commits ahead of `origin/main` and
+`hls-conformance.yml` has never run. `git push` is the first
+action. Once the workflow runs on macos-latest, capture the
+`mediastreamvalidator` output from the uploaded artifact. Session
+31 pre-emptively closed the four live-playlist spec items most
 validators flag first (`EXT-X-INDEPENDENT-SEGMENTS`,
-`EXT-X-PRELOAD-HINT`, `EXT-X-RENDITION-REPORT`,
-`CAN-SKIP-UNTIL` + `EXT-X-SKIP`), so the baseline should be
-narrower than it would have been off the session-30 head.
-Remaining suspects to watch for in the first run:
+`EXT-X-PRELOAD-HINT`, `EXT-X-RENDITION-REPORT`, `CAN-SKIP-UNTIL` +
+`EXT-X-SKIP`), so the baseline should be narrower than it would
+have been off the session-30 head. Remaining suspects to watch
+for:
 
 * `EXT-X-PART:DURATION` precision drift if the policy's
-  `part_target_secs` and the actual fragment durations disagree
-  by more than a few ms.
+  `part_target_secs` (0.2 s) and the actual fragment durations
+  disagree by more than a few ms.
 * Blocking-reload `_HLS_msn` / `_HLS_part` query response
   formatting.
-* Byte-range addressing for partials (not yet implemented).
-* LL-HLS VOD windows for DVR scrub (not yet implemented).
+* Byte-range addressing for partials (not yet implemented; may
+  be flagged as a warning rather than an error).
+* LL-HLS VOD windows for DVR scrub (not yet implemented; same).
+* Runtime gotchas in the workflow itself: the `mediastreamvalidator`
+  binary may not be present on the `macos-latest` runner image
+  (Apple HTTP Live Streaming Tools are not brew-installable).
+  The workflow handles that via a soft-skip step; if the real
+  validator never runs, the ffmpeg client-pull second signal is
+  the only compliance read. Escalation path: self-hosted macOS
+  runner with the HLS Tools .dmg pre-installed, or a mirror of
+  the .pkg in a private S3 bucket.
 
-Fix each finding in `lvqr-hls` in place, then flip the
-workflow's `continue-on-error` to `false`. Second priority:
-begin `lvqr-dash` egress (Tier 2.6), a one-session project that
-reuses both cmaf codec detectors.
+Fix each finding in `lvqr-hls` in place as its own commit. Do
+not bundle unrelated fixes. After the baseline is clean, flip
+`.github/workflows/hls-conformance.yml`'s `continue-on-error: true`
+to `false` in one final commit so the job becomes a required
+check.
+
+**Step 2 -- Finish the `lvqr-dash` Tier 2.6 work** (one focused
+session of remaining scope after Step 1).
+
+Session 31 landed the crate skeleton and the typed MPD renderer
+(`3aefa5f`). The remaining work to close Tier 2.6 and let DASH
+ride alongside LL-HLS in a single `lvqr serve` invocation:
+
+* `crates/lvqr-dash/src/server.rs`: `DashServer` + `MultiDashServer`
+  types mirroring `lvqr-hls::HlsServer` / `MultiHlsServer`. State:
+  `Arc<DashState>` with `init_video` / `init_audio` bytes, a
+  segment cache keyed on `(track, seq)`, latest segment counters
+  for the MPD renderer. Methods: `new(DashConfig)`, `push_init`,
+  `push_segment`, `router()` returning an `axum::Router`.
+* Router routes:
+    * `GET /dash/{broadcast}/manifest.mpd` -- renders the current
+      MPD by composing an `Mpd` value from `DashConfig` + latest
+      segment counters + codec strings pulled from the shared
+      `lvqr_cmaf::detect_*_codec_string` helpers.
+    * `GET /dash/{broadcast}/init-video.m4s` and
+      `/init-audio.m4s` -- serve the cached init bytes.
+    * `GET /dash/{broadcast}/seg-video-{n}.m4s` and
+      `/seg-audio-{n}.m4s` -- look up cached segment bytes by
+      `(track, n)`; 404 on miss.
+* `crates/lvqr-dash/src/bridge.rs`: `DashFragmentBridge`
+  implementing `lvqr_ingest::FragmentObserver`. `on_init` stashes
+  bytes into the server's init slot. `on_fragment` writes segment
+  bytes into the cache under `seg-<track>-<n>.m4s` where `n` is
+  derived from the Fragment's `sequence` field. Follows the same
+  drop-entry-before-observing reentrancy pattern the WHIP bridge
+  and the HLS bridge already use.
+* `crates/lvqr-cli/src/main.rs`: new `--dash-port` arg (env
+  `LVQR_DASH_PORT`, default 0 = disabled). When non-zero,
+  `serve_from_args` constructs a `MultiDashServer`, attaches it
+  as a `FragmentObserver` on the RTMP + WHIP bridges, and mounts
+  its router on a dedicated axum server bound to the configured
+  address.
+* Integration test in `crates/lvqr-dash/tests/integration_router.rs`
+  driving two video segment pushes + one audio segment push
+  through `tower::ServiceExt::oneshot`, asserting the MPD body
+  contains both AdaptationSets and that every segment URI the
+  manifest references resolves to the cached bytes.
+* CLI integration test at `crates/lvqr-cli/tests/rtmp_dash_e2e.rs`
+  mirroring `rtmp_hls_e2e.rs`: start a `TestServer` with both
+  HLS + DASH ports, push an RTMP broadcast via `rml_rtmp`, read
+  back `/dash/live/test/manifest.mpd` + at least one segment
+  body over a real HTTP/1.1 loopback client.
+* 5-artifact contract slots for `lvqr-dash`: promote to
+  `IN_SCOPE` in `scripts/check_test_contract.sh` once at least
+  proptest + integration + E2E are filled in.
+
+Step 2 verification gates (on top of Step 1's):
+
+    cargo fmt --all
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo test --workspace
+    git log -1 --format='%an <%ae>'   # Moheeb Zara alone
+
+Commit scope: one commit per concrete change. Plan:
+
+  1. Server + types.
+  2. Bridge observer impl.
+  3. CLI --dash-port wiring.
+  4. Integration tests.
+  5. Contract scope + docs.
+
+After Step 2, Tier 2.6 in the maturity row flips from
+PARTIAL ~25% to DONE, and the critical-path weight shifts to
+`lvqr-srt` / `lvqr-rtsp` (the last two missing ingest protocols)
+or to the Tier 3 webhook auth provider (the cheapest production-
+auth item).
 
 ## Maturity audit -- what is left to v1.0 (session 30 follow-up)
 
