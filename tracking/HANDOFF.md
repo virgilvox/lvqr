@@ -1,8 +1,74 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.6 lvqr-dash closed
+## Project Status: v0.4-dev -- Tier 2.6 lvqr-dash closed + LL-HLS closed-segment cache bug fixed
 
-**Last Updated**: 2026-04-15 (session 32 close after 6 commits:
+**Last Updated**: 2026-04-15 (session 33 landed in-session: LL-HLS
+closed-segment-bytes coalesce fix + lvqr-dash proptest harness).
+
+## Session 33 close (2026-04-15)
+
+Two concrete commits on top of the session-32 head:
+
+1. **LL-HLS closed-segment cache coalesce** (`76fc6a0`). Fixes
+   the `audio-seg-0.m4s` 404 the first `hls-conformance.yml` CI
+   run surfaced via the ffmpeg client-side compliance pass.
+   `HlsServer::push_chunk_bytes` and `HlsServer::close_pending_segment`
+   now snapshot `manifest.segments.len()` before mutating the
+   builder, and after mutation any newly-closed segment's
+   constituent part URIs are looked up in the cache and
+   concatenated (via `BytesMut`) into a single blob that is
+   inserted under `seg.uri`. The coalesce runs under the cache
+   write lock after the builder write lock is released so the
+   two locks are never held simultaneously. Audio renditions
+   get the same fix for free because `seg.uri` already carries
+   the `audio-<prefix>` rewrite.
+
+   A new integration test in `crates/lvqr-hls/tests/integration_server.rs`
+   (`closed_segment_uri_serves_coalesced_bytes`) pushes 10
+   partials plus one Segment-kind chunk, fetches `/seg-0.m4s`,
+   and asserts the response body is the byte-exact concatenation
+   of the 10 pushed part bodies. The existing
+   `playlist_init_and_segment_round_trip` test continues to
+   exercise the part-URI resolution path unchanged.
+
+2. **lvqr-dash proptest harness** (`810b334`). Closes the
+   proptest slot of the 5-artifact contract for `lvqr-dash`,
+   leaving fuzz + external conformance as the still-open slots.
+   `crates/lvqr-dash/tests/proptest_mpd.rs` covers five
+   invariants at 200 cases each: render never panics on
+   well-formed input, rendered body starts/ends with XML
+   markers, `<AdaptationSet ` count matches input, `render_mpd`
+   free function is byte-equal to `Mpd::render`, and the
+   `type="dynamic"` / `"static"` attribute matches `MpdType`.
+   `scripts/check_test_contract.sh` now reports `ok proptest`
+   for `lvqr-dash`; total missing slots falls from 12 to 11.
+
+**Tests**: 88 test binaries (+2 from session 32), **402 tests**
+(+6 from session 32: +1 regression test for the HLS fix and +5
+proptest cases for lvqr-dash), 0 failures, 1 ignored doctest.
+
+### Session 34 entry point
+
+Primary scope: verify on a re-triggered `hls-conformance.yml`
+run that the ffmpeg client-pull path no longer 404s on
+`audio-seg-0.m4s`. If clean, flip `continue-on-error: true` to
+`false` in `.github/workflows/hls-conformance.yml` as a
+separate commit (so a future LL-HLS regression blocks
+merges). The `mediastreamvalidator` soft-skip path remains --
+promotion to a truly hard-required gate still requires a
+self-hosted macOS runner with Apple HTTP Live Streaming Tools
+pre-installed.
+
+Secondary scopes for session 34: the lvqr-dash fuzz target
+(pure-value renderer surface, but a libfuzzer harness over
+arbitrary `Mpd` bytes still catches edge cases in string
+escaping), LL-HLS VOD windows for DVR scrub, byte-range
+partials, and the eviction watermark so coalesced segment
+bytes get purged from the cache when the manifest drops the
+segment from its sliding window (no leak today, but observable
+memory growth on long-running broadcasts).
+
+## Session 32 close (2026-04-15)
 push of the session-26-through-31 backlog, Tier 2.6 lvqr-dash
 DashServer + MultiDashServer + DashFragmentBridge + --dash-port
 wiring + integration router tests + RTMP->DASH E2E, 5-artifact
