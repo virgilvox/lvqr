@@ -1516,6 +1516,7 @@ dependencies = [
  "lvqr-auth",
  "lvqr-cmaf",
  "lvqr-core",
+ "lvqr-dash",
  "lvqr-fragment",
  "lvqr-hls",
  "lvqr-ingest",
@@ -1602,11 +1603,15 @@ dependencies = [
 name = "lvqr-dash"
 version = "0.3.1"
 dependencies = [
+ "axum",
  "bytes",
+ "http-body-util",
  "lvqr-cmaf",
  "lvqr-fragment",
+ "lvqr-ingest",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
 ]
 

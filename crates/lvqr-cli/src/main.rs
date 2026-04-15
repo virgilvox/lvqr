@@ -44,6 +44,17 @@ struct ServeArgs {
     #[arg(long, default_value = "0", env = "LVQR_WHEP_PORT")]
     whep_port: u16,
 
+    /// MPEG-DASH HTTP listen port. Set to 0 to disable DASH egress.
+    /// When non-zero, `lvqr serve` binds a dedicated axum server on
+    /// this port exposing `/dash/{broadcast}/manifest.mpd`,
+    /// `/dash/{broadcast}/init-{video,audio}.m4s`, and the numbered
+    /// `seg-{video,audio}-<n>.m4s` segment URIs the MPD references.
+    /// The bridge is observer-based: every RTMP + WHIP publisher
+    /// feeds the same `MultiDashServer` through a `DashFragmentBridge`
+    /// without any additional wiring per protocol.
+    #[arg(long, default_value = "0", env = "LVQR_DASH_PORT")]
+    dash_port: u16,
+
     /// WHIP HTTP listen port. Set to 0 to disable WHIP ingest. When
     /// non-zero, `lvqr serve` binds a dedicated axum server on this
     /// port exposing `POST/PATCH/DELETE /whip/{broadcast}` for
@@ -179,6 +190,12 @@ async fn serve_from_args(args: ServeArgs) -> Result<()> {
         Some(([0, 0, 0, 0], args.whip_port).into())
     };
 
+    let dash_addr = if args.dash_port == 0 {
+        None
+    } else {
+        Some(([0, 0, 0, 0], args.dash_port).into())
+    };
+
     let config = ServeConfig {
         relay_addr: ([0, 0, 0, 0], args.port).into(),
         rtmp_addr: ([0, 0, 0, 0], args.rtmp_port).into(),
@@ -186,6 +203,7 @@ async fn serve_from_args(args: ServeArgs) -> Result<()> {
         hls_addr,
         whep_addr,
         whip_addr,
+        dash_addr,
         mesh_enabled: args.mesh_enabled,
         max_peers: args.max_peers,
         auth: Some(auth),

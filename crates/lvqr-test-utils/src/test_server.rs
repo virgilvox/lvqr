@@ -46,6 +46,7 @@ pub struct TestServerConfig {
     record_dir: Option<PathBuf>,
     archive_dir: Option<PathBuf>,
     hls_disabled: bool,
+    dash_enabled: bool,
 }
 
 impl TestServerConfig {
@@ -88,6 +89,15 @@ impl TestServerConfig {
         self.hls_disabled = true;
         self
     }
+
+    /// Enable the MPEG-DASH HTTP surface. Off by default; tests
+    /// that exercise the `/dash/{broadcast}/...` routes flip it on
+    /// via this builder so the server pre-binds an ephemeral
+    /// loopback listener.
+    pub fn with_dash(mut self) -> Self {
+        self.dash_enabled = true;
+        self
+    }
 }
 
 /// A running LVQR server bound to ephemeral loopback ports.
@@ -117,6 +127,7 @@ impl TestServer {
             hls_addr: if config.hls_disabled { None } else { Some(ephemeral) },
             whep_addr: None,
             whip_addr: None,
+            dash_addr: if config.dash_enabled { Some(ephemeral) } else { None },
             mesh_enabled: config.mesh_enabled,
             max_peers: config.max_peers.unwrap_or(3),
             auth: config.auth,
@@ -163,6 +174,23 @@ impl TestServer {
         self.handle
             .hls_url(path)
             .expect("HLS surface disabled on this TestServer; remove without_hls() to enable")
+    }
+
+    /// Bound MPEG-DASH HTTP address. Panics if DASH was not
+    /// enabled via [`TestServerConfig::with_dash`].
+    pub fn dash_addr(&self) -> SocketAddr {
+        self.handle
+            .dash_addr()
+            .expect("DASH surface not enabled on this TestServer; call with_dash() to enable")
+    }
+
+    /// Build an HTTP URL pointing at a path on the DASH surface,
+    /// e.g. `dash_url("/dash/live/test/manifest.mpd")`. Panics if
+    /// DASH was not enabled.
+    pub fn dash_url(&self, path: &str) -> String {
+        self.handle
+            .dash_url(path)
+            .expect("DASH surface not enabled on this TestServer; call with_dash() to enable")
     }
 
     /// Admin HTTP base URL (e.g. `http://127.0.0.1:34921`).

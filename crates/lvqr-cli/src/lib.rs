@@ -23,6 +23,7 @@ use axum::routing::get;
 use bytes::Bytes;
 use lvqr_auth::{AuthContext, AuthDecision, NoopAuthProvider, SharedAuth};
 use lvqr_core::{EventBus, RelayEvent};
+use lvqr_dash::{DashConfig, DashFragmentBridge, MultiDashServer};
 use lvqr_hls::{MultiHlsServer, PlaylistBuilderConfig};
 use lvqr_ingest::SharedFragmentObserver;
 use lvqr_moq::Track;
@@ -71,6 +72,13 @@ pub struct ServeConfig {
     /// address that accepts `POST /whip/{broadcast}` SDP offers.
     /// When `None`, no WHIP surface is exposed.
     pub whip_addr: Option<SocketAddr>,
+    /// Optional MPEG-DASH HTTP bind address. When `Some`, `start()`
+    /// spins up a `MultiDashServer` axum router on this address
+    /// that observes the same fragment stream the LL-HLS bridge
+    /// observes and serves `/dash/{broadcast}/manifest.mpd` plus
+    /// numbered segment URIs. RTMP and WHIP publishers both feed
+    /// the DASH egress without any per-protocol wiring.
+    pub dash_addr: Option<SocketAddr>,
     /// Enable the peer mesh coordinator and `/signal` endpoint.
     pub mesh_enabled: bool,
     /// Max children per mesh parent when `mesh_enabled`.
@@ -110,6 +118,7 @@ impl ServeConfig {
             hls_addr: Some((loopback, 0).into()),
             whep_addr: None,
             whip_addr: None,
+            dash_addr: None,
             mesh_enabled: false,
             max_peers: 3,
             auth: None,
@@ -135,6 +144,7 @@ pub struct ServerHandle {
     hls_addr: Option<SocketAddr>,
     whep_addr: Option<SocketAddr>,
     whip_addr: Option<SocketAddr>,
+    dash_addr: Option<SocketAddr>,
     shutdown: CancellationToken,
     join: Option<tokio::task::JoinHandle<()>>,
 }
@@ -168,6 +178,24 @@ impl ServerHandle {
     /// Bound WHIP HTTP address, when WHIP ingest is enabled.
     pub fn whip_addr(&self) -> Option<SocketAddr> {
         self.whip_addr
+    }
+
+    /// Bound MPEG-DASH HTTP address, when DASH egress is enabled.
+    pub fn dash_addr(&self) -> Option<SocketAddr> {
+        self.dash_addr
+    }
+
+    /// HTTP URL pointing at a path on the DASH surface, e.g.
+    /// `dash_url("/dash/live/test/manifest.mpd")`. Returns `None`
+    /// when DASH is not enabled.
+    pub fn dash_url(&self, path: &str) -> Option<String> {
+        let addr = self.dash_addr?;
+        let path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        Some(format!("http://{addr}{path}"))
     }
 
     /// HTTP base URL for the admin / WS surface.
@@ -286,6 +314,15 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         .hls_addr
         .map(|_| MultiHlsServer::new(PlaylistBuilderConfig::default()));
 
+    // Optional multi-broadcast MPEG-DASH server. Sibling of the
+    // LL-HLS fan-out above: a single `MultiDashServer` observes
+    // the shared fragment stream and projects it onto a per-broadcast
+    // axum router mounted under `/dash/{broadcast}/...`. Both RTMP
+    // and WHIP publishers feed it through the same
+    // `DashFragmentBridge` the `SharedFragmentObserver` list below
+    // composes into its tee.
+    let dash_server = config.dash_addr.map(|_| MultiDashServer::new(DashConfig::default()));
+
     // RTMP ingest bridged to MoQ. Pre-bind the TCP listener so we can
     // report the real bound port (for ephemeral-port test setups).
     let mut bridge_builder =
@@ -311,6 +348,9 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let mut fragment_observers: Vec<SharedFragmentObserver> = Vec::new();
     if let Some(hls) = hls_server.clone() {
         fragment_observers.push(Arc::new(HlsFragmentBridge::new(hls)));
+    }
+    if let Some(dash) = dash_server.clone() {
+        fragment_observers.push(Arc::new(DashFragmentBridge::new(dash)));
     }
     if let Some((dir, index)) = archive_index.clone() {
         fragment_observers.push(Arc::new(IndexingFragmentObserver::new(dir, index)));
@@ -401,6 +441,18 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
         tracing::info!(addr = %bound, "WHEP HTTP bound");
+        (Some(listener), Some(bound))
+    } else {
+        (None, None)
+    };
+
+    // DASH listener: pre-bind so ephemeral-port test harnesses can
+    // read the real port back via `ServerHandle::dash_addr`
+    // immediately after `start()` returns.
+    let (dash_listener, dash_bound) = if let Some(addr) = config.dash_addr {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let bound = listener.local_addr()?;
+        tracing::info!(addr = %bound, "MPEG-DASH HTTP bound");
         (Some(listener), Some(bound))
     } else {
         (None, None)
@@ -588,11 +640,14 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let rtmp_shutdown = shutdown.clone();
     let admin_shutdown = shutdown.clone();
     let hls_shutdown = shutdown.clone();
+    let dash_shutdown = shutdown.clone();
     let whep_shutdown = shutdown.clone();
     let whip_shutdown = shutdown.clone();
     let bg_shutdown_for_task = shutdown.clone();
     let hls_router_pair =
         hls_listener.map(|listener| (listener, hls_server.expect("hls_server set when listener is set")));
+    let dash_router_pair =
+        dash_listener.map(|listener| (listener, dash_server.expect("dash_server set when listener is set")));
     let whep_router_pair =
         whep_listener.map(|listener| (listener, whep_server.expect("whep_server set when listener is set")));
     let whip_router_pair =
@@ -646,6 +701,21 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             shutdown_on_exit_hls.cancel();
         };
 
+        let shutdown_on_exit_dash = bg_shutdown_for_task.clone();
+        let dash_fut = async move {
+            let Some((listener, server)) = dash_router_pair else {
+                return;
+            };
+            let router = server.router();
+            let result = axum::serve(listener, router)
+                .with_graceful_shutdown(async move { dash_shutdown.cancelled().await })
+                .await;
+            if let Err(e) = &result {
+                tracing::error!(error = %e, "DASH server error");
+            }
+            shutdown_on_exit_dash.cancel();
+        };
+
         let shutdown_on_exit_whep = bg_shutdown_for_task.clone();
         let whep_fut = async move {
             let Some((listener, server)) = whep_router_pair else {
@@ -676,7 +746,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             shutdown_on_exit_whip.cancel();
         };
 
-        let _ = tokio::join!(relay_fut, rtmp_fut, admin_fut, hls_fut, whep_fut, whip_fut);
+        let _ = tokio::join!(relay_fut, rtmp_fut, admin_fut, hls_fut, dash_fut, whep_fut, whip_fut);
         // Keep the WHIP bridge Arc alive until every server has
         // drained. Otherwise a late WHIP sample forwarded from an
         // in-flight session could race an early drop.
@@ -691,6 +761,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         hls_addr: hls_bound,
         whep_addr: whep_bound,
         whip_addr: whip_bound,
+        dash_addr: dash_bound,
         shutdown,
         join: Some(join),
     })

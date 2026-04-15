@@ -38,6 +38,7 @@ lvqr-record = { workspace = true }
 lvqr-fragment = { workspace = true }
 lvqr-cmaf = { workspace = true }
 lvqr-hls = { workspace = true }
+lvqr-dash = { workspace = true }
 lvqr-whep = { workspace = true }
 lvqr-whip = { workspace = true }
 lvqr-archive = { workspace = true }
