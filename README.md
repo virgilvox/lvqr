@@ -6,6 +6,18 @@
 
 A Rust binary that relays live video using QUIC/MoQ. Built on moq-lite for zero-copy fan-out from ingest to delivery.
 
+## Status (v0.4-dev, session 31 close)
+
+Session 31 closed the WHIP Opus -> LL-HLS fragment observer
+fanout (the last loose thread in the WHIP audio story) and
+landed the `.github/workflows/hls-conformance.yml` workflow:
+every PR now runs `lvqr serve` on macos-latest, pushes a
+deterministic ffmpeg RTMP fixture, and validates the LL-HLS
+output with Apple `mediastreamvalidator` plus an ffmpeg
+client-pull second-signal. The job is `continue-on-error`
+until the baseline findings are triaged; promotion to required
+is the session-32 entry point.
+
 ## Status (v0.4-dev, session 30 close)
 
 **Tier 2.3 data plane is closed and Tier 2.4 archive is live.** Real
@@ -55,7 +67,7 @@ segments by decode-time window:
   protected-auth test that exercises both the header and
   query-parameter bearer transports.
 
-**Working and tested** (82 test binaries workspace-wide, 360
+**Working and tested** (82 test binaries workspace-wide, 361
 individual tests, 0 failures under the default feature set,
 `cargo clippy --workspace --all-targets -- -D warnings` clean,
 `cargo fmt --all --check` clean; 0 `todo!()` / `unimplemented!()`

@@ -1,16 +1,119 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Opus end-to-end across every audio egress
+## Project Status: v0.4-dev -- WHIP Opus closed end-to-end, Apple validator CI job landed
 
-**Last Updated**: 2026-04-15 (session 30 close, Opus through LL-HLS + WHEP)
+**Last Updated**: 2026-04-15 (session 31 close, WHIP Opus through
+LL-HLS fragment observer + mediastreamvalidator workflow)
 **Tests**: `cargo test --workspace` green under the default
-feature set: **82 test binaries, 360 individual tests passing**,
+feature set: **82 test binaries, 361 individual tests passing**,
 0 failures, 1 ignored doctest. `cargo clippy --workspace
 --all-targets -- -D warnings` clean. `cargo fmt --all --check`
-clean. Session-30 delta over session-29's `7d72ba7` baseline:
-+6 tests (4 lvqr-cmaf detect_audio_codec_string unit tests, 1
-lvqr-hls Opus master-playlist integration test, 1 new WHEP Opus
-loopback E2E); +1 test binary.
+clean. Session-31 delta over session-30's `432290c` baseline:
++1 test (new lvqr-whip recording-observer unit test proving
+`WhipMoqBridge` fires `FragmentObserver::on_init` +
+`on_fragment` for the `1.mp4` Opus track). No new test binaries.
+
+## Session 31 close (2026-04-15)
+
+Two concrete deliverables, each in its own commit, plus this docs pass.
+
+1. **WHIP Opus -> LL-HLS fragment observer** (`d4378bd`). The
+   last loose thread in the WHIP audio story. `WhipMoqBridge`
+   already fired the raw-sample observer for Opus frames so WHEP
+   subscribers got same-codec passthrough, but it did not fire
+   the fragment observer, so LL-HLS and the archive tee never
+   saw the audio track. `ensure_audio_initialized` now calls
+   `FragmentObserver::on_init` for `1.mp4` at 48 kHz with the
+   Opus CMAF init bytes, and `push_audio_sample` calls
+   `on_fragment` after a successful sink push. Both follow the
+   same release-the-DashMap-entry-before-observing reentrancy
+   pattern the video path already uses. `HlsFragmentBridge` was
+   already codec-agnostic above the init segment
+   (`MultiHlsServer::ensure_audio` takes timescale,
+   `HlsServer::push_init` runs the init bytes through
+   `detect_audio_codec_string`), so no HLS-side changes were
+   needed.
+
+   Verified by a new bridge unit test that wires a recording
+   `FragmentObserver` into the bridge, pushes one AVC keyframe
+   plus two Opus frames, and asserts (a) the audio `on_init`
+   fires at 48 kHz with non-empty CMAF `ftyp`-prefixed bytes
+   that `detect_audio_codec_string` recognises as `"opus"`,
+   and (b) two `1.mp4` fragments fire in DTS order with the
+   expected 960-tick durations. The end-to-end chain from WHIP
+   input through the LL-HLS audio rendition master playlist is
+   covered transitively by session 30's
+   `master_playlist_reports_opus_codec_when_audio_rendition_has_opus_init`
+   in `lvqr-hls/tests/integration_master.rs`.
+
+2. **LL-HLS conformance workflow** (`e2698f9`). New
+   `.github/workflows/hls-conformance.yml` runs on every PR and
+   `main` push against `macos-latest`:
+
+   * Builds `lvqr-cli` in release mode, starts `lvqr serve` in
+     the background on canonical ports (RTMP 1935, HLS 8888).
+   * Pushes a deterministic 20s 640x360@30 H.264 baseline + AAC
+     44.1 kHz stereo fixture to `rtmp://127.0.0.1:1935/live/test`
+     via ffmpeg.
+   * Captures `master.m3u8` and `playlist.m3u8` to the run log.
+   * Runs Apple `mediastreamvalidator` against the master
+     playlist and tees its output into an uploaded build
+     artifact. `continue-on-error` stays on until the baseline
+     clears: real findings are expected. Flip to required once
+     the baseline is green.
+   * Always runs a second-signal ffmpeg-as-client pull + ffprobe
+     on the same playlist so every run captures an independent
+     compliance read even when `mediastreamvalidator` is
+     unavailable on the runner image. Apple's HTTP Live Streaming
+     Tools are not brew-installable; the `locate
+     mediastreamvalidator` step treats absence as a soft gap
+     rather than a failure and logs an escalation note.
+   * Uploads `/tmp/msv-out` (playlists, validator logs, ffmpeg
+     logs, `lvqr serve` log) as a 14-day build artifact.
+
+   This is the single highest-leverage Tier 1 item on the
+   critical path: every previous "LVQR LL-HLS is
+   spec-compliant" claim was unverified because
+   `mediastreamvalidator` had never been run against real LVQR
+   output. The job closes that gap for PR feedback; the
+   existing `lvqr-hls/tests/conformance_manifest.rs` still runs
+   a synthetic-stub variant in the normal `cargo test` path as
+   a unit-test-scope conformance check.
+
+### Maturity audit deltas
+
+* **Tier 1 "Apple mediastreamvalidator in CI"**: was NOT
+  STARTED, now PARTIAL. The workflow exists and runs on every
+  PR; it is not yet a required check because the baseline
+  findings have not been triaged. Promotion to required is the
+  session-32 entry point -- once the first successful run is
+  captured, every finding gets fixed until exit zero is
+  reliable, then `continue-on-error` comes off.
+* **Tier 2.7 "WHIP Opus -> LL-HLS fragment observer"**: was an
+  explicit carry-over item from session 30, now DONE.
+* Everything else in the maturity audit remains unchanged from
+  the `432290c` baseline.
+
+### Session 32 entry point
+
+Promote `hls-conformance.yml` to a hard gate. First run on main
+will produce a baseline; whatever `mediastreamvalidator`
+complains about is the work. Likely suspects based on past
+experience with LL-HLS validators:
+
+* `EXT-X-PART:DURATION` precision drift if the policy's
+  `part_target_secs` and the actual fragment durations disagree
+  by more than a few ms.
+* Missing or malformed `EXT-X-PRELOAD-HINT` for the next part.
+* `EXT-X-RENDITION-REPORT` absent (not yet implemented -- this
+  is already tracked in the 2.5 "PARTIAL" row of the audit).
+* Blocking-reload `_HLS_msn` / `_HLS_part` query response
+  formatting.
+
+Fix each finding in `lvqr-hls` in place, then flip the
+workflow's `continue-on-error` to `false`. Second priority:
+begin `lvqr-dash` egress (Tier 2.6), a one-session project that
+reuses both cmaf codec detectors.
 
 ## Maturity audit -- what is left to v1.0 (session 30 follow-up)
 
@@ -48,7 +151,7 @@ neither blocks anything in Tier 1+.
 | 5-artifact CI enforcement script | NOT STARTED | `tests/CONTRACT.md` documents the contract; nothing greps PRs for missing slots. Two-hour scripting project. |
 | Golden-file regression corpus | PARTIAL | fMP4 writer has goldens; LL-HLS and master-playlist goldens don't exist yet. |
 | `cargo audit` in CI | DONE | `.github/workflows/ci.yml` runs cargo audit on every PR. |
-| Apple `mediastreamvalidator` in CI | NOT STARTED | Required for the Tier 2.5 "spec-compliant LL-HLS" claim. |
+| Apple `mediastreamvalidator` in CI | PARTIAL (session 31) | `.github/workflows/hls-conformance.yml` runs on every PR against macos-latest, spins up `lvqr serve`, pushes a deterministic ffmpeg RTMP fixture, and runs `mediastreamvalidator` (plus an ffmpeg client-pull second signal). `continue-on-error: true` until the baseline findings are triaged; promotion to required is the session-32 entry point. |
 
 Bottom line on Tier 1: the foundations that blocked Tier 2
 progress are all done. The items still open are **benchmarking
@@ -67,7 +170,7 @@ MediaMTX / MediaMTX-style servers").
 | 2.4 | `lvqr-archive` | DONE | redb segment index, on-disk segments, HTTP playback surface (`/playback/*`), traversal guard, `SharedAuth` gate. S3 upload via `object_store` is NOT STARTED but roadmap's "optional" slot. |
 | 2.5 | `lvqr-hls` + LL-HLS | PARTIAL (~85%) | Blocking reload, partials, master playlist with codec-aware CODECS, audio rendition group, multi-broadcast routing all done. **Open**: VOD windows for archive scrub in the HLS surface, `EXT-X-RENDITION-REPORT`, `EXT-X-PRELOAD-HINT`, byte-range addressing for partials. Apple `mediastreamvalidator` has never been run against our output. |
 | 2.6 | `lvqr-dash` | NOT STARTED | Aligned CMAF segments already exist; the missing piece is a typed MPD generator via `quick-xml`. Can reuse `detect_video_codec_string` and `detect_audio_codec_string` from session 27/30. Budget: one session. |
-| 2.7 | WHIP + WHEP | DONE | H.264, H.265, and Opus all ride end-to-end in both directions. The only loose thread is the WHIP Opus -> LL-HLS fragment observer fanout, session-31 item 1 (half-day follow-up). |
+| 2.7 | WHIP + WHEP | DONE | H.264, H.265, and Opus all ride end-to-end in both directions. Session 31 closed the last open thread: `WhipMoqBridge` now fires `FragmentObserver::on_init` + `on_fragment` for the `1.mp4` Opus track so LL-HLS audio renditions and the archive tee pick up WHIP audio automatically. |
 | 2.8 | `lvqr-srt` | NOT STARTED | libsrt FFI, MPEG-TS demuxer, broadcast-encoder interop. Roadmap calls this ~2.5 weeks. One of the two "cut if Tier 2 blows its budget" candidates. |
 | 2.9 | `lvqr-rtsp` server | NOT STARTED | Hand-rolled state machine + `retina` for RTSP-pull. The other cut candidate. |
 | 2.10 | CLI single-binary default (M1 gate) | PARTIAL | RTMP + WHIP + WHEP + HLS + MoQ already wire up in one `lvqr serve` invocation. SRT + RTSP would round out the "all protocols at once" claim. `lvqr serve --demo` flag does not exist yet. |
@@ -126,7 +229,7 @@ Items that are not tier items but block a clean v1.0 release:
 5. **Criterion benchmarks**. The roadmap says fanout, fragment build, and archive scan should have criterion slots. Workspace has **zero** benches. Blocks any honest "X ns per op" marketing claim and blocks the M2 "published benchmarks vs MediaMTX" milestone.
 6. **MoQ session auth publish-vs-subscribe split**. Tier 0 documented this as deferred to moq-native upstream. Still open.
 7. **Track name convention is stringly-typed**. `"0.mp4"` / `"1.mp4"` literals appear in 6+ crates. A `TrackId` newtype would make the "kind by track name" invariant compiler-checked.
-8. **WHIP Opus -> LL-HLS fragment observer**. Session-30 open item: `WhipMoqBridge::push_audio_sample` fires the raw-sample observer (WHEP) but not the fragment observer (LL-HLS + archive). Half-day follow-up to fully close the WHIP audio story end-to-end.
+8. ~~**WHIP Opus -> LL-HLS fragment observer**~~. Closed in session 31 (`d4378bd`). `WhipMoqBridge::push_audio_sample` now fires the fragment observer alongside the raw-sample observer, so LL-HLS + archive pick up WHIP Opus without any HLS-side changes.
 9. **Real-browser HEVC + Opus interop smoke**. The loopback E2Es prove the byte pipelines work; running against Safari / flag-enabled Chromium / Firefox is a deployment-validation step that hasn't happened.
 
 ### Gap summary by strategic weight
