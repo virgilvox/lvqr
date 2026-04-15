@@ -5,16 +5,18 @@
 **Last Updated**: 2026-04-15 (session 31 close, WHIP Opus through
 LL-HLS fragment observer + mediastreamvalidator workflow)
 **Tests**: `cargo test --workspace` green under the default
-feature set: **82 test binaries, 363 individual tests passing**,
+feature set: **82 test binaries, 365 individual tests passing**,
 0 failures, 1 ignored doctest. `cargo clippy --workspace
 --all-targets -- -D warnings` clean. `cargo fmt --all --check`
 clean. Session-31 delta over session-30's `432290c` baseline:
-+3 tests (1 lvqr-whip recording-observer unit test proving
++5 tests (1 lvqr-whip recording-observer unit test proving
 `WhipMoqBridge` fires `FragmentObserver::on_init` +
 `on_fragment` for the `1.mp4` Opus track; 2 lvqr-hls manifest
 tests covering `EXT-X-PRELOAD-HINT` population through a
-segment boundary and across the audio-prefix config). No new
-test binaries.
+segment boundary and across the audio-prefix config; 2
+lvqr-hls integration tests covering `EXT-X-RENDITION-REPORT`
+sibling-rendition emission in the multi-broadcast router). No
+new test binaries.
 
 ## Session 31 close (2026-04-15)
 
@@ -94,6 +96,12 @@ Two concrete deliverables, each in its own commit, plus this docs pass.
   reliable, then `continue-on-error` comes off.
 * **Tier 2.7 "WHIP Opus -> LL-HLS fragment observer"**: was an
   explicit carry-over item from session 30, now DONE.
+* **Tier 2.5 LL-HLS**: was PARTIAL ~85%, now PARTIAL ~92%.
+  Session 31 closed three of the four `Open` items in the
+  session-30 audit row: `EXT-X-INDEPENDENT-SEGMENTS` (`365b964`),
+  `EXT-X-PRELOAD-HINT` (`365b964`), and `EXT-X-RENDITION-REPORT`
+  (`a637ee2`). Still open: LL-HLS VOD windows, byte-range
+  partials, `EXT-X-SKIP` / delta playlist.
 * Everything else in the maturity audit remains unchanged from
   the `432290c` baseline.
 
@@ -109,6 +117,29 @@ Two concrete deliverables, each in its own commit, plus this docs pass.
    pre-existing-but-orphaned whep `parse_offer_sdp` target
    into `.github/workflows/fuzz.yml` matrix so both now run
    on every relevant PR + nightly.
+
+5. **Tier 2.5 EXT-X-RENDITION-REPORT** (`a637ee2`). Third
+   LL-HLS spec fix. Each media playlist now declares an
+   `EXT-X-RENDITION-REPORT` tag for every sibling rendition in
+   the master playlist, pointing at the sibling's live
+   `(LAST-MSN, LAST-PART)` so a subscriber polling one
+   rendition can discover the others' position without an
+   extra round trip. New public
+   `HlsServer::current_rendition_position` accessor reads the
+   builder's manifest and returns the LL-HLS-correct position
+   tuple (open-segment sequence + trailing partial index when
+   partials pend, otherwise last-closed-segment sequence +
+   last part index). `handle_multi_get` computes a
+   single-element `RenditionReport` slice for whichever
+   rendition the target is NOT currently rendering; the single-
+   broadcast router always passes an empty slice.
+   `render_playlist` gained a `reports: &[RenditionReport]`
+   parameter and appends the lines via `append_rendition_reports`
+   after the preload hint. Two new integration tests cover the
+   happy path (video + audio both publishing, asserts both
+   playlists contain the sibling report with the expected
+   MSN/PART) and the video-only-broadcast regression guard
+   (asserts no dangling report is emitted).
 
 4. **Tier 2.5 LL-HLS media-playlist spec fixes** (`365b964`).
    Two mechanical additions the conformance workflow's Apple
@@ -206,7 +237,7 @@ MediaMTX / MediaMTX-style servers").
 | 2.2 | `lvqr-codec` | PARTIAL | AAC (hardened with proptest + 7350 Hz floor), HEVC SPS, H.264 SPS all shipped. VP9 and AV1 parsers not started. Opus is opaque (no parser needed for passthrough); a `codec_string` generator would be nice-to-have. |
 | 2.3 | `lvqr-cmaf` segmenter | DONE | AVC, HEVC, AAC, and Opus init writers all ship with unit tests and mp4-atom round-trip validation. `CmafPolicy`, `TrackCoalescer`, `build_moof_mdat` all in place. AV1 / VP9 init writers deferred alongside 2.2. |
 | 2.4 | `lvqr-archive` | DONE | redb segment index, on-disk segments, HTTP playback surface (`/playback/*`), traversal guard, `SharedAuth` gate. S3 upload via `object_store` is NOT STARTED but roadmap's "optional" slot. |
-| 2.5 | `lvqr-hls` + LL-HLS | PARTIAL (~85%) | Blocking reload, partials, master playlist with codec-aware CODECS, audio rendition group, multi-broadcast routing all done. **Open**: VOD windows for archive scrub in the HLS surface, `EXT-X-RENDITION-REPORT`, `EXT-X-PRELOAD-HINT`, byte-range addressing for partials. Apple `mediastreamvalidator` has never been run against our output. |
+| 2.5 | `lvqr-hls` + LL-HLS | PARTIAL (~92%) | Blocking reload, partials, master playlist with codec-aware CODECS, audio rendition group, multi-broadcast routing, `EXT-X-INDEPENDENT-SEGMENTS`, `EXT-X-PRELOAD-HINT`, and `EXT-X-RENDITION-REPORT` all done. **Open**: VOD windows for archive scrub in the HLS surface, byte-range addressing for partials, `EXT-X-SKIP` / delta playlist support. Apple `mediastreamvalidator` workflow landed in session 31 (`e2698f9`) but has not had its first baseline run yet -- promotion to required and triage of findings is the session-32 entry point. |
 | 2.6 | `lvqr-dash` | NOT STARTED | Aligned CMAF segments already exist; the missing piece is a typed MPD generator via `quick-xml`. Can reuse `detect_video_codec_string` and `detect_audio_codec_string` from session 27/30. Budget: one session. |
 | 2.7 | WHIP + WHEP | DONE | H.264, H.265, and Opus all ride end-to-end in both directions. Session 31 closed the last open thread: `WhipMoqBridge` now fires `FragmentObserver::on_init` + `on_fragment` for the `1.mp4` Opus track so LL-HLS audio renditions and the archive tee pick up WHIP audio automatically. |
 | 2.8 | `lvqr-srt` | NOT STARTED | libsrt FFI, MPEG-TS demuxer, broadcast-encoder interop. Roadmap calls this ~2.5 weeks. One of the two "cut if Tier 2 blows its budget" candidates. |
