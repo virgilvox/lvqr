@@ -108,10 +108,16 @@ pub struct Manifest {
     pub map_uri: String,
     /// Closed segments, oldest first.
     pub segments: Vec<Segment>,
-    /// Partials that belong to the next not-yet-closed segment. The
-    /// last entry is rendered as `#EXT-X-PRELOAD-HINT` iff it is the
-    /// trailing partial that the client should fetch next.
+    /// Partials that belong to the next not-yet-closed segment.
     pub preliminary_parts: Vec<Part>,
+    /// URI of the next partial the server expects to emit, populated
+    /// by the builder. Rendered as `#EXT-X-PRELOAD-HINT:TYPE=PART,URI="..."`
+    /// so LL-HLS clients can issue a blocking request for the
+    /// partial before the server has actually finished writing it.
+    /// `None` before the first chunk has been pushed; always `Some`
+    /// after that. Apple `mediastreamvalidator` flags low-latency
+    /// playlists that omit this tag.
+    pub preload_hint_uri: Option<String>,
 }
 
 impl Manifest {
@@ -122,6 +128,13 @@ impl Manifest {
         let mut out = String::with_capacity(512 + self.segments.len() * 128);
         let _ = writeln!(out, "#EXTM3U");
         let _ = writeln!(out, "#EXT-X-VERSION:{}", self.version);
+        // Every segment the builder closes starts on a keyframe
+        // (segment-kind chunks always carry an independent sample),
+        // so every segment can be decoded without data from any
+        // other segment. Advertising this explicitly satisfies the
+        // Apple LL-HLS requirement that EXT-X-INDEPENDENT-SEGMENTS
+        // be present whenever the invariant holds.
+        let _ = writeln!(out, "#EXT-X-INDEPENDENT-SEGMENTS");
         let _ = writeln!(out, "#EXT-X-TARGETDURATION:{}", self.target_duration_secs);
         let _ = writeln!(
             out,
@@ -167,6 +180,14 @@ impl Manifest {
                 part.uri,
                 if part.independent { ",INDEPENDENT=YES" } else { "" },
             );
+        }
+        // Preload hint for the next partial the builder expects to
+        // emit. Rendered last per LL-HLS so a client walking the
+        // playlist top-down encounters it immediately after the
+        // trailing EXT-X-PART. `None` before the first chunk has
+        // been pushed.
+        if let Some(uri) = &self.preload_hint_uri {
+            let _ = writeln!(out, "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"{uri}\"");
         }
         out
     }
@@ -250,6 +271,7 @@ impl PlaylistBuilder {
             map_uri: config.map_uri.clone(),
             segments: Vec::new(),
             preliminary_parts: Vec::new(),
+            preload_hint_uri: None,
         };
         let next_sequence = config.starting_sequence;
         Self {
@@ -303,8 +325,21 @@ impl PlaylistBuilder {
         // Refresh the manifest's view of the preliminary parts so
         // any renderer run after this call sees the latest state.
         self.manifest.preliminary_parts = self.pending_parts.clone();
+        self.manifest.preload_hint_uri = Some(self.next_part_uri());
 
         Ok(&self.manifest)
+    }
+
+    /// Build the URI of the next partial the builder is about to
+    /// emit, using the same `{prefix}part-{sequence}-{part_index}.m4s`
+    /// template `push` uses. Kept private because the only caller is
+    /// the builder's own `EXT-X-PRELOAD-HINT` updater, and exposing
+    /// it publicly would tempt consumers to depend on the URI shape.
+    fn next_part_uri(&self) -> String {
+        format!(
+            "{}part-{}-{}.m4s",
+            self.config.uri_prefix, self.next_sequence, self.part_index
+        )
     }
 
     /// Borrow the current manifest without pushing anything new.
@@ -333,6 +368,11 @@ impl PlaylistBuilder {
         self.next_sequence += 1;
         self.part_index = 0;
         self.manifest.preliminary_parts.clear();
+        // The next partial will land in a fresh segment, so update
+        // the preload hint so a client that polls the playlist
+        // immediately after a segment boundary still knows which
+        // URI to pre-fetch.
+        self.manifest.preload_hint_uri = Some(self.next_part_uri());
     }
 }
 
@@ -409,6 +449,7 @@ mod tests {
         let text = b.manifest().render();
         assert!(text.starts_with("#EXTM3U"));
         assert!(text.contains("#EXT-X-VERSION:9"));
+        assert!(text.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
         assert!(text.contains("#EXT-X-TARGETDURATION:2"));
         assert!(text.contains("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES"));
         assert!(text.contains("#EXT-X-PART-INF:PART-TARGET=0.200"));
@@ -416,6 +457,62 @@ mod tests {
         assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:0"));
         assert!(text.contains("#EXTINF:"));
         assert!(text.contains("seg-0.m4s"));
+    }
+
+    #[test]
+    fn render_emits_preload_hint_after_first_chunk() {
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        // Before any chunk, preload hint is None and absent.
+        let empty = b.manifest().render();
+        assert!(!empty.contains("#EXT-X-PRELOAD-HINT"));
+
+        // After the first Segment chunk (sequence 0, part 0): the
+        // builder advances `part_index` to 1, so the next URI is
+        // `part-0-1.m4s`.
+        b.push(&mk_chunk(0, 30_000, CmafChunkKind::Segment)).unwrap();
+        let text = b.manifest().render();
+        assert!(
+            text.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part-0-1.m4s\""),
+            "expected preload hint for part-0-1; got:\n{text}"
+        );
+
+        // After one more Partial chunk in the same segment: next
+        // URI advances to part index 2.
+        b.push(&mk_chunk(30_000, 30_000, CmafChunkKind::Partial)).unwrap();
+        let text = b.manifest().render();
+        assert!(
+            text.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part-0-2.m4s\""),
+            "expected preload hint for part-0-2; got:\n{text}"
+        );
+
+        // Close the segment. Next hint must jump to the next
+        // sequence's part 0, `part-1-0.m4s`, so a client that polls
+        // immediately after the boundary still sees a valid URI.
+        b.close_pending_segment();
+        let text = b.manifest().render();
+        assert!(
+            text.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part-1-0.m4s\""),
+            "expected preload hint for part-1-0 after close; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn preload_hint_respects_uri_prefix() {
+        // The audio rendition in MultiHlsServer sets
+        // `uri_prefix: "audio-"`, so the preload hint must carry
+        // the same prefix or a client fetching the hint URI
+        // against the audio playlist's HTTP handler will 404.
+        let cfg = PlaylistBuilderConfig {
+            uri_prefix: "audio-".into(),
+            ..PlaylistBuilderConfig::default()
+        };
+        let mut b = PlaylistBuilder::new(cfg);
+        b.push(&mk_chunk(0, 30_000, CmafChunkKind::Segment)).unwrap();
+        let text = b.manifest().render();
+        assert!(
+            text.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"audio-part-0-1.m4s\""),
+            "audio preload hint must carry the audio- prefix; got:\n{text}"
+        );
     }
 
     #[test]
