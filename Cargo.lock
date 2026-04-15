@@ -1599,6 +1599,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lvqr-dash"
+version = "0.3.1"
+dependencies = [
+ "bytes",
+ "lvqr-cmaf",
+ "lvqr-fragment",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lvqr-fragment"
 version = "0.3.1"
 dependencies = [

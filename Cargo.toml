@@ -11,6 +11,7 @@ members = [
     "crates/lvqr-codec",
     "crates/lvqr-cmaf",
     "crates/lvqr-hls",
+    "crates/lvqr-dash",
     "crates/lvqr-relay",
     "crates/lvqr-mesh",
     "crates/lvqr-ingest",
@@ -109,6 +110,7 @@ lvqr-fragment = { version = "0.3.1", path = "crates/lvqr-fragment" }
 lvqr-codec = { version = "0.3.1", path = "crates/lvqr-codec" }
 lvqr-cmaf = { version = "0.3.1", path = "crates/lvqr-cmaf" }
 lvqr-hls = { version = "0.3.1", path = "crates/lvqr-hls" }
+lvqr-dash = { version = "0.3.1", path = "crates/lvqr-dash" }
 lvqr-relay = { version = "0.3.1", path = "crates/lvqr-relay" }
 lvqr-mesh = { version = "0.3.1", path = "crates/lvqr-mesh" }
 lvqr-ingest = { version = "0.3.1", path = "crates/lvqr-ingest" }

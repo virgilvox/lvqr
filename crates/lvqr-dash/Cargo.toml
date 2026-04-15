@@ -1,0 +1,21 @@
+[package]
+name = "lvqr-dash"
+description = "MPEG-DASH egress for LVQR. Typed MPD generator + SegmentTemplate live profile renderer that reuses lvqr-cmaf segments."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["streaming", "dash", "mpeg-dash", "mpd", "video"]
+categories = ["multimedia", "web-programming"]
+
+[dependencies]
+lvqr-cmaf = { workspace = true }
+lvqr-fragment = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
