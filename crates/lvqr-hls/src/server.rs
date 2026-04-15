@@ -292,6 +292,16 @@ struct BlockingReloadQuery {
     hls_msn: Option<u64>,
     #[serde(rename = "_HLS_part")]
     hls_part: Option<u32>,
+    /// `_HLS_skip=YES` (or `v2`) asks the server to return a
+    /// delta playlist: older segments are replaced by a single
+    /// `#EXT-X-SKIP:SKIPPED-SEGMENTS=N` tag. Anything other than
+    /// `YES` / `v2` is treated as the absent case. The delta is
+    /// still subject to the spec floor in
+    /// [`crate::manifest::Manifest::delta_skip_count`]; the query
+    /// only *requests* the directive, the manifest decides
+    /// whether to honour it.
+    #[serde(rename = "_HLS_skip")]
+    hls_skip: Option<String>,
 }
 
 /// One sibling-rendition report block to append to a rendered
@@ -338,8 +348,10 @@ async fn render_playlist(
     state: &Arc<HlsState>,
     hls_msn: Option<u64>,
     hls_part: Option<u32>,
+    hls_skip: Option<&str>,
     reports: &[RenditionReport],
 ) -> Response {
+    let want_delta = matches!(hls_skip, Some(v) if v.eq_ignore_ascii_case("YES") || v.eq_ignore_ascii_case("v2"));
     let timeout = Duration::from_secs((state.target_duration_secs * BLOCK_TIMEOUT_MULTIPLIER).max(1) as u64);
     let deadline = tokio::time::Instant::now() + timeout;
 
@@ -363,7 +375,9 @@ async fn render_playlist(
         };
         if ready {
             let builder = state.builder.read().await;
-            let mut body = builder.manifest().render();
+            let manifest = builder.manifest();
+            let skip = if want_delta { manifest.delta_skip_count() } else { 0 };
+            let mut body = manifest.render_with_skip(skip);
             drop(builder);
             append_rendition_reports(&mut body, reports);
             return ([(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")], body).into_response();
@@ -372,7 +386,9 @@ async fn render_playlist(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             let builder = state.builder.read().await;
-            let mut body = builder.manifest().render();
+            let manifest = builder.manifest();
+            let skip = if want_delta { manifest.delta_skip_count() } else { 0 };
+            let mut body = manifest.render_with_skip(skip);
             drop(builder);
             append_rendition_reports(&mut body, reports);
             return (
@@ -405,7 +421,7 @@ async fn render_uri(state: &Arc<HlsState>, uri: &str) -> Response {
 async fn handle_playlist(State(state): State<Arc<HlsState>>, Query(q): Query<BlockingReloadQuery>) -> Response {
     // Single-broadcast router has no sibling renditions; the
     // multi-broadcast router handles that path.
-    render_playlist(&state, q.hls_msn, q.hls_part, &[]).await
+    render_playlist(&state, q.hls_msn, q.hls_part, q.hls_skip.as_deref(), &[]).await
 }
 
 async fn handle_init(State(state): State<Arc<HlsState>>) -> Response {
@@ -676,7 +692,7 @@ async fn handle_multi_get(
             } else {
                 build_sibling_reports(video.as_ref(), "playlist.m3u8").await
             };
-            render_playlist(&state, q.hls_msn, q.hls_part, &reports).await
+            render_playlist(&state, q.hls_msn, q.hls_part, q.hls_skip.as_deref(), &reports).await
         }
         "init.mp4" | "audio-init.mp4" => render_init(&state).await,
         other => render_uri(&state, other).await,

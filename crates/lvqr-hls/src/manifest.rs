@@ -74,6 +74,15 @@ pub struct ServerControl {
     /// `HOLD-BACK` seconds. Maximum distance from the live edge
     /// that a non-LL client will play.
     pub hold_back: Duration,
+    /// `CAN-SKIP-UNTIL` seconds, if the server supports the
+    /// LL-HLS delta-playlist (`_HLS_skip=YES`) delivery
+    /// directive. `None` disables delta playlists; callers still
+    /// get a correct full playlist when they ask for
+    /// `_HLS_skip=YES` because the renderer falls back to the
+    /// full variant when the delta window is too small to be
+    /// emitted. Apple recommends a value of at least
+    /// `6 * TARGETDURATION`.
+    pub can_skip_until: Option<Duration>,
 }
 
 impl Default for ServerControl {
@@ -82,10 +91,13 @@ impl Default for ServerControl {
         // target part duration and HOLD-BACK >= 3 * target segment
         // duration. With the default 200 ms part / 2 s segment
         // policy from lvqr-cmaf, that's 0.6 s and 6 s respectively.
+        // CAN-SKIP-UNTIL is set to 12 s, the 6 * TARGETDURATION
+        // recommendation for a 2 s target duration.
         Self {
             can_block_reload: true,
             part_hold_back: Duration::from_millis(600),
             hold_back: Duration::from_secs(6),
+            can_skip_until: Some(Duration::from_secs(12)),
         }
     }
 }
@@ -125,6 +137,23 @@ impl Manifest {
     /// ready to serve as an `application/vnd.apple.mpegurl` response
     /// body.
     pub fn render(&self) -> String {
+        self.render_with_skip(0)
+    }
+
+    /// Render a delta playlist that omits the first `skip_count`
+    /// segments in favour of a single `#EXT-X-SKIP:SKIPPED-SEGMENTS=N`
+    /// tag. Called by [`crate::server::render_playlist`] in response
+    /// to a client `_HLS_skip=YES` query when the playlist is long
+    /// enough for a delta update to be worth emitting. The caller
+    /// decides `skip_count` via [`Self::delta_skip_count`] so the
+    /// spec's "must not skip if remaining segments < 4 * target
+    /// duration" clamp lives in exactly one place.
+    ///
+    /// `skip_count == 0` renders an ordinary full playlist; all
+    /// other invariants (version, server control, media sequence,
+    /// preload hint) are preserved unchanged.
+    pub fn render_with_skip(&self, skip_count: usize) -> String {
+        let skip_count = skip_count.min(self.segments.len());
         let mut out = String::with_capacity(512 + self.segments.len() * 128);
         let _ = writeln!(out, "#EXTM3U");
         let _ = writeln!(out, "#EXT-X-VERSION:{}", self.version);
@@ -136,7 +165,10 @@ impl Manifest {
         // be present whenever the invariant holds.
         let _ = writeln!(out, "#EXT-X-INDEPENDENT-SEGMENTS");
         let _ = writeln!(out, "#EXT-X-TARGETDURATION:{}", self.target_duration_secs);
-        let _ = writeln!(
+        // EXT-X-SERVER-CONTROL line. CAN-SKIP-UNTIL is appended
+        // when Some so LL-HLS clients know the server supports
+        // the `_HLS_skip=YES` delivery directive.
+        let _ = write!(
             out,
             "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD={},PART-HOLD-BACK={:.3},HOLD-BACK={:.3}",
             if self.server_control.can_block_reload {
@@ -147,12 +179,24 @@ impl Manifest {
             self.server_control.part_hold_back.as_secs_f32(),
             self.server_control.hold_back.as_secs_f32(),
         );
+        if let Some(skip) = self.server_control.can_skip_until {
+            let _ = write!(out, ",CAN-SKIP-UNTIL={:.3}", skip.as_secs_f32());
+        }
+        out.push('\n');
         let _ = writeln!(out, "#EXT-X-PART-INF:PART-TARGET={:.3}", self.part_target_secs);
         let _ = writeln!(out, "#EXT-X-MAP:URI=\"{}\"", self.map_uri);
+        // EXT-X-MEDIA-SEQUENCE stays pointed at the original first
+        // segment per Apple spec: "The EXT-X-MEDIA-SEQUENCE is not
+        // changed" in a delta playlist. The EXT-X-SKIP tag below
+        // then declares how many of those original segments were
+        // omitted.
         if let Some(first) = self.segments.first() {
             let _ = writeln!(out, "#EXT-X-MEDIA-SEQUENCE:{}", first.sequence);
         }
-        for seg in &self.segments {
+        if skip_count > 0 {
+            let _ = writeln!(out, "#EXT-X-SKIP:SKIPPED-SEGMENTS={skip_count}");
+        }
+        for seg in &self.segments[skip_count..] {
             for part in &seg.parts {
                 let _ = writeln!(
                     out,
@@ -198,6 +242,59 @@ impl Manifest {
 /// full `Manifest` value in a local.
 pub fn render_manifest(manifest: &Manifest) -> String {
     manifest.render()
+}
+
+impl Manifest {
+    /// Decide how many leading segments may be replaced by a single
+    /// `#EXT-X-SKIP:SKIPPED-SEGMENTS=N` tag in response to a client
+    /// `_HLS_skip=YES` directive. Returns zero when no delta
+    /// playlist should be emitted: the spec forbids them when
+    /// `CAN-SKIP-UNTIL` is unset, when the total playlist duration
+    /// is less than `6 * TARGETDURATION`, or when the remaining
+    /// non-skipped window would drop below `4 * TARGETDURATION`.
+    ///
+    /// The target-duration floor is enforced in seconds rather than
+    /// ticks because `TARGETDURATION` is an integer-seconds HLS tag
+    /// while segment durations are in the track timescale.
+    pub fn delta_skip_count(&self) -> usize {
+        let Some(skip_until) = self.server_control.can_skip_until else {
+            return 0;
+        };
+        if self.timescale == 0 || self.segments.is_empty() {
+            return 0;
+        }
+        let ts = self.timescale as u64;
+        let skip_until_ticks = (skip_until.as_secs_f64() * ts as f64) as u64;
+        let td_ticks = self.target_duration_secs as u64 * ts;
+
+        let total: u64 = self.segments.iter().map(|s| s.duration_ticks).sum();
+        // Apple spec 6.2.5.1: total playlist duration must be at
+        // least 6 * TARGETDURATION before a delta playlist is
+        // allowed at all.
+        if total < 6 * td_ticks {
+            return 0;
+        }
+
+        // Walk the segments oldest first; any segment that ends
+        // more than `skip_until` seconds before the end of the
+        // playlist is a candidate for skipping. The spec also
+        // bounds the remaining-after-skip window from below at
+        // `4 * TARGETDURATION`; truncate the candidate count if
+        // it would cross that floor.
+        let min_remaining_ticks = 4 * td_ticks;
+        let mut elapsed = 0u64;
+        let mut candidate = 0usize;
+        for seg in &self.segments {
+            elapsed += seg.duration_ticks;
+            let remaining_after = total - elapsed;
+            if remaining_after > skip_until_ticks && remaining_after >= min_remaining_ticks {
+                candidate += 1;
+            } else {
+                break;
+            }
+        }
+        candidate
+    }
 }
 
 /// Configuration for [`PlaylistBuilder`].
@@ -493,6 +590,109 @@ mod tests {
         assert!(
             text.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part-1-0.m4s\""),
             "expected preload hint for part-1-0 after close; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn render_server_control_advertises_can_skip_until() {
+        let b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        let text = b.manifest().render();
+        assert!(
+            text.contains("CAN-SKIP-UNTIL=12.000"),
+            "server control must advertise 6*TARGETDURATION skip boundary; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn delta_skip_count_is_zero_below_spec_floor() {
+        // Short playlist: 3 segments * 2 s each = 6 s total.
+        // Below the 6 * TARGETDURATION = 12 s floor, so the spec
+        // forbids a delta playlist.
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        for i in 0..3 {
+            let dts = i * 180_000;
+            b.push(&mk_chunk(dts, 180_000, CmafChunkKind::Segment)).unwrap();
+        }
+        // Force the last segment to close so it counts toward the
+        // total duration.
+        b.close_pending_segment();
+        assert_eq!(b.manifest().delta_skip_count(), 0);
+    }
+
+    #[test]
+    fn delta_skip_count_respects_can_skip_until_window() {
+        // 10 segments * 2 s each = 20 s total. CAN-SKIP-UNTIL = 12 s
+        // (default). Walk oldest first: a segment is skippable iff
+        // the time remaining after its end (total - elapsed) is
+        // strictly greater than CAN-SKIP-UNTIL. At i=0 the remaining
+        // is 18 s, i=1 -> 16 s, i=2 -> 14 s (all > 12 s, skip);
+        // at i=3 the remaining hits 12 s exactly, which is NOT
+        // strictly greater so the walk stops. Three segments are
+        // therefore skip candidates, and the kept window is
+        // 14 s which comfortably clears the 4 * TARGETDURATION = 8 s
+        // lower bound.
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        for i in 0..10 {
+            let dts = i * 180_000;
+            b.push(&mk_chunk(dts, 180_000, CmafChunkKind::Segment)).unwrap();
+        }
+        b.close_pending_segment();
+        let skip = b.manifest().delta_skip_count();
+        assert_eq!(skip, 3, "expected 3 segments to be skip candidates");
+
+        // Delta render: EXT-X-SKIP tag carries the count, older
+        // segment URIs are absent, newer segment URIs are present.
+        let delta = b.manifest().render_with_skip(skip);
+        assert!(delta.contains("#EXT-X-SKIP:SKIPPED-SEGMENTS=3"), "delta body:\n{delta}");
+        assert!(!delta.contains("seg-0.m4s"), "skipped segment leaked:\n{delta}");
+        assert!(!delta.contains("seg-2.m4s"), "skipped segment leaked:\n{delta}");
+        assert!(delta.contains("seg-3.m4s"), "kept segment missing:\n{delta}");
+        assert!(delta.contains("seg-9.m4s"), "kept segment missing:\n{delta}");
+        // EXT-X-MEDIA-SEQUENCE must still point at the ORIGINAL
+        // first segment sequence (0), unchanged by the delta.
+        assert!(delta.contains("#EXT-X-MEDIA-SEQUENCE:0"), "delta body:\n{delta}");
+
+        // Full render (skip == 0) still contains every segment.
+        let full = b.manifest().render_with_skip(0);
+        assert!(full.contains("seg-0.m4s") && full.contains("seg-9.m4s"));
+        assert!(!full.contains("#EXT-X-SKIP"));
+    }
+
+    #[test]
+    fn delta_skip_count_is_zero_when_can_skip_until_unset() {
+        // Build a standalone Manifest so the test can exercise
+        // the `can_skip_until: None` branch without routing a
+        // separate constructor through `PlaylistBuilder`.
+        let segments: Vec<Segment> = (0..10u64)
+            .map(|i| Segment {
+                sequence: i,
+                uri: format!("seg-{i}.m4s"),
+                duration_ticks: 180_000,
+                parts: Vec::new(),
+            })
+            .collect();
+        let m = Manifest {
+            version: 9,
+            timescale: 90_000,
+            target_duration_secs: 2,
+            part_target_secs: 0.2,
+            server_control: ServerControl {
+                can_skip_until: None,
+                ..ServerControl::default()
+            },
+            map_uri: "init.mp4".into(),
+            segments,
+            preliminary_parts: Vec::new(),
+            preload_hint_uri: None,
+        };
+        assert_eq!(m.delta_skip_count(), 0);
+        // Rendered server-control line must omit CAN-SKIP-UNTIL in
+        // this case so a client that reads the playlist knows not
+        // to issue a _HLS_skip directive against this server.
+        let text = m.render();
+        assert!(
+            !text.contains("CAN-SKIP-UNTIL"),
+            "server control should omit CAN-SKIP-UNTIL when None; got:\n{text}"
         );
     }
 
