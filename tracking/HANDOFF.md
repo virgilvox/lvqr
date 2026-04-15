@@ -5,18 +5,22 @@
 **Last Updated**: 2026-04-15 (session 31 close, WHIP Opus through
 LL-HLS fragment observer + mediastreamvalidator workflow)
 **Tests**: `cargo test --workspace` green under the default
-feature set: **82 test binaries, 365 individual tests passing**,
+feature set: **82 test binaries, 371 individual tests passing**,
 0 failures, 1 ignored doctest. `cargo clippy --workspace
 --all-targets -- -D warnings` clean. `cargo fmt --all --check`
 clean. Session-31 delta over session-30's `432290c` baseline:
-+5 tests (1 lvqr-whip recording-observer unit test proving
++11 tests (1 lvqr-whip recording-observer unit test proving
 `WhipMoqBridge` fires `FragmentObserver::on_init` +
 `on_fragment` for the `1.mp4` Opus track; 2 lvqr-hls manifest
 tests covering `EXT-X-PRELOAD-HINT` population through a
 segment boundary and across the audio-prefix config; 2
 lvqr-hls integration tests covering `EXT-X-RENDITION-REPORT`
-sibling-rendition emission in the multi-broadcast router). No
-new test binaries.
+sibling-rendition emission in the multi-broadcast router; 4
+lvqr-hls manifest tests covering `CAN-SKIP-UNTIL` +
+`EXT-X-SKIP` delta-playlist decision logic across the spec
+floors; 2 lvqr-hls integration tests covering `_HLS_skip=YES`
+directive routing through the axum router). No new test
+binaries.
 
 ## Session 31 close (2026-04-15)
 
@@ -96,12 +100,14 @@ Two concrete deliverables, each in its own commit, plus this docs pass.
   reliable, then `continue-on-error` comes off.
 * **Tier 2.7 "WHIP Opus -> LL-HLS fragment observer"**: was an
   explicit carry-over item from session 30, now DONE.
-* **Tier 2.5 LL-HLS**: was PARTIAL ~85%, now PARTIAL ~92%.
-  Session 31 closed three of the four `Open` items in the
-  session-30 audit row: `EXT-X-INDEPENDENT-SEGMENTS` (`365b964`),
-  `EXT-X-PRELOAD-HINT` (`365b964`), and `EXT-X-RENDITION-REPORT`
-  (`a637ee2`). Still open: LL-HLS VOD windows, byte-range
-  partials, `EXT-X-SKIP` / delta playlist.
+* **Tier 2.5 LL-HLS**: was PARTIAL ~85%, now PARTIAL ~95%.
+  Session 31 closed four of the five live-playlist `Open`
+  items in the session-30 audit row: `EXT-X-INDEPENDENT-SEGMENTS`
+  (`365b964`), `EXT-X-PRELOAD-HINT` (`365b964`),
+  `EXT-X-RENDITION-REPORT` (`a637ee2`), and `CAN-SKIP-UNTIL` +
+  `EXT-X-SKIP` delta-playlist support for the `_HLS_skip=YES`
+  directive (`aab6156`, `6b63da1`). Still open: LL-HLS VOD
+  windows for DVR scrub, byte-range addressing for partials.
 * Everything else in the maturity audit remains unchanged from
   the `432290c` baseline.
 
@@ -117,6 +123,41 @@ Two concrete deliverables, each in its own commit, plus this docs pass.
    pre-existing-but-orphaned whep `parse_offer_sdp` target
    into `.github/workflows/fuzz.yml` matrix so both now run
    on every relevant PR + nightly.
+
+6. **Tier 2.5 CAN-SKIP-UNTIL + EXT-X-SKIP delta playlists**
+   (`aab6156`, `6b63da1`). Fourth LL-HLS spec fix, closing
+   the last non-VOD open item. Apple's `_HLS_skip=YES`
+   directive lets a client request a truncated playlist that
+   omits older segments in favour of a single
+   `#EXT-X-SKIP:SKIPPED-SEGMENTS=N` tag, cutting bytes over
+   the wire for long-running live sessions.
+
+   `ServerControl` gained `can_skip_until: Option<Duration>`,
+   defaulted to 12 s (6 * TARGETDURATION per Apple's
+   recommendation). `Manifest::render` advertises
+   `CAN-SKIP-UNTIL` in the `EXT-X-SERVER-CONTROL` line when
+   `Some`, and a new public
+   `Manifest::render_with_skip(skip_count)` companion renders
+   a delta playlist with the first N segments replaced by the
+   skip tag. `EXT-X-MEDIA-SEQUENCE` stays pointed at the
+   original first segment per the spec. The decision of how
+   many segments to skip lives in
+   `Manifest::delta_skip_count` and enforces three spec floors
+   in one place: `can_skip_until == None` → 0;
+   total < 6 * TARGETDURATION → 0 (Apple spec 6.2.5.1);
+   remaining-after-skip < 4 * TARGETDURATION → clamped down.
+   `render_playlist` threads a new `_HLS_skip` query field
+   through; both single and multi-broadcast routers now
+   recognise the directive case-insensitively for `YES` or
+   `v2`.
+
+   Six new tests cover the path: four in `manifest.rs::tests`
+   (server-control emission, below-floor refusal, window
+   walk against a 20 s playlist, `can_skip_until=None`
+   standalone-manifest regression guard); two in
+   `integration_server.rs` (router-level delta happy path
+   against 10 segments, short-playlist graceful degradation
+   that ignores `_HLS_skip`).
 
 5. **Tier 2.5 EXT-X-RENDITION-REPORT** (`a637ee2`). Third
    LL-HLS spec fix. Each media playlist now declares an
@@ -165,19 +206,22 @@ Two concrete deliverables, each in its own commit, plus this docs pass.
 
 ### Session 32 entry point
 
-Promote `hls-conformance.yml` to a hard gate. First run on main
-will produce a baseline; whatever `mediastreamvalidator`
-complains about is the work. Likely suspects based on past
-experience with LL-HLS validators:
+Push the branch so `hls-conformance.yml` runs on GitHub;
+capture the first `mediastreamvalidator` baseline. Session 31
+pre-emptively closed the four live-playlist spec items most
+validators flag first (`EXT-X-INDEPENDENT-SEGMENTS`,
+`EXT-X-PRELOAD-HINT`, `EXT-X-RENDITION-REPORT`,
+`CAN-SKIP-UNTIL` + `EXT-X-SKIP`), so the baseline should be
+narrower than it would have been off the session-30 head.
+Remaining suspects to watch for in the first run:
 
 * `EXT-X-PART:DURATION` precision drift if the policy's
   `part_target_secs` and the actual fragment durations disagree
   by more than a few ms.
-* Missing or malformed `EXT-X-PRELOAD-HINT` for the next part.
-* `EXT-X-RENDITION-REPORT` absent (not yet implemented -- this
-  is already tracked in the 2.5 "PARTIAL" row of the audit).
 * Blocking-reload `_HLS_msn` / `_HLS_part` query response
   formatting.
+* Byte-range addressing for partials (not yet implemented).
+* LL-HLS VOD windows for DVR scrub (not yet implemented).
 
 Fix each finding in `lvqr-hls` in place, then flip the
 workflow's `continue-on-error` to `false`. Second priority:
@@ -237,7 +281,7 @@ MediaMTX / MediaMTX-style servers").
 | 2.2 | `lvqr-codec` | PARTIAL | AAC (hardened with proptest + 7350 Hz floor), HEVC SPS, H.264 SPS all shipped. VP9 and AV1 parsers not started. Opus is opaque (no parser needed for passthrough); a `codec_string` generator would be nice-to-have. |
 | 2.3 | `lvqr-cmaf` segmenter | DONE | AVC, HEVC, AAC, and Opus init writers all ship with unit tests and mp4-atom round-trip validation. `CmafPolicy`, `TrackCoalescer`, `build_moof_mdat` all in place. AV1 / VP9 init writers deferred alongside 2.2. |
 | 2.4 | `lvqr-archive` | DONE | redb segment index, on-disk segments, HTTP playback surface (`/playback/*`), traversal guard, `SharedAuth` gate. S3 upload via `object_store` is NOT STARTED but roadmap's "optional" slot. |
-| 2.5 | `lvqr-hls` + LL-HLS | PARTIAL (~92%) | Blocking reload, partials, master playlist with codec-aware CODECS, audio rendition group, multi-broadcast routing, `EXT-X-INDEPENDENT-SEGMENTS`, `EXT-X-PRELOAD-HINT`, and `EXT-X-RENDITION-REPORT` all done. **Open**: VOD windows for archive scrub in the HLS surface, byte-range addressing for partials, `EXT-X-SKIP` / delta playlist support. Apple `mediastreamvalidator` workflow landed in session 31 (`e2698f9`) but has not had its first baseline run yet -- promotion to required and triage of findings is the session-32 entry point. |
+| 2.5 | `lvqr-hls` + LL-HLS | PARTIAL (~95%) | Blocking reload, partials, master playlist with codec-aware CODECS, audio rendition group, multi-broadcast routing, `EXT-X-INDEPENDENT-SEGMENTS`, `EXT-X-PRELOAD-HINT`, `EXT-X-RENDITION-REPORT`, `CAN-SKIP-UNTIL`, and `EXT-X-SKIP` / `_HLS_skip=YES` delta playlists all done. **Open**: VOD windows for archive scrub in the HLS surface, byte-range addressing for partials. Apple `mediastreamvalidator` workflow landed in session 31 (`e2698f9`) but has not had its first baseline run yet -- promotion to required and triage of findings is the session-32 entry point. |
 | 2.6 | `lvqr-dash` | NOT STARTED | Aligned CMAF segments already exist; the missing piece is a typed MPD generator via `quick-xml`. Can reuse `detect_video_codec_string` and `detect_audio_codec_string` from session 27/30. Budget: one session. |
 | 2.7 | WHIP + WHEP | DONE | H.264, H.265, and Opus all ride end-to-end in both directions. Session 31 closed the last open thread: `WhipMoqBridge` now fires `FragmentObserver::on_init` + `on_fragment` for the `1.mp4` Opus track so LL-HLS audio renditions and the archive tee pick up WHIP audio automatically. |
 | 2.8 | `lvqr-srt` | NOT STARTED | libsrt FFI, MPEG-TS demuxer, broadcast-encoder interop. Roadmap calls this ~2.5 weeks. One of the two "cut if Tier 2 blows its budget" candidates. |
