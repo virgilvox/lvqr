@@ -24,6 +24,19 @@
 //! but skipping them at the source avoids churning `&mut Rtc` for
 //! no effect.
 //!
+//! Session 28 adds HEVC alongside H.264. `RtcConfig` now enables
+//! both `h264` and `h265`, `SessionCtx` stores parallel
+//! `video_pt_h264` / `video_pt_h265` slots resolved in one sweep
+//! over `Writer::payload_params`, and `write_video_sample`
+//! receives the incoming sample's [`lvqr_ingest::VideoCodec`] tag
+//! (carried through `SessionMsg::Video.codec`) and picks the
+//! matching pt. A sample whose codec is not in the negotiated
+//! payload params -- e.g. an HEVC publisher fanning out to a
+//! Firefox subscriber that offered only H.264 -- is dropped with
+//! a one-shot warn. The AVCC -> Annex B converter is codec-
+//! agnostic (length-prefixed framing is the same for both), so
+//! the write path is shared.
+//!
 //! What this module still deliberately does NOT do:
 //!
 //! * Audio write. The ingest bridge emits AAC raw access units; WHEP

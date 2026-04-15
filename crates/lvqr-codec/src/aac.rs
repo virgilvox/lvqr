@@ -243,4 +243,23 @@ mod tests {
         assert_eq!(asc.sample_rate, 96000);
         assert_eq!(asc.channel_config, 2);
     }
+
+    #[test]
+    fn parse_rejects_explicit_sample_rate_below_7350_hz() {
+        // Regression pin for the session-27 fix to `read_sample_rate`.
+        // Before the fix, AOT=2 + sfi=15 + a 24-bit explicit freq
+        // field of 1 would decode to `sample_rate = 1` and pass
+        // through. `proptest_aac::successful_parse_has_plausible_sample_rate`
+        // discovered the class via the seed `[87,128,0,0,128]`
+        // (decodes to rate=1433). After the fix, both shapes
+        // return `CodecError::MalformedAsc` so the nonsense rate
+        // never reaches downstream timescale math.
+        let explicit_seed: &[u8] = &[87, 128, 0, 0, 128];
+        match parse_asc(explicit_seed) {
+            Err(CodecError::MalformedAsc(msg)) => {
+                assert!(msg.contains("7350"), "expected the 7350 Hz floor error, got: {msg}");
+            }
+            other => panic!("expected MalformedAsc error, got {other:?}"),
+        }
+    }
 }

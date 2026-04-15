@@ -15,18 +15,19 @@
 //! the egress side.
 //!
 //! Scope of session 25 (H.264): video-only, one MoQ track per
-//! broadcast (`0.mp4`). Session 26 extends this bridge to accept
-//! HEVC publishers through the same track slot, distinguished per
-//! broadcast via the [`VideoCodec`] tag carried on every
-//! [`IngestSample`]. HEVC publishers land in the MoQ broadcast
-//! only; the LL-HLS / WHEP / DVR-archive observer taps fire solely
-//! for H.264 publishers because the downstream egress crates
-//! currently hard-code `avc1` in the master playlist and WHEP
-//! packetizer — threading the codec through is tracked as a
-//! session-27 follow-up.
+//! broadcast (`0.mp4`). Session 26 added HEVC publishers through
+//! the same track slot, distinguished via the [`VideoCodec`] tag
+//! carried on every [`IngestSample`]. Session 27 made LL-HLS
+//! codec-aware via `lvqr_cmaf::detect_video_codec_string` so the
+//! fragment observer (HLS + archive) fans HEVC fragments without
+//! advertising the wrong `CODECS` attribute. Session 28 widened
+//! `RawSampleObserver::on_raw_sample` to carry the codec tag so
+//! the WHEP backend can route per sample through the matching
+//! `str0m::Pt`. HEVC now reaches every egress end-to-end.
 //!
 //! Audio rejection is still explicit: Opus samples are dropped
-//! with a one-shot warn rather than silently lost.
+//! with a one-shot warn rather than silently lost. Opus-native
+//! audio egress is session 29's recommended entry point.
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -180,14 +181,14 @@ impl WhipMoqBridge {
         video_sink.set_init_segment(init.clone());
         info!(broadcast, width, height, ?codec, "whip: broadcast initialized");
 
-        // Session 27 lifted the AVC-only guard on the fragment
-        // observer: `lvqr-hls::HlsServer::push_init` now parses
-        // the init bytes via `lvqr_cmaf::detect_video_codec_string`
-        // and emits the correct `CODECS="..."` attribute in the
-        // master playlist, and `lvqr-archive`'s indexing observer
-        // is codec-indifferent (it stores the bytes verbatim).
-        // The raw-sample observer (WHEP) is still AVC-only because
-        // WHEP's str0m backend hard-codes the H.264 packetizer.
+        // Fragment observer (LL-HLS + archive tee) fires for both
+        // codecs. Session 27 lifted the original AVC-only guard
+        // once `lvqr-hls::HlsServer::push_init` grew a codec
+        // detector via `lvqr_cmaf::detect_video_codec_string`;
+        // the archive indexer is and always has been codec-
+        // indifferent. Session 28 then lifted the raw-sample
+        // observer's guard (below) so WHEP egress gets the same
+        // codec-aware routing.
         if let Some(obs) = self.observer.as_ref() {
             obs.on_init(broadcast, "0.mp4", 90_000, init);
         }
