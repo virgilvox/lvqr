@@ -1,11 +1,68 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- LL-HLS DVR end-to-end: RTMP disconnect triggers EXT-X-ENDLIST
+## Project Status: v0.4-dev -- All egress paths handle broadcaster disconnect
 
-**Last Updated**: 2026-04-16 (session 39 closed: finalize wired
-to RTMP disconnect via BroadcastStopped event bus. Sessions
-34-39 together shipped the complete LL-HLS DVR arc: eviction,
-PDT, finalize, DVR window flag, disconnect wiring).
+**Last Updated**: 2026-04-16 (sessions 40-41 closed: WHIP
+disconnect -> BroadcastStopped + DASH finalize on disconnect.
+Both RTMP and WHIP disconnects now trigger EXT-X-ENDLIST on HLS
+and type="static" on DASH).
+
+## Session 41 close (2026-04-16)
+
+One commit on top of session 40's `9675a13`. DASH finalize on
+broadcaster disconnect, completing the disconnect story for
+every egress path.
+
+### Session 41 commit
+
+1. **DASH finalize on disconnect** (`cf6d07f`). `DashState`
+   gains `finalized: AtomicBool`. `DashServer::finalize()` sets
+   it; `render_manifest()` then produces an MPD with
+   `type="static"`, profile `isoff-on-demand`, and no
+   `minimumUpdatePeriod`. `MultiDashServer::finalize_broadcast()`
+   looks up and finalizes the per-broadcast server. A new
+   event subscriber in `lvqr-cli::start()` mirrors the HLS
+   finalize subscriber.
+
+## Session 40 close (2026-04-16)
+
+One commit. WHIP disconnect now emits `BroadcastStopped`.
+
+### Session 40 commit
+
+1. **WHIP disconnect -> BroadcastStopped** (`9675a13`).
+   `IngestSampleSink` trait gains `on_disconnect(&self, broadcast)`
+   (default no-op). `WhipMoqBridge` implements it to remove the
+   broadcast from its `DashMap` and emit `BroadcastStopped`.
+   `run_session_loop` is split into outer + inner so
+   `on_disconnect` fires unconditionally on every exit path.
+   `WhipMoqBridge` gains `with_events(EventBus)` builder method;
+   `lvqr-cli` wires it.
+
+### The complete disconnect story (sessions 39-41)
+
+| Ingest | Event | HLS | DASH |
+|--------|-------|-----|------|
+| RTMP | `on_unpublish` -> `BroadcastStopped` (session 39) | `EXT-X-ENDLIST` | `type="static"` |
+| WHIP | `on_disconnect` -> `BroadcastStopped` (session 40) | `EXT-X-ENDLIST` | `type="static"` |
+
+### Verification
+
+`cargo fmt --all --check` clean. `cargo clippy --workspace
+--all-targets -- -D warnings` clean. All DASH tests pass
+including the 3 golden MPD fixtures (the live path still renders
+`minimumUpdatePeriod="PT2.0S"` unchanged). All 13 cli tests
+pass. All pushed to `origin/main`.
+
+### Session 42 entry point
+
+* **Byte-range partials for LL-HLS** (cuts per-partial HTTP
+  overhead, 3-4 commits).
+* **Self-hosted macOS runner for mediastreamvalidator**.
+* **Criterion benches for lvqr-cmaf and lvqr-ingest**.
+* **SRT ingest** (Tier 2.8 in the roadmap).
+
+
 
 ## Session 39 close (2026-04-16)
 
