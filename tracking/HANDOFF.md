@@ -1,8 +1,137 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Archive consumer broadcaster-native, first consumer-side switchover -- 529 tests, all green
+## Project Status: v0.4.0 -- Tier 2.1 consumer-side migration COMPLETE; FragmentObserver deleted -- 528 tests, all green
 
-**Last Updated**: 2026-04-16 (session 59 close).
+**Last Updated**: 2026-04-16 (session 60 close).
+
+## Session 60 close (2026-04-16)
+
+### What shipped (3 commits, +716 / -1211 lines, net -495)
+
+1. **LL-HLS bridge switched to broadcaster-native** (`42a0c01`).
+   `BroadcasterHlsBridge` replaces `HlsFragmentBridge`. An
+   `on_entry_created` callback on the shared
+   `FragmentBroadcasterRegistry` spawns one tokio drain task per
+   `(broadcast, track)`; the task refreshes broadcaster meta each
+   iteration to catch init-segment republishes (reconnect, codec
+   change) and resets `CmafPolicyState` accordingly. The on-wire
+   LL-HLS surface is byte-identical; rtmp_hls_e2e + rtsp_hls_e2e
+   + srt_hls_e2e all pass unchanged against the new path.
+
+2. **DASH bridge switched to broadcaster-native** (`e8a063b`).
+   Same pattern. `BroadcasterDashBridge` subscribes via
+   `on_entry_created` and stamps a monotonic `$Number$` counter
+   onto every fragment; an init-change resets the counter so
+   `SegmentTemplate` resolution restarts at 1 after a reconnect.
+   Drops the lvqr-ingest dependency from lvqr-dash now that the
+   crate no longer implements `FragmentObserver`. rtmp_dash_e2e
+   passes unchanged.
+
+3. **FragmentObserver trait + observer-side dispatch deleted**
+   (`a5b9316`). Every Tier 2.1 consumer is now broadcaster-native,
+   so the observer surface is dead code. Deletions:
+   * `FragmentObserver`, `SharedFragmentObserver`,
+     `NoopFragmentObserver` from `lvqr-ingest::observer`. Kept
+     `RawSampleObserver` + `MediaCodec` (WHEP RTP packetizer tap).
+   * `Option<&SharedFragmentObserver>` parameter dropped from
+     `publish_init` / `publish_fragment`.
+   * `with_observer` / `set_observer` builders from
+     `RtmpMoqBridge` and `WhipMoqBridge`. `observer` parameter
+     dropped from `SrtIngestServer::run` and `RtspServer::run`.
+   * `TeeFragmentObserver` from `lvqr-cli::archive`.
+   * `fragment_observers` Vec + `shared_fragment_observer` +
+     `with_observer` calls from `lvqr-cli::start`.
+   * Unit tests that exercised the observer trait directly
+     (WHIP, SRT, RTSP, dispatch, DASH) rewritten against the
+     broadcaster-registry surface.
+
+### Ground truth (session 60 close)
+
+* **Head**: `a5b9316` on `main`. v0.4.0.
+* **Tests**: 528 passed, 0 failed, 1 ignored. Delta from session
+  59: -1 (one RTSP integration test consolidated with the
+  migrated full-ingest test since both now exercise the same
+  broadcaster path after the dual-wire surface was removed).
+* **Code**: +716 / -1211 net lines across the three commits. Net
+  -495 lines: deleting the observer transitively saved more than
+  the broadcaster drain tasks added.
+* **CI gates locally clean**: fmt, clippy (`-D warnings`),
+  test --workspace all green.
+
+### Consumer-side migration status
+
+| Consumer          | Status             | Session |
+|-------------------|--------------------|---------|
+| Archive indexer   | broadcaster-native | 59      |
+| LL-HLS bridge     | broadcaster-native | 60      |
+| DASH bridge       | broadcaster-native | 60      |
+| FragmentObserver  | DELETED            | 60      |
+
+### Load-bearing invariants (unchanged, all four still pinned)
+
+1. FragmentBroadcaster sender lives outside the `Arc<Shared>`
+   subscribers hold.
+2. Registry `get_or_create` returns pointer-equal Arcs under
+   contention.
+3. Registry callbacks run outside every registry lock.
+4. Broadcaster drain tasks do NOT hold a strong
+   `Arc<FragmentBroadcaster>`. Comment on every drain function
+   (archive, HLS, DASH) documents the trap; all three drains
+   hold only the `BroadcasterStream` Receiver side.
+
+### Remaining to Tier 4 entry
+
+| Slice                                | Remaining sessions | Calendar |
+|--------------------------------------|--------------------|----------|
+| RTSP playback egress (RTP packetize) | 5-8                | 0.5 wk   |
+| lvqr-cmaf standalone with mp4-atom   | 5-8                | 0.5 wk   |
+| Apple mediastreamvalidator in CI     | 3-5                | 0.25-0.5 wk |
+| Tier 1 gaps (playwright, soak, comparison) | 15-20        | 1-2 wk (24h soak bound) |
+| Tier 3 full                          | 40-55              | 3-5 wk   |
+| Tier 4 full                          | 50-70              | 4-7 wk   |
+
+**Realistic M4 ETA: 3-5 calendar weeks of sustained sessions.**
+The observer deletion closed the biggest structural gap the
+Tier 2.1 migration had left; every new ingest protocol and every
+new egress now plugs in via the registry surface alone.
+
+### Protocols supported
+
+Unchanged. 10 protocols: RTMP + WHIP + SRT + RTSP ingest;
+LL-HLS + DASH + WHEP + MoQ + WebSocket egress.
+
+### Known gaps
+
+1. **RTSP playback egress**: PLAY direction works at protocol
+   level but does not packetize outbound RTP.
+2. **Apple mediastreamvalidator in CI**: biggest audit gap.
+3. **Tier 1 infra**: no playwright, no 24h soak, no MediaMTX
+   comparison harness.
+4. **Tiers 3-5**: not started.
+
+### Session 61 entry point
+
+Priority order:
+
+1. **RTSP playback egress**. RTP packetization for the PLAY
+   direction. H.264: single NAL or FU-A per RFC 6184. HEVC:
+   FU per RFC 7798. AAC: RFC 3640. Integrate with the existing
+   `lvqr-rtsp` `play` path; broadcaster subscription is the
+   producer side.
+
+2. **Apple mediastreamvalidator in CI**. GitHub Actions job
+   that runs Apple's validator against `lvqr-hls`-generated
+   playlists and blocks merges on validator-red. Biggest
+   audit-findings gap after the consumer migration.
+
+3. **lvqr-cmaf with mp4-atom**. Existing hand-rolled fMP4
+   writer works for AVC + HEVC + AAC + Opus today; mp4-atom
+   buys clean AV1 + timed-text support in one swap.
+
+4. **Tier 3 planning**. Cluster (chitchat, 4 human-weeks / ~15-20
+   LLM sessions) + observability (OTLP, 2.5 human-weeks / ~10-15
+   LLM sessions). Start planning once the items above land.
+
 
 ## Sessions 53-59 cycle summary (2026-04-09 → 2026-04-16)
 
