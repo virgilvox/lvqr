@@ -37,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
 use crate::archive::{BroadcasterArchiveIndexer, TeeFragmentObserver, playback_router};
-use crate::hls::HlsFragmentBridge;
+use crate::hls::BroadcasterHlsBridge;
 
 /// Configuration passed to [`start`] to bring up a full-stack LVQR server.
 ///
@@ -415,14 +415,23 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         BroadcasterArchiveIndexer::install(dir.clone(), Arc::clone(index), &shared_registry);
     }
 
-    let mut fragment_observers: Vec<SharedFragmentObserver> = Vec::new();
-    if let Some(hls) = hls_server.clone() {
-        fragment_observers.push(Arc::new(HlsFragmentBridge::new(
-            hls,
+    // Install the broadcaster-based LL-HLS composition bridge on the
+    // shared registry. Every ingest crate's first `publish_init` for a
+    // `(broadcast, track)` pair fires the callback; the callback
+    // subscribes and spawns a drain task that projects fragments onto
+    // the shared `MultiHlsServer`. Session 60 consumer-side switchover:
+    // replaces the FragmentObserver path the HLS bridge used through
+    // session 59.
+    if let Some(ref hls) = hls_server {
+        BroadcasterHlsBridge::install(
+            hls.clone(),
             config.hls_target_duration_secs * 1000,
             config.hls_part_target_ms,
-        )));
+            &shared_registry,
+        );
     }
+
+    let mut fragment_observers: Vec<SharedFragmentObserver> = Vec::new();
     if let Some(dash) = dash_server.clone() {
         fragment_observers.push(Arc::new(DashFragmentBridge::new(dash)));
     }
