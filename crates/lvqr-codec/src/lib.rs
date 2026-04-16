@@ -37,5 +37,7 @@ pub mod aac;
 pub mod bit_reader;
 pub mod error;
 pub mod hevc;
+pub mod ts;
 
 pub use error::CodecError;
+pub use ts::{PesPacket, StreamType, TsDemuxer};
