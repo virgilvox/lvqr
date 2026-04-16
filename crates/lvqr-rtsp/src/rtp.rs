@@ -1,13 +1,23 @@
-//! RTP interleaved frame parsing and H.264 depacketization.
+//! RTP wire format: interleaved-frame parsing, header codec,
+//! codec-specific depacketizers, and codec-specific packetizers.
 //!
 //! RTSP interleaved TCP transport (RFC 2326 Section 10.12) wraps
 //! RTP/RTCP packets in a 4-byte header: `$` (0x24), channel (u8),
 //! length (u16 big-endian), then payload. Even channels carry RTP;
 //! odd channels carry RTCP.
 //!
-//! H.264 RTP depacketization follows RFC 6184: single NAL unit
-//! packets (type 1-23), FU-A fragmentation (type 28), and STAP-A
-//! aggregation (type 24).
+//! Depacketizers (ingest / RECORD path):
+//! * H.264 per RFC 6184: single NAL unit (type 1-23), STAP-A (24),
+//!   FU-A (28).
+//! * HEVC per RFC 7798: single NAL (0-47), AP (48), FU (49).
+//! * AAC per RFC 3640 AAC-hbr.
+//!
+//! Packetizers (egress / PLAY path, session 61): the inverse of each
+//! depacketizer. H.264 and HEVC emit single-NAL packets when the NAL
+//! fits within [`DEFAULT_RTP_MTU`], fragmentation otherwise. AAC emits
+//! one AU per packet. Every packetizer test round-trips through its
+//! matching depacketizer so the RFC wire format is pinned by
+//! equivalence rather than by re-encoded prose.
 
 /// Parsed interleaved frame from the TCP stream.
 #[derive(Debug)]
@@ -423,6 +433,278 @@ impl AacDepacketizer {
     }
 }
 
+// ====================================================================
+// RTP packetizers (producer side, session 61).
+//
+// The depacketizers above invert these: every packetizer test below
+// round-trips through its matching depacketizer, which pins the wire
+// format without re-encoding the RFC in prose.
+// ====================================================================
+
+/// Default MTU for RTP payload bytes (header + body). Sized conservatively
+/// below the Ethernet 1500-byte MTU after accounting for:
+///   * the 12-byte RTP header,
+///   * the 4-byte RTSP interleaved frame header,
+///   * ~40 bytes of TCP/IP overhead.
+///
+/// 1400 bytes is the de-facto convention for RTP packetizers running over
+/// plain-Internet paths. Callers can override via the `with_mtu` builder.
+pub const DEFAULT_RTP_MTU: usize = 1400;
+
+/// Write the 12-byte RTP fixed header into `buf`. Version=2, padding=0,
+/// extension=0, CC=0. Matches the format [`parse_rtp_header`] expects.
+fn write_rtp_header(buf: &mut Vec<u8>, payload_type: u8, sequence: u16, timestamp: u32, ssrc: u32, marker: bool) {
+    buf.push(0x80);
+    buf.push(payload_type | if marker { 0x80 } else { 0 });
+    buf.extend_from_slice(&sequence.to_be_bytes());
+    buf.extend_from_slice(&timestamp.to_be_bytes());
+    buf.extend_from_slice(&ssrc.to_be_bytes());
+}
+
+/// H.264 RTP packetizer per RFC 6184.
+///
+/// Emits a single-NAL-unit packet when the NAL fits within
+/// [`mtu`](Self::mtu), and FU-A fragmentation (NAL type 28) otherwise.
+/// Sequence number bumps per emitted packet.
+///
+/// Intentionally does NOT emit STAP-A aggregation packets: the LVQR
+/// ingest path drops SPS / PPS NAL units because they are carried on
+/// the fMP4 init segment instead. Playback must re-inject them from
+/// the init segment before the first keyframe; that is the caller's
+/// responsibility, not the packetizer's.
+#[derive(Debug)]
+pub struct H264Packetizer {
+    pub ssrc: u32,
+    pub payload_type: u8,
+    pub sequence: u16,
+    pub mtu: usize,
+}
+
+impl H264Packetizer {
+    pub fn new(ssrc: u32, payload_type: u8, initial_sequence: u16) -> Self {
+        Self {
+            ssrc,
+            payload_type,
+            sequence: initial_sequence,
+            mtu: DEFAULT_RTP_MTU,
+        }
+    }
+
+    /// Override the default MTU. FU-A requires at least 3 bytes of payload
+    /// (1 for FU indicator + 1 for FU header + 1 byte of NAL body); asserts
+    /// the given value covers that minimum.
+    pub fn with_mtu(mut self, mtu: usize) -> Self {
+        assert!(mtu >= 3, "H.264 RTP MTU must be at least 3 bytes");
+        self.mtu = mtu;
+        self
+    }
+
+    /// Packetize one H.264 NAL unit into one or more RTP packets.
+    ///
+    /// `nalu` starts with the NAL header byte (no Annex B start code, no
+    /// AVCC length prefix). `timestamp` is the 90-kHz RTP timestamp for
+    /// the access unit. `end_of_au` sets the marker bit on the final
+    /// emitted packet; typically `true` for the last NAL of an access
+    /// unit and `false` for earlier NALs in a multi-NAL access unit.
+    ///
+    /// Empty NAL units produce no packets.
+    pub fn packetize(&mut self, nalu: &[u8], timestamp: u32, end_of_au: bool) -> Vec<Vec<u8>> {
+        if nalu.is_empty() {
+            return Vec::new();
+        }
+        if nalu.len() <= self.mtu {
+            return vec![self.emit_packet(end_of_au, timestamp, nalu)];
+        }
+        let nal_header = nalu[0];
+        let nri = nal_header & 0x60;
+        let nal_type = nal_header & 0x1F;
+        let fu_indicator = nri | NAL_TYPE_FU_A;
+        let body = &nalu[1..];
+        let chunk_size = self.mtu - 2;
+        let mut packets = Vec::new();
+        let mut offset = 0;
+        while offset < body.len() {
+            let end = (offset + chunk_size).min(body.len());
+            let is_start = offset == 0;
+            let is_end = end == body.len();
+            let mut fu_header: u8 = nal_type;
+            if is_start {
+                fu_header |= 0x80;
+            }
+            if is_end {
+                fu_header |= 0x40;
+            }
+            let mut body_buf = Vec::with_capacity(2 + (end - offset));
+            body_buf.push(fu_indicator);
+            body_buf.push(fu_header);
+            body_buf.extend_from_slice(&body[offset..end]);
+            let marker = end_of_au && is_end;
+            packets.push(self.emit_packet(marker, timestamp, &body_buf));
+            offset = end;
+        }
+        packets
+    }
+
+    fn emit_packet(&mut self, marker: bool, timestamp: u32, payload: &[u8]) -> Vec<u8> {
+        let mut pkt = Vec::with_capacity(12 + payload.len());
+        write_rtp_header(&mut pkt, self.payload_type, self.sequence, timestamp, self.ssrc, marker);
+        pkt.extend_from_slice(payload);
+        self.sequence = self.sequence.wrapping_add(1);
+        pkt
+    }
+}
+
+/// HEVC RTP packetizer per RFC 7798.
+///
+/// Emits a single-NAL-unit packet when the NAL fits within
+/// [`mtu`](Self::mtu), and FU fragmentation (NAL type 49) otherwise.
+/// HEVC NAL headers are 2 bytes; the FU packet reuses the original
+/// PayloadHdr bytes with the NAL type replaced by 49, then carries a
+/// 1-byte FU header with the original NAL type plus start/end flags.
+///
+/// Does not emit Aggregation Packets (AP, type 48): LVQR carries the
+/// parameter sets (VPS / SPS / PPS) on the fMP4 init segment and
+/// strips them from the fragment payload. Playback must re-inject
+/// parameter sets from the init segment before the first keyframe.
+#[derive(Debug)]
+pub struct HevcPacketizer {
+    pub ssrc: u32,
+    pub payload_type: u8,
+    pub sequence: u16,
+    pub mtu: usize,
+}
+
+impl HevcPacketizer {
+    pub fn new(ssrc: u32, payload_type: u8, initial_sequence: u16) -> Self {
+        Self {
+            ssrc,
+            payload_type,
+            sequence: initial_sequence,
+            mtu: DEFAULT_RTP_MTU,
+        }
+    }
+
+    /// Override the default MTU. HEVC FU requires at least 4 bytes of
+    /// payload (2 PayloadHdr + 1 FU header + 1 byte of NAL body).
+    pub fn with_mtu(mut self, mtu: usize) -> Self {
+        assert!(mtu >= 4, "HEVC RTP MTU must be at least 4 bytes");
+        self.mtu = mtu;
+        self
+    }
+
+    /// Packetize one HEVC NAL unit into one or more RTP packets.
+    ///
+    /// `nalu` starts with the 2-byte HEVC NAL header. Empty and
+    /// truncated NAL units (< 2 bytes) produce no packets.
+    pub fn packetize(&mut self, nalu: &[u8], timestamp: u32, end_of_au: bool) -> Vec<Vec<u8>> {
+        if nalu.len() < 2 {
+            return Vec::new();
+        }
+        if nalu.len() <= self.mtu {
+            return vec![self.emit_packet(end_of_au, timestamp, nalu)];
+        }
+        let nal_type = (nalu[0] >> 1) & 0x3F;
+        // Reconstruct the 2-byte PayloadHdr for the FU packet: replace the
+        // NAL type (bits 1-6 of byte 0) with 49 (HEVC_NAL_TYPE_FU), keep
+        // the forbidden_zero_bit (bit 7 of byte 0) and the layer_id+tid
+        // (bit 0 of byte 0 and all of byte 1) from the original NAL
+        // header. The depacketizer inverts this exactly.
+        let payload_hdr_byte0 = (nalu[0] & 0x81) | (HEVC_NAL_TYPE_FU << 1);
+        let payload_hdr_byte1 = nalu[1];
+        let body = &nalu[2..];
+        let chunk_size = self.mtu - 3;
+        let mut packets = Vec::new();
+        let mut offset = 0;
+        while offset < body.len() {
+            let end = (offset + chunk_size).min(body.len());
+            let is_start = offset == 0;
+            let is_end = end == body.len();
+            let mut fu_header: u8 = nal_type;
+            if is_start {
+                fu_header |= 0x80;
+            }
+            if is_end {
+                fu_header |= 0x40;
+            }
+            let mut body_buf = Vec::with_capacity(3 + (end - offset));
+            body_buf.push(payload_hdr_byte0);
+            body_buf.push(payload_hdr_byte1);
+            body_buf.push(fu_header);
+            body_buf.extend_from_slice(&body[offset..end]);
+            let marker = end_of_au && is_end;
+            packets.push(self.emit_packet(marker, timestamp, &body_buf));
+            offset = end;
+        }
+        packets
+    }
+
+    fn emit_packet(&mut self, marker: bool, timestamp: u32, payload: &[u8]) -> Vec<u8> {
+        let mut pkt = Vec::with_capacity(12 + payload.len());
+        write_rtp_header(&mut pkt, self.payload_type, self.sequence, timestamp, self.ssrc, marker);
+        pkt.extend_from_slice(payload);
+        self.sequence = self.sequence.wrapping_add(1);
+        pkt
+    }
+}
+
+/// AAC RTP packetizer per RFC 3640 AAC-hbr mode.
+///
+/// One AAC access unit per RTP packet. The AU-headers-length carries
+/// a single 16-bit header (13-bit AU-size + 3-bit AU-Index=0), so the
+/// packet layout is:
+///
+/// ```text
+///   [2 bytes AU-headers-length = 16]
+///   [2 bytes AU header: size << 3]
+///   [N bytes AU data]
+/// ```
+///
+/// RFC 3640 allows multiple AUs per packet and AU fragmentation across
+/// packets; this packetizer keeps the simple 1:1 mode because the LVQR
+/// ingest path emits one AAC frame per Fragment. A multi-AU mode can
+/// be added later if jitter-buffer sizing or network path MTU
+/// requires it. AAC access units over the MTU are emitted whole; AAC
+/// fragmentation across packets is not implemented.
+#[derive(Debug)]
+pub struct AacPacketizer {
+    pub ssrc: u32,
+    pub payload_type: u8,
+    pub sequence: u16,
+}
+
+impl AacPacketizer {
+    pub fn new(ssrc: u32, payload_type: u8, initial_sequence: u16) -> Self {
+        Self {
+            ssrc,
+            payload_type,
+            sequence: initial_sequence,
+        }
+    }
+
+    /// Packetize one AAC access unit into a single RTP packet. `frame`
+    /// carries raw AAC bytes (no ADTS header). `timestamp` is the RTP
+    /// timestamp in the audio sample rate clock. The marker bit is set
+    /// because RFC 3640 recommends it on every packet for AAC-hbr.
+    pub fn packetize(&mut self, frame: &[u8], timestamp: u32) -> Vec<u8> {
+        // 13-bit AU-size max = 8191 bytes. Real AAC frames are < 4 kB.
+        assert!(
+            frame.len() <= 0x1FFF,
+            "AAC AU size exceeds 13-bit AU-size field ({} bytes)",
+            frame.len()
+        );
+        let au_header: u16 = (frame.len() as u16) << 3;
+        let mut body = Vec::with_capacity(2 + 2 + frame.len());
+        body.extend_from_slice(&16u16.to_be_bytes()); // AU-headers-length in bits
+        body.extend_from_slice(&au_header.to_be_bytes());
+        body.extend_from_slice(frame);
+        let mut pkt = Vec::with_capacity(12 + body.len());
+        write_rtp_header(&mut pkt, self.payload_type, self.sequence, timestamp, self.ssrc, true);
+        pkt.extend_from_slice(&body);
+        self.sequence = self.sequence.wrapping_add(1);
+        pkt
+    }
+}
+
 /// Parse the hex-encoded AudioSpecificConfig from an RFC 3640 fmtp line.
 /// Returns the decoded bytes, e.g. `[0x12, 0x10]` for `config=1210`.
 pub fn parse_aac_config_from_fmtp(fmtp: &str) -> Option<Vec<u8>> {
@@ -822,5 +1104,282 @@ mod tests {
         let fmtp = "97 mode=AAC-hbr;config=1190";
         let config = parse_aac_config_from_fmtp(fmtp).unwrap();
         assert_eq!(config, vec![0x11, 0x90]);
+    }
+
+    // --- H.264 packetizer tests (round-tripped through H264Depacketizer
+    // to pin the RFC 6184 wire format without re-encoding it in prose). ---
+
+    /// Extract the RTP payload bytes (everything after the 12-byte
+    /// fixed header) from a packet emitted by a packetizer. Assumes
+    /// no CSRC list and no RTP header extension, both of which the
+    /// packetizers guarantee via the constant 0x80 version byte.
+    fn rtp_payload(pkt: &[u8]) -> &[u8] {
+        &pkt[12..]
+    }
+
+    #[test]
+    fn h264_packetize_single_nal_roundtrip() {
+        // Small IDR (nal_type=5) with NRI=0x60 fits in one MTU.
+        let nalu = vec![0x65, 0xAA, 0xBB, 0xCC, 0xDD];
+        let mut pack = H264Packetizer::new(0xDEADBEEF, 96, 1000);
+        let packets = pack.packetize(&nalu, 90_000, true);
+        assert_eq!(packets.len(), 1, "NAL fits in MTU -> one packet");
+
+        let pkt = &packets[0];
+        let hdr = parse_rtp_header(pkt).unwrap();
+        assert_eq!(hdr.payload_type, 96);
+        assert_eq!(hdr.sequence, 1000);
+        assert_eq!(hdr.timestamp, 90_000);
+        assert_eq!(hdr.ssrc, 0xDEADBEEF);
+        assert!(hdr.marker, "end_of_au -> marker bit set");
+
+        let mut depack = H264Depacketizer::new();
+        let result = depack.depacketize(rtp_payload(pkt), &hdr).unwrap();
+        assert_eq!(result.nalus, vec![nalu]);
+        assert!(result.keyframe);
+        assert_eq!(pack.sequence, 1001, "sequence bumped");
+    }
+
+    #[test]
+    fn h264_packetize_single_nal_non_marker() {
+        let nalu = vec![0x41, 0x11, 0x22];
+        let mut pack = H264Packetizer::new(1, 96, 0);
+        let packets = pack.packetize(&nalu, 3000, false);
+        assert_eq!(packets.len(), 1);
+        let hdr = parse_rtp_header(&packets[0]).unwrap();
+        assert!(!hdr.marker, "end_of_au=false -> marker clear");
+    }
+
+    #[test]
+    fn h264_packetize_fu_a_fragmentation_roundtrip() {
+        // Build an IDR NAL larger than the MTU so FU-A kicks in. NRI bits
+        // are 0x60 (nal_ref_idc = 3), which the FU indicator must echo.
+        let mut nalu = vec![0x65]; // NAL header (NRI=0x60, type=5)
+        let body: Vec<u8> = (0..100).map(|i| i as u8).collect();
+        nalu.extend_from_slice(&body);
+
+        // MTU = 20 -> each FU packet carries 20 - 2 = 18 body bytes.
+        // 100 body bytes / 18 = ceil(5.56) = 6 fragments.
+        let mut pack = H264Packetizer::new(0xABCDEF01, 96, 500).with_mtu(20);
+        let packets = pack.packetize(&nalu, 90_000, true);
+        assert_eq!(packets.len(), 6, "100 body bytes @ 18 per FU = 6 packets");
+
+        // Marker bit must fire only on the last packet.
+        for (i, pkt) in packets.iter().enumerate() {
+            let hdr = parse_rtp_header(pkt).unwrap();
+            assert_eq!(hdr.sequence, 500 + i as u16);
+            assert_eq!(hdr.timestamp, 90_000, "same access unit");
+            if i == packets.len() - 1 {
+                assert!(hdr.marker, "last FU carries marker=1");
+            } else {
+                assert!(!hdr.marker, "intermediate FU carries marker=0");
+            }
+        }
+
+        // Feed every packet through the depacketizer in order. Only the
+        // final packet produces a reassembled NAL; the rest return None.
+        let mut depack = H264Depacketizer::new();
+        let mut reassembled: Option<Vec<u8>> = None;
+        for pkt in &packets {
+            let hdr = parse_rtp_header(pkt).unwrap();
+            if let Some(result) = depack.depacketize(rtp_payload(pkt), &hdr) {
+                assert!(reassembled.is_none(), "only one reassembled NAL");
+                assert_eq!(result.nalus.len(), 1);
+                reassembled = Some(result.nalus.into_iter().next().unwrap());
+                assert!(result.keyframe);
+            }
+        }
+        assert_eq!(reassembled.unwrap(), nalu, "FU-A round-trips byte-perfectly");
+    }
+
+    #[test]
+    fn h264_packetize_empty_nal_produces_nothing() {
+        let mut pack = H264Packetizer::new(1, 96, 0);
+        assert!(pack.packetize(&[], 0, true).is_empty());
+        assert_eq!(pack.sequence, 0);
+    }
+
+    #[test]
+    fn h264_packetize_sequence_wraps() {
+        let mut pack = H264Packetizer::new(1, 96, u16::MAX);
+        let _ = pack.packetize(&[0x41, 0xAA], 0, true);
+        let _ = pack.packetize(&[0x41, 0xBB], 0, true);
+        assert_eq!(pack.sequence, 1, "u16 sequence wraps through 0");
+    }
+
+    #[test]
+    fn h264_packetize_multi_nal_access_unit_marker_placement() {
+        // Caller drives a 2-NAL access unit: first NAL marker=false,
+        // second NAL marker=true. Packetizer does not second-guess.
+        let mut pack = H264Packetizer::new(1, 96, 0);
+        let first = pack.packetize(&[0x41, 0x11, 0x22], 90_000, false);
+        let second = pack.packetize(&[0x41, 0x33, 0x44], 90_000, true);
+        let first_hdr = parse_rtp_header(&first[0]).unwrap();
+        let second_hdr = parse_rtp_header(&second[0]).unwrap();
+        assert!(!first_hdr.marker);
+        assert!(second_hdr.marker);
+        assert_eq!(first_hdr.sequence, 0);
+        assert_eq!(second_hdr.sequence, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "H.264 RTP MTU must be at least 3")]
+    fn h264_packetize_rejects_tiny_mtu() {
+        let _ = H264Packetizer::new(1, 96, 0).with_mtu(2);
+    }
+
+    // --- HEVC packetizer tests ---
+
+    #[test]
+    fn hevc_packetize_single_nal_roundtrip() {
+        // IDR_W_RADL (type 19) + 2-byte NAL header + small body.
+        let mut nalu = hevc_nal_header(19, 1).to_vec();
+        nalu.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let mut pack = HevcPacketizer::new(0x01234567, 96, 42);
+        let packets = pack.packetize(&nalu, 90_000, true);
+        assert_eq!(packets.len(), 1);
+
+        let hdr = parse_rtp_header(&packets[0]).unwrap();
+        assert_eq!(hdr.sequence, 42);
+        assert_eq!(hdr.timestamp, 90_000);
+        assert!(hdr.marker);
+
+        let mut depack = HevcDepacketizer::new();
+        let result = depack.depacketize(rtp_payload(&packets[0]), &hdr).unwrap();
+        assert_eq!(result.nalus, vec![nalu]);
+        assert!(result.keyframe);
+    }
+
+    #[test]
+    fn hevc_packetize_fu_fragmentation_roundtrip() {
+        // IDR NAL that spills over the MTU: 2-byte header + 60-byte body.
+        let mut nalu = hevc_nal_header(19, 1).to_vec();
+        let body: Vec<u8> = (0..60).map(|i| i as u8).collect();
+        nalu.extend_from_slice(&body);
+
+        // MTU = 16 -> each FU carries 16 - 3 = 13 body bytes.
+        // 60 body bytes / 13 = ceil(4.6) = 5 fragments.
+        let mut pack = HevcPacketizer::new(0xAA, 96, 0).with_mtu(16);
+        let packets = pack.packetize(&nalu, 90_000, true);
+        assert_eq!(packets.len(), 5);
+
+        for (i, pkt) in packets.iter().enumerate() {
+            let hdr = parse_rtp_header(pkt).unwrap();
+            assert_eq!(hdr.sequence, i as u16);
+            if i == packets.len() - 1 {
+                assert!(hdr.marker);
+            } else {
+                assert!(!hdr.marker);
+            }
+        }
+
+        let mut depack = HevcDepacketizer::new();
+        let mut reassembled: Option<Vec<u8>> = None;
+        for pkt in &packets {
+            let hdr = parse_rtp_header(pkt).unwrap();
+            if let Some(result) = depack.depacketize(rtp_payload(pkt), &hdr) {
+                assert!(reassembled.is_none());
+                reassembled = Some(result.nalus.into_iter().next().unwrap());
+                assert!(result.keyframe);
+            }
+        }
+        assert_eq!(reassembled.unwrap(), nalu);
+    }
+
+    #[test]
+    fn hevc_packetize_short_nal_produces_nothing() {
+        let mut pack = HevcPacketizer::new(1, 96, 0);
+        assert!(pack.packetize(&[], 0, true).is_empty());
+        assert!(
+            pack.packetize(&[0x01], 0, true).is_empty(),
+            "1 byte is not a valid HEVC header"
+        );
+        assert_eq!(pack.sequence, 0);
+    }
+
+    #[test]
+    fn hevc_packetize_non_keyframe_fu_roundtrip() {
+        // TRAIL_R (type 1), non-keyframe.
+        let mut nalu = hevc_nal_header(1, 1).to_vec();
+        let body: Vec<u8> = (0..40).map(|i| i as u8 ^ 0xAA).collect();
+        nalu.extend_from_slice(&body);
+
+        let mut pack = HevcPacketizer::new(1, 96, 0).with_mtu(16);
+        let packets = pack.packetize(&nalu, 90_000, true);
+        assert!(packets.len() >= 2, "expected fragmentation");
+
+        let mut depack = HevcDepacketizer::new();
+        let mut reassembled: Option<Vec<u8>> = None;
+        for pkt in &packets {
+            let hdr = parse_rtp_header(pkt).unwrap();
+            if let Some(result) = depack.depacketize(rtp_payload(pkt), &hdr) {
+                reassembled = Some(result.nalus.into_iter().next().unwrap());
+                assert!(!result.keyframe, "TRAIL_R is not a keyframe");
+            }
+        }
+        assert_eq!(reassembled.unwrap(), nalu);
+    }
+
+    #[test]
+    #[should_panic(expected = "HEVC RTP MTU must be at least 4")]
+    fn hevc_packetize_rejects_tiny_mtu() {
+        let _ = HevcPacketizer::new(1, 96, 0).with_mtu(3);
+    }
+
+    // --- AAC packetizer tests ---
+
+    #[test]
+    fn aac_packetize_single_frame_roundtrip() {
+        let frame = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x10, 0x20];
+        let mut pack = AacPacketizer::new(0x11223344, 97, 7);
+        let pkt = pack.packetize(&frame, 44_100);
+
+        let hdr = parse_rtp_header(&pkt).unwrap();
+        assert_eq!(hdr.payload_type, 97);
+        assert_eq!(hdr.sequence, 7);
+        assert_eq!(hdr.timestamp, 44_100);
+        assert_eq!(hdr.ssrc, 0x11223344);
+        assert!(hdr.marker, "AAC packetizer sets marker per RFC 3640 convention");
+
+        let depack = AacDepacketizer::new();
+        let result = depack.depacketize(rtp_payload(&pkt), &hdr).unwrap();
+        assert_eq!(result.frames, vec![frame]);
+        assert_eq!(pack.sequence, 8);
+    }
+
+    #[test]
+    fn aac_packetize_small_frame_layout_matches_rfc() {
+        // Verify the on-wire layout explicitly so an accidental endianness
+        // or bit-shift regression is caught without reading the layout
+        // through the depacketizer. AU-headers-length = 16 (one 16-bit
+        // AU header); AU header = size << 3 (13-bit size + 3 bits of
+        // AU-index which we always emit as zero).
+        let frame = vec![0x01, 0x02, 0x03];
+        let mut pack = AacPacketizer::new(0, 97, 0);
+        let pkt = pack.packetize(&frame, 0);
+        let body = rtp_payload(&pkt);
+
+        assert_eq!(&body[0..2], &16u16.to_be_bytes(), "AU-headers-length in bits");
+        let au_header = u16::from_be_bytes([body[2], body[3]]);
+        assert_eq!(au_header >> 3, 3, "AU-size field = frame.len()");
+        assert_eq!(au_header & 0x7, 0, "AU-Index = 0");
+        assert_eq!(&body[4..], &frame[..], "AU data appended verbatim");
+    }
+
+    #[test]
+    fn aac_packetize_sequence_bumps_per_call() {
+        let mut pack = AacPacketizer::new(1, 97, 100);
+        let _ = pack.packetize(&[0x01, 0x02], 0);
+        let _ = pack.packetize(&[0x03, 0x04], 1024);
+        let _ = pack.packetize(&[0x05, 0x06], 2048);
+        assert_eq!(pack.sequence, 103);
+    }
+
+    #[test]
+    #[should_panic(expected = "AAC AU size exceeds 13-bit")]
+    fn aac_packetize_rejects_oversize_frame() {
+        let mut pack = AacPacketizer::new(1, 97, 0);
+        let oversize = vec![0u8; 0x2000]; // 8192 bytes, exceeds 13-bit max of 8191
+        let _ = pack.packetize(&oversize, 0);
     }
 }
