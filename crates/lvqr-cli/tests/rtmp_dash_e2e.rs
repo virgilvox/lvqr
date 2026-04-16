@@ -3,12 +3,13 @@
 //! Sister test to `rtmp_hls_e2e.rs`. Where the HLS E2E drives the
 //! RTMP -> Fragment -> CmafChunk -> MultiHlsServer -> axum pipeline
 //! and reads back an LL-HLS media playlist, this one drives the
-//! RTMP -> Fragment -> DashFragmentBridge -> MultiDashServer -> axum
-//! pipeline that Tier 2.6 landed. There are no mocks: a real
-//! `rml_rtmp` client publishes, a real `lvqr_cli::start`-driven
-//! server forwards fragments through the DASH bridge, and a real
-//! raw-TCP HTTP/1.1 client reads the `/dash/{broadcast}/manifest.mpd`
-//! and a numbered `seg-video-N.m4s` off the bound DASH listener.
+//! RTMP -> Fragment -> shared FragmentBroadcasterRegistry ->
+//! BroadcasterDashBridge drain task -> MultiDashServer -> axum
+//! pipeline. There are no mocks: a real `rml_rtmp` client publishes,
+//! a real `lvqr_cli::start`-driven server drains fragments out of
+//! the registry into the DASH server, and a real raw-TCP HTTP/1.1
+//! client reads the `/dash/{broadcast}/manifest.mpd` and a numbered
+//! `seg-video-N.m4s` off the bound DASH listener.
 
 use bytes::Bytes;
 use lvqr_test_utils::{TestServer, TestServerConfig};
@@ -221,7 +222,8 @@ async fn publish_two_keyframes(addr: SocketAddr, app: &str, key: &str) -> (TcpSt
 }
 
 /// Real end-to-end: one RTMP broadcast -> RtmpMoqBridge ->
-/// DashFragmentBridge -> MultiDashServer -> axum HTTP. Verifies the
+/// shared FragmentBroadcasterRegistry -> BroadcasterDashBridge drain
+/// task -> MultiDashServer -> axum HTTP. Verifies the
 /// /dash/live/test/manifest.mpd endpoint renders a syntactically
 /// plausible MPD, the init-video.m4s endpoint serves the init
 /// segment with the expected ftyp prefix, and at least one numbered

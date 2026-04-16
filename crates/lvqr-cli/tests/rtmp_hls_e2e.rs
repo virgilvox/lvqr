@@ -328,10 +328,11 @@ async fn fetch_playlist_and_part_uris(hls_addr: SocketAddr, app: &str, key: &str
 }
 
 /// Real end-to-end: two concurrent RTMP publishes -> RtmpMoqBridge ->
-/// HlsFragmentBridge -> MultiHlsServer -> axum HTTP. Verifies that
-/// both broadcasts expose independent `/hls/{app}/{key}/playlist.m3u8`
-/// endpoints, that the two playlists reference distinct part URIs
-/// (the per-broadcast `PlaylistBuilder` state machines are genuinely
+/// shared FragmentBroadcasterRegistry -> BroadcasterHlsBridge drain
+/// tasks -> MultiHlsServer -> axum HTTP. Verifies that both broadcasts
+/// expose independent `/hls/{app}/{key}/playlist.m3u8` endpoints,
+/// that the two playlists reference distinct part URIs (the
+/// per-broadcast `PlaylistBuilder` state machines are genuinely
 /// independent), and that fetching one part from each broadcast
 /// returns a `moof`-prefixed body. Also asserts a negative lookup
 /// for an unknown broadcast returns 404 so the router does not

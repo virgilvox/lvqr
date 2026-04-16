@@ -3,7 +3,8 @@
 //! Pushes synthetic MPEG-TS streams (H.264 and HEVC) over SRT into
 //! `lvqr serve`, then verifies the HLS playlist contains segments.
 //! Proves the full path: SRT socket -> TsDemuxer -> PES -> Fragment
-//! -> HlsFragmentBridge -> MultiHlsServer -> axum HTTP.
+//! -> shared FragmentBroadcasterRegistry -> BroadcasterHlsBridge
+//! drain task -> MultiHlsServer -> axum HTTP.
 
 use bytes::Bytes;
 use futures_util::SinkExt;
