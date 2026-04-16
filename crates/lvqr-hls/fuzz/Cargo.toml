@@ -1,0 +1,42 @@
+[package]
+name = "lvqr-hls-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+# Excluded from the main workspace because libfuzzer-sys requires
+# nightly rustc and sanitizer instrumentation that the stable
+# workspace builds cannot produce. Run with:
+#
+#   cargo +nightly fuzz run playlist_builder
+#
+# Seeds for each target live under fuzz/corpus/<target>/ and can be
+# populated from real chunk sequences or from crash samples the
+# fuzzer finds. The `playlist_builder` target interprets the input
+# as a sequence of (dts_delta, duration, kind) tuples and feeds
+# them into a `PlaylistBuilder` configured with the session-34
+# sliding-window cap, then asserts that every intermediate render
+# produces well-formed UTF-8 starting with `#EXTM3U`. The target
+# deliberately covers both the session-33 closed-segment coalesce
+# path inside `PlaylistBuilder::close_pending_segment` and the
+# session-34 eviction + `drain_evicted_uris` path.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lvqr-hls = { path = ".." }
+lvqr-cmaf = { path = "../../lvqr-cmaf" }
+bytes = "1"
+
+[[bin]]
+name = "playlist_builder"
+path = "fuzz_targets/playlist_builder.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true
