@@ -1,11 +1,69 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- LL-HLS sliding-window eviction + two contract fuzz slots closed
+## Project Status: v0.4-dev -- LL-HLS eviction + fuzz skeletons + first criterion bench
 
-**Last Updated**: 2026-04-15 (session 35 closed: lvqr-hls +
-lvqr-cmaf cargo-fuzz skeletons, contract missing-slot count
-9 -> 7, on top of session 34's LL-HLS sliding-window eviction
-end-to-end).
+**Last Updated**: 2026-04-16 (session 36 closed: first criterion
+bench for PlaylistBuilder push/render/eviction. Sessions 34-36
+together shipped the sliding-window eviction end-to-end, two
+cargo-fuzz skeletons, and the first microbench in the workspace).
+
+## Session 36 close (2026-04-16)
+
+One commit on top of session 35's `4c0eae6`. Session 36 focused
+on Tier 1 test infra after sessions 34 and 35 closed the LL-HLS
+feature gap and the `lvqr-hls` / `lvqr-cmaf` fuzz slots.
+
+### Session 36 commit list
+
+1. **Criterion bench for PlaylistBuilder** (`32cd6dc`). First
+   criterion bench in the workspace, closing the "zero criterion
+   benches" gap the session-30 maturity audit listed. Three bench
+   groups: `push_partial` (hot path, ~200ns), `push_segment_boundary`
+   (close + eviction, unbounded ~0.9us at 60 segs, capped60
+   ~1.9us at 240 primed), `render` (Manifest::render, ~46us at
+   the production cap of 60 segments). The 60-segment production
+   cap means render stays under 50us per manifest in the steady
+   state, which is well within the blocking-reload polling budget.
+
+### CI verification
+
+CI run `24486545369` against commit `4c0eae6` (session 35 head)
+confirmed all three workflows pass on `origin/main` with the
+session-34 eviction path live:
+
+* **CI**: 5m2s, success.
+* **LL-HLS Conformance**: 3m10s, success. The ffmpeg client-pull
+  path ran against the `max_segments=Some(60)` production config.
+  No 404 on any segment URI. The eviction cap did not fire in the
+  10-segment CI fixture, which is correct: with a 60-segment
+  window and a 10-segment fixture, eviction never triggers.
+* **Test Contract**: 7s, success.
+
+### Session 37 entry point
+
+Primary scope options, in priority order:
+
+* **LL-HLS VOD / DVR archive surface**. Session 34's eviction
+  drops bytes for good. A DVR surface behind
+  `#EXT-X-PLAYLIST-TYPE:EVENT` retention policy is a real gap
+  now that the live window is bounded. Design question still
+  open: `lvqr-hls` archive cache vs `lvqr-record` archive
+  index.
+* **Byte-range partials for LL-HLS**. Cuts per-partial HTTP
+  overhead. Requires Range header support in the router,
+  Part.byterange data model, renderer emission, cache layout
+  change. 3-4 commit scope.
+* **Self-hosted macOS runner with Apple HTTP Live Streaming
+  Tools**. `mediastreamvalidator` from soft-skip to primary
+  signal.
+* **Close remaining contract slots**. `lvqr-fragment` and
+  `lvqr-moq` are data-model / re-export crates with no real
+  parser surface -- adding fuzz targets there would be
+  theatrical. `lvqr-whip` / `lvqr-whep` conformance slots
+  need real WebRTC interop vectors. `lvqr-record` fuzz on the
+  redb write path is plausible.
+
+
 
 ## Session 35 close (2026-04-15)
 
