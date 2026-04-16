@@ -35,8 +35,10 @@
 
 pub mod fragment;
 pub mod moq_sink;
+pub mod moq_stream;
 pub mod stream;
 
 pub use fragment::{Fragment, FragmentFlags, FragmentMeta};
 pub use moq_sink::{MoqSinkError, MoqTrackSink};
+pub use moq_stream::{MoqGroupStream, MoqTrackStream};
 pub use stream::FragmentStream;
