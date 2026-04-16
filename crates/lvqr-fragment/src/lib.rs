@@ -37,10 +37,12 @@ pub mod broadcaster;
 pub mod fragment;
 pub mod moq_sink;
 pub mod moq_stream;
+pub mod registry;
 pub mod stream;
 
 pub use broadcaster::{BroadcasterStream, DEFAULT_BROADCASTER_CAPACITY, FragmentBroadcaster};
 pub use fragment::{Fragment, FragmentFlags, FragmentMeta};
 pub use moq_sink::{MoqSinkError, MoqTrackSink};
 pub use moq_stream::{MoqGroupStream, MoqTrackStream};
+pub use registry::FragmentBroadcasterRegistry;
 pub use stream::FragmentStream;
