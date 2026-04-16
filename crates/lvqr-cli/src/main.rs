@@ -34,6 +34,16 @@ struct ServeArgs {
     #[arg(long, default_value = "8888", env = "LVQR_HLS_PORT")]
     hls_port: u16,
 
+    /// LL-HLS DVR window depth in seconds. Controls how many seconds
+    /// of closed segments the live playlist retains before oldest-first
+    /// eviction. Segments older than this window return 404. After a
+    /// broadcast ends (finalize), the retained window becomes a VOD
+    /// surface that clients can scrub freely. Set to 0 for unbounded
+    /// retention (memory grows linearly with broadcast duration).
+    /// Default is 120 seconds (~60 segments at the 2 s target duration).
+    #[arg(long, default_value = "120", env = "LVQR_HLS_DVR_WINDOW")]
+    hls_dvr_window: u32,
+
     /// WHEP HTTP listen port. Set to 0 to disable WHEP egress. When
     /// non-zero, `lvqr serve` binds a dedicated axum server on this
     /// port exposing `POST/PATCH/DELETE /whep/{broadcast}` for
@@ -201,6 +211,7 @@ async fn serve_from_args(args: ServeArgs) -> Result<()> {
         rtmp_addr: ([0, 0, 0, 0], args.rtmp_port).into(),
         admin_addr: ([0, 0, 0, 0], args.admin_port).into(),
         hls_addr,
+        hls_dvr_window_secs: args.hls_dvr_window,
         whep_addr,
         whip_addr,
         dash_addr,

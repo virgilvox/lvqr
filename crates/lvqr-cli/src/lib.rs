@@ -56,6 +56,11 @@ pub struct ServeConfig {
     /// `/init.mp4`, and the per-chunk media URIs the playlist references.
     /// When `None`, no HLS surface is exposed.
     pub hls_addr: Option<SocketAddr>,
+    /// DVR window depth in seconds for the LL-HLS sliding-window
+    /// eviction. Translated to `max_segments = dvr_secs /
+    /// target_duration_secs` at server construction. 0 means
+    /// unbounded (no eviction). Default: 120 (60 segments at 2 s).
+    pub hls_dvr_window_secs: u32,
     /// Optional WHEP (WebRTC HTTP Egress Protocol) HTTP bind address.
     /// When `Some`, `start()` constructs a `Str0mAnswerer` and a
     /// `WhepServer`, attaches the server as a `RawSampleObserver` on
@@ -116,6 +121,7 @@ impl ServeConfig {
             rtmp_addr: (loopback, 0).into(),
             admin_addr: (loopback, 0).into(),
             hls_addr: Some((loopback, 0).into()),
+            hls_dvr_window_secs: 120,
             whep_addr: None,
             whip_addr: None,
             dash_addr: None,
@@ -310,17 +316,15 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // broadcast gets its own per-broadcast `HlsServer` on first
     // publish; the axum router demultiplexes requests under
     // `/hls/{broadcast}/...`.
-    // Production LL-HLS builder config: cap the sliding window at
-    // 60 closed segments. At the default 2 s target duration that is
-    // ~120 s of history, roughly matching the DVR scrub depth the
-    // archive path already supports and keeping steady-state memory
-    // bounded even on multi-hour broadcasts. Tests under
-    // crates/lvqr-hls use PlaylistBuilderConfig::default() directly,
-    // which keeps max_segments at None so they continue to exercise
-    // the unbounded path.
+    let target_dur = PlaylistBuilderConfig::default().target_duration_secs;
+    let max_segments = if config.hls_dvr_window_secs == 0 || target_dur == 0 {
+        None
+    } else {
+        Some((config.hls_dvr_window_secs / target_dur) as usize)
+    };
     let hls_server = config.hls_addr.map(|_| {
         MultiHlsServer::new(PlaylistBuilderConfig {
-            max_segments: Some(60),
+            max_segments,
             ..PlaylistBuilderConfig::default()
         })
     });
