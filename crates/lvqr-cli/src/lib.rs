@@ -782,7 +782,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             let Some((listener, server)) = hls_router_pair else {
                 return;
             };
-            let router = server.router();
+            let router = server.router().layer(CorsLayer::permissive());
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move { hls_shutdown.cancelled().await })
                 .await;
@@ -797,7 +797,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             let Some((listener, server)) = dash_router_pair else {
                 return;
             };
-            let router = server.router();
+            let router = server.router().layer(CorsLayer::permissive());
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move { dash_shutdown.cancelled().await })
                 .await;
