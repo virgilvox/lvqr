@@ -1,9 +1,116 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Tier 2.6 lvqr-dash closed + LL-HLS closed-segment cache bug fixed
+## Project Status: v0.4-dev -- LL-HLS sliding-window eviction wired end-to-end
 
-**Last Updated**: 2026-04-15 (session 33 landed in-session: LL-HLS
-closed-segment-bytes coalesce fix + lvqr-dash proptest harness).
+**Last Updated**: 2026-04-15 (session 34 closed: PlaylistBuilder
+sliding-window eviction + server-side cache purge + production
+cap at 60 segments in the lvqr-cli serve path).
+
+## Session 34 close (2026-04-15)
+
+Three concrete commits on top of session 33's `8b5c3c9`. The
+session landed the LL-HLS sliding-window eviction called out as
+primary scope in the session 33 entry point: the unbounded growth
+in `PlaylistBuilder.manifest.segments` is now capped, the
+server-side byte cache purges in lock-step, and the lvqr-cli
+production path runs with a 60-segment window (~120 s of history
+at the default 2 s target duration).
+
+### Session 34 commit list
+
+1. **LL-HLS PlaylistBuilder sliding-window eviction** (`87f1b41`).
+   Adds `max_segments: Option<usize>` to `PlaylistBuilderConfig`
+   (default `None` for backwards compat), an `evicted_uris` buffer
+   on `PlaylistBuilder`, and a `drain_evicted_uris` method.
+   `close_pending_segment` drains overflow from the front of
+   `manifest.segments` and pushes both the dropped segment URI
+   and each of its constituent part URIs into the buffer. The
+   audio rendition config derivation in `server.rs` propagates
+   `max_segments` so audio playlists slide in lock-step with
+   video. Two unit tests in `manifest.rs`: one asserts the
+   retained window, the advanced sequence, the drained URI list
+   (including the off-by-one-looking part indices the builder's
+   `part_index` reset behaviour produces), and the advanced
+   `#EXT-X-MEDIA-SEQUENCE`; the second asserts the default config
+   stays unbounded.
+
+2. **Server-side cache purge on eviction** (`54cd1bb`).
+   `push_chunk_bytes` and `close_pending_segment` in `HlsServer`
+   drain `evicted_uris` from the builder and call `cache.remove`
+   on each entry after the builder lock releases. Also switches
+   `collect_coalesce_work` from index-based to sequence-based
+   detection: eviction may shrink `manifest.segments` from the
+   front inside the same push, which would break a positional
+   `[prev_seg_len..]` walk. Capturing the prior tail sequence and
+   filtering for strictly-greater survivors keeps the session-33
+   coalesce path correct under the new window. Integration test
+   `sliding_window_purges_cache_and_advances_media_sequence` in
+   `integration_server.rs` builds a server with `max_segments=3`,
+   pushes six 10-part segments plus a seventh Segment-kind close,
+   and asserts `EXT-X-MEDIA-SEQUENCE:3`, the playlist no longer
+   references `seg-0.m4s`, `GET /seg-0.m4s` returns 404 (cache
+   purged), and `GET /seg-3.m4s` returns non-empty coalesced
+   bytes. The existing `closed_segment_uri_serves_coalesced_bytes`
+   regression test still passes.
+
+3. **lvqr-cli production cap at 60 segments** (`99b514d`). Wires
+   the `MultiHlsServer::new` call in the `lvqr-cli` serve path to
+   `PlaylistBuilderConfig { max_segments: Some(60), .. }`. Sixty
+   segments at 2 s target duration is 120 s of history, roughly
+   matching the DVR scrub depth the archive path already
+   supports. `rtmp_hls_e2e` and `rtmp_dash_e2e` pass under the new
+   cap. Tests under `crates/lvqr-hls` stay on
+   `PlaylistBuilderConfig::default()` directly, which keeps
+   `max_segments=None` and continues to exercise the unbounded
+   path.
+
+### Verification
+
+`cargo fmt --all --check` clean. `cargo clippy --workspace
+--all-targets -- -D warnings` clean. `cargo test --workspace`
+reports 88 `test result: ok` lines, **410 tests passed**, 1
+ignored doctest (up from 408 at session 33 close: +2 unit tests
+in `manifest.rs` and +1 integration test in
+`integration_server.rs`, all exercising the new eviction path).
+`git log -1 --format='%an <%ae>'` after each commit is
+`Moheeb Zara <hackbuildvideo@gmail.com>` alone.
+
+### Session 35 entry point
+
+Primary scope options in priority order:
+
+* **LL-HLS VOD / DVR windows**. The sliding-window eviction now
+  drops bytes for good. A DVR surface wants a secondary "archive"
+  cache behind an explicit `#EXT-X-PLAYLIST-TYPE:EVENT` retention
+  policy so Rewind-style clients can pull N minutes back without
+  pinning the live window. Design question: does the archive
+  cache belong inside `lvqr-hls` or at the `lvqr-record` layer
+  that already owns the archive index path `rtmp_archive_e2e.rs`
+  exercises?
+
+* **Byte-range partials**. Session 34 keeps each partial as its
+  own `part-<msn>-<idx>.m4s` URI. Apple LL-HLS spec also allows
+  a single closed-segment file with `#EXT-X-BYTERANGE` partials
+  inside it; this cuts the per-partial HTTP overhead at the cost
+  of a more elaborate cache-coalesce path. Worth sketching now
+  that the coalesce path exists.
+
+* **Self-hosted macOS runner for `mediastreamvalidator`**. The
+  `hls-conformance.yml` workflow still soft-skips validator
+  because `macos-latest` images do not ship Apple HTTP Live
+  Streaming Tools. Promoting the ffmpeg client-pull path to a
+  self-hosted macOS runner with the tools pre-installed would
+  flip the validator from advisory to primary and close the
+  biggest gap called out in the session-30 maturity audit.
+
+Known gaps carried over from session 33 that session 34 did not
+touch: `lvqr-dash` still has no external conformance slot (the
+golden fixtures and libfuzzer skeleton closed the other three
+slots), and the Tier 2 crates below `lvqr-hls` / `lvqr-dash`
+still have the 11 missing contract slots the session-30 audit
+enumerated.
+
+
 
 ## Session 33 close (2026-04-15)
 

@@ -6,6 +6,22 @@
 
 A Rust binary that relays live video using QUIC/MoQ. Built on moq-lite for zero-copy fan-out from ingest to delivery.
 
+## Status (v0.4-dev, session 34 close)
+
+Session 34 wired LL-HLS sliding-window eviction end-to-end. The
+`PlaylistBuilder` now takes a `max_segments: Option<usize>` cap
+and drains evicted segment and part URIs into a buffer the server
+layer purges from its byte cache under the same mutation. The
+`collect_coalesce_work` detection switched to sequence-based so
+the session-33 closed-segment coalesce path remains correct even
+when eviction shrinks `manifest.segments` from the front inside
+the same push. The `lvqr-cli` serve path runs with a 60-segment
+production cap (~120 s of history at the default 2 s target
+duration, matching the DVR scrub depth the archive path
+supports); `crates/lvqr-hls` tests stay on the unbounded default.
+`cargo test --workspace` reports 410 passing across 88 test
+binaries with 1 ignored doctest.
+
 ## Status (v0.4-dev, session 32 close)
 
 Session 32 closed Tier 2.6 `lvqr-dash`. The crate was at
