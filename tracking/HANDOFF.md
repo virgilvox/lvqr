@@ -1,8 +1,58 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- LL-HLS + DASH production-grade (420 tests, all CI green)
+## Project Status: v0.4-dev approaching M1 -- 420 tests, all CI green
 
-**Last Updated**: 2026-04-16 (sessions 34-43 audited and closed).
+**Last Updated**: 2026-04-16 (session 44: CORS fix, README
+refresh, M1 scope decision).
+
+## Session 44 close (2026-04-16)
+
+### M1 scope decision
+
+The roadmap's risk table says: "Cut SRT and RTSP from Tier 2
+and move them to Tier 3 if Tier 2 hits 14 weeks without
+reaching M1." We are well past that.
+
+**Decision: M1 = RTMP + WHIP + HLS + DASH + WHEP + MoQ.
+SRT and RTSP are post-M1.**
+
+LVQR already surpasses MediaMTX on LL-HLS spec compliance,
+DASH, WHIP/WHEP, DVR archive, and MoQ. SRT and RTSP are
+important for professional broadcast but do not block the
+core product story.
+
+### Session 44 commits
+
+1. **CORS on HLS + DASH routers** (`1bda636`). Browser-hosted
+   hls.js/dash.js can now fetch cross-origin.
+2. **README refresh** (`806d7e4`). Status, CLI reference,
+   architecture diagram, crate table all current.
+
+### What M1 looks like now
+
+`lvqr serve` with no flags:
+- RTMP ingest on :1935, WHIP via --whip-port
+- LL-HLS on :8888 (configurable timing, DVR window, PDT,
+  ENDLIST on disconnect)
+- DASH via --dash-port (type=static on disconnect)
+- WHEP via --whep-port, MoQ on :4443
+- Admin on :8080 with optional auth
+- Optional recording + archive
+- CORS on all HTTP surfaces
+- 420 tests, all CI green
+
+### What blocks a public M1 release
+
+1. Browser playback verification (OBS -> lvqr -> hls.js).
+2. Version bump 0.3.1 -> 0.4.0 + CHANGELOG.
+3. mediastreamvalidator (nice-to-have, not blocking).
+
+### Session 45 entry point
+
+* Browser playback verification + quickstart update.
+* Version bump to 0.4.0.
+* SRT ingest (post-M1, first new protocol).
+* Self-hosted macOS runner for mediastreamvalidator.
 
 ## Sessions 34-43 audit (2026-04-16)
 
