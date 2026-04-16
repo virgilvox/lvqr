@@ -1,41 +1,119 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Configurable LL-HLS timing (420 tests)
+## Project Status: v0.4-dev -- LL-HLS + DASH production-grade (420 tests, all CI green)
 
-**Last Updated**: 2026-04-16 (session 43 closed: --hls-target-duration
-+ --hls-part-target CLI flags for operator-tunable segment/partial
-timing, end-to-end from CLI through CmafPolicy, PlaylistBuilder,
-and ServerControl).
+**Last Updated**: 2026-04-16 (sessions 34-43 audited and closed).
 
-## Session 43 close (2026-04-16)
+## Sessions 34-43 audit (2026-04-16)
 
-One commit on top of session 42's `b53069c`.
+Ten sessions shipped 23 commits (+2,099 lines across 27 files)
+that took the LL-HLS and DASH egress from "working prototype"
+to "production-grade with operator-tunable knobs". Everything
+is on `origin/main` at `62660c4`. CI is green across all three
+workflows (Test Contract, LL-HLS Conformance, CI).
 
-### Session 43 commit
+### Ground truth numbers
 
-1. **Configurable LL-HLS segment/partial timing** (`8b59fc9`).
-   `--hls-target-duration <secs>` (env `LVQR_HLS_TARGET_DURATION`,
-   default 2) and `--hls-part-target <ms>` (env
-   `LVQR_HLS_PART_TARGET`, default 200). The config flows
-   end-to-end: CLI -> `ServeConfig` -> `PlaylistBuilderConfig`
-   (`EXT-X-TARGETDURATION` + `PART-TARGET`) + `CmafPolicy`
-   (segmenter close threshold) + `ServerControl` (HOLD-BACK =
-   3 * target, PART-HOLD-BACK = 3 * part, CAN-SKIP-UNTIL =
-   6 * target auto-derived). `CmafPolicy::with_durations`
-   constructor converts millisecond values to timescale ticks.
-   The DVR window calculation respects the configured target
-   duration. All 420 tests pass unchanged.
+* **Tests**: 420 passing, 0 failing, 1 ignored doctest, 88
+  test suites. Delta from session 33: +12 tests.
+* **Contract**: 7 missing slots across 5 crates (lvqr-record
+  fuzz; lvqr-moq fuzz + conformance; lvqr-fragment fuzz +
+  conformance; lvqr-whip conformance; lvqr-whep conformance).
+  5 crates fully compliant (lvqr-ingest, lvqr-codec, lvqr-cmaf,
+  lvqr-hls, lvqr-dash). Delta from session 33: 9 -> 7.
+* **Benches**: render at 60 segments (production cap) ~43 us;
+  push_partial ~630 ns; push_segment_boundary ~1 us.
+* **CI**: Test Contract 6 s, LL-HLS Conformance 5 m, CI 10 m.
+  All passing on HEAD.
 
-### Verification
+### What sessions 34-43 shipped
 
-`cargo fmt --all --check` clean. `cargo clippy --workspace
---all-targets -- -D warnings` clean. 420 tests passing.
+| Session | Scope | Key commit |
+|---------|-------|------------|
+| 34 | Sliding-window eviction (max_segments, cache purge, production cap) | `87f1b41` |
+| 35 | lvqr-hls + lvqr-cmaf fuzz skeletons (contract 9->7) | `3466dcd`, `bfc02dd` |
+| 36 | First criterion bench for PlaylistBuilder | `32cd6dc` |
+| 37 | EXT-X-PROGRAM-DATE-TIME per segment (RFC 8216bis) | `293ebe2` |
+| 38 | EXT-X-ENDLIST + finalize + --hls-dvr-window flag | `c27d4c9`, `e6db779` |
+| 39 | RTMP disconnect -> HLS finalize E2E test | `fac6131` |
+| 40 | WHIP disconnect -> BroadcastStopped | `9675a13` |
+| 41 | DASH finalize on disconnect (type=static) | `cf6d07f` |
+| 42 | DASH finalize unit + E2E tests | `bd4ee91` |
+| 43 | Configurable segment/partial timing CLI flags | `8b59fc9` |
+
+### CLI flags added
+
+```
+--hls-dvr-window <secs>             DVR rewind depth (default 120)
+--hls-target-duration <secs>        segment size (default 2)
+--hls-part-target <ms>              partial size (default 200)
+```
+
+All confirmed visible in `lvqr serve --help`.
+
+### LL-HLS spec conformance
+
+Every mandatory RFC 8216bis tag is emitted: VERSION, INDEPENDENT-
+SEGMENTS, TARGETDURATION, SERVER-CONTROL (CAN-BLOCK-RELOAD,
+PART-HOLD-BACK, HOLD-BACK, CAN-SKIP-UNTIL), PART-INF, MAP,
+MEDIA-SEQUENCE, PART, PRELOAD-HINT, PROGRAM-DATE-TIME, SKIP,
+ENDLIST. ServerControl timing auto-derives from the configured
+segment/part durations.
+
+### Disconnect story
+
+Both RTMP (`on_unpublish`) and WHIP (`on_disconnect`) emit
+`BroadcastStopped` on the event bus. HLS appends
+`EXT-X-ENDLIST`; DASH switches to `type="static"` and omits
+`minimumUpdatePeriod`. Both paths have E2E tests.
+
+### What LVQR can do end-to-end
+
+* RTMP ingest (OBS / ffmpeg): AVC video + AAC audio.
+* WHIP ingest: H.264 / H.265 video + Opus audio.
+* LL-HLS egress: bounded sliding window, per-segment PDT,
+  EXT-X-ENDLIST on disconnect, operator-tunable DVR depth +
+  segment/part timing, delta playlists, blocking reload.
+* MPEG-DASH egress: live-profile dynamic MPD, static on
+  disconnect, per-broadcast fan-out.
+* WHEP egress: WebRTC subscribers via str0m.
+* DVR archive: redb index + HTTP `/playback/*`.
+* WebSocket fMP4 relay, disk record, pluggable auth (JWT +
+  static token + open access).
+
+### Maturity against ROADMAP.md
+
+* **Tier 0 (audit findings)**: DONE.
+* **Tier 1 (test infra)**: ~67%. First criterion bench. Two
+  fuzz slots closed. 7 contract slots remaining.
+  `mediastreamvalidator` still soft-skips on CI.
+* **Tier 2 (protocols)**: ~89%. LL-HLS + DASH production-ready.
+  Remaining: VP9/AV1 parsers (2.2), byte-range partials (2.5),
+  SRT (2.8), RTSP (2.9), single-binary M1 default (2.10).
+* **Tier 3 / 4 / 5**: NOT STARTED.
 
 ### Session 44 entry point
 
-* **SRT ingest** (Tier 2.8 -- biggest competitive gap).
-* **Byte-range partials for LL-HLS**.
-* **Self-hosted macOS runner for mediastreamvalidator**.
+Primary scope candidates, in priority order:
+
+1. **SRT ingest** (Tier 2.8). Biggest competitive gap vs
+   MediaMTX. Requires libsrt binding (srt-rs or raw FFI),
+   MPEG-TS demux, and fragment conversion. Multi-session scope
+   but the crate skeleton + socket accept loop can land in one
+   session without being half-finished if scoped as an
+   `lvqr-srt` crate with a `SrtListener::accept` that yields
+   raw TS bytes.
+
+2. **Byte-range partials for LL-HLS**. Cuts per-partial HTTP
+   overhead. Requires cache layout change + renderer +
+   Range header support. 3-4 commits.
+
+3. **Self-hosted macOS runner** for `mediastreamvalidator`
+   primary CI signal.
+
+4. **CORS middleware**. Flagged as tech debt since session 30.
+   A permissive default for dev + restrictive for production
+   is one commit.
 
 
 
