@@ -1,8 +1,98 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 M1 shipped + HEVC SRT + RTSP w/ RTP depack -- 465 tests, all green
+## Project Status: v0.4.0 -- RTSP fully wired (H.264+HEVC ingest -> HLS) -- 473 tests, all green
 
-**Last Updated**: 2026-04-16 (session 51 final audit).
+**Last Updated**: 2026-04-16 (session 52 close).
+
+## Session 52 close (2026-04-16)
+
+### What shipped (4 commits, +965/-21 lines)
+
+1. **RTSP H.264 fragment emission** (`0e51e02`). Wired
+   `process_rtp_frame` to extract SPS/PPS from depacketized NALs,
+   emit AVC init segment via `write_avc_init_segment`, then build
+   AVCC-framed `moof/mdat` fragments through the shared
+   `FragmentObserver`. Mirrors the SRT `process_h264` pattern.
+   ConnectionState gains ingest bookkeeping fields (sps, pps,
+   video_init_emitted, video_seq, prev_video_dts). 2 new tests.
+
+2. **HEVC RTP depacketizer + dual-codec fragment emission**
+   (`9b6c120`). `HevcDepacketizer` in the rtp module handles single
+   NAL (types 0-47), AP (type 48), and FU (type 49) per RFC 7798.
+   Keyframe detection for IDR_W_RADL (19), IDR_N_LP (20), CRA (21).
+   Refactored `process_rtp_frame` to detect codec from session SDP
+   tracks and dispatch to H.264 or HEVC processing. HEVC emission
+   uses `write_hevc_init_segment` with SPS parsing via `lvqr-codec`.
+   Unified `nals_to_length_prefixed` with `NalFilter` enum. 6 new
+   tests (38 total in crate).
+
+3. **Wire RTSP into lvqr-cli** (`62891cc`). `--rtsp-port` flag
+   (default 0 / disabled, env `LVQR_RTSP_PORT`). When non-zero,
+   `start()` pre-binds an `RtspServer` TCP listener and spawns it
+   alongside SRT/RTMP/WHIP. `rtsp_addr` added to `ServeConfig`,
+   `ServerHandle`, `TestServer`, and `TestServerConfig`
+   (`with_rtsp()` builder).
+
+4. **RTSP -> HLS E2E integration test** (`81fd54e`). Proves the
+   full path: TCP connect, ANNOUNCE with H.264 SDP, SETUP with
+   interleaved transport, RECORD, push interleaved RTP frames
+   (STAP-A SPS+PPS, two IDR keyframes), verify HLS playlist at
+   `/hls/publish/rtsp_test/playlist.m3u8` contains segments. Fixed
+   `RtspServer::bind()` to stash pre-bound `TcpListener` instead
+   of drop+rebind race on ephemeral ports.
+
+### Ground truth (session 52)
+
+* **Head**: `81fd54e` on `main`. v0.4.0.
+* **Tests**: 473 passed, 0 failed, 1 ignored, 93 suites.
+* **Code**: 36,442 lines of Rust across 23 crates.
+* **CI**: `cargo fmt`, `cargo clippy --workspace -D warnings`,
+  `cargo test --workspace` all clean.
+
+### Protocols supported
+
+| Protocol | Direction | Crate | Status | E2E tested |
+|----------|-----------|-------|--------|------------|
+| RTMP | ingest | lvqr-ingest | DONE | yes |
+| WHIP | ingest | lvqr-whip | DONE | yes |
+| SRT | ingest | lvqr-srt | DONE (H.264+HEVC+AAC) | yes |
+| RTSP | ingest | lvqr-rtsp | DONE (H.264+HEVC) | yes |
+| WebSocket | ingest+egress | lvqr-cli | DONE | yes |
+| LL-HLS | egress | lvqr-hls | DONE | yes |
+| DASH | egress | lvqr-dash | DONE | yes |
+| WHEP | egress | lvqr-whep | DONE | yes |
+| MoQ | egress | lvqr-moq | DONE | yes |
+
+### Known gaps
+
+1. **RTSP audio**: AAC RTP depacketization not yet implemented.
+   Ingest is video-only. Follow RFC 3640 (AAC in RTP).
+2. **RTSP playback egress**: PLAY direction works at the RTSP
+   protocol level (state machine, DESCRIBE/SETUP/PLAY handshake)
+   but does not packetize fragments into outbound RTP.
+3. **Unified Fragment Model** (Tier 2.1): types exist but ingress
+   not migrated to fragment-stream-based dispatch.
+4. **Peer mesh media relay**: topology works, forwarding is Tier 4.
+5. **Tier 1 infra**: no playwright, no 24h soak, no comparison.
+6. **Tiers 3-5**: cluster, observability, WASM, SDKs not started.
+7. **Contract**: 7 missing slots across 5 crates.
+
+### Session 53 entry point
+
+Priority order:
+
+1. **Contract gaps** -- 7 missing slots across 5 crates. Fuzz
+   targets for lvqr-record, lvqr-moq, lvqr-fragment; conformance
+   tests for lvqr-whip, lvqr-whep.
+
+2. **RTSP audio (AAC)** -- add AAC RTP depacketizer to rtp module
+   per RFC 3640. Wire audio fragment emission mirroring SRT's
+   `process_aac`. Add audio track to E2E test.
+
+3. **Tier 2.1 unified fragment model** -- migrate ingest paths
+   to fragment-stream-based dispatch.
+
+4. **Tier 3 planning** -- cluster (chitchat), observability (OTLP).
 
 ## Session 51 close (2026-04-16)
 
