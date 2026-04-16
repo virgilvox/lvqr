@@ -5,7 +5,11 @@ use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
-use lvqr_cmaf::{AudioInitParams, VideoInitParams, build_moof_mdat, write_aac_init_segment, write_avc_init_segment};
+use lvqr_cmaf::{
+    AudioInitParams, HevcInitParams, VideoInitParams, build_moof_mdat, write_aac_init_segment, write_avc_init_segment,
+    write_hevc_init_segment,
+};
+use lvqr_codec::hevc::{self as hevc_codec, HevcNalType};
 use lvqr_codec::ts::{PesPacket, StreamType, TsDemuxer};
 use lvqr_core::{EventBus, RelayEvent};
 use lvqr_fragment::{Fragment, FragmentFlags};
@@ -98,6 +102,7 @@ struct ConnectionState {
     audio_seq: u64,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
+    vps: Option<Vec<u8>>,
     /// Previous video DTS for frame duration computation. When
     /// `None` (first frame), a default of 3000 ticks (33 ms at
     /// 90 kHz) is used. Subsequent frames use the PTS/DTS delta.
@@ -125,6 +130,7 @@ async fn handle_connection(
         audio_seq: 0,
         sps: None,
         pps: None,
+        vps: None,
         prev_video_dts: None,
         prev_audio_dts: None,
         audio_timescale: 44100,
@@ -170,9 +176,7 @@ fn process_pes(
     match pes.stream_type {
         StreamType::H264 => process_h264(state, broadcast, pes, observer),
         StreamType::Aac => process_aac(state, broadcast, pes, observer),
-        StreamType::H265 => {
-            debug!(%broadcast, "SRT HEVC not yet wired; dropping PES");
-        }
+        StreamType::H265 => process_hevc(state, broadcast, pes, observer),
         StreamType::Unknown(st) => {
             debug!(%broadcast, stream_type = st, "SRT unknown stream type; dropping PES");
         }
@@ -246,6 +250,109 @@ fn process_h264(
         cts_offset: pts.wrapping_sub(dts) as i32,
         duration,
         payload: Bytes::from(avcc),
+        keyframe,
+    };
+    state.video_seq += 1;
+    let moof_mdat = build_moof_mdat(state.video_seq as u32, 1, dts, &[raw]);
+    let frag = Fragment::new(
+        "0.mp4",
+        state.video_seq,
+        0,
+        0,
+        dts,
+        pts,
+        duration as u64,
+        if keyframe {
+            FragmentFlags::KEYFRAME
+        } else {
+            FragmentFlags::DELTA
+        },
+        moof_mdat,
+    );
+    obs.on_fragment(broadcast, "0.mp4", &frag);
+}
+
+fn process_hevc(
+    state: &mut ConnectionState,
+    broadcast: &str,
+    pes: &PesPacket,
+    observer: Option<&SharedFragmentObserver>,
+) {
+    let obs = match observer {
+        Some(o) => o,
+        None => return,
+    };
+    let payload = &pes.payload;
+    let nalus = split_annex_b(payload);
+
+    for nalu in &nalus {
+        if nalu.len() < 2 {
+            continue;
+        }
+        let nal_type = (nalu[0] >> 1) & 0x3F;
+        match nal_type {
+            32 => state.vps = Some(nalu.to_vec()),
+            33 => state.sps = Some(nalu.to_vec()),
+            34 => state.pps = Some(nalu.to_vec()),
+            _ => {}
+        }
+    }
+
+    if !state.video_init_emitted {
+        let (Some(vps), Some(sps), Some(pps)) = (&state.vps, &state.sps, &state.pps) else {
+            return;
+        };
+        let sps_info = match hevc_codec::parse_sps(sps) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(%broadcast, error = ?e, "SRT: HEVC SPS parse failed; waiting for valid params");
+                return;
+            }
+        };
+        let params = HevcInitParams {
+            vps: vps.clone(),
+            sps: sps.clone(),
+            pps: pps.clone(),
+            sps_info,
+            timescale: 90_000,
+        };
+        let mut buf = BytesMut::with_capacity(512);
+        if let Err(e) = write_hevc_init_segment(&mut buf, &params) {
+            warn!(%broadcast, error = %e, "SRT: failed to write HEVC init segment");
+            return;
+        }
+        let init = buf.freeze();
+        obs.on_init(broadcast, "0.mp4", 90_000, init);
+        state.video_init_emitted = true;
+        info!(%broadcast, "SRT: HEVC video init emitted");
+    }
+
+    let hvcc = annex_b_to_hvcc(payload);
+    if hvcc.is_empty() {
+        return;
+    }
+
+    let dts = pes.dts.or(pes.pts).unwrap_or(0);
+    let pts = pes.pts.unwrap_or(dts);
+    let keyframe = nalus.iter().any(|n| {
+        if n.len() < 2 {
+            return false;
+        }
+        let t = HevcNalType::from_u8((n[0] >> 1) & 0x3F);
+        t.is_keyframe()
+    });
+    let duration = match state.prev_video_dts {
+        Some(prev) if dts > prev => (dts - prev) as u32,
+        _ => 3000,
+    };
+    state.prev_video_dts = Some(dts);
+
+    let raw = lvqr_cmaf::RawSample {
+        track_id: 1,
+        dts,
+        cts_offset: pts.wrapping_sub(dts) as i32,
+        duration,
+        payload: Bytes::from(hvcc),
         keyframe,
     };
     state.video_seq += 1;
@@ -426,4 +533,66 @@ fn annex_b_to_avcc(data: &[u8]) -> Vec<u8> {
         out.extend_from_slice(nalu);
     }
     out
+}
+
+/// Convert Annex B framed HEVC NALUs to length-prefixed format,
+/// stripping VPS/SPS/PPS (stored in the init segment).
+fn annex_b_to_hvcc(data: &[u8]) -> Vec<u8> {
+    let nalus = split_annex_b(data);
+    let mut out = Vec::with_capacity(data.len());
+    for nalu in nalus {
+        if nalu.len() < 2 {
+            continue;
+        }
+        let nal_type = (nalu[0] >> 1) & 0x3F;
+        if nal_type == 32 || nal_type == 33 || nal_type == 34 {
+            continue;
+        }
+        let len = nalu.len() as u32;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(nalu);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn annex_b_to_hvcc_strips_param_sets() {
+        // VPS (type 32 = 0x40>>1), SPS (type 33 = 0x42>>1), PPS (type 34 = 0x44>>1)
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0xAA]); // VPS
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0xBB]); // SPS
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x44, 0x01, 0xCC]); // PPS
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xDD]); // IDR slice
+        let out = annex_b_to_hvcc(&data);
+        // Only the IDR slice should remain, length-prefixed.
+        assert_eq!(out.len(), 4 + 3); // 4-byte length + 3-byte NAL
+        assert_eq!(&out[0..4], &3u32.to_be_bytes());
+        assert_eq!(&out[4..7], &[0x26, 0x01, 0xDD]);
+    }
+
+    #[test]
+    fn annex_b_to_avcc_strips_sps_pps() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x67, 0xAA]); // SPS (type 7)
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x68, 0xBB]); // PPS (type 8)
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x65, 0xCC]); // IDR slice (type 5)
+        let out = annex_b_to_avcc(&data);
+        assert_eq!(out.len(), 4 + 2);
+        assert_eq!(&out[4..6], &[0x65, 0xCC]);
+    }
+
+    #[test]
+    fn split_annex_b_handles_3_and_4_byte_start_codes() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0xAA, 0xBB]); // 3-byte SC
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0xCC]); // 4-byte SC
+        let nalus = split_annex_b(&data);
+        assert_eq!(nalus.len(), 2);
+        assert_eq!(nalus[0], &[0xAA, 0xBB]);
+        assert_eq!(nalus[1], &[0xCC]);
+    }
 }
