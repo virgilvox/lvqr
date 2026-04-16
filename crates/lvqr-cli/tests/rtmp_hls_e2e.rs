@@ -582,3 +582,61 @@ async fn rtmp_publish_with_audio_reaches_master_playlist() {
     drop(_s);
     server.shutdown().await.expect("shutdown");
 }
+
+/// Publish two keyframes, disconnect the RTMP client, then verify the
+/// playlist carries #EXT-X-ENDLIST. The disconnect fires the
+/// BroadcastStopped event, which the session-39 HLS finalize
+/// subscriber picks up and calls MultiHlsServer::finalize_broadcast.
+#[tokio::test]
+async fn rtmp_disconnect_produces_endlist_in_playlist() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("lvqr=debug")
+        .with_test_writer()
+        .try_init();
+
+    let server = TestServer::start(TestServerConfig::default())
+        .await
+        .expect("start TestServer");
+    let rtmp_addr = server.rtmp_addr();
+    let hls_addr = server.hls_addr();
+
+    // Publish two keyframes so the segmenter closes one segment.
+    let (rtmp_stream, _session) = publish_two_keyframes(rtmp_addr, "live", "fin").await;
+
+    // Wait for fragments to land on the HLS surface.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Before disconnect: playlist exists and has no ENDLIST.
+    let resp = http_get(hls_addr, "/hls/live/fin/playlist.m3u8").await;
+    assert_eq!(resp.status, 200);
+    let body = std::str::from_utf8(&resp.body).expect("utf-8");
+    assert!(body.starts_with("#EXTM3U"));
+    assert!(
+        !body.contains("#EXT-X-ENDLIST"),
+        "ENDLIST must not appear before disconnect:\n{body}"
+    );
+
+    // Drop the RTMP stream to trigger disconnect -> on_unpublish ->
+    // BroadcastStopped -> finalize_broadcast.
+    drop(rtmp_stream);
+    drop(_session);
+
+    // Give the event loop time to propagate the disconnect through
+    // the event bus and finalize the HLS broadcast.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // After disconnect: playlist must contain ENDLIST.
+    let resp = http_get(hls_addr, "/hls/live/fin/playlist.m3u8").await;
+    assert_eq!(resp.status, 200);
+    let body = std::str::from_utf8(&resp.body).expect("utf-8");
+    assert!(
+        body.contains("#EXT-X-ENDLIST"),
+        "playlist must contain #EXT-X-ENDLIST after disconnect:\n{body}"
+    );
+    assert!(
+        !body.contains("#EXT-X-PRELOAD-HINT"),
+        "preload hint must be suppressed after finalize:\n{body}"
+    );
+
+    server.shutdown().await.expect("shutdown");
+}

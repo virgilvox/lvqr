@@ -498,6 +498,36 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         });
     }
 
+    // HLS finalization subscriber: when a broadcaster disconnects
+    // the RTMP bridge emits BroadcastStopped, and this task calls
+    // MultiHlsServer::finalize_broadcast so the playlist gains
+    // EXT-X-ENDLIST and the retained window becomes a VOD surface.
+    if let Some(ref hls) = hls_server {
+        let hls_for_finalize = hls.clone();
+        let mut hls_event_rx = events.subscribe();
+        let hls_finalize_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = hls_finalize_shutdown.cancelled() => break,
+                    msg = hls_event_rx.recv() => {
+                        match msg {
+                            Ok(RelayEvent::BroadcastStopped { name }) => {
+                                tracing::info!(broadcast = %name, "finalizing HLS broadcast");
+                                hls_for_finalize.finalize_broadcast(&name).await;
+                            }
+                            Ok(_) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!(missed = n, "HLS finalize subscriber lagged");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Admin HTTP state and router.
     let metrics_state = relay.metrics().clone();
     let bridge_for_stats = bridge.clone();

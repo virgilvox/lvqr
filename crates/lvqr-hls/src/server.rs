@@ -709,6 +709,31 @@ impl MultiHlsServer {
             .and_then(|e| e.audio.clone())
     }
 
+    /// Mark a broadcast as ended. Calls [`HlsServer::finalize`] on
+    /// both the video and audio renditions (if present), which closes
+    /// the pending segment, coalesces its bytes, appends
+    /// `#EXT-X-ENDLIST`, and wakes any parked blocking-reload
+    /// subscribers. No-op if the broadcast is unknown.
+    pub async fn finalize_broadcast(&self, broadcast: &str) {
+        let (video, audio) = {
+            let map = self
+                .inner
+                .broadcasts
+                .lock()
+                .expect("multi hls broadcasts mutex poisoned");
+            match map.get(broadcast) {
+                Some(entry) => (Some(entry.video.clone()), entry.audio.clone()),
+                None => return,
+            }
+        };
+        if let Some(v) = video {
+            v.finalize().await;
+        }
+        if let Some(a) = audio {
+            a.finalize().await;
+        }
+    }
+
     /// Number of broadcasts currently tracked (regardless of how
     /// many renditions each broadcast has). Test-oriented.
     pub fn broadcast_count(&self) -> usize {
