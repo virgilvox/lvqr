@@ -1,8 +1,151 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- FragmentBroadcasterRegistry shipped, Tier 2.1 lookup layer complete -- 520 tests, all green
+## Project Status: v0.4.0 -- RTSP ingest dual-wired to FragmentBroadcaster, first ingest-migration landing -- 521 tests, all green
 
-**Last Updated**: 2026-04-16 (session 55 close).
+**Last Updated**: 2026-04-16 (session 56 close).
+
+## Timeline note (2026-04-16)
+
+Revised estimates based on observed velocity. This project started
+~1 calendar week ago and is at session 56, v0.4.0, 521 tests, 10
+protocols, every Tier 2.1 primitive shipped, first ingest migration
+landed. That is ~10-15 sessions per calendar week with ~2-3 commits
+each averaging 300-500 lines. Work throughput is roughly 10-20x a
+single human engineer on Rust scaffolding + tests + docs.
+
+Re-baselining ROADMAP calendar (originally written for single-human
+velocity, 18-24 months to M4) against LLM velocity:
+
+| Slice                                | Human weeks | LLM sessions | Calendar |
+|--------------------------------------|-------------|--------------|----------|
+| Tier 2 leftover (ingest migration + lvqr-cmaf + mediastreamvalidator) | 3-5 | 15-25 | 1-2 weeks |
+| Tier 1 gaps (playwright, soak, comparison) | 3-4 | 15-20 | 1-2 weeks, bounded by 24h soak calendar |
+| Tier 3 (cluster, DVR, OTLP, webhooks, captions, stream keys) | 12-14 | 40-55 | 3-5 weeks |
+| Tier 4 (io_uring, WASM, C2PA, federation, AI agents, transcoding, SLO, one-token) | 10-12 | 50-70 | 4-7 weeks |
+
+**Realistic M4 ETA: 3-5 calendar weeks of sustained sessions.**
+Floor set by genuinely calendar-bound items (24h soak literally
+takes 24h; 3-node chitchat cluster debugging needs real iteration;
+WASM filter + AI agents have research components that cannot be
+shortcut through raw token throughput).
+
+## Session 56 close (2026-04-16)
+
+### What shipped (1 commit, +250/-31 lines)
+
+1. **RTSP ingest dual-wired to FragmentBroadcasterRegistry**
+   (`c1d145c`). First ingest-path migration against the Tier 2.1
+   primitive surface.
+
+   `RtspServer` now owns (or accepts via `with_registry`) a
+   `FragmentBroadcasterRegistry`, threads it through the full
+   connection handling chain, and at every emit site publishes
+   both:
+
+   * Legacy `SharedFragmentObserver` callback path (preserved
+     exactly for existing HLS / archive consumers).
+   * New `FragmentBroadcaster` via `registry.get_or_create(...)`
+     + `bc.set_init_segment(init)` + `bc.emit(frag)`.
+
+   Two small helpers, `publish_init` and `publish_fragment`,
+   centralize the dual dispatch. These are the seam future
+   sessions delete from once every consumer has moved to the
+   broadcaster side. The codec strings written into the
+   broadcaster meta are standard RFC 6381 form
+   (`"avc1"`, `"hev1"`, `"mp4a.40.2"`) with the right timescale
+   per track.
+
+   New public API:
+
+   * `RtspServer::with_registry(addr, registry)` constructor
+     for external-owned registries (future: multi-protocol
+     shared registry at the cli level).
+   * `RtspServer::registry()` getter so tests and cli wiring
+     can subscribe.
+
+   New integration test: `dual_wire_broadcaster_matches_observer_for_h264_keyframe`
+   runs the full ingest handshake + STAP-A + IDR push over real
+   TCP, pulls the broadcaster handle out of the registry, asserts
+   the init segment is carried on `broadcaster.meta()`, subscribes,
+   then verifies both the broadcaster subscription and the observer
+   spy receive the IDR keyframe fragment with `flags.keyframe`
+   preserved. Pins the migration contract: broadcaster-native
+   consumers see equivalent data to observer-native consumers.
+
+   All 60 existing lvqr-rtsp tests still pass.
+
+### Ground truth (session 56 close)
+
+* **Head**: `c1d145c` on `main`. v0.4.0.
+* **Tests**: 521 passed, 0 failed, 1 ignored. Delta from session
+  55: +1 (new dual-wire integration test).
+* **Code**: lvqr-rtsp grew by +219 net lines across `src/server.rs`
+  and `tests/integration_server.rs`.
+* **CI gates locally clean**: `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace` all green.
+
+### Tier 2.1 migration status
+
+Per-crate migration progress (dual-wired = publishes to both
+legacy observer and new broadcaster; broadcaster-only = observer
+side removed):
+
+| Crate         | Status        | Session shipped |
+|---------------|---------------|-----------------|
+| lvqr-rtsp     | dual-wired    | 56 (this)       |
+| lvqr-srt      | observer-only | -               |
+| lvqr-whip     | observer-only | -               |
+| lvqr-ingest   | observer-only | -               |
+
+One down, three to go. SRT is the next-cleanest target (same
+ingest shape as RTSP, similar emit-site layout). WHIP and RTMP
+already have internal MoqTrackSink wiring so the migration pattern
+needs a small adaptation.
+
+### Protocols supported
+
+Unchanged. 10 protocols: RTMP + WHIP + SRT + RTSP ingest;
+LL-HLS + DASH + WHEP + MoQ + WebSocket egress.
+
+### Known gaps
+
+1. **SRT + WHIP + RTMP ingest migrations**: same dual-wire pattern
+   as RTSP. Session 57 priority.
+2. **Consumer-side migration off the observer**: archive indexer,
+   HLS bridge, etc. still read the observer callback. Once every
+   ingest is dual-wired, switch each consumer to
+   `registry.subscribe(broadcast, track)` one at a time, then
+   delete the observer path.
+3. **RTSP playback egress**: PLAY direction works at the protocol
+   level but does not packetize outbound RTP.
+4. **Apple mediastreamvalidator in CI**: biggest audit gap.
+5. **Tier 1 infra**: no playwright, no 24h soak, no MediaMTX
+   comparison harness.
+6. **Tiers 3-5**: not started.
+7. **Contract**: 7 missing slots across 5 crates.
+
+### Session 57 entry point
+
+Priority order:
+
+1. **Dual-wire SRT ingest**. Same pattern as RTSP: thread a
+   registry through `SrtIngestServer` -> per-connection ingest
+   handler -> `process_h264` / `process_hevc` / `process_aac`.
+   Add a dual-wire integration test mirroring the RTSP one.
+2. **Dual-wire WHIP ingest**. The WHIP bridge already uses
+   MoqTrackSink internally; add a registry alongside and publish
+   via `publish_init` / `publish_fragment` helpers copy-adapted
+   from lvqr-rtsp.
+3. **Dual-wire RTMP bridge**. Same as WHIP.
+4. **Consumer migration**. Once every ingest is dual-wired, move
+   the archive indexer + HLS bridge to `registry.subscribe(...)`,
+   delete the observer path from each crate, and delete
+   `FragmentObserver` itself.
+5. **RTSP playback egress**: RTP packetization (H.264 NAL ->
+   single NAL / FU-A, HEVC -> FU, AAC -> RFC 3640). Closes the
+   last RTSP competitive gap.
+6. **Apple mediastreamvalidator in CI**: the biggest audit gap.
 
 ## Session 55 close (2026-04-16)
 
