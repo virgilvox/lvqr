@@ -1,10 +1,75 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- LL-HLS DVR surface complete (eviction + PDT + finalize + DVR window flag)
+## Project Status: v0.4-dev -- LL-HLS DVR end-to-end: RTMP disconnect triggers EXT-X-ENDLIST
 
-**Last Updated**: 2026-04-16 (session 38 closed: EXT-X-ENDLIST
-+ PlaylistBuilder::finalize for end-of-stream, --hls-dvr-window
-CLI flag for operator-tunable DVR depth).
+**Last Updated**: 2026-04-16 (session 39 closed: finalize wired
+to RTMP disconnect via BroadcastStopped event bus. Sessions
+34-39 together shipped the complete LL-HLS DVR arc: eviction,
+PDT, finalize, DVR window flag, disconnect wiring).
+
+## Session 39 close (2026-04-16)
+
+One commit on top of session 38's `7aba946`. Session 39 wired
+the final mile of the LL-HLS DVR surface: when an RTMP publisher
+disconnects, the playlist now gains `#EXT-X-ENDLIST` and the
+retained window becomes a VOD surface that clients can scrub
+freely.
+
+### Session 39 commit list
+
+1. **Wire HLS finalize on RTMP disconnect** (`fac6131`).
+   `MultiHlsServer` gains `finalize_broadcast(&self, name)`:
+   looks up the video and audio `HlsServer` handles by name
+   and calls `finalize().await` on each. A new event subscriber
+   in `lvqr-cli::start()` listens for `BroadcastStopped` on
+   the event bus and calls `finalize_broadcast`. E2E test
+   `rtmp_disconnect_produces_endlist_in_playlist` publishes two
+   keyframes, drops the RTMP stream, and asserts
+   `#EXT-X-ENDLIST` appears and `#EXT-X-PRELOAD-HINT` is
+   suppressed.
+
+### Verification
+
+`cargo fmt --all --check` clean. `cargo clippy --workspace
+--all-targets -- -D warnings` clean. All 13 `lvqr-cli` tests
+pass including the new E2E test. The test runs in ~1 s end-to-end:
+RTMP publish -> disconnect -> event propagation -> HTTP GET ->
+assertion.
+
+### The complete LL-HLS DVR arc (sessions 34-39)
+
+1. Session 34: `max_segments` sliding window eviction
+2. Session 37: `EXT-X-PROGRAM-DATE-TIME` per segment
+3. Session 38: `EXT-X-ENDLIST` + `finalize()` + `--hls-dvr-window`
+4. Session 39: `finalize_broadcast()` + event bus wiring + E2E test
+
+A broadcaster can now:
+  - Publish via RTMP (or WHIP, but disconnect wiring is RTMP-only
+    for now)
+  - Viewers watch live via LL-HLS with configurable DVR depth
+    (`--hls-dvr-window <secs>`)
+  - When the broadcaster disconnects, the playlist gains
+    `#EXT-X-ENDLIST` and the retained window becomes VOD
+  - Full-broadcast replay beyond the DVR window is served via
+    `lvqr-record` + `lvqr-archive` at `/playback/*`
+
+### Known gap: WHIP disconnect
+
+The WHIP ingest path does not emit `BroadcastStopped` events.
+`WhipMoqBridge` has no event bus integration (unlike
+`RtmpMoqBridge` which has it at `bridge.rs:212`). A WHIP
+publisher that disconnects will not trigger HLS finalize. This
+is a session 40 item.
+
+### Session 40 entry point
+
+* **WHIP disconnect -> BroadcastStopped** (close the WHIP gap).
+* **Byte-range partials for LL-HLS**.
+* **Self-hosted macOS runner for mediastreamvalidator**.
+* **DASH finalize on disconnect** (the DASH bridge has the same
+  gap: no end-of-stream signal).
+
+
 
 ## Session 38 close (2026-04-16)
 
