@@ -1956,6 +1956,7 @@ dependencies = [
  "lvqr-core",
  "lvqr-fragment",
  "lvqr-ingest",
+ "lvqr-test-utils",
  "proptest",
  "tokio",
  "tokio-util",

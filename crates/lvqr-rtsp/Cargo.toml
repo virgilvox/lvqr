@@ -22,4 +22,5 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+lvqr-test-utils = { workspace = true }
 proptest = "1"
