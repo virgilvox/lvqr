@@ -1,11 +1,68 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- LL-HLS eviction + fuzz skeletons + first criterion bench
+## Project Status: v0.4-dev -- EXT-X-PROGRAM-DATE-TIME conformance fix
 
-**Last Updated**: 2026-04-16 (session 36 closed: first criterion
-bench for PlaylistBuilder push/render/eviction. Sessions 34-36
-together shipped the sliding-window eviction end-to-end, two
-cargo-fuzz skeletons, and the first microbench in the workspace).
+**Last Updated**: 2026-04-16 (session 37 closed:
+EXT-X-PROGRAM-DATE-TIME per-segment emission in the LL-HLS
+renderer, closing an RFC 8216bis conformance gap that
+mediastreamvalidator would have flagged).
+
+## Session 37 close (2026-04-16)
+
+One commit on top of session 36's `2cb5b0e`. Session 37 shipped
+a spec-conformance fix rather than more test infra: the LL-HLS
+renderer advertises `CAN-SKIP-UNTIL=12.000` in
+`EXT-X-SERVER-CONTROL` but never emitted
+`#EXT-X-PROGRAM-DATE-TIME`, which RFC 8216bis requires when
+skip is advertised.
+
+### Session 37 commit list
+
+1. **EXT-X-PROGRAM-DATE-TIME per segment** (`293ebe2`).
+   `PlaylistBuilderConfig` gains `program_date_time_base:
+   Option<u64>` (millis since UNIX epoch for the wall-clock
+   time of DTS=0). When set, `close_pending_segment` computes
+   each segment's PDT by adding cumulative segment-duration
+   offset to the base and stores it on
+   `Segment.program_date_time_millis`. The renderer emits
+   `#EXT-X-PROGRAM-DATE-TIME:<iso8601>` before each non-skipped
+   segment. The ISO 8601 formatter uses the Hinnant
+   `civil_from_days` algorithm inline -- no chrono/time
+   dependency. `MultiHlsServer` stamps
+   `program_date_time_base = SystemTime::now()` per-broadcast
+   at `ensure_video` / `ensure_audio` creation time so every
+   broadcast anchors its PDT independently. Audio renditions
+   inherit the same base via `audio_config_from`.
+
+### Verification
+
+`cargo fmt --all --check` clean. `cargo clippy --workspace
+--all-targets -- -D warnings` clean. `cargo test --workspace`
+reports **414 tests passed** (+4 from session 36), 1 ignored
+doctest. Four new unit tests: `render_emits_program_date_time_per_segment`,
+`program_date_time_omitted_when_base_is_none`,
+`format_program_date_time_known_epoch`,
+`format_program_date_time_unix_epoch`.
+
+### Session 38 entry point
+
+Primary scope options, in priority order:
+
+* **LL-HLS VOD / DVR archive surface**. Now that session 34's
+  sliding window drops bytes and session 37's PDT gives every
+  segment a wall-clock anchor, a DVR surface behind
+  `#EXT-X-PLAYLIST-TYPE:EVENT` is the natural next step.
+  Design question: `lvqr-hls` archive cache vs `lvqr-record`
+  archive index.
+* **Byte-range partials for LL-HLS**. Cuts per-partial HTTP
+  overhead. 3-4 commit scope.
+* **Self-hosted macOS runner with Apple HTTP Live Streaming
+  Tools** for `mediastreamvalidator` primary signal.
+* **`lvqr-record` fuzz target** on the redb write path (last
+  plausible fuzz slot: `lvqr-fragment` / `lvqr-moq` are
+  data-model / re-export crates with no parser surface).
+
+
 
 ## Session 36 close (2026-04-16)
 
