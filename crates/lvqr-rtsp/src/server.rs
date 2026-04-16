@@ -5,7 +5,8 @@ use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
 use lvqr_cmaf::{
-    HevcInitParams, RawSample, VideoInitParams, build_moof_mdat, write_avc_init_segment, write_hevc_init_segment,
+    AudioInitParams, HevcInitParams, RawSample, VideoInitParams, build_moof_mdat, write_aac_init_segment,
+    write_avc_init_segment, write_hevc_init_segment,
 };
 use lvqr_codec::hevc as hevc_codec;
 use lvqr_core::{EventBus, RelayEvent};
@@ -17,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::proto::{self, Method, Response, parse_transport};
-use crate::rtp::{self, H264Depacketizer, HevcDepacketizer, parse_rtp_header};
+use crate::rtp::{self, AacDepacketizer, H264Depacketizer, HevcDepacketizer, parse_rtp_header};
 use crate::session::{
     Session, SessionId, SessionMode, SessionState, TrackCodec, generate_session_id, parse_sdp_tracks,
 };
@@ -96,13 +97,20 @@ struct ConnectionState {
     server_addr: SocketAddr,
     h264_depack: H264Depacketizer,
     hevc_depack: HevcDepacketizer,
+    aac_depack: AacDepacketizer,
     rtp_packet_count: u64,
+    // Video state
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
     vps: Option<Vec<u8>>,
     video_init_emitted: bool,
     video_seq: u64,
     prev_video_dts: Option<u64>,
+    // Audio state
+    audio_init_emitted: bool,
+    audio_seq: u64,
+    audio_timescale: u32,
+    prev_audio_dts: Option<u64>,
 }
 
 async fn handle_connection(
@@ -120,6 +128,7 @@ async fn handle_connection(
         server_addr,
         h264_depack: H264Depacketizer::new(),
         hevc_depack: HevcDepacketizer::new(),
+        aac_depack: AacDepacketizer::new(),
         rtp_packet_count: 0,
         sps: None,
         pps: None,
@@ -127,6 +136,10 @@ async fn handle_connection(
         video_init_emitted: false,
         video_seq: 0,
         prev_video_dts: None,
+        audio_init_emitted: false,
+        audio_seq: 0,
+        audio_timescale: 44100,
+        prev_audio_dts: None,
     };
 
     loop {
@@ -208,8 +221,65 @@ fn process_rtp_frame(
     };
     let rtp_payload = &frame.payload[header.header_len..];
 
-    // Determine codec from the session's SDP tracks. Default to H.264
-    // when no ANNOUNCE was received (e.g. playback SETUP without SDP).
+    let obs = match observer {
+        Some(o) => o,
+        None => return,
+    };
+
+    let session = match conn.sessions.values().find(|s| s.state == SessionState::Recording) {
+        Some(s) => s,
+        None => return,
+    };
+    let broadcast = session.broadcast.clone();
+
+    // Determine media type by matching the interleaved channel to the
+    // track's transport setup. Channel 0/1 is typically the first track
+    // (video), channel 2/3 the second (audio). Fall back to detecting
+    // by track order when no explicit mapping is found.
+    let rtp_channel = frame.channel;
+    let media_type = find_media_type_for_channel(session, rtp_channel);
+
+    match media_type {
+        crate::session::MediaType::Audio => {
+            process_audio_rtp(conn, &broadcast, rtp_payload, &header, obs);
+        }
+        crate::session::MediaType::Video => {
+            process_video_rtp(conn, &broadcast, rtp_payload, &header, frame.channel, obs);
+        }
+    }
+}
+
+/// Determine the media type for a given interleaved RTP channel by
+/// checking the session's track transports. Falls back to Video for
+/// channel 0, Audio for channel 2, Video otherwise.
+fn find_media_type_for_channel(session: &Session, channel: u8) -> crate::session::MediaType {
+    use crate::session::MediaType;
+    // Walk through tracks in order and check their transport's interleaved range.
+    for track in &session.tracks {
+        if let Some(transport) = session.transports.get(&track.control) {
+            if let Some((rtp_ch, _rtcp_ch)) = transport.interleaved {
+                if rtp_ch == channel {
+                    return track.media_type;
+                }
+            }
+        }
+    }
+    // Fallback: channel 0 -> video, channel 2 -> audio.
+    if channel >= 2 {
+        MediaType::Audio
+    } else {
+        MediaType::Video
+    }
+}
+
+fn process_video_rtp(
+    conn: &mut ConnectionState,
+    broadcast: &str,
+    rtp_payload: &[u8],
+    header: &rtp::RtpHeader,
+    channel: u8,
+    obs: &SharedFragmentObserver,
+) {
     let codec = conn
         .sessions
         .values()
@@ -223,8 +293,8 @@ fn process_rtp_frame(
         .unwrap_or(TrackCodec::H264);
 
     let result = match codec {
-        TrackCodec::H265 => conn.hevc_depack.depacketize(rtp_payload, &header),
-        _ => conn.h264_depack.depacketize(rtp_payload, &header),
+        TrackCodec::H265 => conn.hevc_depack.depacketize(rtp_payload, header),
+        _ => conn.h264_depack.depacketize(rtp_payload, header),
     };
     let Some(result) = result else {
         return;
@@ -233,34 +303,109 @@ fn process_rtp_frame(
     conn.rtp_packet_count += 1;
     let codec_label = if codec == TrackCodec::H265 { "H.265" } else { "H.264" };
     debug!(
-        channel = frame.channel,
+        channel,
         ts = header.timestamp,
         nalus = result.nalus.len(),
         keyframe = result.keyframe,
         marker = result.marker,
         count = conn.rtp_packet_count,
         codec = codec_label,
-        "RTSP RTP depacketized"
+        "RTSP RTP depacketized video"
     );
 
-    let obs = match observer {
-        Some(o) => o,
-        None => return,
-    };
-
-    let broadcast = match conn
-        .sessions
-        .values()
-        .find(|s| s.state == SessionState::Recording)
-        .map(|s| s.broadcast.clone())
-    {
-        Some(b) => b,
-        None => return,
-    };
-
     match codec {
-        TrackCodec::H265 => process_hevc_nalus(conn, &broadcast, &result, obs),
-        _ => process_h264_nalus(conn, &broadcast, &result, obs),
+        TrackCodec::H265 => process_hevc_nalus(conn, broadcast, &result, obs),
+        _ => process_h264_nalus(conn, broadcast, &result, obs),
+    }
+}
+
+fn process_audio_rtp(
+    conn: &mut ConnectionState,
+    broadcast: &str,
+    rtp_payload: &[u8],
+    header: &rtp::RtpHeader,
+    obs: &SharedFragmentObserver,
+) {
+    let Some(result) = conn.aac_depack.depacketize(rtp_payload, header) else {
+        return;
+    };
+
+    conn.rtp_packet_count += 1;
+    debug!(
+        ts = header.timestamp,
+        frames = result.frames.len(),
+        count = conn.rtp_packet_count,
+        "RTSP RTP depacketized AAC"
+    );
+
+    // Emit audio init segment on first AAC frame.
+    if !conn.audio_init_emitted {
+        // Try to get AudioSpecificConfig from the SDP fmtp line.
+        let asc = conn
+            .sessions
+            .values()
+            .find(|s| s.state == SessionState::Recording)
+            .and_then(|s| s.tracks.iter().find(|t| t.codec == TrackCodec::Aac))
+            .and_then(|t| t.fmtp.as_ref())
+            .and_then(|fmtp| rtp::parse_aac_config_from_fmtp(fmtp));
+
+        let Some(asc) = asc else {
+            debug!(%broadcast, "RTSP: no AAC config in SDP, skipping audio init");
+            return;
+        };
+
+        // Extract sample rate from the audio track's clock_rate.
+        let timescale = conn
+            .sessions
+            .values()
+            .find(|s| s.state == SessionState::Recording)
+            .and_then(|s| s.tracks.iter().find(|t| t.codec == TrackCodec::Aac))
+            .map(|t| t.clock_rate)
+            .unwrap_or(44100);
+
+        let params = AudioInitParams { asc, timescale };
+        let mut buf = BytesMut::with_capacity(512);
+        if let Err(e) = write_aac_init_segment(&mut buf, &params) {
+            warn!(%broadcast, error = %e, "RTSP: failed to write AAC init segment");
+            return;
+        }
+        obs.on_init(broadcast, "1.mp4", timescale, buf.freeze());
+        conn.audio_init_emitted = true;
+        conn.audio_timescale = timescale;
+        info!(%broadcast, %timescale, "RTSP: audio init emitted");
+    }
+
+    // Emit each AAC access unit as a fragment.
+    let dts = result.timestamp as u64;
+    for frame_data in &result.frames {
+        let duration = match conn.prev_audio_dts {
+            Some(prev) if dts > prev => (dts - prev) as u32,
+            _ => 1024,
+        };
+        conn.prev_audio_dts = Some(dts);
+
+        let raw = RawSample {
+            track_id: 2,
+            dts,
+            cts_offset: 0,
+            duration,
+            payload: Bytes::copy_from_slice(frame_data),
+            keyframe: true,
+        };
+        conn.audio_seq += 1;
+        let moof_mdat = build_moof_mdat(conn.audio_seq as u32, 2, dts, &[raw]);
+        let frag = Fragment::new(
+            "1.mp4",
+            conn.audio_seq,
+            0,
+            0,
+            dts,
+            dts,
+            duration as u64,
+            FragmentFlags::AUDIO,
+            moof_mdat,
+        );
+        obs.on_fragment(broadcast, "1.mp4", &frag);
     }
 }
 
@@ -654,6 +799,7 @@ mod tests {
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
+            aac_depack: AacDepacketizer::new(),
             rtp_packet_count: 0,
             sps: None,
             pps: None,
@@ -661,6 +807,10 @@ mod tests {
             video_init_emitted: false,
             video_seq: 0,
             prev_video_dts: None,
+            audio_init_emitted: false,
+            audio_seq: 0,
+            audio_timescale: 44100,
+            prev_audio_dts: None,
         };
         let req = proto::Request {
             method: Method::Describe,
@@ -683,6 +833,7 @@ mod tests {
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
+            aac_depack: AacDepacketizer::new(),
             rtp_packet_count: 0,
             sps: None,
             pps: None,
@@ -690,6 +841,10 @@ mod tests {
             video_init_emitted: false,
             video_seq: 0,
             prev_video_dts: None,
+            audio_init_emitted: false,
+            audio_seq: 0,
+            audio_timescale: 44100,
+            prev_audio_dts: None,
         };
 
         // SETUP creates a session.
@@ -745,6 +900,7 @@ mod tests {
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
+            aac_depack: AacDepacketizer::new(),
             rtp_packet_count: 0,
             sps: None,
             pps: None,
@@ -752,6 +908,10 @@ mod tests {
             video_init_emitted: false,
             video_seq: 0,
             prev_video_dts: None,
+            audio_init_emitted: false,
+            audio_seq: 0,
+            audio_timescale: 44100,
+            prev_audio_dts: None,
         };
 
         // ANNOUNCE with SDP body.
@@ -847,6 +1007,7 @@ mod tests {
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
+            aac_depack: AacDepacketizer::new(),
             rtp_packet_count: 0,
             sps: None,
             pps: None,
@@ -854,6 +1015,10 @@ mod tests {
             video_init_emitted: false,
             video_seq: 0,
             prev_video_dts: None,
+            audio_init_emitted: false,
+            audio_seq: 0,
+            audio_timescale: 44100,
+            prev_audio_dts: None,
         };
 
         // Set up a recording session so process_rtp_frame has a broadcast name.

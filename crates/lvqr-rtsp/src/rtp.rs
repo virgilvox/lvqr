@@ -347,6 +347,106 @@ fn is_hevc_keyframe(nal_type: u8) -> bool {
     matches!(nal_type, 19..=21) // IDR_W_RADL, IDR_N_LP, CRA_NUT
 }
 
+/// Result of AAC RTP depacketization: one or more raw AAC Access Units.
+#[derive(Debug)]
+pub struct AacDepackResult {
+    pub frames: Vec<Vec<u8>>,
+    pub timestamp: u32,
+    pub marker: bool,
+}
+
+/// AAC RTP depacketizer for RFC 3640 AAC-hbr mode.
+///
+/// In AAC-hbr mode each RTP packet carries:
+/// - 2 bytes: AU-headers-length (in bits)
+/// - N AU headers (each 16 bits: 13-bit AU-size + 3-bit AU-Index)
+/// - Concatenated AU data
+///
+/// The AU-headers-length field divided by 16 gives the number of
+/// AU headers, and each AU-size gives the byte count of the
+/// corresponding Access Unit in the data section.
+#[derive(Debug, Default)]
+pub struct AacDepacketizer;
+
+impl AacDepacketizer {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Depacketize one RTP packet containing AAC-hbr data.
+    pub fn depacketize(&self, rtp_payload: &[u8], header: &RtpHeader) -> Option<AacDepackResult> {
+        if rtp_payload.len() < 2 {
+            return None;
+        }
+
+        let au_headers_length_bits = u16::from_be_bytes([rtp_payload[0], rtp_payload[1]]) as usize;
+        // Each AU header in AAC-hbr is 16 bits (sizelength=13 + indexlength=3).
+        let au_header_count = au_headers_length_bits / 16;
+        if au_header_count == 0 {
+            return None;
+        }
+
+        let au_headers_bytes = au_header_count * 2;
+        let headers_end = 2 + au_headers_bytes;
+        if headers_end > rtp_payload.len() {
+            return None;
+        }
+
+        // Parse AU sizes from the headers.
+        let mut au_sizes = Vec::with_capacity(au_header_count);
+        for i in 0..au_header_count {
+            let off = 2 + i * 2;
+            let h = u16::from_be_bytes([rtp_payload[off], rtp_payload[off + 1]]);
+            let au_size = (h >> 3) as usize; // top 13 bits
+            au_sizes.push(au_size);
+        }
+
+        // Extract AU data.
+        let mut frames = Vec::with_capacity(au_sizes.len());
+        let mut data_offset = headers_end;
+        for size in &au_sizes {
+            if data_offset + size > rtp_payload.len() {
+                break;
+            }
+            frames.push(rtp_payload[data_offset..data_offset + size].to_vec());
+            data_offset += size;
+        }
+        if frames.is_empty() {
+            return None;
+        }
+
+        Some(AacDepackResult {
+            frames,
+            timestamp: header.timestamp,
+            marker: header.marker,
+        })
+    }
+}
+
+/// Parse the hex-encoded AudioSpecificConfig from an RFC 3640 fmtp line.
+/// Returns the decoded bytes, e.g. `[0x12, 0x10]` for `config=1210`.
+pub fn parse_aac_config_from_fmtp(fmtp: &str) -> Option<Vec<u8>> {
+    // fmtp line looks like: "97 streamtype=5;profile-level-id=1;mode=AAC-hbr;...;config=1210"
+    // Skip the payload type number at the start.
+    let params = fmtp.split_once(' ').map(|(_, rest)| rest).unwrap_or(fmtp);
+    for param in params.split(';') {
+        let param = param.trim();
+        if let Some(hex) = param.strip_prefix("config=") {
+            let hex = hex.trim();
+            if hex.len() % 2 != 0 {
+                return None;
+            }
+            let mut bytes = Vec::with_capacity(hex.len() / 2);
+            for i in (0..hex.len()).step_by(2) {
+                let byte = u8::from_str_radix(&hex[i..i + 2], 16).ok()?;
+                bytes.push(byte);
+            }
+            return Some(bytes);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +730,97 @@ mod tests {
         mid.push(19); // continuation, type=19
         mid.extend_from_slice(&[0xCC, 0xDD]);
         assert!(depack.depacketize(&mid, &hdr).is_none());
+    }
+
+    // --- AAC depacketizer tests ---
+
+    #[test]
+    fn aac_depack_single_frame() {
+        // One AU: AU-headers-length = 16 bits (1 header), size=5, index=0.
+        let au_size: u16 = 5;
+        let au_header = au_size << 3; // 13-bit size + 3-bit index
+        let mut payload = vec![];
+        payload.extend_from_slice(&16u16.to_be_bytes()); // AU-headers-length in bits
+        payload.extend_from_slice(&au_header.to_be_bytes());
+        payload.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE]); // 5 bytes AU data
+
+        let hdr = RtpHeader {
+            payload_type: 97,
+            sequence: 1,
+            timestamp: 44100,
+            ssrc: 0,
+            marker: true,
+            header_len: 12,
+        };
+        let depack = AacDepacketizer::new();
+        let result = depack.depacketize(&payload, &hdr).unwrap();
+        assert_eq!(result.frames.len(), 1);
+        assert_eq!(result.frames[0], &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+    }
+
+    #[test]
+    fn aac_depack_multiple_frames() {
+        // Two AUs in one packet.
+        let au1_size: u16 = 3;
+        let au2_size: u16 = 4;
+        let au1_header = au1_size << 3;
+        let au2_header = au2_size << 3;
+        let mut payload = vec![];
+        payload.extend_from_slice(&32u16.to_be_bytes()); // 2 headers * 16 bits each
+        payload.extend_from_slice(&au1_header.to_be_bytes());
+        payload.extend_from_slice(&au2_header.to_be_bytes());
+        payload.extend_from_slice(&[0x11, 0x22, 0x33]); // AU 1
+        payload.extend_from_slice(&[0x44, 0x55, 0x66, 0x77]); // AU 2
+
+        let hdr = RtpHeader {
+            payload_type: 97,
+            sequence: 1,
+            timestamp: 44100,
+            ssrc: 0,
+            marker: true,
+            header_len: 12,
+        };
+        let depack = AacDepacketizer::new();
+        let result = depack.depacketize(&payload, &hdr).unwrap();
+        assert_eq!(result.frames.len(), 2);
+        assert_eq!(result.frames[0], &[0x11, 0x22, 0x33]);
+        assert_eq!(result.frames[1], &[0x44, 0x55, 0x66, 0x77]);
+    }
+
+    #[test]
+    fn aac_depack_too_short() {
+        let depack = AacDepacketizer::new();
+        let hdr = RtpHeader {
+            payload_type: 97,
+            sequence: 1,
+            timestamp: 44100,
+            ssrc: 0,
+            marker: true,
+            header_len: 12,
+        };
+        assert!(depack.depacketize(&[0x00], &hdr).is_none());
+        assert!(depack.depacketize(&[0x00, 0x00], &hdr).is_none()); // zero headers
+    }
+
+    #[test]
+    fn parse_aac_config_from_fmtp_basic() {
+        let fmtp = "97 streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1210";
+        let config = parse_aac_config_from_fmtp(fmtp).unwrap();
+        assert_eq!(config, vec![0x12, 0x10]);
+    }
+
+    #[test]
+    fn parse_aac_config_from_fmtp_missing() {
+        let fmtp = "97 streamtype=5;profile-level-id=1;mode=AAC-hbr";
+        assert!(parse_aac_config_from_fmtp(fmtp).is_none());
+    }
+
+    #[test]
+    fn parse_aac_config_48khz_stereo() {
+        // 48kHz stereo: object_type=2 (AAC-LC), freq_idx=3 (48000), channels=2
+        // ASC: 0x11 0x90 -> (2<<3 | 3>>1) = 0x11, (3<<7 | 2<<3) = 0x90
+        let fmtp = "97 mode=AAC-hbr;config=1190";
+        let config = parse_aac_config_from_fmtp(fmtp).unwrap();
+        assert_eq!(config, vec![0x11, 0x90]);
     }
 }
