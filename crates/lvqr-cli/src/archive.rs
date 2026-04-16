@@ -14,9 +14,8 @@
 //! unit. Range scans return rows ordered by `start_dts`, which is
 //! exactly the DVR scrub primitive the archive is for.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
@@ -27,120 +26,153 @@ use axum::routing::get;
 use bytes::Bytes;
 use lvqr_archive::{RedbSegmentIndex, SegmentIndex, SegmentRef};
 use lvqr_auth::{AuthContext, AuthDecision, SharedAuth};
-use lvqr_fragment::Fragment;
+use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentStream};
 use lvqr_ingest::{FragmentObserver, SharedFragmentObserver};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
-/// Per-track state captured at `on_init` and consulted on every
-/// subsequent `on_fragment`. The timescale comes from the bridge's
-/// `on_init` signature (90 kHz for video, the AAC sample rate for
-/// audio). `segment_seq` counts monotonic writes so the on-disk
-/// filename is stable per-track.
-struct TrackState {
-    timescale: u32,
-    segment_seq: u64,
-}
+/// Broadcaster-native archive indexer. Session 59 consumer-side
+/// switchover: replaces [`IndexingFragmentObserver`]'s
+/// FragmentObserver-hook dispatch with a
+/// [`FragmentBroadcasterRegistry::on_entry_created`] callback that
+/// spawns one tokio task per `(broadcast, track)` and drains
+/// `next_fragment()` into the same on-disk layout and redb index the
+/// observer-based path used.
+///
+/// Install via [`BroadcasterArchiveIndexer::install`] exactly once at
+/// server startup, *after* every ingest crate has been constructed
+/// with the same shared [`FragmentBroadcasterRegistry`]. The callback
+/// runs on fresh insertion into the registry; every fragment emitted
+/// subsequently is written to disk + indexed by the spawned drain
+/// task. No state lives on the indexer itself -- it is a one-shot
+/// wiring helper.
+///
+/// Differences from the observer-based version:
+///
+/// * No explicit `on_init` message. The init segment bytes are not
+///   written to disk as a standalone file (they were not under the
+///   observer path either). `timescale` is captured from the
+///   broadcaster's meta, which is installed at
+///   `FragmentBroadcaster::new` time and never changes.
+///
+/// * No shared-state map. Each `(broadcast, track)` gets its own
+///   drain task with its own segment_seq counter; tasks terminate
+///   cleanly when the producer side drops the broadcaster (i.e.
+///   `registry.remove` + every ingest clone dropped).
+pub(crate) struct BroadcasterArchiveIndexer;
 
-/// Fragment observer that writes every fragment to
-/// `<archive_dir>/<broadcast>/<track>/<seq>.m4s` and records a
-/// `SegmentRef` into a shared `RedbSegmentIndex`.
-pub(crate) struct IndexingFragmentObserver {
-    archive_dir: PathBuf,
-    index: Arc<RedbSegmentIndex>,
-    tracks: Mutex<HashMap<(String, String), TrackState>>,
-}
+impl BroadcasterArchiveIndexer {
+    /// Register an `on_entry_created` callback on the supplied
+    /// registry. The callback spawns a drain task per broadcaster on
+    /// the current tokio runtime; callers must invoke this from
+    /// inside a tokio runtime.
+    pub fn install(archive_dir: PathBuf, index: Arc<RedbSegmentIndex>, registry: &FragmentBroadcasterRegistry) {
+        let dir_root = archive_dir;
+        let index_root = index;
+        registry.on_entry_created(move |broadcast, track, bc| {
+            let dir = dir_root.clone();
+            let index = Arc::clone(&index_root);
+            let broadcast = broadcast.to_string();
+            let track = track.to_string();
+            // Subscribe synchronously inside the callback so no emit
+            // can race ahead of the drain loop. The subscription is
+            // handed to the spawned task by move capture.
+            let sub = bc.subscribe();
+            let timescale = bc.meta().timescale;
+            let handle = match Handle::try_current() {
+                Ok(h) => h,
+                Err(_) => {
+                    tracing::warn!(
+                        broadcast = %broadcast,
+                        track = %track,
+                        "BroadcasterArchiveIndexer: callback fired outside tokio runtime; drain not spawned",
+                    );
+                    return;
+                }
+            };
+            // Deliberately DO NOT hold an Arc<FragmentBroadcaster> in the
+            // drain task. Doing so would keep the broadcast::Sender alive
+            // via the Arc and the recv loop would never see Closed after
+            // every ingest-side clone dropped -- the task would leak and
+            // redb would hold its exclusive lock forever, exactly the
+            // shutdown bug the session 54 draft discovered for the
+            // subscribe path. The BroadcasterStream already owns only
+            // the Receiver side, so this is correct.
+            handle.spawn(Self::drain(dir, index, broadcast, track, timescale, sub));
+        });
+    }
 
-impl IndexingFragmentObserver {
-    pub fn new(archive_dir: PathBuf, index: Arc<RedbSegmentIndex>) -> Self {
-        Self {
-            archive_dir,
-            index,
-            tracks: Mutex::new(HashMap::new()),
+    async fn drain(
+        dir: PathBuf,
+        index: Arc<RedbSegmentIndex>,
+        broadcast: String,
+        track: String,
+        timescale: u32,
+        mut sub: lvqr_fragment::BroadcasterStream,
+    ) {
+        let mut segment_seq: u64 = 0;
+        while let Some(fragment) = sub.next_fragment().await {
+            if fragment.duration == 0 {
+                continue;
+            }
+            segment_seq += 1;
+            let start_dts = fragment.dts;
+            let end_dts = fragment.dts.saturating_add(fragment.duration);
+            let keyframe_start = fragment.flags.keyframe;
+            let path = Self::segment_path(&dir, &broadcast, &track, segment_seq);
+            let payload = fragment.payload.clone();
+            let length = payload.len() as u64;
+            let broadcast = broadcast.clone();
+            let track = track.clone();
+            let index = Arc::clone(&index);
+            let path_for_task = path.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Some(parent) = path_for_task.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    tracing::warn!(error = ?e, dir = %parent.display(), "broadcaster archive: mkdir failed");
+                    return;
+                }
+                if let Err(e) = std::fs::write(&path_for_task, payload.as_ref()) {
+                    tracing::warn!(error = ?e, path = %path_for_task.display(), "broadcaster archive: fs::write failed");
+                    return;
+                }
+                let path_str = match path_for_task.to_str() {
+                    Some(s) => s.to_string(),
+                    None => {
+                        tracing::warn!(
+                            path = %path_for_task.display(),
+                            "broadcaster archive: path is not valid utf-8"
+                        );
+                        return;
+                    }
+                };
+                let seg = SegmentRef {
+                    broadcast,
+                    track,
+                    segment_seq,
+                    start_dts,
+                    end_dts,
+                    timescale,
+                    keyframe_start,
+                    path: path_str,
+                    byte_offset: 0,
+                    length,
+                };
+                if let Err(e) = index.record(&seg) {
+                    tracing::warn!(error = ?e, "broadcaster archive: index.record failed");
+                }
+            });
         }
+        tracing::info!(
+            broadcast = %broadcast,
+            track = %track,
+            "BroadcasterArchiveIndexer: drain terminated (producers closed)",
+        );
     }
 
     fn segment_path(root: &Path, broadcast: &str, track: &str, seq: u64) -> PathBuf {
         root.join(broadcast).join(track).join(format!("{seq:08}.m4s"))
-    }
-}
-
-impl FragmentObserver for IndexingFragmentObserver {
-    fn on_init(&self, broadcast: &str, track: &str, timescale: u32, _init: Bytes) {
-        let mut map = self.tracks.lock().expect("archive observer mutex poisoned");
-        map.insert(
-            (broadcast.to_string(), track.to_string()),
-            TrackState {
-                timescale,
-                segment_seq: 0,
-            },
-        );
-    }
-
-    fn on_fragment(&self, broadcast: &str, track: &str, fragment: &Fragment) {
-        if fragment.duration == 0 {
-            return;
-        }
-
-        let (timescale, seq) = {
-            let mut map = self.tracks.lock().expect("archive observer mutex poisoned");
-            let Some(state) = map.get_mut(&(broadcast.to_string(), track.to_string())) else {
-                // Fragment arrived before its init. Defensive branch;
-                // the bridge invariant fires on_init first.
-                return;
-            };
-            state.segment_seq += 1;
-            (state.timescale, state.segment_seq)
-        };
-
-        let start_dts = fragment.dts;
-        let end_dts = fragment.dts.saturating_add(fragment.duration);
-        let keyframe_start = fragment.flags.keyframe;
-        let path = Self::segment_path(&self.archive_dir, broadcast, track, seq);
-        let payload = fragment.payload.clone();
-        let length = payload.len() as u64;
-        let broadcast_owned = broadcast.to_string();
-        let track_owned = track.to_string();
-        let index = Arc::clone(&self.index);
-
-        let Ok(handle) = Handle::try_current() else {
-            tracing::warn!("archive observer on_fragment outside tokio runtime; dropping fragment");
-            return;
-        };
-        handle.spawn_blocking(move || {
-            if let Some(parent) = path.parent()
-                && let Err(e) = std::fs::create_dir_all(parent)
-            {
-                tracing::warn!(error = ?e, dir = %parent.display(), "archive: mkdir failed");
-                return;
-            }
-            if let Err(e) = std::fs::write(&path, payload.as_ref()) {
-                tracing::warn!(error = ?e, path = %path.display(), "archive: fs::write failed");
-                return;
-            }
-            let path_str = match path.to_str() {
-                Some(s) => s.to_string(),
-                None => {
-                    tracing::warn!(path = %path.display(), "archive: path is not valid utf-8");
-                    return;
-                }
-            };
-            let seg = SegmentRef {
-                broadcast: broadcast_owned,
-                track: track_owned,
-                segment_seq: seq,
-                start_dts,
-                end_dts,
-                timescale,
-                keyframe_start,
-                path: path_str,
-                byte_offset: 0,
-                length,
-            };
-            if let Err(e) = index.record(&seg) {
-                tracing::warn!(error = ?e, "archive: index.record failed");
-            }
-        });
     }
 }
 
