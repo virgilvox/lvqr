@@ -597,4 +597,49 @@ mod tests {
         assert_eq!(parse_seq("seg-video-xx.m4s", "seg-video-"), None);
         assert_eq!(parse_seq("other.m4s", "seg-video-"), None);
     }
+
+    #[test]
+    fn finalize_switches_mpd_to_static() {
+        let server = DashServer::new(DashConfig::default());
+        server.push_video_init(Bytes::from_static(b"\x00\x00\x00\x08ftypiso5"));
+        server.push_video_segment(1, Bytes::from_static(b"seg1"));
+
+        let live = server.render_manifest().unwrap();
+        assert!(
+            live.contains(r#"type="dynamic""#),
+            "before finalize, MPD must be dynamic; got:\n{live}"
+        );
+        assert!(
+            live.contains("minimumUpdatePeriod="),
+            "before finalize, MPD must have minimumUpdatePeriod; got:\n{live}"
+        );
+
+        server.finalize();
+        let vod = server.render_manifest().unwrap();
+        assert!(
+            vod.contains(r#"type="static""#),
+            "after finalize, MPD must be static; got:\n{vod}"
+        );
+        assert!(
+            !vod.contains("minimumUpdatePeriod="),
+            "after finalize, MPD must omit minimumUpdatePeriod; got:\n{vod}"
+        );
+        assert!(
+            vod.contains("isoff-on-demand"),
+            "after finalize, profile must be on-demand; got:\n{vod}"
+        );
+    }
+
+    #[test]
+    fn finalize_twice_is_harmless() {
+        let server = DashServer::new(DashConfig::default());
+        server.push_video_init(Bytes::from_static(b"\x00\x00\x00\x08ftypiso5"));
+        server.push_video_segment(1, Bytes::from_static(b"seg1"));
+
+        server.finalize();
+        let first = server.render_manifest().unwrap();
+        server.finalize();
+        let second = server.render_manifest().unwrap();
+        assert_eq!(first, second, "second finalize must not change the MPD");
+    }
 }

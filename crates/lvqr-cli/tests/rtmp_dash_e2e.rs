@@ -280,3 +280,57 @@ async fn rtmp_publish_reaches_dash_router() {
     drop(_rtmp_stream);
     server.shutdown().await.expect("shutdown");
 }
+
+/// Publish two keyframes, disconnect the RTMP client, then verify the
+/// DASH manifest switches from type="dynamic" to type="static". The
+/// disconnect fires BroadcastStopped, which the session-41 DASH
+/// finalize subscriber picks up and calls
+/// MultiDashServer::finalize_broadcast.
+#[tokio::test]
+async fn rtmp_disconnect_produces_static_dash_manifest() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("lvqr=debug")
+        .with_test_writer()
+        .try_init();
+
+    let server = TestServer::start(TestServerConfig::default().with_dash())
+        .await
+        .expect("start TestServer with DASH");
+    let rtmp_addr = server.rtmp_addr();
+    let dash_addr = server.dash_addr();
+
+    let (rtmp_stream, session) = publish_two_keyframes(rtmp_addr, "live", "fin").await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Before disconnect: manifest is dynamic.
+    let resp = http_get(dash_addr, "/dash/live/fin/manifest.mpd").await;
+    assert_eq!(resp.status, 200);
+    let body = std::str::from_utf8(&resp.body).expect("utf-8");
+    assert!(
+        body.contains(r#"type="dynamic""#),
+        "before disconnect, MPD must be dynamic:\n{body}"
+    );
+
+    // Drop the RTMP stream to trigger disconnect -> BroadcastStopped
+    // -> finalize_broadcast.
+    drop(rtmp_stream);
+    drop(session);
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // After disconnect: manifest must be static.
+    let resp = http_get(dash_addr, "/dash/live/fin/manifest.mpd").await;
+    assert_eq!(resp.status, 200);
+    let body = std::str::from_utf8(&resp.body).expect("utf-8");
+    assert!(
+        body.contains(r#"type="static""#),
+        "after disconnect, MPD must be static:\n{body}"
+    );
+    assert!(
+        !body.contains("minimumUpdatePeriod="),
+        "after disconnect, MPD must omit minimumUpdatePeriod:\n{body}"
+    );
+
+    server.shutdown().await.expect("shutdown");
+}
