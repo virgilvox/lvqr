@@ -28,3 +28,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 http-body-util = "0.1"
 lvqr-codec = { workspace = true }
 lvqr-test-utils = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "playlist_builder"
+harness = false
