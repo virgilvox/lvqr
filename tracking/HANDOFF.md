@@ -1,11 +1,58 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- All egress paths handle broadcaster disconnect
+## Project Status: v0.4-dev -- Disconnect story fully tested (420 tests)
 
-**Last Updated**: 2026-04-16 (sessions 40-41 closed: WHIP
-disconnect -> BroadcastStopped + DASH finalize on disconnect.
-Both RTMP and WHIP disconnects now trigger EXT-X-ENDLIST on HLS
-and type="static" on DASH).
+**Last Updated**: 2026-04-16 (session 42 closed: DASH finalize
+unit tests + RTMP disconnect -> type="static" E2E test. 420
+tests across 88+ binaries, all egress disconnect paths verified).
+
+## Session 42 close (2026-04-16)
+
+One commit on top of session 41's docs commit. Closes the
+testing gap deferred from session 41.
+
+### Session 42 commit
+
+1. **DASH finalize tests** (`bd4ee91`). Two unit tests in
+   `server.rs` (`finalize_switches_mpd_to_static`,
+   `finalize_twice_is_harmless`) and one E2E test in
+   `rtmp_dash_e2e.rs` (`rtmp_disconnect_produces_static_dash_manifest`)
+   that publishes via RTMP, disconnects, and asserts the MPD
+   switches from `type="dynamic"` to `type="static"` with no
+   `minimumUpdatePeriod`.
+
+### Verification
+
+420 tests passing (+3 from session 41), 1 ignored doctest.
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
+All pushed to `origin/main`.
+
+### Sessions 34-42 summary (the production readiness arc)
+
+| Session | What | Tests added |
+|---------|------|-------------|
+| 34 | LL-HLS sliding-window eviction | +3 |
+| 35 | lvqr-hls + lvqr-cmaf fuzz skeletons | 0 (nightly-only) |
+| 36 | First criterion bench | 0 (bench) |
+| 37 | EXT-X-PROGRAM-DATE-TIME | +4 |
+| 38 | EXT-X-ENDLIST + finalize + --hls-dvr-window | +2 |
+| 39 | RTMP disconnect -> HLS finalize E2E | +1 |
+| 40 | WHIP disconnect -> BroadcastStopped | 0 |
+| 41 | DASH finalize on disconnect | 0 |
+| 42 | DASH finalize unit + E2E tests | +3 |
+
+Total: 410 -> 420 tests across 9 sessions.
+
+### Session 43 entry point
+
+* **Byte-range partials for LL-HLS** (cuts per-partial HTTP
+  overhead).
+* **Self-hosted macOS runner for mediastreamvalidator**.
+* **SRT ingest** (Tier 2.8 in the roadmap -- the biggest
+  competitive gap against MediaMTX).
+* **Criterion benches for lvqr-cmaf/lvqr-ingest**.
+
+
 
 ## Session 41 close (2026-04-16)
 
