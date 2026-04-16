@@ -1,8 +1,128 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- RTSP ingest dual-wired to FragmentBroadcaster, first ingest-migration landing -- 521 tests, all green
+## Project Status: v0.4.0 -- SRT + RTSP dual-wired, shared dispatch module, halfway through ingest migration -- 525 tests, all green
 
-**Last Updated**: 2026-04-16 (session 56 close).
+**Last Updated**: 2026-04-16 (session 57 close).
+
+## Session 57 close (2026-04-16)
+
+### What shipped (2 commits, +346/-34 lines)
+
+1. **Shared dispatch module** (`754aaae`). The session-56 dual-wire
+   helpers lived as local fns inside lvqr-rtsp/server.rs. Hoisted
+   them into `lvqr-ingest::dispatch` so every ingest crate imports
+   one pair of helpers. Module doc captures the migration rationale:
+   observer call happens first (preserves pre-migration ordering
+   for existing tests); broadcaster side is idempotent via
+   get_or_create; no unnecessary fragment clones. 3 unit tests:
+   publish_init writes to both paths; publish_fragment writes to
+   both paths; publish with None observer still feeds the registry.
+
+   lvqr-rtsp/server.rs updated to import from
+   `lvqr_ingest::{publish_init, publish_fragment}` and the local
+   copies removed. All 60 lvqr-rtsp tests continue to pass.
+
+2. **SRT ingest dual-wired** (`6b345db`). Second ingest crate
+   migrated. SrtIngestServer now owns (or accepts via
+   with_registry) a FragmentBroadcasterRegistry, threads it through
+   handle_connection -> process_pes -> {process_h264, process_hevc,
+   process_aac}, and calls the shared publish_init / publish_fragment
+   helpers at every emit site.
+
+   Observer-None early-return removed in each process_* path: the
+   broadcaster side still wants the fragment even when no observer
+   is wired (future configurations may have only broadcaster
+   consumers).
+
+   Codec strings for broadcaster meta are RFC 6381 form (avc1,
+   hev1, mp4a.40.2). Audio path uses the real captured
+   state.audio_timescale so fragment meta matches ADTS-derived
+   sample rate.
+
+   New inline unit test:
+   dual_wire_h264_publishes_to_observer_and_broadcaster builds a
+   synthetic Annex-B H.264 PES (SPS+PPS+IDR), drives it through
+   process_h264 with both a spy observer and a live broadcaster
+   subscription, and asserts both see the same init bytes (on
+   broadcaster meta) and the same keyframe fragment payload.
+
+### Ground truth (session 57 close)
+
+* **Head**: `6b345db` on `main`. v0.4.0.
+* **Tests**: 525 passed, 0 failed, 1 ignored. Delta from session
+  56: +4 (3 dispatch module unit tests + 1 SRT dual-wire).
+* **Code**: +188 lines across `lvqr-ingest::dispatch` (new),
+  -44 lines of duplicated local helpers from lvqr-rtsp. SRT
+  grew by +124 lines (dual-wire wiring + integration test).
+* **CI gates locally clean**: fmt, clippy (`-D warnings`), test
+  --workspace all green.
+
+### Ingest migration status
+
+| Crate         | Status        | Session shipped |
+|---------------|---------------|-----------------|
+| lvqr-rtsp     | dual-wired    | 56              |
+| lvqr-srt      | dual-wired    | 57 (this)       |
+| lvqr-whip     | observer-only | -               |
+| lvqr-ingest (RTMP bridge) | observer-only | -   |
+
+Halfway through ingest. WHIP + RTMP bridge remain. Once all four
+are dual-wired, the consumer-side migration starts: archive
+indexer + HLS bridge switch to `registry.subscribe()`, then the
+observer trait itself gets deleted.
+
+### Remaining to Tier 4 entry
+
+Slight update from session 56 estimates. Now ~4 sessions into
+the migration, with 2 of 4 ingest crates dual-wired. The
+per-crate dual-wire pattern is mechanical at this point.
+
+| Slice                                | Remaining sessions | Calendar |
+|--------------------------------------|--------------------|----------|
+| Ingest migration (WHIP, RTMP, consumer-side, observer deletion) | 6-10 | 0.5-1 week |
+| lvqr-cmaf standalone with mp4-atom   | 5-8                | 0.5 week |
+| Apple mediastreamvalidator in CI     | 3-5                | 0.25-0.5 week |
+| Tier 1 gaps (playwright, 24h soak, MediaMTX comparison) | 15-20 | 1-2 weeks |
+| Tier 3 full                          | 40-55              | 3-5 weeks |
+| Tier 4 full                          | 50-70              | 4-7 weeks |
+
+**Realistic M4 ETA: 3-5 calendar weeks of sustained sessions.**
+Unchanged from session 56: floor is 24h soak + multi-node cluster
+iteration + WASM/AI research items.
+
+### Protocols supported
+
+Unchanged. 10 protocols: RTMP + WHIP + SRT + RTSP ingest;
+LL-HLS + DASH + WHEP + MoQ + WebSocket egress.
+
+### Known gaps
+
+1. **WHIP + RTMP ingest migrations**: same dual-wire pattern.
+   Session 58 priority.
+2. **Consumer-side migration**: once every ingest is dual-wired,
+   switch archive indexer + HLS bridge to
+   `registry.subscribe(broadcast, track)` one at a time, then
+   delete the observer path.
+3. **RTSP playback egress**: RTP packetization of PLAY direction.
+4. **Apple mediastreamvalidator in CI**: biggest audit gap.
+5. **Tier 1 infra**: no playwright, no 24h soak, no MediaMTX
+   comparison harness.
+6. **Tiers 3-5**: not started.
+
+### Session 58 entry point
+
+1. **Dual-wire WHIP ingest**. WhipMoqBridge has an internal
+   MoqTrackSink today; add a registry alongside, thread it
+   through the per-connection ingest pump, and use the same
+   publish_init / publish_fragment helpers.
+2. **Dual-wire RTMP bridge**. RtmpMoqBridge pattern is similar
+   to WHIP. Same shape.
+3. **Start consumer-side migration**. Archive indexer first
+   (it is the simplest consumer; HLS bridge has more state).
+4. **RTSP playback egress** (independent, slot in when
+   ingest migration wraps).
+
+## Session 56 close (2026-04-16)
 
 ## Timeline note (2026-04-16)
 
