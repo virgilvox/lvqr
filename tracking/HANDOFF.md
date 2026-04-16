@@ -1,12 +1,12 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 M1 shipped + HEVC SRT + RTSP scaffold -- 456 tests, all CI green
+## Project Status: v0.4.0 M1 shipped + HEVC SRT + RTSP w/ RTP depack -- 465 tests, all green
 
-**Last Updated**: 2026-04-16 (session 51 close).
+**Last Updated**: 2026-04-16 (session 51 final audit).
 
 ## Session 51 close (2026-04-16)
 
-### What shipped (5 commits, +1,828/-28 lines)
+### What shipped (7 commits, +2,349/-30 lines)
 
 1. **HEVC in SRT ingest** (`469d8d3`). Wired the stubbed H.265
    code path: VPS/SPS/PPS extraction from Annex B NALs, HEVC SPS
@@ -30,12 +30,25 @@
    per-connection handler, full playback + ingest handshake flows.
    23 unit tests. +1,221 lines across 4 source files.
 
-### Ground truth (session 51)
+5. **RTP interleaved frame parsing + H.264 depacketization**
+   (`cf8e3e9`). rtp module with interleaved TCP frame parser,
+   RTP header parser, H.264 depacketizer (single NAL, STAP-A,
+   FU-A per RFC 6184). Connection handler distinguishes $-framed
+   RTP from RTSP text requests. 8 unit tests (31 total in crate).
 
-* **Head**: `6db660d` on `main`. v0.4.0.
-* **Tests**: 456 passed, 0 failed, 92 test suites.
-* **Code**: ~34,500 lines of Rust across 23 crates.
-* **CI**: All 4 workflows passing.
+6. **Handoff refresh** (`2a53d83`). Session 51 audit block.
+
+### Ground truth (session 51 final audit)
+
+* **Head**: `cf8e3e9` on `main`. v0.4.0.
+* **Tests**: 465 passed, 0 failed, 1 ignored, 92 suites.
+* **Code**: 35,089 lines of Rust across 23 crates.
+* **CI**: All 4 workflows green. `cargo fmt`, `cargo clippy
+  --workspace -D warnings`, `cargo test --workspace` all clean.
+* **Target cleaned**: 116 GB -> 5.9 GB (accumulated build artifacts).
+* **Bench baselines**: TsDemuxer bulk feed 1.2-5.0 GiB/s, per-packet
+  ~800ns, PES reassembly 0.9-3.9 GiB/s. PlaylistBuilder render at
+  60 segments ~43 us.
 
 ### Protocols supported
 
@@ -49,38 +62,65 @@
 | DASH | egress | lvqr-dash | DONE | yes |
 | WHEP | egress | lvqr-whep | DONE | yes |
 | MoQ | egress | lvqr-moq | DONE | yes |
-| RTSP | playback+ingest | lvqr-rtsp | SCAFFOLD (no RTP yet) | no |
+| RTSP | playback+ingest | lvqr-rtsp | RTP DEPACK (no fragment emit) | no |
 
 ### Competitive position
 
 LVQR is the only Rust library offering HEVC over SRT as composable
 crates. LiveKit has zero SRT support. MediaMTX handles HEVC/SRT but
-is monolithic Go. Ant Media's HEVC is partial. No mature Rust RTSP
-server crate exists (our hand-rolled approach is correct).
+is monolithic Go (cannot be embedded). Ant Media's HEVC is partial.
+No mature Rust RTSP server crate exists; our hand-rolled approach
+is the correct call. Watch for: HEVC parameter sets spanning TS
+packet boundaries in 10-bit Main 10 profile streams (industry gotcha).
 
-### Known gaps (updated)
+### Known gaps
 
-1. **RTSP RTP depacketization**: lvqr-rtsp has the protocol parser
-   and state machine but no RTP handling yet. Next session: add
-   interleaved TCP RTP frame parsing, H.264/HEVC depacketization
-   (FU-A/AP), and wire to fragment observer.
-2. **Unified Fragment Model** (Tier 2.1): types exist but ingress
+1. **RTSP fragment emission**: rtp module depacketizes H.264 NALs
+   but does not yet emit fragments. Needs: reconstruct Annex B from
+   depacketized NALs, extract SPS/PPS, call write_avc_init_segment,
+   emit moof/mdat via fragment observer. Mirror the SRT ingest
+   pattern in `crates/lvqr-srt/src/ingest.rs`.
+2. **RTSP HEVC depacketization**: H.265 RTP uses RFC 7798 (FU/AP
+   NAL units). NAL type is `(byte >> 1) & 0x3F` (same as HEVC
+   everywhere else in the codebase). Add to rtp module after H.264
+   fragment emission is proven.
+3. **RTSP E2E test**: no test pushes RTP into the RTSP server yet.
+   Use ffmpeg `ffmpeg -f lavfi -i testsrc -c:v libx264 -f rtsp
+   rtsp://localhost:PORT/publish/test` or build synthetic RTP
+   packets like the SRT E2E test does for MPEG-TS.
+4. **Unified Fragment Model** (Tier 2.1): types exist but ingress
    not migrated to fragment-stream-based dispatch.
-3. **Peer mesh media relay**: topology works, forwarding is Tier 4.
-4. **Tier 1 infra**: no playwright, no 24h soak, no comparison.
-5. **Tiers 3-5**: cluster, observability, WASM, SDKs not started.
-6. **Contract**: 7 missing slots across 5 crates.
+5. **Peer mesh media relay**: topology works, forwarding is Tier 4.
+6. **Tier 1 infra**: no playwright, no 24h soak, no comparison.
+7. **Tiers 3-5**: cluster, observability, WASM, SDKs not started.
+8. **Contract**: 7 missing slots across 5 crates.
 
 ### Session 52 entry point
 
-* **RTSP RTP depacketization** -- add interleaved TCP frame
-  parsing ($-prefixed 4-byte header), H.264 FU-A depacketization,
-  wire to fragment observer, E2E test with ffmpeg RTSP push.
-* **RTSP HEVC** -- extend to H.265 RTP depacketization (RFC 7798
-  FU/AP NAL units) once H.264 is proven.
-* **Contract gaps** -- fuzz targets for lvqr-record, lvqr-moq,
-  lvqr-fragment; conformance tests for lvqr-whip, lvqr-whep.
-* **Tier 3 planning** -- cluster (chitchat), observability (OTLP).
+Priority order:
+
+1. **RTSP fragment emission** -- wire the H264Depacketizer output
+   to the fragment observer. In `server.rs::process_rtp_frame`,
+   collect depacketized NALs into Annex B format, extract SPS/PPS,
+   call `write_avc_init_segment` on first keyframe, then emit
+   `build_moof_mdat` fragments. The SRT `process_h264` function
+   (crates/lvqr-srt/src/ingest.rs:186) is the exact pattern.
+
+2. **RTSP E2E test** -- push synthetic RTP packets over interleaved
+   TCP, verify HLS playlist appears. Follow the SRT E2E test
+   pattern (crates/lvqr-cli/tests/srt_hls_e2e.rs).
+
+3. **RTSP HEVC depack** -- add HevcDepacketizer to rtp module
+   (RFC 7798 FU/AP), then wire fragment emission for HEVC the
+   same way SRT's `process_hevc` does it.
+
+4. **Wire RTSP into lvqr-cli** -- add `--rtsp-port` flag,
+   spawn RtspServer in the serve command alongside SRT.
+
+5. **Contract gaps** -- fuzz targets for lvqr-record, lvqr-moq,
+   lvqr-fragment; conformance tests for lvqr-whip, lvqr-whep.
+
+6. **Tier 3 planning** -- cluster (chitchat), observability (OTLP).
 
 ## Session 44 close (2026-04-16)
 
