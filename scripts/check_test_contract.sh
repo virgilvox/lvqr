@@ -48,7 +48,7 @@ IN_SCOPE=(
     lvqr-dash
     # Tier 2 crates below will be enabled as they land:
     # lvqr-srt
-    # lvqr-rtsp
+    lvqr-rtsp
     # lvqr-archive
 )
 

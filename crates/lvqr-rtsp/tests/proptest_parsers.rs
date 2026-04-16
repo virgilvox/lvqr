@@ -156,3 +156,30 @@ proptest! {
         prop_assert_eq!(consumed, 4 + payload_len);
     }
 }
+
+// ----------------------------------------------------------------
+// AAC depacketizer + fmtp parser
+// ----------------------------------------------------------------
+
+proptest! {
+    /// AacDepacketizer must never panic on arbitrary RTP payloads.
+    #[test]
+    fn aac_depack_never_panics(payload in proptest::collection::vec(any::<u8>(), 0..2048)) {
+        let header = rtp::RtpHeader {
+            payload_type: 97,
+            sequence: 0,
+            timestamp: 0,
+            ssrc: 0,
+            marker: true,
+            header_len: 12,
+        };
+        let depack = rtp::AacDepacketizer::new();
+        let _ = depack.depacketize(&payload, &header);
+    }
+
+    /// parse_aac_config_from_fmtp must never panic on arbitrary strings.
+    #[test]
+    fn parse_aac_config_never_panics(s in "\\PC{0,512}") {
+        let _ = rtp::parse_aac_config_from_fmtp(&s);
+    }
+}
