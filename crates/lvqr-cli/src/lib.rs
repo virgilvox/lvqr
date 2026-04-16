@@ -310,9 +310,20 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // broadcast gets its own per-broadcast `HlsServer` on first
     // publish; the axum router demultiplexes requests under
     // `/hls/{broadcast}/...`.
-    let hls_server = config
-        .hls_addr
-        .map(|_| MultiHlsServer::new(PlaylistBuilderConfig::default()));
+    // Production LL-HLS builder config: cap the sliding window at
+    // 60 closed segments. At the default 2 s target duration that is
+    // ~120 s of history, roughly matching the DVR scrub depth the
+    // archive path already supports and keeping steady-state memory
+    // bounded even on multi-hour broadcasts. Tests under
+    // crates/lvqr-hls use PlaylistBuilderConfig::default() directly,
+    // which keeps max_segments at None so they continue to exercise
+    // the unbounded path.
+    let hls_server = config.hls_addr.map(|_| {
+        MultiHlsServer::new(PlaylistBuilderConfig {
+            max_segments: Some(60),
+            ..PlaylistBuilderConfig::default()
+        })
+    });
 
     // Optional multi-broadcast MPEG-DASH server. Sibling of the
     // LL-HLS fan-out above: a single `MultiDashServer` observes
