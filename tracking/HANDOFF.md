@@ -1,11 +1,85 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- EXT-X-PROGRAM-DATE-TIME conformance fix
+## Project Status: v0.4-dev -- LL-HLS DVR surface complete (eviction + PDT + finalize + DVR window flag)
 
-**Last Updated**: 2026-04-16 (session 37 closed:
-EXT-X-PROGRAM-DATE-TIME per-segment emission in the LL-HLS
-renderer, closing an RFC 8216bis conformance gap that
-mediastreamvalidator would have flagged).
+**Last Updated**: 2026-04-16 (session 38 closed: EXT-X-ENDLIST
++ PlaylistBuilder::finalize for end-of-stream, --hls-dvr-window
+CLI flag for operator-tunable DVR depth).
+
+## Session 38 close (2026-04-16)
+
+Two commits on top of session 37's `8f0182e`. Session 38 closed
+the LL-HLS DVR / VOD surface end-to-end by answering the
+session-35 design question with a pragmatic insight: no new
+archive cache is needed. The existing architecture handles DVR
+with two small changes: `#EXT-X-ENDLIST` for end-of-stream and a
+configurable sliding window. Full-broadcast replay beyond the DVR
+window already works via `lvqr-record` + `lvqr-archive`.
+
+### Design decision: DVR surface architecture
+
+The session-35 HANDOFF asked "does the archive cache belong
+inside `lvqr-hls` or at the `lvqr-record` layer?" Answer:
+**neither needs a new archive**. DVR scrub within the live
+window is `max_segments` (already configurable since session 34).
+End-of-stream VOD within the window is `#EXT-X-ENDLIST` (session
+38 Commit A). Full-broadcast replay is the existing
+`lvqr-record` + `lvqr-archive` pipeline at `/playback/*`.
+
+### Session 38 commit list
+
+1. **EXT-X-ENDLIST + PlaylistBuilder::finalize** (`c27d4c9`).
+   `Manifest` gains `ended: bool`. When true, the renderer
+   appends `#EXT-X-ENDLIST` and suppresses `#EXT-X-PRELOAD-HINT`
+   (the two are mutually exclusive). `PlaylistBuilder::finalize()`
+   closes the pending segment, clears the preload hint, sets
+   `ended=true`. Idempotent (calling twice is harmless).
+   `HlsServer::finalize()` is the async wrapper that coalesces
+   the last segment's bytes and purges evicted URIs. After
+   finalize the retained window becomes a VOD surface.
+
+2. **`--hls-dvr-window` CLI flag** (`e6db779`). Adds
+   `--hls-dvr-window <secs>` (env `LVQR_HLS_DVR_WINDOW`, default
+   120) to `lvqr-cli serve`. Translates to
+   `max_segments = dvr_secs / target_duration_secs` at
+   construction time. 0 means unbounded. Replaces the session-34
+   hardcoded `max_segments = Some(60)` with operator-tunable
+   depth.
+
+### Verification
+
+`cargo fmt --all --check` clean. `cargo clippy --workspace
+--all-targets -- -D warnings` clean. `cargo test -p lvqr-cli
+--tests` green (12 tests including rtmp_hls_e2e and
+rtmp_dash_e2e). `cargo test --workspace` reports **416 tests
+passed** (+2 finalize unit tests from session 37 Commit A), 1
+ignored doctest.
+
+### Session 39 entry point
+
+The LL-HLS surface now covers every mandatory RFC 8216bis tag:
+`EXT-X-PROGRAM-DATE-TIME` (session 37), `EXT-X-ENDLIST` (session
+38), `CAN-SKIP-UNTIL` + delta playlists (session 31), sliding
+window eviction (session 34), and per-broadcast PDT anchoring
+(session 37). The DVR window is operator-tunable via
+`--hls-dvr-window`.
+
+Primary scope options for session 39:
+
+* **Wire finalize on broadcaster disconnect**. Session 38 added
+  the `HlsServer::finalize()` method but no caller invokes it
+  yet. When an RTMP publisher disconnects (or a WHIP session
+  ends), the HLS bridge should call finalize so the trailing
+  `#EXT-X-ENDLIST` actually appears. Trace the disconnect path
+  from `lvqr-ingest` -> fragment observer -> HLS bridge to find
+  the right injection point.
+* **Byte-range partials for LL-HLS**. Cuts per-partial HTTP
+  overhead.
+* **Self-hosted macOS runner with Apple HTTP Live Streaming
+  Tools** for `mediastreamvalidator` primary signal.
+* **Criterion benches for `lvqr-cmaf` and `lvqr-ingest`**.
+
+
 
 ## Session 37 close (2026-04-16)
 
