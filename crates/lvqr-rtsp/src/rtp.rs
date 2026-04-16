@@ -226,6 +226,127 @@ impl H264Depacketizer {
     }
 }
 
+/// HEVC NAL unit type constants for RTP depacketization (RFC 7798).
+const HEVC_NAL_TYPE_AP: u8 = 48;
+const HEVC_NAL_TYPE_FU: u8 = 49;
+
+/// HEVC RTP depacketizer (RFC 7798).
+///
+/// Handles single NAL unit packets (types 0-47), Aggregation Packets
+/// (AP, type 48), and Fragmentation Units (FU, type 49). HEVC NAL
+/// headers are 2 bytes; NAL type is `(byte[0] >> 1) & 0x3F`.
+#[derive(Debug, Default)]
+pub struct HevcDepacketizer {
+    fu_buf: Vec<u8>,
+    fu_active: bool,
+}
+
+impl HevcDepacketizer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Process one RTP packet and return any completed NAL units.
+    pub fn depacketize(&mut self, rtp_payload: &[u8], header: &RtpHeader) -> Option<DepackResult> {
+        if rtp_payload.len() < 2 {
+            return None;
+        }
+
+        let nal_type = (rtp_payload[0] >> 1) & 0x3F;
+
+        match nal_type {
+            0..=47 => {
+                // Single NAL unit packet (the entire RTP payload is one NAL).
+                let keyframe = is_hevc_keyframe(nal_type);
+                Some(DepackResult {
+                    nalus: vec![rtp_payload.to_vec()],
+                    keyframe,
+                    timestamp: header.timestamp,
+                    marker: header.marker,
+                })
+            }
+            HEVC_NAL_TYPE_AP => {
+                // Aggregation packet: skip 2-byte PayloadHdr, then
+                // repeated [2-byte NALU size][NALU data].
+                let mut nalus = Vec::new();
+                let mut keyframe = false;
+                let mut offset = 2;
+                while offset + 2 <= rtp_payload.len() {
+                    let nalu_len = u16::from_be_bytes([rtp_payload[offset], rtp_payload[offset + 1]]) as usize;
+                    offset += 2;
+                    if offset + nalu_len > rtp_payload.len() {
+                        break;
+                    }
+                    let nalu = &rtp_payload[offset..offset + nalu_len];
+                    if nalu.len() >= 2 {
+                        let inner_type = (nalu[0] >> 1) & 0x3F;
+                        if is_hevc_keyframe(inner_type) {
+                            keyframe = true;
+                        }
+                    }
+                    nalus.push(nalu.to_vec());
+                    offset += nalu_len;
+                }
+                if nalus.is_empty() {
+                    return None;
+                }
+                Some(DepackResult {
+                    nalus,
+                    keyframe,
+                    timestamp: header.timestamp,
+                    marker: header.marker,
+                })
+            }
+            HEVC_NAL_TYPE_FU => {
+                // Fragmentation unit: 2-byte PayloadHdr + 1-byte FU header + payload.
+                if rtp_payload.len() < 3 {
+                    return None;
+                }
+                let fu_header = rtp_payload[2];
+                let start = fu_header & 0x80 != 0;
+                let end = fu_header & 0x40 != 0;
+                let fu_nal_type = fu_header & 0x3F;
+
+                if start {
+                    // Reconstruct the 2-byte HEVC NAL header from the
+                    // PayloadHdr (bytes 0-1) with the NAL type replaced
+                    // by the FU's original NAL type.
+                    self.fu_buf.clear();
+                    let byte0 = (rtp_payload[0] & 0x81) | (fu_nal_type << 1);
+                    self.fu_buf.push(byte0);
+                    self.fu_buf.push(rtp_payload[1]);
+                    self.fu_buf.extend_from_slice(&rtp_payload[3..]);
+                    self.fu_active = true;
+                } else if self.fu_active {
+                    self.fu_buf.extend_from_slice(&rtp_payload[3..]);
+                } else {
+                    return None;
+                }
+
+                if end {
+                    self.fu_active = false;
+                    let nalu = std::mem::take(&mut self.fu_buf);
+                    let keyframe = nalu.len() >= 2 && is_hevc_keyframe((nalu[0] >> 1) & 0x3F);
+                    Some(DepackResult {
+                        nalus: vec![nalu],
+                        keyframe,
+                        timestamp: header.timestamp,
+                        marker: header.marker,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Returns true for HEVC NAL types that indicate a random access point.
+fn is_hevc_keyframe(nal_type: u8) -> bool {
+    matches!(nal_type, 19..=21) // IDR_W_RADL, IDR_N_LP, CRA_NUT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +488,147 @@ mod tests {
         };
         // FU-A continuation without prior start
         let mid = vec![0x7C, 0x05, 0xCC, 0xDD];
+        assert!(depack.depacketize(&mid, &hdr).is_none());
+    }
+
+    // --- HEVC depacketizer tests ---
+
+    /// Build a 2-byte HEVC NAL header: forbidden(1) | type(6) | layer_id(6) | tid(3).
+    fn hevc_nal_header(nal_type: u8, tid: u8) -> [u8; 2] {
+        [(nal_type << 1), tid]
+    }
+
+    #[test]
+    fn hevc_depack_single_nal() {
+        // IDR_W_RADL (type 19)
+        let mut payload = hevc_nal_header(19, 1).to_vec();
+        payload.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let hdr = RtpHeader {
+            payload_type: 96,
+            sequence: 1,
+            timestamp: 90000,
+            ssrc: 0,
+            marker: true,
+            header_len: 12,
+        };
+        let mut depack = HevcDepacketizer::new();
+        let result = depack.depacketize(&payload, &hdr).unwrap();
+        assert_eq!(result.nalus.len(), 1);
+        assert!(result.keyframe);
+        assert_eq!(result.nalus[0], payload);
+    }
+
+    #[test]
+    fn hevc_depack_single_non_keyframe() {
+        // TRAIL_R (type 1) -- not a keyframe
+        let mut payload = hevc_nal_header(1, 1).to_vec();
+        payload.extend_from_slice(&[0xDD, 0xEE]);
+        let hdr = RtpHeader {
+            payload_type: 96,
+            sequence: 1,
+            timestamp: 90000,
+            ssrc: 0,
+            marker: true,
+            header_len: 12,
+        };
+        let mut depack = HevcDepacketizer::new();
+        let result = depack.depacketize(&payload, &hdr).unwrap();
+        assert!(!result.keyframe);
+    }
+
+    #[test]
+    fn hevc_depack_ap() {
+        // AP with VPS (type 32) + SPS (type 33)
+        let vps = {
+            let mut v = hevc_nal_header(32, 1).to_vec();
+            v.extend_from_slice(&[0x01, 0x02]);
+            v
+        };
+        let sps = {
+            let mut v = hevc_nal_header(33, 1).to_vec();
+            v.extend_from_slice(&[0x03, 0x04]);
+            v
+        };
+        let mut payload = hevc_nal_header(HEVC_NAL_TYPE_AP, 1).to_vec();
+        payload.extend_from_slice(&(vps.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&vps);
+        payload.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&sps);
+
+        let hdr = RtpHeader {
+            payload_type: 96,
+            sequence: 1,
+            timestamp: 90000,
+            ssrc: 0,
+            marker: false,
+            header_len: 12,
+        };
+        let mut depack = HevcDepacketizer::new();
+        let result = depack.depacketize(&payload, &hdr).unwrap();
+        assert_eq!(result.nalus.len(), 2);
+        assert_eq!(result.nalus[0], vps);
+        assert_eq!(result.nalus[1], sps);
+        assert!(!result.keyframe);
+    }
+
+    #[test]
+    fn hevc_depack_fu_reassembly() {
+        let mut depack = HevcDepacketizer::new();
+        let hdr = RtpHeader {
+            payload_type: 96,
+            sequence: 1,
+            timestamp: 90000,
+            ssrc: 0,
+            marker: false,
+            header_len: 12,
+        };
+        let hdr_end = RtpHeader {
+            marker: true,
+            sequence: 3,
+            ..hdr
+        };
+
+        // FU start: PayloadHdr (type=49, tid=1) + FU header (S=1, type=19/IDR_W_RADL) + data.
+        let fu_payload_hdr = hevc_nal_header(HEVC_NAL_TYPE_FU, 1);
+        let mut start_pkt = fu_payload_hdr.to_vec();
+        start_pkt.push(0x80 | 19); // S=1, E=0, type=19
+        start_pkt.extend_from_slice(&[0xAA, 0xBB]);
+        assert!(depack.depacketize(&start_pkt, &hdr).is_none());
+
+        // FU middle
+        let mut mid_pkt = fu_payload_hdr.to_vec();
+        mid_pkt.push(19); // S=0, E=0, type=19
+        mid_pkt.extend_from_slice(&[0xCC, 0xDD]);
+        assert!(depack.depacketize(&mid_pkt, &hdr).is_none());
+
+        // FU end
+        let mut end_pkt = fu_payload_hdr.to_vec();
+        end_pkt.push(0x40 | 19); // S=0, E=1, type=19
+        end_pkt.extend_from_slice(&[0xEE, 0xFF]);
+        let result = depack.depacketize(&end_pkt, &hdr_end).unwrap();
+        assert_eq!(result.nalus.len(), 1);
+        assert!(result.keyframe);
+        // Reassembled: 2-byte HEVC NAL header (type=19) + fragment payloads
+        let reassembled = &result.nalus[0];
+        assert_eq!((reassembled[0] >> 1) & 0x3F, 19);
+        assert_eq!(&reassembled[2..], &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    }
+
+    #[test]
+    fn hevc_depack_fu_mid_without_start_returns_none() {
+        let mut depack = HevcDepacketizer::new();
+        let hdr = RtpHeader {
+            payload_type: 96,
+            sequence: 5,
+            timestamp: 90000,
+            ssrc: 0,
+            marker: false,
+            header_len: 12,
+        };
+        let fu_payload_hdr = hevc_nal_header(HEVC_NAL_TYPE_FU, 1);
+        let mut mid = fu_payload_hdr.to_vec();
+        mid.push(19); // continuation, type=19
+        mid.extend_from_slice(&[0xCC, 0xDD]);
         assert!(depack.depacketize(&mid, &hdr).is_none());
     }
 }

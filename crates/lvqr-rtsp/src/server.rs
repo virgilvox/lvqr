@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
-use lvqr_cmaf::{RawSample, VideoInitParams, build_moof_mdat, write_avc_init_segment};
+use lvqr_cmaf::{
+    HevcInitParams, RawSample, VideoInitParams, build_moof_mdat, write_avc_init_segment, write_hevc_init_segment,
+};
+use lvqr_codec::hevc as hevc_codec;
 use lvqr_core::{EventBus, RelayEvent};
 use lvqr_fragment::{Fragment, FragmentFlags};
 use lvqr_ingest::SharedFragmentObserver;
@@ -14,8 +17,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::proto::{self, Method, Response, parse_transport};
-use crate::rtp::{self, H264Depacketizer, parse_rtp_header};
-use crate::session::{Session, SessionId, SessionMode, SessionState, generate_session_id, parse_sdp_tracks};
+use crate::rtp::{self, H264Depacketizer, HevcDepacketizer, parse_rtp_header};
+use crate::session::{
+    Session, SessionId, SessionMode, SessionState, TrackCodec, generate_session_id, parse_sdp_tracks,
+};
 
 const SUPPORTED_METHODS: &str = "OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, RECORD, TEARDOWN, GET_PARAMETER";
 
@@ -74,9 +79,11 @@ struct ConnectionState {
     sessions: HashMap<SessionId, Session>,
     server_addr: SocketAddr,
     h264_depack: H264Depacketizer,
+    hevc_depack: HevcDepacketizer,
     rtp_packet_count: u64,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
+    vps: Option<Vec<u8>>,
     video_init_emitted: bool,
     video_seq: u64,
     prev_video_dts: Option<u64>,
@@ -96,9 +103,11 @@ async fn handle_connection(
         sessions: HashMap::new(),
         server_addr,
         h264_depack: H264Depacketizer::new(),
+        hevc_depack: HevcDepacketizer::new(),
         rtp_packet_count: 0,
         sps: None,
         pps: None,
+        vps: None,
         video_init_emitted: false,
         video_seq: 0,
         prev_video_dts: None,
@@ -183,11 +192,30 @@ fn process_rtp_frame(
     };
     let rtp_payload = &frame.payload[header.header_len..];
 
-    let Some(result) = conn.h264_depack.depacketize(rtp_payload, &header) else {
+    // Determine codec from the session's SDP tracks. Default to H.264
+    // when no ANNOUNCE was received (e.g. playback SETUP without SDP).
+    let codec = conn
+        .sessions
+        .values()
+        .find(|s| s.state == SessionState::Recording)
+        .and_then(|s| {
+            s.tracks
+                .iter()
+                .find(|t| t.media_type == crate::session::MediaType::Video)
+        })
+        .map(|t| t.codec)
+        .unwrap_or(TrackCodec::H264);
+
+    let result = match codec {
+        TrackCodec::H265 => conn.hevc_depack.depacketize(rtp_payload, &header),
+        _ => conn.h264_depack.depacketize(rtp_payload, &header),
+    };
+    let Some(result) = result else {
         return;
     };
 
     conn.rtp_packet_count += 1;
+    let codec_label = if codec == TrackCodec::H265 { "H.265" } else { "H.264" };
     debug!(
         channel = frame.channel,
         ts = header.timestamp,
@@ -195,7 +223,8 @@ fn process_rtp_frame(
         keyframe = result.keyframe,
         marker = result.marker,
         count = conn.rtp_packet_count,
-        "RTSP RTP depacketized H.264"
+        codec = codec_label,
+        "RTSP RTP depacketized"
     );
 
     let obs = match observer {
@@ -203,7 +232,6 @@ fn process_rtp_frame(
         None => return,
     };
 
-    // Extract the broadcast name from the first active ingest session.
     let broadcast = match conn
         .sessions
         .values()
@@ -214,7 +242,18 @@ fn process_rtp_frame(
         None => return,
     };
 
-    // Extract SPS/PPS from depacketized NALs.
+    match codec {
+        TrackCodec::H265 => process_hevc_nalus(conn, &broadcast, &result, obs),
+        _ => process_h264_nalus(conn, &broadcast, &result, obs),
+    }
+}
+
+fn process_h264_nalus(
+    conn: &mut ConnectionState,
+    broadcast: &str,
+    result: &rtp::DepackResult,
+    obs: &SharedFragmentObserver,
+) {
     for nalu in &result.nalus {
         if nalu.is_empty() {
             continue;
@@ -227,7 +266,6 @@ fn process_rtp_frame(
         }
     }
 
-    // Emit init segment on first keyframe once SPS+PPS are available.
     if !conn.video_init_emitted {
         let (Some(sps), Some(pps)) = (&conn.sps, &conn.pps) else {
             return;
@@ -244,18 +282,79 @@ fn process_rtp_frame(
             warn!(%broadcast, error = %e, "RTSP: failed to write AVC init segment");
             return;
         }
-        let init = buf.freeze();
-        obs.on_init(&broadcast, "0.mp4", 90_000, init);
+        obs.on_init(broadcast, "0.mp4", 90_000, buf.freeze());
         conn.video_init_emitted = true;
-        info!(%broadcast, "RTSP: video init emitted");
+        info!(%broadcast, "RTSP: H.264 video init emitted");
     }
 
-    // Convert depacketized NALs to AVCC (length-prefixed), skipping SPS/PPS.
-    let avcc = nals_to_avcc(&result.nalus);
+    let avcc = nals_to_length_prefixed(&result.nalus, NalFilter::H264);
     if avcc.is_empty() {
         return;
     }
+    emit_video_fragment(conn, broadcast, result, avcc, obs);
+}
 
+fn process_hevc_nalus(
+    conn: &mut ConnectionState,
+    broadcast: &str,
+    result: &rtp::DepackResult,
+    obs: &SharedFragmentObserver,
+) {
+    for nalu in &result.nalus {
+        if nalu.len() < 2 {
+            continue;
+        }
+        let nal_type = (nalu[0] >> 1) & 0x3F;
+        match nal_type {
+            32 => conn.vps = Some(nalu.clone()),
+            33 => conn.sps = Some(nalu.clone()),
+            34 => conn.pps = Some(nalu.clone()),
+            _ => {}
+        }
+    }
+
+    if !conn.video_init_emitted {
+        let (Some(vps), Some(sps), Some(pps)) = (&conn.vps, &conn.sps, &conn.pps) else {
+            return;
+        };
+        let sps_info = match hevc_codec::parse_sps(sps) {
+            Ok(info) => info,
+            Err(e) => {
+                warn!(%broadcast, error = %e, "RTSP: failed to parse HEVC SPS");
+                return;
+            }
+        };
+        let params = HevcInitParams {
+            vps: vps.clone(),
+            sps: sps.clone(),
+            pps: pps.clone(),
+            sps_info,
+            timescale: 90_000,
+        };
+        let mut buf = BytesMut::with_capacity(512);
+        if let Err(e) = write_hevc_init_segment(&mut buf, &params) {
+            warn!(%broadcast, error = %e, "RTSP: failed to write HEVC init segment");
+            return;
+        }
+        obs.on_init(broadcast, "0.mp4", 90_000, buf.freeze());
+        conn.video_init_emitted = true;
+        info!(%broadcast, "RTSP: HEVC video init emitted");
+    }
+
+    let hvcc = nals_to_length_prefixed(&result.nalus, NalFilter::Hevc);
+    if hvcc.is_empty() {
+        return;
+    }
+    emit_video_fragment(conn, broadcast, result, hvcc, obs);
+}
+
+fn emit_video_fragment(
+    conn: &mut ConnectionState,
+    broadcast: &str,
+    result: &rtp::DepackResult,
+    payload: Vec<u8>,
+    obs: &SharedFragmentObserver,
+) {
     let dts = result.timestamp as u64;
     let keyframe = result.keyframe;
     let duration = match conn.prev_video_dts {
@@ -269,7 +368,7 @@ fn process_rtp_frame(
         dts,
         cts_offset: 0,
         duration,
-        payload: Bytes::from(avcc),
+        payload: Bytes::from(payload),
         keyframe,
     };
     conn.video_seq += 1;
@@ -289,20 +388,39 @@ fn process_rtp_frame(
         },
         moof_mdat,
     );
-    obs.on_fragment(&broadcast, "0.mp4", &frag);
+    obs.on_fragment(broadcast, "0.mp4", &frag);
 }
 
-/// Convert a set of depacketized NAL units to AVCC (length-prefixed) format,
-/// stripping SPS (type 7) and PPS (type 8) which belong in the init segment.
-fn nals_to_avcc(nalus: &[Vec<u8>]) -> Vec<u8> {
+#[derive(Clone, Copy)]
+enum NalFilter {
+    H264,
+    Hevc,
+}
+
+/// Convert depacketized NAL units to length-prefixed format, stripping
+/// parameter sets that belong in the init segment.
+fn nals_to_length_prefixed(nalus: &[Vec<u8>], filter: NalFilter) -> Vec<u8> {
     let total: usize = nalus.iter().map(|n| n.len() + 4).sum();
     let mut out = Vec::with_capacity(total);
     for nalu in nalus {
         if nalu.is_empty() {
             continue;
         }
-        let nal_type = nalu[0] & 0x1F;
-        if nal_type == 7 || nal_type == 8 {
+        let skip = match filter {
+            NalFilter::H264 => {
+                let t = nalu[0] & 0x1F;
+                t == 7 || t == 8 // SPS, PPS
+            }
+            NalFilter::Hevc => {
+                if nalu.len() < 2 {
+                    true
+                } else {
+                    let t = (nalu[0] >> 1) & 0x3F;
+                    t == 32 || t == 33 || t == 34 // VPS, SPS, PPS
+                }
+            }
+        };
+        if skip {
             continue;
         }
         let len = nalu.len() as u32;
@@ -519,9 +637,11 @@ mod tests {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             h264_depack: H264Depacketizer::new(),
+            hevc_depack: HevcDepacketizer::new(),
             rtp_packet_count: 0,
             sps: None,
             pps: None,
+            vps: None,
             video_init_emitted: false,
             video_seq: 0,
             prev_video_dts: None,
@@ -546,9 +666,11 @@ mod tests {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             h264_depack: H264Depacketizer::new(),
+            hevc_depack: HevcDepacketizer::new(),
             rtp_packet_count: 0,
             sps: None,
             pps: None,
+            vps: None,
             video_init_emitted: false,
             video_seq: 0,
             prev_video_dts: None,
@@ -606,9 +728,11 @@ mod tests {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             h264_depack: H264Depacketizer::new(),
+            hevc_depack: HevcDepacketizer::new(),
             rtp_packet_count: 0,
             sps: None,
             pps: None,
+            vps: None,
             video_init_emitted: false,
             video_seq: 0,
             prev_video_dts: None,
@@ -666,12 +790,12 @@ mod tests {
     }
 
     #[test]
-    fn nals_to_avcc_strips_sps_pps() {
+    fn nals_to_length_prefixed_strips_sps_pps() {
         let sps = vec![0x67, 0x42, 0x00, 0x1F]; // NAL type 7
         let pps = vec![0x68, 0xCE, 0x38, 0x80]; // NAL type 8
         let idr = vec![0x65, 0xAA, 0xBB]; // NAL type 5 (IDR)
         let nalus = vec![sps, pps, idr.clone()];
-        let avcc = nals_to_avcc(&nalus);
+        let avcc = nals_to_length_prefixed(&nalus, NalFilter::H264);
         // Only the IDR should remain, length-prefixed.
         assert_eq!(avcc.len(), 4 + 3);
         assert_eq!(&avcc[0..4], &3u32.to_be_bytes());
@@ -706,9 +830,11 @@ mod tests {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             h264_depack: H264Depacketizer::new(),
+            hevc_depack: HevcDepacketizer::new(),
             rtp_packet_count: 0,
             sps: None,
             pps: None,
+            vps: None,
             video_init_emitted: false,
             video_seq: 0,
             prev_video_dts: None,
