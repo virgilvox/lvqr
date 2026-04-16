@@ -1,8 +1,119 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 2.1 consumer-side migration COMPLETE; FragmentObserver deleted -- 528 tests, all green
+## Project Status: v0.4.0 -- RTP packetizers landed for PLAY direction; 544 tests, all green
 
-**Last Updated**: 2026-04-16 (session 60 close).
+**Last Updated**: 2026-04-16 (session 61 close).
+
+## Session 61 close (2026-04-16)
+
+### What shipped (1 commit, +563 / -4 lines)
+
+1. **RTP packetizers: H.264 + HEVC + AAC** (`d156827`). Producer
+   side of the RTP wire format. `rtp.rs` already carried the
+   depacketizers the ingest / RECORD path uses since session 44;
+   this commit fills in the inverse for the PLAY direction.
+
+   * `H264Packetizer` per RFC 6184: single-NAL-unit when the NAL
+     fits within `mtu`, FU-A fragmentation (NAL type 28) otherwise.
+     NRI bits carried through the FU indicator; marker bit settable
+     per-call on the last NAL of an access unit.
+   * `HevcPacketizer` per RFC 7798: single NAL when it fits, FU
+     (type 49) otherwise. PayloadHdr preserves the original
+     `layer_id` + `tid` and replaces only the NAL type.
+   * `AacPacketizer` per RFC 3640 AAC-hbr: one AU per packet
+     (13-bit AU-size + 3-bit AU-Index=0). Multi-AU + AU
+     fragmentation deferred until real-world jitter / MTU data
+     demands it.
+
+   Neither H.264 nor HEVC packetizer emits aggregation packets
+   (STAP-A / AP). LVQR carries parameter sets on the fMP4 init
+   segment and strips them from the fragment payload; the eventual
+   PLAY wiring must re-inject SPS/PPS/VPS from the init segment
+   before the first keyframe.
+
+   16 new tests, every packetizer round-trips through its matching
+   depacketizer so the RFC wire format is pinned by equivalence
+   rather than re-encoded prose. Covers single-NAL, FU fragmentation
+   across multiple packets (marker placement + sequence continuity),
+   non-keyframes, MTU validation panics, sequence wrap, multi-NAL
+   access unit marker placement, and explicit on-wire AAC layout.
+
+### Ground truth (session 61 close)
+
+* **Head**: `d156827` on `main`. v0.4.0.
+* **Tests**: 544 passed, 0 failed, 1 ignored. Delta from session
+  60: +16 (the packetizer unit tests).
+* **Code**: +563 / -4. Net +559 lines in `rtp.rs` (all additions
+  past the existing depacketizer section, including the 16 tests).
+* **CI gates locally clean**: fmt, clippy (`-D warnings`),
+  test --workspace all green.
+
+### Scope note: why just the packetizers this session
+
+RTSP playback egress is estimated at 5-8 sessions in the handoff
+ROI table; session 60 identified three discrete pieces of work:
+
+1. **RTP packetizers** (this session).
+2. **Fragment → NAL demux**. Parse `mdat` body out of the fMP4
+   `moof+mdat` fragment payload so the PLAY drain task can feed
+   raw NAL units / AAC access units into the packetizers. AVCC
+   length-prefixed bytes for video; raw AAC for audio.
+3. **PLAY path wiring**. Spawn a per-session drain task that
+   subscribes to the shared registry broadcaster, demuxes `mdat`
+   payloads, packetizes, and writes interleaved RTP frames onto
+   the TCP socket. Re-inject SPS / PPS / VPS from the init segment
+   before the first keyframe. Also needs DESCRIBE's SDP to carry
+   the negotiated codec params.
+
+Piece 1 is bounded and tightly testable in isolation. Pieces 2 and
+3 are interlocked, so bundling them into one commit is cleaner than
+splitting; they land in session 62.
+
+### Load-bearing invariants (all four still pinned)
+
+Unchanged from session 60. The packetizers are pure producer
+functions; they don't touch the broadcaster primitives.
+
+### Protocols supported
+
+Unchanged. 10 protocols: RTMP + WHIP + SRT + RTSP ingest;
+LL-HLS + DASH + WHEP + MoQ + WebSocket egress.
+
+### Known gaps
+
+1. **RTSP PLAY wiring**: packetizers exist now, but no task
+   subscribes to the registry and emits RTP. Session 62.
+2. **Apple mediastreamvalidator in CI**: biggest audit gap.
+3. **Tier 1 infra**: no playwright, no 24h soak, no MediaMTX
+   comparison harness.
+4. **Tiers 3-5**: not started.
+
+### Session 62 entry point
+
+Priority order:
+
+1. **RTSP PLAY path wiring**. Build the fMP4 `mdat` extractor
+   (pure fn, unit-testable: parse box header chain, find the
+   `mdat` box, return its body slice). Wire `handle_play` to
+   spawn a drain task per session that subscribes to the shared
+   registry, extracts NAL / AAC bytes, runs the packetizer,
+   and writes interleaved frames to the TCP socket. Re-inject
+   parameter sets from the init segment before the first RTP
+   packet of each video stream. Update DESCRIBE's SDP to carry
+   real `sprop-parameter-sets` / `config` derived from the
+   broadcaster meta. Add an end-to-end integration test:
+   RTMP publish in, RTSP DESCRIBE + SETUP + PLAY out, verify
+   RTP frames arrive at the client and depack cleanly.
+
+2. **Apple mediastreamvalidator in CI**. GitHub Actions job
+   that runs Apple's validator against `lvqr-hls`-generated
+   playlists and blocks merges on validator-red.
+
+3. **lvqr-cmaf with mp4-atom**. Swap the hand-rolled fMP4
+   writer for mp4-atom once AV1 + timed text becomes load-
+   bearing.
+
+4. **Tier 3 planning**.
 
 ## Session 60 close (2026-04-16)
 
