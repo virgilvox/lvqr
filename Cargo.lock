@@ -1768,6 +1768,7 @@ name = "lvqr-codec"
 version = "0.4.0"
 dependencies = [
  "bytes",
+ "criterion",
  "lvqr-conformance",
  "proptest",
  "thiserror 2.0.18",
@@ -1942,6 +1943,21 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "web-transport-quinn",
+]
+
+[[package]]
+name = "lvqr-rtsp"
+version = "0.4.0"
+dependencies = [
+ "bytes",
+ "lvqr-cmaf",
+ "lvqr-codec",
+ "lvqr-core",
+ "lvqr-fragment",
+ "lvqr-ingest",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
