@@ -278,20 +278,48 @@ cargo build --release
 
 ## Quickstart
 
+### 1. Start the server
+
 ```bash
-# Start the relay
-lvqr serve
+lvqr serve --dash-port 8889
+```
 
-# Open the test app (stream from webcam, watch, monitor)
-cd test-app && python3 -m http.server 9000
-# Open http://localhost:9000 in Chrome
-# Stream tab: Preview -> Go Live (streams webcam via WebCodecs H.264)
-# Watch tab: Connect (plays via MSE)
-# Admin tab: Refresh (shows live stats)
+This starts RTMP ingest on :1935, LL-HLS on :8888, DASH on
+:8889, MoQ on :4443, and admin on :8080. All listeners are
+configurable; see the CLI reference below.
 
-# Or stream from OBS/ffmpeg
-# Server: rtmp://localhost:1935/live  Stream Key: my-stream
-# Watch: ws://localhost:8080/ws/live/my-stream
+### 2. Publish from OBS or ffmpeg
+
+```bash
+# OBS: Settings -> Stream -> Server: rtmp://localhost:1935/live
+#                             Stream Key: demo
+
+# Or use ffmpeg for a test pattern:
+ffmpeg -re -f lavfi -i testsrc=size=640x360:rate=30 \
+  -f lavfi -i sine=frequency=440:sample_rate=44100 \
+  -c:v libx264 -preset ultrafast -tune zerolatency \
+  -c:a aac -b:a 128k \
+  -f flv rtmp://localhost:1935/live/demo
+```
+
+### 3. Play back in a browser
+
+Open any of these in a browser (or use hls.js / dash.js):
+
+- **LL-HLS**: `http://localhost:8888/hls/live/demo/playlist.m3u8`
+- **DASH**: `http://localhost:8889/dash/live/demo/manifest.mpd`
+- **WebSocket fMP4**: `ws://localhost:8080/ws/live/demo`
+
+For hls.js, paste the playlist URL into the
+[hls.js demo page](https://hls-js.netlify.app/demo/). For
+dash.js, use the
+[dash.js reference player](https://reference.dashif.org/dash.js/).
+
+### 4. Monitor
+
+```bash
+curl http://localhost:8080/healthz
+curl http://localhost:8080/api/v1/stats
 ```
 
 ## Architecture
