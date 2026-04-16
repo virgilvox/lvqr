@@ -37,7 +37,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/virgilvox/lvqr"
@@ -112,26 +112,26 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
 # Internal crates
-lvqr-core = { version = "0.3.1", path = "crates/lvqr-core" }
-lvqr-moq = { version = "0.3.1", path = "crates/lvqr-moq" }
-lvqr-fragment = { version = "0.3.1", path = "crates/lvqr-fragment" }
-lvqr-codec = { version = "0.3.1", path = "crates/lvqr-codec" }
-lvqr-cmaf = { version = "0.3.1", path = "crates/lvqr-cmaf" }
-lvqr-hls = { version = "0.3.1", path = "crates/lvqr-hls" }
-lvqr-dash = { version = "0.3.1", path = "crates/lvqr-dash" }
-lvqr-relay = { version = "0.3.1", path = "crates/lvqr-relay" }
-lvqr-mesh = { version = "0.3.1", path = "crates/lvqr-mesh" }
-lvqr-ingest = { version = "0.3.1", path = "crates/lvqr-ingest" }
-lvqr-whep = { version = "0.3.1", path = "crates/lvqr-whep" }
-lvqr-whip = { version = "0.3.1", path = "crates/lvqr-whip" }
-lvqr-archive = { version = "0.3.1", path = "crates/lvqr-archive" }
-lvqr-signal = { version = "0.3.1", path = "crates/lvqr-signal" }
-lvqr-admin = { version = "0.3.1", path = "crates/lvqr-admin" }
-lvqr-auth = { version = "0.3.1", path = "crates/lvqr-auth" }
-lvqr-conformance = { version = "0.3.1", path = "crates/lvqr-conformance" }
-lvqr-record = { version = "0.3.1", path = "crates/lvqr-record" }
-lvqr-test-utils = { version = "0.3.1", path = "crates/lvqr-test-utils" }
-lvqr-cli = { version = "0.3.1", path = "crates/lvqr-cli" }
+lvqr-core = { version = "0.4.0", path = "crates/lvqr-core" }
+lvqr-moq = { version = "0.4.0", path = "crates/lvqr-moq" }
+lvqr-fragment = { version = "0.4.0", path = "crates/lvqr-fragment" }
+lvqr-codec = { version = "0.4.0", path = "crates/lvqr-codec" }
+lvqr-cmaf = { version = "0.4.0", path = "crates/lvqr-cmaf" }
+lvqr-hls = { version = "0.4.0", path = "crates/lvqr-hls" }
+lvqr-dash = { version = "0.4.0", path = "crates/lvqr-dash" }
+lvqr-relay = { version = "0.4.0", path = "crates/lvqr-relay" }
+lvqr-mesh = { version = "0.4.0", path = "crates/lvqr-mesh" }
+lvqr-ingest = { version = "0.4.0", path = "crates/lvqr-ingest" }
+lvqr-whep = { version = "0.4.0", path = "crates/lvqr-whep" }
+lvqr-whip = { version = "0.4.0", path = "crates/lvqr-whip" }
+lvqr-archive = { version = "0.4.0", path = "crates/lvqr-archive" }
+lvqr-signal = { version = "0.4.0", path = "crates/lvqr-signal" }
+lvqr-admin = { version = "0.4.0", path = "crates/lvqr-admin" }
+lvqr-auth = { version = "0.4.0", path = "crates/lvqr-auth" }
+lvqr-conformance = { version = "0.4.0", path = "crates/lvqr-conformance" }
+lvqr-record = { version = "0.4.0", path = "crates/lvqr-record" }
+lvqr-test-utils = { version = "0.4.0", path = "crates/lvqr-test-utils" }
+lvqr-cli = { version = "0.4.0", path = "crates/lvqr-cli" }
 
 [profile.release]
 lto = true
