@@ -1,0 +1,39 @@
+[package]
+name = "lvqr-cmaf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+# Excluded from the main workspace because libfuzzer-sys requires
+# nightly rustc and sanitizer instrumentation that the stable
+# workspace builds cannot produce. Run with:
+#
+#   cargo +nightly fuzz run detect_codec_strings
+#
+# The `detect_codec_strings` target interprets the fuzzer input
+# as a raw init-segment byte buffer and runs both
+# `detect_video_codec_string` and `detect_audio_codec_string`
+# against it. These two functions are publisher-reachable: the
+# DASH and HLS renderers read their output into the `codecs`
+# attribute of the media playlist / MPD, so a crash or a panic
+# inside the parser is a publisher-triggered denial of service.
+# The DASH renderer's session-33 attribute-escape path handles
+# the output side; this target covers the input side.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lvqr-cmaf = { path = ".." }
+
+[[bin]]
+name = "detect_codec_strings"
+path = "fuzz_targets/detect_codec_strings.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true

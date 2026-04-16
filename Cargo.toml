@@ -10,6 +10,7 @@ exclude = [
     "crates/lvqr-whip/fuzz",
     "crates/lvqr-dash/fuzz",
     "crates/lvqr-hls/fuzz",
+    "crates/lvqr-cmaf/fuzz",
 ]
 members = [
     "crates/lvqr-core",
