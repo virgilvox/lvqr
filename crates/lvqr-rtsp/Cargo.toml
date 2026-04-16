@@ -1,0 +1,22 @@
+[package]
+name = "lvqr-rtsp"
+description = "RTSP/1.0 server for LVQR -- session state machine, interleaved TCP transport, RTP depacketization"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["streaming", "rtsp", "rtp", "ingest", "live"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+bytes = { workspace = true }
+lvqr-cmaf = { workspace = true }
+lvqr-codec = { workspace = true }
+lvqr-core = { workspace = true }
+lvqr-fragment = { workspace = true }
+lvqr-ingest = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "sync", "io-util"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
