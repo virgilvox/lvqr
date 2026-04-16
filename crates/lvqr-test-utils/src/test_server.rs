@@ -131,6 +131,7 @@ impl TestServer {
             whep_addr: None,
             whip_addr: None,
             dash_addr: if config.dash_enabled { Some(ephemeral) } else { None },
+            srt_addr: None,
             mesh_enabled: config.mesh_enabled,
             max_peers: config.max_peers.unwrap_or(3),
             auth: config.auth,

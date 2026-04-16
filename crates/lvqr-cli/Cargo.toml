@@ -42,6 +42,7 @@ lvqr-dash = { workspace = true }
 lvqr-whep = { workspace = true }
 lvqr-whip = { workspace = true }
 lvqr-archive = { workspace = true }
+lvqr-srt = { workspace = true }
 
 axum = { workspace = true }
 bytes = { workspace = true }

@@ -1,0 +1,25 @@
+[package]
+name = "lvqr-srt"
+description = "SRT ingest for LVQR -- pure Rust SRT listener with MPEG-TS demux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["streaming", "srt", "mpeg-ts", "ingest", "live"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+bytes = { workspace = true }
+futures-util = "0.3"
+lvqr-cmaf = { workspace = true }
+lvqr-codec = { workspace = true }
+lvqr-core = { workspace = true }
+lvqr-fragment = { workspace = true }
+lvqr-ingest = { workspace = true }
+lvqr-moq = { workspace = true }
+srt-tokio = "0.4"
+tokio = { workspace = true, features = ["net", "rt", "sync"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }

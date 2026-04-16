@@ -92,6 +92,11 @@ pub struct ServeConfig {
     /// numbered segment URIs. RTMP and WHIP publishers both feed
     /// the DASH egress without any per-protocol wiring.
     pub dash_addr: Option<SocketAddr>,
+    /// Optional SRT ingest bind address. When `Some`, `start()`
+    /// spins up an `SrtIngestServer` on this UDP address that
+    /// accepts MPEG-TS streams and fans them through the fragment
+    /// observer chain.
+    pub srt_addr: Option<SocketAddr>,
     /// Enable the peer mesh coordinator and `/signal` endpoint.
     pub mesh_enabled: bool,
     /// Max children per mesh parent when `mesh_enabled`.
@@ -135,6 +140,7 @@ impl ServeConfig {
             whep_addr: None,
             whip_addr: None,
             dash_addr: None,
+            srt_addr: None,
             mesh_enabled: false,
             max_peers: 3,
             auth: None,
@@ -439,6 +445,14 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     } else {
         (None, None)
     };
+
+    // Optional SRT ingest server. Like WHIP, the SRT bridge fans
+    // fragments through the shared FragmentObserver so every egress
+    // picks up SRT publishers automatically.
+    let srt_server = config.srt_addr.map(lvqr_srt::SrtIngestServer::new);
+    let shared_fragment_observer_for_srt = shared_fragment_observer.clone();
+    let srt_events_clone = events.clone();
+    let srt_shutdown_token = shutdown.clone();
 
     let bridge = Arc::new(bridge_builder);
     let rtmp_config = lvqr_ingest::RtmpConfig {
@@ -837,10 +851,21 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             shutdown_on_exit_whip.cancel();
         };
 
-        let _ = tokio::join!(relay_fut, rtmp_fut, admin_fut, hls_fut, dash_fut, whep_fut, whip_fut);
-        // Keep the WHIP bridge Arc alive until every server has
-        // drained. Otherwise a late WHIP sample forwarded from an
-        // in-flight session could race an early drop.
+        let srt_shutdown = bg_shutdown_for_task.clone();
+        let srt_obs = shared_fragment_observer_for_srt;
+        let srt_events = srt_events_clone;
+        let srt_cancel = srt_shutdown_token;
+        let srt_fut = async move {
+            let Some(server) = srt_server else { return };
+            if let Err(e) = server.run(srt_obs, srt_events, srt_cancel).await {
+                tracing::error!(error = %e, "SRT server error");
+            }
+            srt_shutdown.cancel();
+        };
+
+        let _ = tokio::join!(
+            relay_fut, rtmp_fut, admin_fut, hls_fut, dash_fut, whep_fut, whip_fut, srt_fut
+        );
         drop(whip_bridge_keepalive);
         tracing::info!("shutdown complete");
     });

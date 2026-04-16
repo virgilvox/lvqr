@@ -31,6 +31,7 @@ members = [
     "crates/lvqr-auth",
     "crates/lvqr-conformance",
     "crates/lvqr-record",
+    "crates/lvqr-srt",
     "crates/lvqr-wasm",
     "crates/lvqr-cli",
     "crates/lvqr-test-utils",
@@ -130,6 +131,7 @@ lvqr-admin = { version = "0.4.0", path = "crates/lvqr-admin" }
 lvqr-auth = { version = "0.4.0", path = "crates/lvqr-auth" }
 lvqr-conformance = { version = "0.4.0", path = "crates/lvqr-conformance" }
 lvqr-record = { version = "0.4.0", path = "crates/lvqr-record" }
+lvqr-srt = { version = "0.4.0", path = "crates/lvqr-srt" }
 lvqr-test-utils = { version = "0.4.0", path = "crates/lvqr-test-utils" }
 lvqr-cli = { version = "0.4.0", path = "crates/lvqr-cli" }
 
