@@ -14,8 +14,9 @@ categories = ["multimedia"]
 lvqr-moq = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

@@ -33,11 +33,13 @@
 //! those crates land in Tier 2.2 through 2.5. `lvqr-fragment` owns only the
 //! interchange type and the MoQ adapters.
 
+pub mod broadcaster;
 pub mod fragment;
 pub mod moq_sink;
 pub mod moq_stream;
 pub mod stream;
 
+pub use broadcaster::{BroadcasterStream, DEFAULT_BROADCASTER_CAPACITY, FragmentBroadcaster};
 pub use fragment::{Fragment, FragmentFlags, FragmentMeta};
 pub use moq_sink::{MoqSinkError, MoqTrackSink};
 pub use moq_stream::{MoqGroupStream, MoqTrackStream};
