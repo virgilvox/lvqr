@@ -1,8 +1,129 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- SRT + RTSP dual-wired, shared dispatch module, halfway through ingest migration -- 525 tests, all green
+## Project Status: v0.4.0 -- All 4 ingest crates dual-wired to FragmentBroadcaster, ingest migration COMPLETE -- 526 tests, all green
 
-**Last Updated**: 2026-04-16 (session 57 close).
+**Last Updated**: 2026-04-16 (session 58 close).
+
+## Session 58 close (2026-04-16)
+
+### What shipped (2 commits, +220/-33 lines)
+
+1. **WHIP bridge dual-wired** (`0593bf2`). Third ingest crate.
+   WhipMoqBridge gains `FragmentBroadcasterRegistry` field
+   (+ `with_registry` builder + `registry()` getter). Four emit
+   sites migrated: video init (codec_fourcc -> 0.mp4 @ 90 kHz),
+   audio init (Opus -> 1.mp4 @ 48 kHz), video fragment (codec
+   from sample.codec: avc1/hev1), audio fragment (Opus).
+
+   One new unit test:
+   `dual_wire_broadcaster_matches_observer_for_video_and_audio`
+   drives an H.264 keyframe + Opus frame through the bridge,
+   asserts both observer spy and registry broadcasters receive
+   init segments and fragments, then pushes a second round and
+   proves a subscriber taken on the pre-existing broadcaster
+   receives the video delta and the second Opus fragment.
+
+2. **RTMP bridge dual-wired** (`0d31c34`). Fourth and final ingest
+   crate. Same pattern, adapted for the closure-based callback
+   architecture: `registry_video` and `registry_audio` clones
+   alongside the existing `observer_video` / `observer_audio`
+   clones in `create_rtmp_server`. Four emit sites inside the
+   on_video + on_audio closures migrated. Codec strings RFC 6381
+   (avc1 video, mp4a.40.2 AAC audio). Audio timescale captured
+   from the AAC sequence header.
+
+### Ground truth (session 58 close)
+
+* **Head**: `0d31c34` on `main`. v0.4.0.
+* **Tests**: 526 passed, 0 failed, 1 ignored. Delta from session
+  57: +1 (WHIP dual-wire integration test).
+* **Code**: +220 lines, -33 lines. Four files touched
+  (lvqr-whip/src/bridge.rs, lvqr-ingest/src/bridge.rs and the
+  test-only additions).
+* **CI gates locally clean**: fmt, clippy (`-D warnings`),
+  test --workspace all green.
+
+### Tier 2.1 ingest migration: COMPLETE
+
+| Crate                      | Status      | Session |
+|----------------------------|-------------|---------|
+| lvqr-rtsp                  | dual-wired  | 56      |
+| lvqr-srt                   | dual-wired  | 57      |
+| lvqr-whip                  | dual-wired  | 58      |
+| lvqr-ingest (RTMP bridge)  | dual-wired  | 58      |
+
+Every ingest protocol now publishes fragments through both the
+legacy `FragmentObserver` callback AND the shared
+`FragmentBroadcasterRegistry`. Next phase is the consumer-side
+switchover: migrate `lvqr-record`/archive indexer and the HLS
+bridge to `registry.subscribe(broadcast, track)`, then delete
+the `FragmentObserver` trait + `publish_init` / `publish_fragment`
+observer branches, leaving a single broadcaster-only dispatch
+path.
+
+### Remaining to Tier 4 entry
+
+| Slice                                | Remaining sessions | Calendar |
+|--------------------------------------|--------------------|----------|
+| Consumer-side migration + observer deletion | 4-8         | 0.25-0.5 wk |
+| lvqr-cmaf standalone with mp4-atom   | 5-8                | 0.5 wk   |
+| Apple mediastreamvalidator in CI     | 3-5                | 0.25-0.5 wk |
+| Tier 1 gaps (playwright, soak, comparison) | 15-20        | 1-2 wk (24h soak bound) |
+| Tier 3 full                          | 40-55              | 3-5 wk   |
+| Tier 4 full                          | 50-70              | 4-7 wk   |
+
+**Realistic M4 ETA: 3-5 calendar weeks of sustained sessions.**
+Ingest migration moved faster than the session-57 estimate (2
+crates this session vs 1 forecast), validating the "mechanical at
+this point" observation once the primitive surface landed.
+
+### Protocols supported
+
+Unchanged. 10 protocols: RTMP + WHIP + SRT + RTSP ingest;
+LL-HLS + DASH + WHEP + MoQ + WebSocket egress.
+
+### Known gaps
+
+1. **Consumer-side migration**: archive indexer + HLS bridge
+   still read the observer callback. Switch each to
+   `registry.subscribe(...)`, then delete the observer path from
+   every dispatch site. Session 59 priority.
+2. **RTSP playback egress**: PLAY direction works at protocol
+   level but does not packetize outbound RTP.
+3. **lvqr-cmaf with mp4-atom**: existing hand-rolled fMP4 writer
+   works for H.264+HEVC+AAC+Opus; `mp4-atom` for AV1 / captions
+   in Tier 2 polish.
+4. **Apple mediastreamvalidator in CI**: biggest audit gap.
+5. **Tier 1 infra**: no playwright, no 24h soak, no MediaMTX
+   comparison harness.
+6. **Tiers 3-5**: not started.
+
+### Session 59 entry point
+
+Priority order:
+
+1. **Consumer-side switchover**. The archive indexer
+   (`lvqr-archive` and/or `lvqr-record` -- the actual indexer
+   lives in cli wiring around `IndexingFragmentObserver`) is the
+   simplest starting point: replace its `FragmentObserver` impl
+   with a background task that calls `registry.subscribe(broadcast,
+   track)` for each broadcast it cares about, reads
+   `next_fragment()`, and writes to disk + redb index.
+
+2. **HLS bridge switchover**. Same pattern for
+   `lvqr-cli::HlsFragmentBridge` (or wherever the HLS observer
+   hook lives today). The HLS path has more state (playlist
+   builder, chunk coalescer) but the incoming surface is
+   identical.
+
+3. **Delete FragmentObserver**. Once every consumer is
+   broadcaster-native, the observer branch inside
+   `publish_init` / `publish_fragment` becomes dead. Remove the
+   observer side, drop the trait from `lvqr-ingest::observer`,
+   drop the `with_observer` builders from every ingest crate.
+
+4. **RTSP playback egress** (independent, slots in after the
+   cleanup work).
 
 ## Session 57 close (2026-04-16)
 
