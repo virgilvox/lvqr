@@ -4,12 +4,14 @@ pub mod rtmp;
 #[cfg(feature = "rtmp")]
 pub mod bridge;
 
+pub mod dispatch;
 pub mod observer;
 
 pub mod error;
 pub mod protocol;
 pub mod remux;
 
+pub use dispatch::{publish_fragment, publish_init};
 pub use error::IngestError;
 pub use observer::{
     FragmentObserver, MediaCodec, NoopFragmentObserver, NoopRawSampleObserver, RawSampleObserver,

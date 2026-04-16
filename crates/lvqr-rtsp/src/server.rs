@@ -10,8 +10,8 @@ use lvqr_cmaf::{
 };
 use lvqr_codec::hevc as hevc_codec;
 use lvqr_core::{EventBus, RelayEvent};
-use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta};
-use lvqr_ingest::SharedFragmentObserver;
+use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags};
+use lvqr_ingest::{SharedFragmentObserver, publish_fragment, publish_init};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -234,48 +234,6 @@ async fn handle_connection(
     }
 
     Ok(())
-}
-
-/// Publish an init segment through both the legacy `FragmentObserver` hook
-/// (preserved for existing HLS / archive consumers) and the new
-/// [`FragmentBroadcasterRegistry`] path (for session-54+ broadcaster-native
-/// consumers).
-///
-/// This is the session-56 migration seam: ingest stays dual-wired until
-/// every downstream consumer has been moved to subscribe via the registry,
-/// at which point the observer side can be removed without touching the
-/// emit sites.
-fn publish_init(
-    obs: Option<&SharedFragmentObserver>,
-    registry: &FragmentBroadcasterRegistry,
-    broadcast: &str,
-    track: &str,
-    codec: &str,
-    timescale: u32,
-    init: Bytes,
-) {
-    if let Some(obs) = obs {
-        obs.on_init(broadcast, track, timescale, init.clone());
-    }
-    let bc = registry.get_or_create(broadcast, track, FragmentMeta::new(codec, timescale));
-    bc.set_init_segment(init);
-}
-
-/// Publish a fragment through both dispatch paths. See [`publish_init`].
-fn publish_fragment(
-    obs: Option<&SharedFragmentObserver>,
-    registry: &FragmentBroadcasterRegistry,
-    broadcast: &str,
-    track: &str,
-    codec: &str,
-    timescale: u32,
-    frag: Fragment,
-) {
-    if let Some(obs) = obs {
-        obs.on_fragment(broadcast, track, &frag);
-    }
-    let bc = registry.get_or_create(broadcast, track, FragmentMeta::new(codec, timescale));
-    bc.emit(frag);
 }
 
 fn process_rtp_frame(
