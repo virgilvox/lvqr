@@ -138,6 +138,11 @@ pub struct Manifest {
     /// after that. Apple `mediastreamvalidator` flags low-latency
     /// playlists that omit this tag.
     pub preload_hint_uri: Option<String>,
+    /// When `true` the renderer appends `#EXT-X-ENDLIST` at the
+    /// bottom of the playlist. This signals to HLS clients that no
+    /// more segments will appear and the playlist is final. Set by
+    /// [`PlaylistBuilder::finalize`] when the broadcast ends.
+    pub ended: bool,
 }
 
 impl Manifest {
@@ -241,7 +246,12 @@ impl Manifest {
         // playlist top-down encounters it immediately after the
         // trailing EXT-X-PART. `None` before the first chunk has
         // been pushed.
-        if let Some(uri) = &self.preload_hint_uri {
+        // Preload hint and endlist are mutually exclusive: a
+        // finalized playlist has no "next partial" to hint at, and
+        // an active playlist must not carry EXT-X-ENDLIST.
+        if self.ended {
+            let _ = writeln!(out, "#EXT-X-ENDLIST");
+        } else if let Some(uri) = &self.preload_hint_uri {
             let _ = writeln!(out, "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"{uri}\"");
         }
         out
@@ -413,6 +423,7 @@ impl PlaylistBuilder {
             segments: Vec::new(),
             preliminary_parts: Vec::new(),
             preload_hint_uri: None,
+            ended: false,
         };
         let next_sequence = config.starting_sequence;
         Self {
@@ -554,6 +565,22 @@ impl PlaylistBuilder {
     /// inside each evicted segment, in eviction order.
     pub fn drain_evicted_uris(&mut self) -> Vec<String> {
         std::mem::take(&mut self.evicted_uris)
+    }
+
+    /// Mark the playlist as ended. Closes the pending segment (so
+    /// the last few partials become a proper closed segment with
+    /// coalesced bytes), clears the preload hint (there is no
+    /// "next partial" after end-of-stream), and sets `ended = true`
+    /// so the renderer appends `#EXT-X-ENDLIST`. Once finalized the
+    /// builder still accepts `manifest()` reads but will reject
+    /// further `push` calls with `HlsError::NonMonotonic` (the
+    /// DTS would need to go backwards to fit into an already-closed
+    /// stream). Calling `finalize()` twice is harmless.
+    pub fn finalize(&mut self) {
+        self.close_pending_segment();
+        self.manifest.preliminary_parts.clear();
+        self.manifest.preload_hint_uri = None;
+        self.manifest.ended = true;
     }
 }
 
@@ -793,6 +820,7 @@ mod tests {
             segments,
             preliminary_parts: Vec::new(),
             preload_hint_uri: None,
+            ended: false,
         };
         assert_eq!(m.delta_skip_count(), 0);
         // Rendered server-control line must omit CAN-SKIP-UNTIL in
@@ -959,6 +987,47 @@ mod tests {
     #[test]
     fn format_program_date_time_unix_epoch() {
         assert_eq!(super::format_program_date_time(0), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn finalize_emits_endlist_and_suppresses_preload_hint() {
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        b.push(&mk_chunk(0, 180_000, CmafChunkKind::Segment)).unwrap();
+        b.push(&mk_chunk(180_000, 180_000, CmafChunkKind::Partial)).unwrap();
+        // Before finalize: preload hint present, no ENDLIST.
+        let pre = b.manifest().render();
+        assert!(
+            pre.contains("#EXT-X-PRELOAD-HINT:"),
+            "preload hint must exist before finalize"
+        );
+        assert!(
+            !pre.contains("#EXT-X-ENDLIST"),
+            "ENDLIST must not appear before finalize"
+        );
+
+        b.finalize();
+        let post = b.manifest().render();
+        assert!(post.contains("#EXT-X-ENDLIST"), "ENDLIST must appear after finalize");
+        assert!(
+            !post.contains("#EXT-X-PRELOAD-HINT:"),
+            "preload hint must disappear after finalize; got:\n{post}"
+        );
+        // The pending partials should have been closed into a segment.
+        assert!(
+            !b.manifest().segments.is_empty(),
+            "finalize must close the pending segment"
+        );
+    }
+
+    #[test]
+    fn finalize_twice_is_harmless() {
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        b.push(&mk_chunk(0, 180_000, CmafChunkKind::Segment)).unwrap();
+        b.finalize();
+        let text1 = b.manifest().render();
+        b.finalize();
+        let text2 = b.manifest().render();
+        assert_eq!(text1, text2, "second finalize must not change the output");
     }
 
     #[test]

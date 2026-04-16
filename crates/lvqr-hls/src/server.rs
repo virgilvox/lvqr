@@ -294,6 +294,26 @@ impl HlsServer {
         self.state.notify.notify_waiters();
     }
 
+    /// Mark this broadcast as ended. Closes the pending segment,
+    /// coalesces its bytes, purges any evicted URIs from the cache,
+    /// clears the preload hint, and appends `#EXT-X-ENDLIST` to
+    /// the rendered playlist so HLS clients stop polling. After
+    /// this call the playlist is final: no more segments will
+    /// appear, and the retained window becomes a VOD surface that
+    /// clients can scrub freely. Calling `finalize()` twice is
+    /// harmless.
+    pub async fn finalize(&self) {
+        let mut builder = self.state.builder.write().await;
+        let prev_last_seq = builder.manifest().segments.last().map(|s| s.sequence);
+        builder.finalize();
+        let coalesce_work = collect_coalesce_work(builder.manifest(), prev_last_seq);
+        let evicted = builder.drain_evicted_uris();
+        drop(builder);
+        coalesce_closed_segments(&self.state, coalesce_work).await;
+        purge_evicted_uris(&self.state, evicted).await;
+        self.state.notify.notify_waiters();
+    }
+
     /// Build an `axum::Router` that serves the LL-HLS surface.
     ///
     /// The returned router is state-less in the axum type sense:
