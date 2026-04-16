@@ -4,6 +4,85 @@
 
 **Last Updated**: 2026-04-16 (session 59 close).
 
+## Sessions 53-59 cycle summary (2026-04-09 → 2026-04-16)
+
+Seven sessions on top of session 52's green baseline. 20 commits,
++3565 / -220 net lines. Tests 495 → 529 (+34). Every cycle
+commit authored solely as Moheeb Zara, no Co-Authored-By
+trailers, no emojis.
+
+### What landed
+
+* **Tier 2.1 primitive surface complete** (sessions 53-55).
+  `MoqGroupStream` + `MoqTrackStream` (MoQ -> Fragment inverse,
+  session 53). `FragmentBroadcaster` single-producer fan-out
+  with lagged-subscriber skip-and-continue semantics (session
+  54). `FragmentBroadcasterRegistry` keyed lookup with
+  double-checked insertion (session 55). All proptested.
+
+* **Ingest migration complete, all 4 crates** (sessions 56-58).
+  RTSP (56), SRT (57), WHIP (58), RTMP bridge (58). Every
+  ingest protocol publishes through both the legacy
+  `FragmentObserver` and the shared `FragmentBroadcasterRegistry`
+  via `lvqr_ingest::{publish_init, publish_fragment}` helpers.
+  Each migration pins a dual-wire regression test proving the
+  broadcaster side and observer side see identical fragments.
+
+* **First consumer switchover** (session 59). Archive indexer
+  migrated off `FragmentObserver` onto an `on_entry_created`
+  callback + per-broadcaster drain task. The shared registry
+  is now threaded through every ingest crate in lvqr-cli.
+  `IndexingFragmentObserver` deleted.
+
+### Load-bearing invariants captured in source comments
+
+Future sessions that refactor any of these MUST preserve them;
+regressions will either hang tests or leak resources:
+
+1. **FragmentBroadcaster sender lives outside the Arc<Shared>
+   subscribers hold** (session 54). Otherwise a subscriber keeps
+   the sender alive and `recv()` never returns `Closed` after
+   every producer clone drops.
+
+2. **Registry get_or_create returns pointer-equal Arcs under
+   contention** (session 55 proptest). Racing ingest peers on
+   one broadcast_id collapse onto one broadcaster.
+
+3. **Registry callbacks run outside every registry lock**
+   (session 59). Lets callbacks freely subscribe / get / inspect
+   without deadlocking.
+
+4. **Broadcaster drain tasks do NOT hold a strong
+   Arc<FragmentBroadcaster>** (session 59). Keepalive Arc would
+   prevent the recv loop from ever seeing `Closed`; in the
+   archive indexer case it held redb's exclusive lock forever.
+   Subscribe is sufficient; the `BroadcasterStream` already owns
+   only the Receiver.
+
+### Velocity note
+
+Project started ~1 calendar week ago. Observed pace is ~10-15
+sessions per calendar week at ~2-3 commits + ~300-500 lines each.
+Ingest migration accelerated over time: session 56 did 1 crate,
+session 57 did 1, session 58 did 2. Once the primitive surface
+landed, per-crate wiring became mechanical. Revised realistic M4
+ETA: 3-5 calendar weeks of sustained sessions, bounded by
+genuinely-calendar items (24h soak, multi-node cluster
+iteration, WASM / AI research items).
+
+### Cycle gates
+
+On every commit (not just each session close):
+
+* `cargo fmt --all --check` clean
+* `cargo clippy --workspace --all-targets -- -D warnings` clean
+* `cargo test -p <crate> --lib` for focused work; `--tests` for
+  integration-touching work; `cargo test --workspace` before the
+  handoff commit
+
+`git log -1 --format='%an <%ae>'` verified `Moheeb Zara
+<hackbuildvideo@gmail.com>` after every commit.
+
 ## Session 59 close (2026-04-16)
 
 ### What shipped (2 commits, +336/-127 lines)
