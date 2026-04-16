@@ -98,33 +98,70 @@ impl TsDemuxer {
     /// handles sync-byte recovery and cross-call buffering
     /// internally; callers may pass any chunk size.
     pub fn feed(&mut self, data: &[u8]) -> Vec<PesPacket> {
-        self.remainder.extend_from_slice(data);
         let mut out = Vec::new();
 
-        loop {
-            // Find the next sync byte.
-            let sync_pos = match self.remainder.iter().position(|&b| b == SYNC_BYTE) {
+        // Fast path: drain any buffered remainder first by
+        // completing one packet from remainder + new data, then
+        // process aligned packets directly from the input slice
+        // without copying into the remainder buffer. This avoids
+        // O(N^2) drain cost for large inputs.
+        let input = if self.remainder.is_empty() {
+            data
+        } else {
+            self.remainder.extend_from_slice(data);
+            // Process everything from remainder, then clear it and
+            // return an empty slice so the main loop is skipped.
+            self.process_buf(&mut out);
+            &[]
+        };
+
+        // Process aligned packets directly from the input slice.
+        let mut pos = 0;
+        while pos < input.len() {
+            let sync_off = match input[pos..].iter().position(|&b| b == SYNC_BYTE) {
                 Some(p) => p,
-                None => {
-                    self.remainder.clear();
-                    break;
-                }
+                None => break,
             };
-            if sync_pos > 0 {
-                self.remainder.drain(..sync_pos);
-            }
-            if self.remainder.len() < TS_PACKET_SIZE {
+            pos += sync_off;
+            if pos + TS_PACKET_SIZE > input.len() {
                 break;
             }
+            let pkt: &[u8; TS_PACKET_SIZE] = input[pos..pos + TS_PACKET_SIZE].try_into().unwrap();
+            self.process_packet(pkt, &mut out);
+            pos += TS_PACKET_SIZE;
+        }
 
-            let pkt: [u8; TS_PACKET_SIZE] = self.remainder[..TS_PACKET_SIZE]
-                .try_into()
-                .expect("slice is exactly 188 bytes");
-            self.remainder.drain(..TS_PACKET_SIZE);
-            self.process_packet(&pkt, &mut out);
+        // Stash any trailing bytes for the next call.
+        if pos < input.len() {
+            self.remainder.extend_from_slice(&input[pos..]);
         }
 
         out
+    }
+
+    /// Drain the remainder buffer, processing complete packets.
+    fn process_buf(&mut self, out: &mut Vec<PesPacket>) {
+        let mut pos = 0;
+        while pos < self.remainder.len() {
+            let sync_off = match self.remainder[pos..].iter().position(|&b| b == SYNC_BYTE) {
+                Some(p) => p,
+                None => {
+                    self.remainder.clear();
+                    return;
+                }
+            };
+            pos += sync_off;
+            if pos + TS_PACKET_SIZE > self.remainder.len() {
+                break;
+            }
+            let pkt: [u8; TS_PACKET_SIZE] = self.remainder[pos..pos + TS_PACKET_SIZE].try_into().unwrap();
+            self.process_packet(&pkt, out);
+            pos += TS_PACKET_SIZE;
+        }
+        // Keep only the unprocessed tail.
+        if pos > 0 {
+            self.remainder.drain(..pos);
+        }
     }
 
     fn process_packet(&mut self, pkt: &[u8; TS_PACKET_SIZE], out: &mut Vec<PesPacket>) {
