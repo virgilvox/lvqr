@@ -41,18 +41,25 @@ core product story.
 - CORS on all HTTP surfaces
 - 420 tests, all CI green
 
-### What blocks a public M1 release
+### M1 shipped (sessions 45-47)
 
-1. Browser playback verification (OBS -> lvqr -> hls.js).
-2. Version bump 0.3.1 -> 0.4.0 + CHANGELOG.
-3. mediastreamvalidator (nice-to-have, not blocking).
+Both M1 blockers closed: CHANGELOG + v0.4.0 version bump
+(`d17e992`), quickstart rewritten for HLS/DASH (`c7d499e`).
 
-### Session 45 entry point
+Post-M1 SRT foundation: MPEG-TS demuxer (`e8a3cba`) with
+proptest + fuzz (`388b76f`). `TsDemuxer::feed` parses PAT/PMT,
+reassembles PES with PTS/DTS, handles sync recovery. 4 unit
+tests + 5 proptest invariants (deterministic chunked reassembly,
+never-panic, valid timestamps). Fuzz target in lvqr-codec/fuzz.
 
-* Browser playback verification + quickstart update.
-* Version bump to 0.4.0.
-* SRT ingest (post-M1, first new protocol).
-* Self-hosted macOS runner for mediastreamvalidator.
+**v0.4.0** on `origin/main`. 429 tests, 0 failures.
+
+### Session 48 entry point
+
+* **Create crates/lvqr-srt** with `srt-tokio` dependency and
+  `SrtListener::accept` -> `TsDemuxer` -> Fragment bridge.
+* **Self-hosted macOS runner** for mediastreamvalidator.
+* **Criterion bench for TS demuxer** throughput.
 
 ## Sessions 34-43 audit (2026-04-16)
 
