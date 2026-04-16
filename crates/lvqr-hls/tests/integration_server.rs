@@ -182,6 +182,85 @@ async fn closed_segment_uri_serves_coalesced_bytes() {
 }
 
 #[tokio::test]
+async fn sliding_window_purges_cache_and_advances_media_sequence() {
+    // Session 34 eviction path: a HlsServer with max_segments=3
+    // must drop the oldest segments from both the rendered playlist
+    // and the byte cache as new segments close. Push six full
+    // segments, then assert: the playlist head has advanced,
+    // GET /seg-0.m4s is a 404 (cache purged), GET /seg-3.m4s still
+    // resolves (within the retained window), and the rendered
+    // playlist carries the advanced EXT-X-MEDIA-SEQUENCE.
+    let server = HlsServer::new(PlaylistBuilderConfig {
+        timescale: 90_000,
+        starting_sequence: 0,
+        map_uri: "init.mp4".into(),
+        uri_prefix: String::new(),
+        target_duration_secs: 2,
+        part_target_secs: 0.2,
+        max_segments: Some(3),
+    });
+    server.push_init(Bytes::from_static(b"\x00init")).await;
+
+    // Six segments, each made of 10 parts (first is Segment-kind,
+    // remaining 9 are Partial-kind). Every segment mirrors the
+    // shape `closed_segment_uri_serves_coalesced_bytes` uses so
+    // the coalesce path still runs under eviction.
+    let part_dur = 18_000u64;
+    let mut dts = 0u64;
+    for seg in 0..6 {
+        for i in 0..10 {
+            let kind = if i == 0 {
+                CmafChunkKind::Segment
+            } else {
+                CmafChunkKind::Partial
+            };
+            let body = Bytes::from(format!("s{seg}-p{i}").into_bytes());
+            server
+                .push_chunk_bytes(&chunk(dts, part_dur, kind), body)
+                .await
+                .unwrap();
+            dts += part_dur;
+        }
+    }
+    // One more Segment-kind push closes segment 5 into the
+    // manifest. The builder now holds six segments; eviction
+    // drops segments 0..=2 and the retained window is 3..=5.
+    server
+        .push_chunk_bytes(
+            &chunk(dts, part_dur, CmafChunkKind::Segment),
+            Bytes::from_static(b"s6-p0"),
+        )
+        .await
+        .unwrap();
+
+    // Playlist reflects the advance and no longer references seg-0.
+    let (status, _ct, body) = get_body(&server, "/playlist.m3u8").await;
+    assert_eq!(status, StatusCode::OK);
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        text.contains("#EXT-X-MEDIA-SEQUENCE:3"),
+        "expected EXT-X-MEDIA-SEQUENCE:3 after eviction; got:\n{text}"
+    );
+    assert!(!text.contains("seg-0.m4s"), "evicted seg-0 must not leak:\n{text}");
+    assert!(text.contains("seg-3.m4s"), "retained seg-3 must be listed:\n{text}");
+    assert!(text.contains("seg-5.m4s"), "retained seg-5 must be listed:\n{text}");
+
+    // Cache-side: evicted closed segment returns 404, retained
+    // closed segment returns non-empty coalesced bytes. The
+    // retained segment's part URIs must also still resolve.
+    let (status, _ct, _body) = get_body(&server, "/seg-0.m4s").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "evicted seg-0 bytes must be purged from cache"
+    );
+    let (status, ct, body) = get_body(&server, "/seg-3.m4s").await;
+    assert_eq!(status, StatusCode::OK, "retained seg-3 must resolve");
+    assert_eq!(ct, "video/iso.segment");
+    assert!(!body.is_empty(), "retained seg-3 body must be non-empty");
+}
+
+#[tokio::test]
 async fn init_returns_404_before_push() {
     let server = HlsServer::new(PlaylistBuilderConfig::default());
     let (status, _ct, _body) = get_body(&server, "/init.mp4").await;

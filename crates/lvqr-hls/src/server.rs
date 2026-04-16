@@ -251,7 +251,7 @@ impl HlsServer {
     /// its ffmpeg client-side compliance pass.
     pub async fn push_chunk_bytes(&self, chunk: &CmafChunk, body: Bytes) -> Result<(), HlsError> {
         let mut builder = self.state.builder.write().await;
-        let prev_seg_len = builder.manifest().segments.len();
+        let prev_last_seq = builder.manifest().segments.last().map(|s| s.sequence);
         builder.push(chunk)?;
         // The URI for the chunk just pushed is the last entry in
         // preliminary_parts (because `push` always appends the new
@@ -263,12 +263,14 @@ impl HlsServer {
             .last()
             .map(|p| p.uri.clone())
             .unwrap_or_default();
-        let coalesce_work = collect_coalesce_work(builder.manifest(), prev_seg_len);
+        let coalesce_work = collect_coalesce_work(builder.manifest(), prev_last_seq);
+        let evicted = builder.drain_evicted_uris();
         drop(builder);
         if !uri.is_empty() {
             self.state.cache.write().await.insert(uri, body);
         }
         coalesce_closed_segments(&self.state, coalesce_work).await;
+        purge_evicted_uris(&self.state, evicted).await;
         self.state.notify.notify_waiters();
         Ok(())
     }
@@ -282,11 +284,13 @@ impl HlsServer {
     /// the end-of-stream segment the force-close flushes.
     pub async fn close_pending_segment(&self) {
         let mut builder = self.state.builder.write().await;
-        let prev_seg_len = builder.manifest().segments.len();
+        let prev_last_seq = builder.manifest().segments.last().map(|s| s.sequence);
         builder.close_pending_segment();
-        let coalesce_work = collect_coalesce_work(builder.manifest(), prev_seg_len);
+        let coalesce_work = collect_coalesce_work(builder.manifest(), prev_last_seq);
+        let evicted = builder.drain_evicted_uris();
         drop(builder);
         coalesce_closed_segments(&self.state, coalesce_work).await;
+        purge_evicted_uris(&self.state, evicted).await;
         self.state.notify.notify_waiters();
     }
 
@@ -308,19 +312,30 @@ impl HlsServer {
 }
 
 /// Snapshot of the `(closed_segment_uri, constituent_part_uris)`
-/// pairs for every segment in the manifest starting at `prev_seg_len`.
-/// Called after a `builder.push` / `close_pending_segment` call
-/// with `prev_seg_len` captured before the mutation, so anything
-/// at or beyond that index is by construction a segment that just
-/// closed. The cloned `String` vectors let the caller release the
-/// builder lock before taking the cache write lock, which avoids
-/// holding both at once.
-fn collect_coalesce_work(manifest: &crate::manifest::Manifest, prev_seg_len: usize) -> Vec<(String, Vec<String>)> {
-    if manifest.segments.len() <= prev_seg_len {
-        return Vec::new();
-    }
-    manifest.segments[prev_seg_len..]
+/// pairs for every segment in the manifest whose sequence number is
+/// strictly greater than `prev_last_seq`. Called after a
+/// `builder.push` / `close_pending_segment` call with the prior
+/// tail sequence captured before the mutation, so any segment with
+/// a greater sequence is by construction a segment that just
+/// closed.
+///
+/// Sequence-based rather than index-based because the sliding
+/// window added in session 34 may evict entries from the front of
+/// `manifest.segments` inside the same mutation, which would break
+/// a positional walk. The cloned `String` vectors let the caller
+/// release the builder lock before taking the cache write lock,
+/// which avoids holding both at once.
+fn collect_coalesce_work(
+    manifest: &crate::manifest::Manifest,
+    prev_last_seq: Option<u64>,
+) -> Vec<(String, Vec<String>)> {
+    manifest
+        .segments
         .iter()
+        .filter(|seg| match prev_last_seq {
+            Some(prev) => seg.sequence > prev,
+            None => true,
+        })
         .map(|seg| (seg.uri.clone(), seg.parts.iter().map(|p| p.uri.clone()).collect()))
         .collect()
 }
@@ -355,6 +370,22 @@ async fn coalesce_closed_segments(state: &Arc<HlsState>, work: Vec<(String, Vec<
             }
         }
         cache.insert(seg_uri, buf.freeze());
+    }
+}
+
+/// Remove every URI the sliding-window eviction dropped from the
+/// rendered playlist. Called after every builder mutation so the
+/// byte cache stays in lock-step with the manifest: a client that
+/// polls the new playlist never sees a URI, and a client that
+/// still holds a stale playlist hits the normal 404 path for
+/// URIs that are no longer part of the live window.
+async fn purge_evicted_uris(state: &Arc<HlsState>, evicted: Vec<String>) {
+    if evicted.is_empty() {
+        return;
+    }
+    let mut cache = state.cache.write().await;
+    for uri in evicted {
+        cache.remove(&uri);
     }
 }
 
