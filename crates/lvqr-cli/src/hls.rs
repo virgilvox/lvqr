@@ -50,14 +50,24 @@ pub(crate) struct HlsFragmentBridge {
     /// Per-broadcast audio policy state machines. Same structure as
     /// `video_states` but keyed on the audio track id.
     audio_states: Mutex<HashMap<String, CmafPolicyState>>,
+    /// Target segment duration in milliseconds. Matches the HLS
+    /// `EXT-X-TARGETDURATION` declaration. Used to build a
+    /// `CmafPolicy` at the track's native timescale when a new
+    /// broadcast publishes its init segment.
+    segment_duration_ms: u32,
+    /// Target partial (chunk) duration in milliseconds. Matches
+    /// the HLS `EXT-X-PART-INF:PART-TARGET` declaration.
+    part_duration_ms: u32,
 }
 
 impl HlsFragmentBridge {
-    pub fn new(multi: MultiHlsServer) -> Self {
+    pub fn new(multi: MultiHlsServer, segment_duration_ms: u32, part_duration_ms: u32) -> Self {
         Self {
             multi,
             video_states: Mutex::new(HashMap::new()),
             audio_states: Mutex::new(HashMap::new()),
+            segment_duration_ms,
+            part_duration_ms,
         }
     }
 
@@ -114,7 +124,7 @@ impl FragmentObserver for HlsFragmentBridge {
         // 1024 / 44100). Video still lands on the 90 kHz constant
         // because the bridge's video init writer is hardcoded to
         // that timescale, but the code path is uniform.
-        let policy = CmafPolicy::for_timescale(timescale);
+        let policy = CmafPolicy::with_durations(timescale, self.segment_duration_ms, self.part_duration_ms);
         match track {
             VIDEO_TRACK => {
                 Self::reset(&self.video_states, policy, broadcast);
@@ -136,14 +146,24 @@ impl FragmentObserver for HlsFragmentBridge {
         // lands first, so this is a defensive branch not a hot path.
         let (server, kind) = match track {
             VIDEO_TRACK => {
-                let kind = Self::classify(&self.video_states, CmafPolicy::VIDEO_90KHZ_DEFAULT, broadcast, fragment);
+                let kind = Self::classify(
+                    &self.video_states,
+                    CmafPolicy::with_durations(90_000, self.segment_duration_ms, self.part_duration_ms),
+                    broadcast,
+                    fragment,
+                );
                 let Some(server) = self.multi.video(broadcast) else {
                     return;
                 };
                 (server, kind)
             }
             AUDIO_TRACK => {
-                let kind = Self::classify(&self.audio_states, CmafPolicy::AUDIO_48KHZ_DEFAULT, broadcast, fragment);
+                let kind = Self::classify(
+                    &self.audio_states,
+                    CmafPolicy::with_durations(48_000, self.segment_duration_ms, self.part_duration_ms),
+                    broadcast,
+                    fragment,
+                );
                 let Some(server) = self.multi.audio(broadcast) else {
                     return;
                 };

@@ -418,7 +418,12 @@ impl PlaylistBuilder {
             timescale: config.timescale,
             target_duration_secs: config.target_duration_secs,
             part_target_secs: config.part_target_secs,
-            server_control: ServerControl::default(),
+            server_control: ServerControl {
+                can_block_reload: true,
+                part_hold_back: Duration::from_secs_f32(config.part_target_secs * 3.0),
+                hold_back: Duration::from_secs(config.target_duration_secs as u64 * 3),
+                can_skip_until: Some(Duration::from_secs(config.target_duration_secs as u64 * 6)),
+            },
             map_uri: config.map_uri.clone(),
             segments: Vec::new(),
             preliminary_parts: Vec::new(),

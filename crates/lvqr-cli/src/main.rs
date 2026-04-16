@@ -44,6 +44,21 @@ struct ServeArgs {
     #[arg(long, default_value = "120", env = "LVQR_HLS_DVR_WINDOW")]
     hls_dvr_window: u32,
 
+    /// LL-HLS target segment duration in seconds. Affects both the
+    /// rendered EXT-X-TARGETDURATION and the CMAF segmenter's
+    /// segment-close policy. Lower values reduce startup latency;
+    /// higher values improve delivery efficiency.
+    #[arg(long, default_value = "2", env = "LVQR_HLS_TARGET_DURATION")]
+    hls_target_duration: u32,
+
+    /// LL-HLS target partial (chunk) duration in milliseconds.
+    /// Affects both the rendered EXT-X-PART-INF:PART-TARGET and
+    /// the CMAF segmenter's partial-close policy. Lower values
+    /// reduce glass-to-glass latency; higher values reduce HTTP
+    /// request overhead per second of video.
+    #[arg(long, default_value = "200", env = "LVQR_HLS_PART_TARGET")]
+    hls_part_target: u32,
+
     /// WHEP HTTP listen port. Set to 0 to disable WHEP egress. When
     /// non-zero, `lvqr serve` binds a dedicated axum server on this
     /// port exposing `POST/PATCH/DELETE /whep/{broadcast}` for
@@ -212,6 +227,8 @@ async fn serve_from_args(args: ServeArgs) -> Result<()> {
         admin_addr: ([0, 0, 0, 0], args.admin_port).into(),
         hls_addr,
         hls_dvr_window_secs: args.hls_dvr_window,
+        hls_target_duration_secs: args.hls_target_duration,
+        hls_part_target_ms: args.hls_part_target,
         whep_addr,
         whip_addr,
         dash_addr,

@@ -63,6 +63,18 @@ impl CmafPolicy {
             segment_duration: ts * 2, // 2 s
         }
     }
+
+    /// Build a policy for an arbitrary timescale with explicit
+    /// durations. `segment_duration_ms` and `part_duration_ms` are
+    /// in milliseconds; the constructor converts them to the
+    /// track's native timescale ticks.
+    pub const fn with_durations(timescale: u32, segment_duration_ms: u32, part_duration_ms: u32) -> Self {
+        let ts = timescale as u64;
+        Self {
+            partial_duration: ts * part_duration_ms as u64 / 1000,
+            segment_duration: ts * segment_duration_ms as u64 / 1000,
+        }
+    }
 }
 
 /// Result of a policy step.

@@ -126,6 +126,8 @@ impl TestServer {
             admin_addr: ephemeral,
             hls_addr: if config.hls_disabled { None } else { Some(ephemeral) },
             hls_dvr_window_secs: 120,
+            hls_target_duration_secs: 2,
+            hls_part_target_ms: 200,
             whep_addr: None,
             whip_addr: None,
             dash_addr: if config.dash_enabled { Some(ephemeral) } else { None },

@@ -61,6 +61,14 @@ pub struct ServeConfig {
     /// target_duration_secs` at server construction. 0 means
     /// unbounded (no eviction). Default: 120 (60 segments at 2 s).
     pub hls_dvr_window_secs: u32,
+    /// LL-HLS target segment duration in seconds. Controls both the
+    /// `EXT-X-TARGETDURATION` declaration and the CMAF segmenter's
+    /// segment-close policy. Default: 2.
+    pub hls_target_duration_secs: u32,
+    /// LL-HLS target partial (chunk) duration in milliseconds.
+    /// Controls both `EXT-X-PART-INF:PART-TARGET` and the CMAF
+    /// segmenter's partial-close policy. Default: 200.
+    pub hls_part_target_ms: u32,
     /// Optional WHEP (WebRTC HTTP Egress Protocol) HTTP bind address.
     /// When `Some`, `start()` constructs a `Str0mAnswerer` and a
     /// `WhepServer`, attaches the server as a `RawSampleObserver` on
@@ -122,6 +130,8 @@ impl ServeConfig {
             admin_addr: (loopback, 0).into(),
             hls_addr: Some((loopback, 0).into()),
             hls_dvr_window_secs: 120,
+            hls_target_duration_secs: 2,
+            hls_part_target_ms: 200,
             whep_addr: None,
             whip_addr: None,
             dash_addr: None,
@@ -316,7 +326,8 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // broadcast gets its own per-broadcast `HlsServer` on first
     // publish; the axum router demultiplexes requests under
     // `/hls/{broadcast}/...`.
-    let target_dur = PlaylistBuilderConfig::default().target_duration_secs;
+    let target_dur = config.hls_target_duration_secs;
+    let part_target_secs = config.hls_part_target_ms as f32 / 1000.0;
     let max_segments = if config.hls_dvr_window_secs == 0 || target_dur == 0 {
         None
     } else {
@@ -324,6 +335,8 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     };
     let hls_server = config.hls_addr.map(|_| {
         MultiHlsServer::new(PlaylistBuilderConfig {
+            target_duration_secs: target_dur,
+            part_target_secs,
             max_segments,
             ..PlaylistBuilderConfig::default()
         })
@@ -362,7 +375,11 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
 
     let mut fragment_observers: Vec<SharedFragmentObserver> = Vec::new();
     if let Some(hls) = hls_server.clone() {
-        fragment_observers.push(Arc::new(HlsFragmentBridge::new(hls)));
+        fragment_observers.push(Arc::new(HlsFragmentBridge::new(
+            hls,
+            config.hls_target_duration_secs * 1000,
+            config.hls_part_target_ms,
+        )));
     }
     if let Some(dash) = dash_server.clone() {
         fragment_observers.push(Arc::new(DashFragmentBridge::new(dash)));
