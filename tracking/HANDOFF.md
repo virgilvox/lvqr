@@ -1,8 +1,130 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- All 4 ingest crates dual-wired to FragmentBroadcaster, ingest migration COMPLETE -- 526 tests, all green
+## Project Status: v0.4.0 -- Archive consumer broadcaster-native, first consumer-side switchover -- 529 tests, all green
 
-**Last Updated**: 2026-04-16 (session 58 close).
+**Last Updated**: 2026-04-16 (session 59 close).
+
+## Session 59 close (2026-04-16)
+
+### What shipped (2 commits, +336/-127 lines)
+
+1. **Registry entry-created callback hook** (`7f90ff8`). Adds
+   `FragmentBroadcasterRegistry::on_entry_created(callback)` that
+   fires exactly once per fresh (broadcast, track) insertion. The
+   callback runs with every registry lock released so it may
+   freely subscribe / inspect the registry without deadlocking
+   (a dedicated test pins this property). Racing callers that
+   collapse onto an existing entry do NOT fire the callback.
+   3 new tests: fires-exactly-once, multiple-callbacks-all-fire,
+   callback-may-subscribe-without-deadlock.
+
+2. **Archive indexer switched to broadcaster-native**
+   (`3bf386a`). First consumer-side switchover of the Tier 2.1
+   migration. The archive / DVR indexer is no longer a
+   FragmentObserver; it is a registry on_entry_created callback
+   that spawns one tokio drain task per (broadcast, track) and
+   streams `next_fragment()` into the same on-disk layout + redb
+   index the observer path used.
+
+   Wiring: `lvqr-cli::start` now constructs one shared
+   `FragmentBroadcasterRegistry` and threads it through every
+   ingest crate via `with_registry`. RtmpMoqBridge, WhipMoqBridge,
+   SrtIngestServer, RtspServer all publish to this one registry
+   so a single consumer per (broadcast, track) sees fragments
+   regardless of which ingest protocol produced them.
+
+   `IndexingFragmentObserver` is deleted. HLS + DASH stay on the
+   observer path for now; their switchovers follow.
+
+   Critical non-regression documented in the drain() source: the
+   task does NOT hold a strong `Arc<FragmentBroadcaster>`. A
+   first draft stashed one "for keepalive" and the recv loop
+   never saw `Closed` after every ingest clone dropped; redb
+   held its exclusive lock forever and the rtmp_archive_e2e
+   test panicked on a follow-up open. Removing the Arc keepalive
+   is the fix and the comment on the drain function calls the
+   trap out so future refactors do not regress.
+
+### Ground truth (session 59 close)
+
+* **Head**: `3bf386a` on `main`. v0.4.0.
+* **Tests**: 529 passed, 0 failed, 1 ignored. Delta from session
+  58: +3 (3 new registry callback tests; archive E2E runs
+  against the new dispatch path without regression).
+* **Code**: +336 lines / -127 lines. Net +209 lines (new
+  BroadcasterArchiveIndexer + callback API, minus deleted
+  IndexingFragmentObserver).
+* **CI gates locally clean**: fmt, clippy (`-D warnings`),
+  test --workspace all green.
+
+### Consumer-side migration status
+
+| Consumer                      | Status             | Session |
+|-------------------------------|--------------------|---------|
+| Archive indexer               | broadcaster-native | 59      |
+| LL-HLS bridge                 | observer-only      | -       |
+| DASH bridge                   | observer-only      | -       |
+
+One down, two to go. After both HLS + DASH migrate, the observer
+side of `publish_init` / `publish_fragment` becomes dead code and
+the `FragmentObserver` trait can be deleted from every ingest
+crate (and from `lvqr-ingest::observer`).
+
+### Remaining to Tier 4 entry
+
+| Slice                                | Remaining sessions | Calendar |
+|--------------------------------------|--------------------|----------|
+| HLS + DASH switchover + observer deletion | 4-6            | 0.25-0.5 wk |
+| lvqr-cmaf standalone with mp4-atom   | 5-8                | 0.5 wk   |
+| Apple mediastreamvalidator in CI     | 3-5                | 0.25-0.5 wk |
+| Tier 1 gaps (playwright, soak, comparison) | 15-20        | 1-2 wk (24h soak bound) |
+| Tier 3 full                          | 40-55              | 3-5 wk   |
+| Tier 4 full                          | 50-70              | 4-7 wk   |
+
+**Realistic M4 ETA: 3-5 calendar weeks of sustained sessions.**
+Unchanged floor: 24h soak + multi-node cluster iteration +
+WASM/AI research components.
+
+### Protocols supported
+
+Unchanged. 10 protocols: RTMP + WHIP + SRT + RTSP ingest;
+LL-HLS + DASH + WHEP + MoQ + WebSocket egress.
+
+### Known gaps
+
+1. **HLS + DASH consumer switchover**: same pattern as archive.
+   Both live in lvqr-cli today (HlsFragmentBridge in hls.rs,
+   DashFragmentBridge re-exported from lvqr-dash). Switch each
+   to register an on_entry_created callback against the shared
+   registry, then delete the observer impls.
+2. **FragmentObserver deletion**: once every consumer is
+   broadcaster-native, the trait + its transitive API
+   (publish_*'s observer branch, with_observer builders on
+   every ingest crate) is dead. Remove.
+3. **RTSP playback egress**: PLAY direction works at protocol
+   level but does not packetize outbound RTP.
+4. **Apple mediastreamvalidator in CI**: biggest audit gap.
+5. **Tier 1 infra**: no playwright, no 24h soak, no MediaMTX
+   comparison harness.
+6. **Tiers 3-5**: not started.
+
+### Session 60 entry point
+
+Priority order:
+
+1. **HLS bridge switchover**. HlsFragmentBridge in
+   `lvqr-cli/src/hls.rs` is a FragmentObserver today. Replace
+   with a broadcaster-native version that registers an
+   on_entry_created callback; per-broadcaster drain task pushes
+   into the HLS chunk coalescer. Delete the observer impl.
+2. **DASH bridge switchover**. DashFragmentBridge in lvqr-dash.
+   Same pattern.
+3. **Delete FragmentObserver**. Remove the observer branches of
+   publish_init / publish_fragment; remove with_observer
+   builders from every ingest crate; drop the trait from
+   lvqr-ingest::observer.
+4. **RTSP playback egress** (independent, slots in after
+   cleanup).
 
 ## Session 58 close (2026-04-16)
 
