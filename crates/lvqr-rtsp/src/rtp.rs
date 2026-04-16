@@ -1,0 +1,372 @@
+//! RTP interleaved frame parsing and H.264 depacketization.
+//!
+//! RTSP interleaved TCP transport (RFC 2326 Section 10.12) wraps
+//! RTP/RTCP packets in a 4-byte header: `$` (0x24), channel (u8),
+//! length (u16 big-endian), then payload. Even channels carry RTP;
+//! odd channels carry RTCP.
+//!
+//! H.264 RTP depacketization follows RFC 6184: single NAL unit
+//! packets (type 1-23), FU-A fragmentation (type 28), and STAP-A
+//! aggregation (type 24).
+
+/// Parsed interleaved frame from the TCP stream.
+#[derive(Debug)]
+pub struct InterleavedFrame {
+    pub channel: u8,
+    pub payload: Vec<u8>,
+}
+
+/// Try to parse one interleaved frame from the buffer.
+/// Returns `Some((frame, consumed_bytes))` if complete,
+/// `None` if more data is needed.
+pub fn parse_interleaved_frame(buf: &[u8]) -> Option<(InterleavedFrame, usize)> {
+    if buf.len() < 4 {
+        return None;
+    }
+    if buf[0] != 0x24 {
+        return None;
+    }
+    let channel = buf[1];
+    let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let total = 4 + length;
+    if buf.len() < total {
+        return None;
+    }
+    Some((
+        InterleavedFrame {
+            channel,
+            payload: buf[4..total].to_vec(),
+        },
+        total,
+    ))
+}
+
+/// Minimal RTP header fields extracted from an RTP packet.
+#[derive(Debug)]
+pub struct RtpHeader {
+    pub payload_type: u8,
+    pub sequence: u16,
+    pub timestamp: u32,
+    pub ssrc: u32,
+    pub marker: bool,
+    pub header_len: usize,
+}
+
+/// Parse the fixed RTP header (12 bytes minimum) plus CSRC and
+/// extension headers to find the payload offset.
+pub fn parse_rtp_header(data: &[u8]) -> Option<RtpHeader> {
+    if data.len() < 12 {
+        return None;
+    }
+    let version = (data[0] >> 6) & 0x03;
+    if version != 2 {
+        return None;
+    }
+    let padding = (data[0] >> 5) & 0x01 != 0;
+    let extension = (data[0] >> 4) & 0x01 != 0;
+    let csrc_count = (data[0] & 0x0F) as usize;
+    let marker = (data[1] >> 7) & 0x01 != 0;
+    let payload_type = data[1] & 0x7F;
+    let sequence = u16::from_be_bytes([data[2], data[3]]);
+    let timestamp = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    let ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+
+    let mut offset = 12 + csrc_count * 4;
+    if offset > data.len() {
+        return None;
+    }
+
+    if extension {
+        if offset + 4 > data.len() {
+            return None;
+        }
+        // Extension header: 2 bytes profile + 2 bytes length (in 32-bit words)
+        let ext_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+        offset += 4 + ext_len * 4;
+        if offset > data.len() {
+            return None;
+        }
+    }
+
+    let payload_end = if padding && !data.is_empty() {
+        let pad_len = data[data.len() - 1] as usize;
+        data.len().saturating_sub(pad_len)
+    } else {
+        data.len()
+    };
+
+    if offset > payload_end {
+        return None;
+    }
+
+    Some(RtpHeader {
+        payload_type,
+        sequence,
+        timestamp,
+        ssrc,
+        marker,
+        header_len: offset,
+    })
+}
+
+/// H.264 NAL unit type constants for RTP depacketization.
+const NAL_TYPE_STAP_A: u8 = 24;
+const NAL_TYPE_FU_A: u8 = 28;
+
+/// H.264 RTP depacketization result: one or more NAL units
+/// extracted from an RTP packet.
+#[derive(Debug)]
+pub struct DepackResult {
+    pub nalus: Vec<Vec<u8>>,
+    pub keyframe: bool,
+    pub timestamp: u32,
+    pub marker: bool,
+}
+
+/// State for reassembling FU-A fragmented NAL units.
+#[derive(Debug, Default)]
+pub struct H264Depacketizer {
+    fu_buf: Vec<u8>,
+    fu_active: bool,
+}
+
+impl H264Depacketizer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Process one RTP packet and return any completed NAL units.
+    pub fn depacketize(&mut self, rtp_payload: &[u8], header: &RtpHeader) -> Option<DepackResult> {
+        if rtp_payload.is_empty() {
+            return None;
+        }
+
+        let nal_type = rtp_payload[0] & 0x1F;
+        let nri = rtp_payload[0] & 0x60;
+
+        match nal_type {
+            1..=23 => {
+                // Single NAL unit packet.
+                let keyframe = nal_type == 5;
+                Some(DepackResult {
+                    nalus: vec![rtp_payload.to_vec()],
+                    keyframe,
+                    timestamp: header.timestamp,
+                    marker: header.marker,
+                })
+            }
+            NAL_TYPE_STAP_A => {
+                // Aggregation packet: multiple NALs with 2-byte length prefix each.
+                let mut nalus = Vec::new();
+                let mut keyframe = false;
+                let mut offset = 1; // skip STAP-A header byte
+                while offset + 2 <= rtp_payload.len() {
+                    let nalu_len = u16::from_be_bytes([rtp_payload[offset], rtp_payload[offset + 1]]) as usize;
+                    offset += 2;
+                    if offset + nalu_len > rtp_payload.len() {
+                        break;
+                    }
+                    let nalu = &rtp_payload[offset..offset + nalu_len];
+                    if !nalu.is_empty() && (nalu[0] & 0x1F) == 5 {
+                        keyframe = true;
+                    }
+                    nalus.push(nalu.to_vec());
+                    offset += nalu_len;
+                }
+                if nalus.is_empty() {
+                    return None;
+                }
+                Some(DepackResult {
+                    nalus,
+                    keyframe,
+                    timestamp: header.timestamp,
+                    marker: header.marker,
+                })
+            }
+            NAL_TYPE_FU_A => {
+                // Fragmentation unit: FU indicator (1 byte) + FU header (1 byte) + payload.
+                if rtp_payload.len() < 2 {
+                    return None;
+                }
+                let fu_header = rtp_payload[1];
+                let start = fu_header & 0x80 != 0;
+                let end = fu_header & 0x40 != 0;
+                let fu_nal_type = fu_header & 0x1F;
+
+                if start {
+                    // First fragment: reconstruct NAL header byte.
+                    self.fu_buf.clear();
+                    self.fu_buf.push(nri | fu_nal_type);
+                    self.fu_buf.extend_from_slice(&rtp_payload[2..]);
+                    self.fu_active = true;
+                } else if self.fu_active {
+                    // Continuation or end fragment.
+                    self.fu_buf.extend_from_slice(&rtp_payload[2..]);
+                } else {
+                    // Out-of-order fragment without a start.
+                    return None;
+                }
+
+                if end {
+                    self.fu_active = false;
+                    let nalu = std::mem::take(&mut self.fu_buf);
+                    let keyframe = !nalu.is_empty() && (nalu[0] & 0x1F) == 5;
+                    Some(DepackResult {
+                        nalus: vec![nalu],
+                        keyframe,
+                        timestamp: header.timestamp,
+                        marker: header.marker,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_interleaved_frame_basic() {
+        let mut data = vec![0x24, 0x00, 0x00, 0x04]; // $ channel=0 length=4
+        data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let (frame, consumed) = parse_interleaved_frame(&data).unwrap();
+        assert_eq!(frame.channel, 0);
+        assert_eq!(frame.payload, &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(consumed, 8);
+    }
+
+    #[test]
+    fn parse_interleaved_frame_incomplete() {
+        let data = vec![0x24, 0x00, 0x00, 0x10, 0x01, 0x02];
+        assert!(parse_interleaved_frame(&data).is_none());
+    }
+
+    #[test]
+    fn parse_interleaved_frame_not_dollar() {
+        let data = b"PLAY rtsp://host RTSP/1.0\r\n";
+        assert!(parse_interleaved_frame(data).is_none());
+    }
+
+    fn make_rtp_packet(pt: u8, seq: u16, ts: u32, marker: bool, payload: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 12 + payload.len()];
+        pkt[0] = 0x80; // version=2
+        pkt[1] = pt | if marker { 0x80 } else { 0x00 };
+        pkt[2..4].copy_from_slice(&seq.to_be_bytes());
+        pkt[4..8].copy_from_slice(&ts.to_be_bytes());
+        pkt[8..12].copy_from_slice(&0x12345678u32.to_be_bytes());
+        pkt[12..].copy_from_slice(payload);
+        pkt
+    }
+
+    #[test]
+    fn parse_rtp_header_basic() {
+        let pkt = make_rtp_packet(96, 1234, 90000, true, &[0x65, 0xAA]);
+        let hdr = parse_rtp_header(&pkt).unwrap();
+        assert_eq!(hdr.payload_type, 96);
+        assert_eq!(hdr.sequence, 1234);
+        assert_eq!(hdr.timestamp, 90000);
+        assert!(hdr.marker);
+        assert_eq!(hdr.header_len, 12);
+    }
+
+    #[test]
+    fn depack_single_nal() {
+        // IDR slice (nal_type=5)
+        let payload = vec![0x65, 0xAA, 0xBB, 0xCC];
+        let hdr = RtpHeader {
+            payload_type: 96,
+            sequence: 1,
+            timestamp: 90000,
+            ssrc: 0,
+            marker: true,
+            header_len: 12,
+        };
+        let mut depack = H264Depacketizer::new();
+        let result = depack.depacketize(&payload, &hdr).unwrap();
+        assert_eq!(result.nalus.len(), 1);
+        assert!(result.keyframe);
+        assert_eq!(result.nalus[0], payload);
+    }
+
+    #[test]
+    fn depack_stap_a() {
+        // STAP-A with two NALs: SPS (type 7) and PPS (type 8)
+        let sps = vec![0x67, 0x42, 0x00, 0x1F];
+        let pps = vec![0x68, 0xCE, 0x38, 0x80];
+        let mut payload = vec![NAL_TYPE_STAP_A]; // STAP-A header
+        payload.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&sps);
+        payload.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&pps);
+
+        let hdr = RtpHeader {
+            payload_type: 96,
+            sequence: 1,
+            timestamp: 90000,
+            ssrc: 0,
+            marker: false,
+            header_len: 12,
+        };
+        let mut depack = H264Depacketizer::new();
+        let result = depack.depacketize(&payload, &hdr).unwrap();
+        assert_eq!(result.nalus.len(), 2);
+        assert_eq!(result.nalus[0], sps);
+        assert_eq!(result.nalus[1], pps);
+        assert!(!result.keyframe);
+    }
+
+    #[test]
+    fn depack_fu_a_reassembly() {
+        let mut depack = H264Depacketizer::new();
+        let hdr = RtpHeader {
+            payload_type: 96,
+            sequence: 1,
+            timestamp: 90000,
+            ssrc: 0,
+            marker: false,
+            header_len: 12,
+        };
+        let hdr_end = RtpHeader {
+            marker: true,
+            sequence: 3,
+            ..hdr
+        };
+
+        // FU-A start: FU indicator (NRI=0x60, type=28) + FU header (S=1, type=5/IDR)
+        let start = vec![0x7C, 0x85, 0xAA, 0xBB];
+        assert!(depack.depacketize(&start, &hdr).is_none());
+
+        // FU-A middle
+        let mid = vec![0x7C, 0x05, 0xCC, 0xDD];
+        assert!(depack.depacketize(&mid, &hdr).is_none());
+
+        // FU-A end
+        let end = vec![0x7C, 0x45, 0xEE, 0xFF];
+        let result = depack.depacketize(&end, &hdr_end).unwrap();
+        assert_eq!(result.nalus.len(), 1);
+        assert!(result.keyframe);
+        // Reassembled: NRI(0x60) | type(5) = 0x65, then all fragment payloads
+        assert_eq!(result.nalus[0], vec![0x65, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    }
+
+    #[test]
+    fn depack_fu_a_mid_without_start_returns_none() {
+        let mut depack = H264Depacketizer::new();
+        let hdr = RtpHeader {
+            payload_type: 96,
+            sequence: 5,
+            timestamp: 90000,
+            ssrc: 0,
+            marker: false,
+            header_len: 12,
+        };
+        // FU-A continuation without prior start
+        let mid = vec![0x7C, 0x05, 0xCC, 0xDD];
+        assert!(depack.depacketize(&mid, &hdr).is_none());
+    }
+}

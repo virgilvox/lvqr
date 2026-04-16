@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::proto::{self, Method, Response, parse_transport};
+use crate::rtp::{self, H264Depacketizer, parse_rtp_header};
 use crate::session::{Session, SessionId, SessionMode, SessionState, generate_session_id, parse_sdp_tracks};
 
 const SUPPORTED_METHODS: &str = "OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, RECORD, TEARDOWN, GET_PARAMETER";
@@ -69,6 +70,8 @@ impl RtspServer {
 struct ConnectionState {
     sessions: HashMap<SessionId, Session>,
     server_addr: SocketAddr,
+    h264_depack: H264Depacketizer,
+    rtp_packet_count: u64,
 }
 
 async fn handle_connection(
@@ -84,6 +87,8 @@ async fn handle_connection(
     let mut conn = ConnectionState {
         sessions: HashMap::new(),
         server_addr,
+        h264_depack: H264Depacketizer::new(),
+        rtp_packet_count: 0,
     };
 
     loop {
@@ -98,22 +103,38 @@ async fn handle_connection(
                 }
                 read_buf.extend_from_slice(&buf[..n]);
 
-                // Process all complete requests in the buffer.
+                // Process all complete messages in the buffer.
+                // Interleaved frames start with '$' (0x24); RTSP
+                // requests start with an ASCII method name.
                 loop {
-                    match proto::parse_request(&read_buf) {
-                        Ok((req, consumed)) => {
-                            debug!(%remote, method = %req.method, uri = %req.uri, "RTSP request");
-                            let resp = handle_request(&mut conn, &req);
-                            socket.write_all(&resp.serialize()).await?;
-                            read_buf.drain(..consumed);
+                    if read_buf.is_empty() {
+                        break;
+                    }
+                    if read_buf[0] == 0x24 {
+                        // Interleaved RTP/RTCP frame.
+                        match rtp::parse_interleaved_frame(&read_buf) {
+                            Some((frame, consumed)) => {
+                                process_rtp_frame(&mut conn, &frame);
+                                read_buf.drain(..consumed);
+                            }
+                            None => break, // incomplete
                         }
-                        Err(proto::ParseError::Incomplete) => break,
-                        Err(e) => {
-                            warn!(%remote, error = %e, "RTSP parse error");
-                            let resp = Response::bad_request().with_cseq(0);
-                            socket.write_all(&resp.serialize()).await?;
-                            read_buf.clear();
-                            break;
+                    } else {
+                        match proto::parse_request(&read_buf) {
+                            Ok((req, consumed)) => {
+                                debug!(%remote, method = %req.method, uri = %req.uri, "RTSP request");
+                                let resp = handle_request(&mut conn, &req);
+                                socket.write_all(&resp.serialize()).await?;
+                                read_buf.drain(..consumed);
+                            }
+                            Err(proto::ParseError::Incomplete) => break,
+                            Err(e) => {
+                                warn!(%remote, error = %e, "RTSP parse error");
+                                let resp = Response::bad_request().with_cseq(0);
+                                socket.write_all(&resp.serialize()).await?;
+                                read_buf.clear();
+                                break;
+                            }
                         }
                     }
                 }
@@ -132,6 +153,33 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+fn process_rtp_frame(conn: &mut ConnectionState, frame: &rtp::InterleavedFrame) {
+    // Odd channels are RTCP -- skip for now.
+    if frame.channel % 2 != 0 {
+        return;
+    }
+
+    let Some(header) = parse_rtp_header(&frame.payload) else {
+        return;
+    };
+    let rtp_payload = &frame.payload[header.header_len..];
+
+    if let Some(result) = conn.h264_depack.depacketize(rtp_payload, &header) {
+        conn.rtp_packet_count += 1;
+        debug!(
+            channel = frame.channel,
+            ts = header.timestamp,
+            nalus = result.nalus.len(),
+            keyframe = result.keyframe,
+            marker = result.marker,
+            count = conn.rtp_packet_count,
+            "RTSP RTP depacketized H.264"
+        );
+        // TODO: wire to fragment observer -- build Annex B from NALs,
+        // extract SPS/PPS, emit init segment + moof/mdat fragments.
+    }
 }
 
 fn handle_request(conn: &mut ConnectionState, req: &proto::Request) -> Response {
@@ -340,6 +388,8 @@ mod tests {
         let conn = ConnectionState {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
+            h264_depack: H264Depacketizer::new(),
+            rtp_packet_count: 0,
         };
         let req = proto::Request {
             method: Method::Describe,
@@ -360,6 +410,8 @@ mod tests {
         let mut conn = ConnectionState {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
+            h264_depack: H264Depacketizer::new(),
+            rtp_packet_count: 0,
         };
 
         // SETUP creates a session.
@@ -413,6 +465,8 @@ mod tests {
         let mut conn = ConnectionState {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
+            h264_depack: H264Depacketizer::new(),
+            rtp_packet_count: 0,
         };
 
         // ANNOUNCE with SDP body.
