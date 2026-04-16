@@ -188,6 +188,18 @@ async fn run_session_loop(
     broadcast: String,
     sink: Arc<dyn IngestSampleSink>,
 ) {
+    run_session_loop_inner(&mut rtc, &socket, local_addr, &mut shutdown, &broadcast, &sink).await;
+    sink.on_disconnect(&broadcast);
+}
+
+async fn run_session_loop_inner(
+    rtc: &mut Rtc,
+    socket: &UdpSocket,
+    local_addr: SocketAddr,
+    shutdown: &mut oneshot::Receiver<()>,
+    broadcast: &str,
+    sink: &Arc<dyn IngestSampleSink>,
+) {
     let mut ctx = IngestCtx::default();
     let mut buf = vec![0u8; 2048];
     loop {
@@ -200,8 +212,7 @@ async fn run_session_loop(
                     }
                 }
                 Ok(Output::Event(event)) => {
-                    if handle_event(event, &mut ctx, &broadcast, sink.as_ref()) {
-                        // Terminal event (ice disconnected): exit the loop.
+                    if handle_event(event, &mut ctx, broadcast, sink.as_ref()) {
                         return;
                     }
                 }
@@ -217,7 +228,7 @@ async fn run_session_loop(
 
         tokio::select! {
             biased;
-            _ = &mut shutdown => {
+            _ = &mut *shutdown => {
                 tracing::debug!(%broadcast, "whip session shutdown signalled");
                 return;
             }

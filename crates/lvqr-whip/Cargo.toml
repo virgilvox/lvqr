@@ -17,6 +17,7 @@ dashmap = { workspace = true }
 h264-reader = { workspace = true }
 lvqr-cmaf = { workspace = true }
 lvqr-codec = { workspace = true }
+lvqr-core = { workspace = true }
 lvqr-fragment = { workspace = true }
 lvqr-ingest = { workspace = true }
 lvqr-moq = { workspace = true }

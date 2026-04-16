@@ -1952,6 +1952,7 @@ dependencies = [
  "h264-reader",
  "lvqr-cmaf",
  "lvqr-codec",
+ "lvqr-core",
  "lvqr-fragment",
  "lvqr-ingest",
  "lvqr-moq",

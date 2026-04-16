@@ -36,6 +36,7 @@ use lvqr_cmaf::{
     write_hevc_init_segment, write_opus_init_segment,
 };
 use lvqr_codec::hevc::{self as hevc_codec, HevcSps};
+use lvqr_core::{EventBus, RelayEvent};
 use lvqr_fragment::{Fragment, FragmentFlags, FragmentMeta, MoqTrackSink};
 use lvqr_ingest::{MediaCodec, SharedFragmentObserver, SharedRawSampleObserver};
 use lvqr_moq::{OriginProducer, Track};
@@ -116,6 +117,12 @@ pub trait IngestSampleSink: Send + Sync + 'static {
     /// not exist yet and holding them back would just grow an
     /// unbounded queue.
     fn on_audio_sample(&self, _broadcast: &str, _sample: IngestAudioSample) {}
+
+    /// Called when the WebRTC session ends (ICE disconnect, poll
+    /// error, or shutdown signal). The bridge uses this to clean
+    /// up per-broadcast state and emit `BroadcastStopped` so the
+    /// HLS finalize subscriber can append `#EXT-X-ENDLIST`.
+    fn on_disconnect(&self, _broadcast: &str) {}
 }
 
 /// Drop-in [`IngestSampleSink`] that throws everything away.
@@ -158,6 +165,7 @@ pub struct WhipMoqBridge {
     streams: DashMap<String, BroadcastState>,
     observer: Option<SharedFragmentObserver>,
     raw_observer: Option<SharedRawSampleObserver>,
+    events: Option<EventBus>,
     audio_warn: AtomicBool,
 }
 
@@ -168,8 +176,14 @@ impl WhipMoqBridge {
             streams: DashMap::new(),
             observer: None,
             raw_observer: None,
+            events: None,
             audio_warn: AtomicBool::new(false),
         }
+    }
+
+    pub fn with_events(mut self, events: EventBus) -> Self {
+        self.events = Some(events);
+        self
     }
 
     pub fn with_observer(mut self, observer: SharedFragmentObserver) -> Self {
@@ -423,12 +437,21 @@ impl IngestSampleSink for WhipMoqBridge {
             return;
         }
         if !self.ensure_audio_initialized(broadcast) {
-            // Broadcast not ready yet (video still waiting for the
-            // first parameter-set IDR) or Opus init writer
-            // rejected the params. Either way drop the frame.
             return;
         }
         self.push_audio_sample(broadcast, sample);
+    }
+
+    fn on_disconnect(&self, broadcast: &str) {
+        if let Some((_, mut state)) = self.streams.remove(broadcast) {
+            state.video_sink.finish_current_group();
+            if let Some(ref bus) = self.events {
+                bus.emit(RelayEvent::BroadcastStopped {
+                    name: broadcast.to_string(),
+                });
+            }
+            info!(broadcast, "whip: removed broadcast on disconnect");
+        }
     }
 }
 

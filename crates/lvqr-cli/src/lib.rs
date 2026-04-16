@@ -404,7 +404,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // (MoQ, LL-HLS, WHEP, disk record, DVR archive) picks up WHIP
     // publishers with zero additional wiring.
     let (whip_server, whip_bridge) = if let Some(addr) = config.whip_addr {
-        let mut whip_bridge = lvqr_whip::WhipMoqBridge::new(relay.origin().clone());
+        let mut whip_bridge = lvqr_whip::WhipMoqBridge::new(relay.origin().clone()).with_events(events.clone());
         if let Some(ref obs) = shared_fragment_observer {
             whip_bridge = whip_bridge.with_observer(obs.clone());
         }
