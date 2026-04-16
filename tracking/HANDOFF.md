@@ -1,8 +1,86 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 M1 shipped + SRT ingest -- 430 tests, all CI green
+## Project Status: v0.4.0 M1 shipped + HEVC SRT + RTSP scaffold -- 456 tests, all CI green
 
-**Last Updated**: 2026-04-16 (sessions 34-50 audited).
+**Last Updated**: 2026-04-16 (session 51 close).
+
+## Session 51 close (2026-04-16)
+
+### What shipped (5 commits, +1,828/-28 lines)
+
+1. **HEVC in SRT ingest** (`469d8d3`). Wired the stubbed H.265
+   code path: VPS/SPS/PPS extraction from Annex B NALs, HEVC SPS
+   parsing via lvqr-codec, fMP4 init segment via write_hevc_init_segment,
+   keyframe detection (IDR_W_RADL/IDR_N_LP/CRA), annex_b_to_hvcc
+   conversion. SRT ingest now handles H.264 + HEVC + AAC, matching
+   the WHIP bridge. 3 unit tests + 1 E2E test.
+
+2. **Criterion bench for TsDemuxer** (`cc62f86`). Three benchmark
+   groups: feed_bulk, feed_per_packet, pes_reassembly. Immediately
+   revealed a 113x throughput bottleneck.
+
+3. **TsDemuxer O(N^2) perf fix** (`71e9649`). Replaced per-packet
+   drain(..188) with zero-copy cursor over input slice. 100x4KB
+   bulk: 44 MiB/s -> 4.96 GiB/s (113x improvement). Large SRT
+   datagrams are now processed without copying into remainder buffer.
+
+4. **lvqr-rtsp crate scaffold** (`6db660d`). Tier 2.9 foundation:
+   RTSP/1.0 message parser, session state machine (Init -> Ready
+   -> Playing/Recording), SDP track parser, TCP server with
+   per-connection handler, full playback + ingest handshake flows.
+   23 unit tests. +1,221 lines across 4 source files.
+
+### Ground truth (session 51)
+
+* **Head**: `6db660d` on `main`. v0.4.0.
+* **Tests**: 456 passed, 0 failed, 92 test suites.
+* **Code**: ~34,500 lines of Rust across 23 crates.
+* **CI**: All 4 workflows passing.
+
+### Protocols supported
+
+| Protocol | Direction | Crate | Status | E2E tested |
+|----------|-----------|-------|--------|------------|
+| RTMP | ingest | lvqr-ingest | DONE | yes |
+| WHIP | ingest | lvqr-whip | DONE | yes |
+| SRT | ingest | lvqr-srt | DONE (H.264+HEVC+AAC) | yes |
+| WebSocket | ingest+egress | lvqr-cli | DONE | yes |
+| LL-HLS | egress | lvqr-hls | DONE | yes |
+| DASH | egress | lvqr-dash | DONE | yes |
+| WHEP | egress | lvqr-whep | DONE | yes |
+| MoQ | egress | lvqr-moq | DONE | yes |
+| RTSP | playback+ingest | lvqr-rtsp | SCAFFOLD (no RTP yet) | no |
+
+### Competitive position
+
+LVQR is the only Rust library offering HEVC over SRT as composable
+crates. LiveKit has zero SRT support. MediaMTX handles HEVC/SRT but
+is monolithic Go. Ant Media's HEVC is partial. No mature Rust RTSP
+server crate exists (our hand-rolled approach is correct).
+
+### Known gaps (updated)
+
+1. **RTSP RTP depacketization**: lvqr-rtsp has the protocol parser
+   and state machine but no RTP handling yet. Next session: add
+   interleaved TCP RTP frame parsing, H.264/HEVC depacketization
+   (FU-A/AP), and wire to fragment observer.
+2. **Unified Fragment Model** (Tier 2.1): types exist but ingress
+   not migrated to fragment-stream-based dispatch.
+3. **Peer mesh media relay**: topology works, forwarding is Tier 4.
+4. **Tier 1 infra**: no playwright, no 24h soak, no comparison.
+5. **Tiers 3-5**: cluster, observability, WASM, SDKs not started.
+6. **Contract**: 7 missing slots across 5 crates.
+
+### Session 52 entry point
+
+* **RTSP RTP depacketization** -- add interleaved TCP frame
+  parsing ($-prefixed 4-byte header), H.264 FU-A depacketization,
+  wire to fragment observer, E2E test with ffmpeg RTSP push.
+* **RTSP HEVC** -- extend to H.265 RTP depacketization (RFC 7798
+  FU/AP NAL units) once H.264 is proven.
+* **Contract gaps** -- fuzz targets for lvqr-record, lvqr-moq,
+  lvqr-fragment; conformance tests for lvqr-whip, lvqr-whep.
+* **Tier 3 planning** -- cluster (chitchat), observability (OTLP).
 
 ## Session 44 close (2026-04-16)
 
