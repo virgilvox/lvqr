@@ -343,13 +343,18 @@ impl Mpd {
         }
         let mut out = String::with_capacity(1024);
         out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        let mup_attr = if self.minimum_update_period.is_empty() {
+            String::new()
+        } else {
+            format!(r#" minimumUpdatePeriod="{}""#, esc(&self.minimum_update_period))
+        };
         let _ = writeln!(
             out,
-            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="{ty}" profiles="{profiles}" minBufferTime="{mbt}" minimumUpdatePeriod="{mup}">"#,
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="{ty}" profiles="{profiles}" minBufferTime="{mbt}"{mup}>"#,
             ty = self.mpd_type.as_str(),
             profiles = esc(&self.profiles),
             mbt = esc(&self.min_buffer_time),
-            mup = esc(&self.minimum_update_period),
+            mup = mup_attr,
         );
         for period in &self.periods {
             period.write(&mut out, 1)?;

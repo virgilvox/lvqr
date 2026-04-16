@@ -528,6 +528,35 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         });
     }
 
+    // DASH finalization subscriber: same pattern as HLS above.
+    // Switches the MPD from type="dynamic" to type="static" so
+    // DASH clients stop polling for new segments.
+    if let Some(ref dash) = dash_server {
+        let dash_for_finalize = dash.clone();
+        let mut dash_event_rx = events.subscribe();
+        let dash_finalize_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = dash_finalize_shutdown.cancelled() => break,
+                    msg = dash_event_rx.recv() => {
+                        match msg {
+                            Ok(RelayEvent::BroadcastStopped { name }) => {
+                                tracing::info!(broadcast = %name, "finalizing DASH broadcast");
+                                dash_for_finalize.finalize_broadcast(&name);
+                            }
+                            Ok(_) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!(missed = n, "DASH finalize subscriber lagged");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Admin HTTP state and router.
     let metrics_state = relay.metrics().clone();
     let bridge_for_stats = bridge.clone();

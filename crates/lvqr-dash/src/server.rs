@@ -136,6 +136,11 @@ struct DashState {
     config: DashConfig,
     video: Mutex<TrackState>,
     audio: Mutex<TrackState>,
+    /// Set by [`DashServer::finalize`] when the broadcast ends.
+    /// The renderer reads this to switch `MpdType::Dynamic` to
+    /// `MpdType::Static` and omit `minimumUpdatePeriod` so DASH
+    /// clients stop polling for new segments.
+    finalized: std::sync::atomic::AtomicBool,
 }
 
 /// Per-broadcast DASH server. Cheap to clone; internally one `Arc`.
@@ -159,6 +164,7 @@ impl DashServer {
                 config,
                 video: Mutex::new(TrackState::new()),
                 audio: Mutex::new(TrackState::new()),
+                finalized: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -303,11 +309,20 @@ impl DashServer {
             });
         }
 
+        let finalized = self.state.finalized.load(std::sync::atomic::Ordering::Relaxed);
         let mpd = Mpd {
-            mpd_type: MpdType::Dynamic,
-            profiles: "urn:mpeg:dash:profile:isoff-live:2011".into(),
+            mpd_type: if finalized { MpdType::Static } else { MpdType::Dynamic },
+            profiles: if finalized {
+                "urn:mpeg:dash:profile:isoff-on-demand:2011".into()
+            } else {
+                "urn:mpeg:dash:profile:isoff-live:2011".into()
+            },
             min_buffer_time: cfg.min_buffer_time.clone(),
-            minimum_update_period: cfg.minimum_update_period.clone(),
+            minimum_update_period: if finalized {
+                String::new()
+            } else {
+                cfg.minimum_update_period.clone()
+            },
             periods: vec![Period {
                 id: "0".into(),
                 start: "PT0S".into(),
@@ -322,6 +337,14 @@ impl DashServer {
     /// a dedicated listener via `axum::serve` when a single-broadcast
     /// surface is enough; [`MultiDashServer::router`] is the
     /// multi-broadcast counterpart.
+    /// Mark this broadcast as ended. Subsequent `render_manifest`
+    /// calls will produce an MPD with `type="static"` and omit
+    /// `minimumUpdatePeriod` so DASH clients stop polling for new
+    /// segments. Calling `finalize()` twice is harmless.
+    pub fn finalize(&self) {
+        self.state.finalized.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn router(&self) -> Router {
         Router::new()
             .route("/manifest.mpd", get(handle_manifest))
@@ -438,6 +461,17 @@ impl MultiDashServer {
             .expect("dash broadcasts lock poisoned")
             .get(broadcast)
             .cloned()
+    }
+
+    /// Mark a broadcast as ended. Calls [`DashServer::finalize`] on
+    /// the per-broadcast server so the rendered MPD switches from
+    /// `type="dynamic"` to `type="static"` and DASH clients stop
+    /// polling. No-op if the broadcast is unknown.
+    pub fn finalize_broadcast(&self, broadcast: &str) {
+        let map = self.inner.broadcasts.lock().expect("dash broadcasts lock poisoned");
+        if let Some(server) = map.get(broadcast) {
+            server.finalize();
+        }
     }
 
     /// Number of tracked broadcasts. Test-oriented.
