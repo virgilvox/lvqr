@@ -81,10 +81,18 @@ struct ConnectionState {
     audio_init_emitted: bool,
     video_seq: u64,
     audio_seq: u64,
-    /// Cached SPS bytes for H.264 init segment generation.
     sps: Option<Vec<u8>>,
-    /// Cached PPS bytes.
     pps: Option<Vec<u8>>,
+    /// Previous video DTS for frame duration computation. When
+    /// `None` (first frame), a default of 3000 ticks (33 ms at
+    /// 90 kHz) is used. Subsequent frames use the PTS/DTS delta.
+    prev_video_dts: Option<u64>,
+    /// Previous audio DTS for frame duration computation.
+    prev_audio_dts: Option<u64>,
+    /// Audio timescale captured from the ADTS header at init
+    /// time. Needed for the default duration fallback (1024
+    /// samples at the track's native rate).
+    audio_timescale: u32,
 }
 
 async fn handle_connection(
@@ -102,6 +110,9 @@ async fn handle_connection(
         audio_seq: 0,
         sps: None,
         pps: None,
+        prev_video_dts: None,
+        prev_audio_dts: None,
+        audio_timescale: 44100,
     };
 
     loop {
@@ -208,12 +219,17 @@ fn process_h264(
     let dts = pes.dts.or(pes.pts).unwrap_or(0);
     let pts = pes.pts.unwrap_or(dts);
     let keyframe = nalus.iter().any(|n| !n.is_empty() && (n[0] & 0x1F) == 5);
+    let duration = match state.prev_video_dts {
+        Some(prev) if dts > prev => (dts - prev) as u32,
+        _ => 3000,
+    };
+    state.prev_video_dts = Some(dts);
 
     let raw = lvqr_cmaf::RawSample {
         track_id: 1,
         dts,
         cts_offset: pts.wrapping_sub(dts) as i32,
-        duration: 3000,
+        duration,
         payload: Bytes::from(avcc),
         keyframe,
     };
@@ -226,7 +242,7 @@ fn process_h264(
         0,
         dts,
         pts,
-        3000,
+        duration as u64,
         if keyframe {
             FragmentFlags::KEYFRAME
         } else {
@@ -289,6 +305,7 @@ fn process_aac(
         let init = buf.freeze();
         obs.on_init(broadcast, "1.mp4", sample_rate, init);
         state.audio_init_emitted = true;
+        state.audio_timescale = sample_rate;
         info!(%broadcast, %sample_rate, "SRT: audio init emitted");
     }
 
@@ -309,12 +326,17 @@ fn process_aac(
         let aac_data = &payload[offset + header_len..offset + frame_len];
         let dts = pes.dts.or(pes.pts).unwrap_or(0);
         let pts = pes.pts.unwrap_or(dts);
+        let duration = match state.prev_audio_dts {
+            Some(prev) if dts > prev => (dts - prev) as u32,
+            _ => 1024,
+        };
+        state.prev_audio_dts = Some(dts);
 
         let raw = lvqr_cmaf::RawSample {
             track_id: 2,
             dts,
             cts_offset: 0,
-            duration: 1024,
+            duration,
             payload: Bytes::copy_from_slice(aac_data),
             keyframe: true,
         };
@@ -327,7 +349,7 @@ fn process_aac(
             0,
             dts,
             pts,
-            1024,
+            duration as u64,
             FragmentFlags::AUDIO,
             moof_mdat,
         );
