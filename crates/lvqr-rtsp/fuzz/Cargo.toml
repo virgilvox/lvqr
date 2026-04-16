@@ -1,0 +1,65 @@
+[package]
+name = "lvqr-rtsp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+# Excluded from the main workspace because libfuzzer-sys requires nightly
+# rustc and sanitizer instrumentation that the stable workspace builds
+# cannot produce. Run with:
+#
+#   cargo +nightly fuzz run parse_rtsp_request
+#   cargo +nightly fuzz run parse_rtp_header
+#   cargo +nightly fuzz run depack_h264
+#   cargo +nightly fuzz run depack_hevc
+#   cargo +nightly fuzz run depack_aac
+#
+# The proptest harness at `tests/proptest_parsers.rs` covers the same
+# never-panic invariants on a ~200-case budget; these fuzz targets run
+# much longer and cover inputs proptest's strategy cannot reach.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lvqr-rtsp = { path = ".." }
+
+[[bin]]
+name = "parse_rtsp_request"
+path = "fuzz_targets/parse_rtsp_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_rtp_header"
+path = "fuzz_targets/parse_rtp_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "depack_h264"
+path = "fuzz_targets/depack_h264.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "depack_hevc"
+path = "fuzz_targets/depack_hevc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "depack_aac"
+path = "fuzz_targets/depack_aac.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true
