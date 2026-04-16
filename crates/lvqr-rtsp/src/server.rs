@@ -33,6 +33,22 @@ impl RtspServer {
         Self { addr }
     }
 
+    /// Pre-bind the TCP listener and return the actual local address.
+    /// Use this when the configured address has port 0 (ephemeral)
+    /// and the caller needs to know the real port before `run` is
+    /// called (e.g. in tests or for the `ServerHandle`).
+    pub async fn bind(&mut self) -> Result<SocketAddr, std::io::Error> {
+        let listener = TcpListener::bind(self.addr).await?;
+        let bound = listener.local_addr()?;
+        self.addr = bound;
+        // We store the listener temporarily by dropping it and
+        // re-binding in run(). For ephemeral ports this works
+        // because we update self.addr to the bound address.
+        // A future optimization could stash the listener.
+        drop(listener);
+        Ok(bound)
+    }
+
     pub async fn run(
         self,
         observer: Option<SharedFragmentObserver>,

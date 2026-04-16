@@ -48,6 +48,7 @@ pub struct TestServerConfig {
     hls_disabled: bool,
     dash_enabled: bool,
     srt_enabled: bool,
+    rtsp_enabled: bool,
 }
 
 impl TestServerConfig {
@@ -104,6 +105,11 @@ impl TestServerConfig {
         self.srt_enabled = true;
         self
     }
+
+    pub fn with_rtsp(mut self) -> Self {
+        self.rtsp_enabled = true;
+        self
+    }
 }
 
 /// A running LVQR server bound to ephemeral loopback ports.
@@ -137,6 +143,7 @@ impl TestServer {
             whep_addr: None,
             whip_addr: None,
             dash_addr: if config.dash_enabled { Some(ephemeral) } else { None },
+            rtsp_addr: if config.rtsp_enabled { Some(ephemeral) } else { None },
             srt_addr: if config.srt_enabled { Some(ephemeral) } else { None },
             mesh_enabled: config.mesh_enabled,
             max_peers: config.max_peers.unwrap_or(3),
@@ -192,6 +199,13 @@ impl TestServer {
         self.handle
             .dash_addr()
             .expect("DASH surface not enabled on this TestServer; call with_dash() to enable")
+    }
+
+    /// Bound RTSP ingest TCP address. Panics if RTSP was not enabled.
+    pub fn rtsp_addr(&self) -> SocketAddr {
+        self.handle
+            .rtsp_addr()
+            .expect("RTSP ingest not enabled on this TestServer; call with_rtsp() to enable")
     }
 
     /// Bound SRT ingest UDP address. Panics if SRT was not enabled.

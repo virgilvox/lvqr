@@ -92,6 +92,11 @@ pub struct ServeConfig {
     /// numbered segment URIs. RTMP and WHIP publishers both feed
     /// the DASH egress without any per-protocol wiring.
     pub dash_addr: Option<SocketAddr>,
+    /// Optional RTSP ingest bind address. When `Some`, `start()`
+    /// spins up an `RtspServer` on this TCP address that accepts
+    /// RTSP ANNOUNCE/RECORD sessions with interleaved RTP and fans
+    /// depacketized H.264/HEVC through the fragment observer chain.
+    pub rtsp_addr: Option<SocketAddr>,
     /// Optional SRT ingest bind address. When `Some`, `start()`
     /// spins up an `SrtIngestServer` on this UDP address that
     /// accepts MPEG-TS streams and fans them through the fragment
@@ -140,6 +145,7 @@ impl ServeConfig {
             whep_addr: None,
             whip_addr: None,
             dash_addr: None,
+            rtsp_addr: None,
             srt_addr: None,
             mesh_enabled: false,
             max_peers: 3,
@@ -167,6 +173,7 @@ pub struct ServerHandle {
     whep_addr: Option<SocketAddr>,
     whip_addr: Option<SocketAddr>,
     dash_addr: Option<SocketAddr>,
+    rtsp_addr: Option<SocketAddr>,
     srt_addr: Option<SocketAddr>,
     shutdown: CancellationToken,
     join: Option<tokio::task::JoinHandle<()>>,
@@ -206,6 +213,11 @@ impl ServerHandle {
     /// Bound MPEG-DASH HTTP address, when DASH egress is enabled.
     pub fn dash_addr(&self) -> Option<SocketAddr> {
         self.dash_addr
+    }
+
+    /// Bound RTSP ingest TCP address, when RTSP ingest is enabled.
+    pub fn rtsp_addr(&self) -> Option<SocketAddr> {
+        self.rtsp_addr
     }
 
     /// Bound SRT ingest UDP address, when SRT ingest is enabled.
@@ -466,6 +478,20 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let shared_fragment_observer_for_srt = shared_fragment_observer.clone();
     let srt_events_clone = events.clone();
     let srt_shutdown_token = shutdown.clone();
+
+    // Optional RTSP ingest server. Like SRT, the RTSP bridge fans
+    // depacketized H.264/HEVC through the shared FragmentObserver.
+    let (rtsp_server, rtsp_bound) = if let Some(addr) = config.rtsp_addr {
+        let mut server = lvqr_rtsp::RtspServer::new(addr);
+        let bound = server.bind().await?;
+        tracing::info!(addr = %bound, "RTSP ingest bound");
+        (Some(server), Some(bound))
+    } else {
+        (None, None)
+    };
+    let shared_fragment_observer_for_rtsp = shared_fragment_observer.clone();
+    let rtsp_events_clone = events.clone();
+    let rtsp_shutdown_token = shutdown.clone();
 
     let bridge = Arc::new(bridge_builder);
     let rtmp_config = lvqr_ingest::RtmpConfig {
@@ -876,8 +902,20 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             srt_shutdown.cancel();
         };
 
+        let rtsp_shutdown = bg_shutdown_for_task.clone();
+        let rtsp_obs = shared_fragment_observer_for_rtsp;
+        let rtsp_events = rtsp_events_clone;
+        let rtsp_cancel = rtsp_shutdown_token;
+        let rtsp_fut = async move {
+            let Some(server) = rtsp_server else { return };
+            if let Err(e) = server.run(rtsp_obs, rtsp_events, rtsp_cancel).await {
+                tracing::error!(error = %e, "RTSP server error");
+            }
+            rtsp_shutdown.cancel();
+        };
+
         let _ = tokio::join!(
-            relay_fut, rtmp_fut, admin_fut, hls_fut, dash_fut, whep_fut, whip_fut, srt_fut
+            relay_fut, rtmp_fut, admin_fut, hls_fut, dash_fut, whep_fut, whip_fut, srt_fut, rtsp_fut
         );
         drop(whip_bridge_keepalive);
         tracing::info!("shutdown complete");
@@ -891,6 +929,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         whep_addr: whep_bound,
         whip_addr: whip_bound,
         dash_addr: dash_bound,
+        rtsp_addr: rtsp_bound,
         srt_addr: srt_bound,
         shutdown,
         join: Some(join),

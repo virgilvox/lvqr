@@ -80,6 +80,14 @@ struct ServeArgs {
     #[arg(long, default_value = "0", env = "LVQR_DASH_PORT")]
     dash_port: u16,
 
+    /// RTSP ingest listen port. Set to 0 to disable RTSP ingest.
+    /// When non-zero, `lvqr serve` binds an RTSP/1.0 TCP listener
+    /// on this port that accepts ANNOUNCE/RECORD sessions with
+    /// interleaved RTP. Depacketized H.264/HEVC NALs are converted
+    /// to Fragments that reach every existing egress.
+    #[arg(long, default_value = "0", env = "LVQR_RTSP_PORT")]
+    rtsp_port: u16,
+
     /// SRT ingest listen port. Set to 0 to disable SRT ingest.
     /// When non-zero, `lvqr serve` binds an SRT listener on this
     /// UDP port that accepts MPEG-TS streams from broadcast
@@ -235,6 +243,11 @@ async fn serve_from_args(args: ServeArgs) -> Result<()> {
         rtmp_addr: ([0, 0, 0, 0], args.rtmp_port).into(),
         admin_addr: ([0, 0, 0, 0], args.admin_port).into(),
         hls_addr,
+        rtsp_addr: if args.rtsp_port == 0 {
+            None
+        } else {
+            Some(([0, 0, 0, 0], args.rtsp_port).into())
+        },
         srt_addr: if args.srt_port == 0 {
             None
         } else {

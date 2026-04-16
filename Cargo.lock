@@ -1721,6 +1721,7 @@ dependencies = [
  "lvqr-moq",
  "lvqr-record",
  "lvqr-relay",
+ "lvqr-rtsp",
  "lvqr-signal",
  "lvqr-srt",
  "lvqr-test-utils",
