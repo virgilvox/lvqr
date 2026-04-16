@@ -378,7 +378,6 @@ Supporting crates:
 | `lvqr-admin` | HTTP API: stats, streams, mesh, Prometheus metrics, admin auth + auth-failure metric |
 | `lvqr-conformance` | Reference fixtures (kvazaar HEVC, ffprobe corpus) and external-validator wrappers |
 | `lvqr-cli` | Single binary: relay + RTMP + WHIP + WS ingest + LL-HLS + DASH + WHEP + admin + recorder + archive + mesh |
-| `lvqr-wasm` | **Deprecated**; use `@lvqr/core` and `@lvqr/player` instead |
 
 ### How It Works
 

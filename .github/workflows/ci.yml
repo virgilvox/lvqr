@@ -74,20 +74,6 @@ jobs:
         # baseline is clean.
         run: cargo audit
 
-  wasm:
-    name: WASM Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - name: Install wasm-pack
-        run: cargo install wasm-pack
-      - name: Build WASM
-        run: wasm-pack build crates/lvqr-wasm --target web
-
   docker:
     name: Docker Build
     runs-on: ubuntu-latest

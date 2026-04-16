@@ -178,17 +178,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-trait"
-version = "0.1.89"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -529,16 +518,6 @@ name = "conducer"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f69abafc03aacb0ca4489bcd0ba181ff70bc1cc441e31dd1fc6ad8b41d336a"
-
-[[package]]
-name = "console_error_panic_hook"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
-dependencies = [
- "cfg-if",
- "wasm-bindgen",
-]
 
 [[package]]
 name = "const-oid"
@@ -2017,22 +1996,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lvqr-wasm"
-version = "0.4.0"
-dependencies = [
- "bytes",
- "console_error_panic_hook",
- "js-sys",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test",
- "web-sys",
-]
-
-[[package]]
 name = "lvqr-whep"
 version = "0.4.0"
 dependencies = [
@@ -2139,16 +2102,6 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
-
-[[package]]
-name = "minicov"
-version = "0.3.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4869b6a491569605d66d3952bcdf03df789e5b536e5f0cf7758a7f08a55ae24d"
-dependencies = [
- "cc",
- "walkdir",
-]
 
 [[package]]
 name = "minimal-lexical"
@@ -2362,7 +2315,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
- "libm",
 ]
 
 [[package]]
@@ -3279,17 +3231,6 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
-]
-
-[[package]]
-name = "serde-wasm-bindgen"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
-dependencies = [
- "js-sys",
- "serde",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -4298,45 +4239,6 @@ checksum = "5fd04d9e306f1907bd13c6361b5c6bfc7b3b3c095ed3f8a9246390f8dbdee129"
 dependencies = [
  "unicode-ident",
 ]
-
-[[package]]
-name = "wasm-bindgen-test"
-version = "0.3.68"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bb55e2540ad1c56eec35fd63e2aea15f83b11ce487fd2de9ad11578dfc047ea"
-dependencies = [
- "async-trait",
- "cast",
- "js-sys",
- "libm",
- "minicov",
- "nu-ansi-term",
- "num-traits",
- "oorandom",
- "serde",
- "serde_json",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test-macro",
- "wasm-bindgen-test-shared",
-]
-
-[[package]]
-name = "wasm-bindgen-test-macro"
-version = "0.3.68"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "caf0ca1bd612b988616bac1ab34c4e4290ef18f7148a1d8b7f31c150080e9295"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "wasm-bindgen-test-shared"
-version = "0.2.118"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23cda5ecc67248c48d3e705d3e03e00af905769b78b9d2a1678b663b8b9d4472"
 
 [[package]]
 name = "web-async"

@@ -32,7 +32,6 @@ members = [
     "crates/lvqr-conformance",
     "crates/lvqr-record",
     "crates/lvqr-srt",
-    "crates/lvqr-wasm",
     "crates/lvqr-cli",
     "crates/lvqr-test-utils",
 ]
