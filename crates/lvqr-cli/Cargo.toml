@@ -68,6 +68,9 @@ anyhow = { workspace = true }
 rml_rtmp = { workspace = true }
 # WebSocket client for the RTMP -> WS E2E test.
 tokio-tungstenite = "0.24"
+# SRT client for the SRT -> HLS E2E test.
+srt-tokio = "0.4"
+futures-util = "0.3"
 tracing-subscriber = { workspace = true }
 tower = { workspace = true }
 http = "1"

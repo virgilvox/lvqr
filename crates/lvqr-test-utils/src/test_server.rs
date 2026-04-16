@@ -47,6 +47,7 @@ pub struct TestServerConfig {
     archive_dir: Option<PathBuf>,
     hls_disabled: bool,
     dash_enabled: bool,
+    srt_enabled: bool,
 }
 
 impl TestServerConfig {
@@ -98,6 +99,11 @@ impl TestServerConfig {
         self.dash_enabled = true;
         self
     }
+
+    pub fn with_srt(mut self) -> Self {
+        self.srt_enabled = true;
+        self
+    }
 }
 
 /// A running LVQR server bound to ephemeral loopback ports.
@@ -131,7 +137,7 @@ impl TestServer {
             whep_addr: None,
             whip_addr: None,
             dash_addr: if config.dash_enabled { Some(ephemeral) } else { None },
-            srt_addr: None,
+            srt_addr: if config.srt_enabled { Some(ephemeral) } else { None },
             mesh_enabled: config.mesh_enabled,
             max_peers: config.max_peers.unwrap_or(3),
             auth: config.auth,
@@ -186,6 +192,13 @@ impl TestServer {
         self.handle
             .dash_addr()
             .expect("DASH surface not enabled on this TestServer; call with_dash() to enable")
+    }
+
+    /// Bound SRT ingest UDP address. Panics if SRT was not enabled.
+    pub fn srt_addr(&self) -> SocketAddr {
+        self.handle
+            .srt_addr()
+            .expect("SRT ingest not enabled on this TestServer; call with_srt() to enable")
     }
 
     /// Build an HTTP URL pointing at a path on the DASH surface,

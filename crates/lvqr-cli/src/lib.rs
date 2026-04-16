@@ -167,6 +167,7 @@ pub struct ServerHandle {
     whep_addr: Option<SocketAddr>,
     whip_addr: Option<SocketAddr>,
     dash_addr: Option<SocketAddr>,
+    srt_addr: Option<SocketAddr>,
     shutdown: CancellationToken,
     join: Option<tokio::task::JoinHandle<()>>,
 }
@@ -205,6 +206,11 @@ impl ServerHandle {
     /// Bound MPEG-DASH HTTP address, when DASH egress is enabled.
     pub fn dash_addr(&self) -> Option<SocketAddr> {
         self.dash_addr
+    }
+
+    /// Bound SRT ingest UDP address, when SRT ingest is enabled.
+    pub fn srt_addr(&self) -> Option<SocketAddr> {
+        self.srt_addr
     }
 
     /// HTTP URL pointing at a path on the DASH surface, e.g.
@@ -449,7 +455,14 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // Optional SRT ingest server. Like WHIP, the SRT bridge fans
     // fragments through the shared FragmentObserver so every egress
     // picks up SRT publishers automatically.
-    let srt_server = config.srt_addr.map(lvqr_srt::SrtIngestServer::new);
+    let (srt_server, srt_bound) = if let Some(addr) = config.srt_addr {
+        let mut server = lvqr_srt::SrtIngestServer::new(addr);
+        let bound = server.bind().await?;
+        tracing::info!(addr = %bound, "SRT ingest bound");
+        (Some(server), Some(bound))
+    } else {
+        (None, None)
+    };
     let shared_fragment_observer_for_srt = shared_fragment_observer.clone();
     let srt_events_clone = events.clone();
     let srt_shutdown_token = shutdown.clone();
@@ -878,6 +891,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         whep_addr: whep_bound,
         whip_addr: whip_bound,
         dash_addr: dash_bound,
+        srt_addr: srt_bound,
         shutdown,
         join: Some(join),
     })

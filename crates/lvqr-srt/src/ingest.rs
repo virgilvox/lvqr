@@ -17,23 +17,38 @@ use tracing::{debug, info, warn};
 /// demux MPEG-TS, and emit Fragments.
 pub struct SrtIngestServer {
     addr: SocketAddr,
+    pre_bound: Option<tokio::net::UdpSocket>,
 }
 
 impl SrtIngestServer {
     pub fn new(addr: SocketAddr) -> Self {
-        Self { addr }
+        Self { addr, pre_bound: None }
     }
 
-    /// Run the listener loop until `shutdown` fires. Each accepted
-    /// connection spawns a task that feeds TS bytes through a
-    /// `TsDemuxer` and converts PES packets to Fragments.
+    /// Pre-bind the UDP socket and return the actual local address.
+    /// Use this when the configured address has port 0 (ephemeral)
+    /// and the caller needs to know the real port before `run` is
+    /// called (e.g. in tests or for the `ServerHandle`).
+    pub async fn bind(&mut self) -> Result<SocketAddr, std::io::Error> {
+        let socket = tokio::net::UdpSocket::bind(self.addr).await?;
+        let bound = socket.local_addr()?;
+        self.addr = bound;
+        self.pre_bound = Some(socket);
+        Ok(bound)
+    }
+
+    /// Run the listener loop until `shutdown` fires.
     pub async fn run(
-        &self,
+        self,
         observer: Option<SharedFragmentObserver>,
         events: EventBus,
         shutdown: CancellationToken,
     ) -> Result<(), std::io::Error> {
-        let (mut listener, mut incoming) = srt_tokio::SrtListener::builder().bind(self.addr).await?;
+        let builder = srt_tokio::SrtListener::builder();
+        let (mut listener, mut incoming) = match self.pre_bound {
+            Some(socket) => builder.socket(socket).bind(self.addr).await?,
+            None => builder.bind(self.addr).await?,
+        };
 
         info!(addr = %self.addr, "SRT ingest bound");
 
