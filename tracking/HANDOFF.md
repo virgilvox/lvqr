@@ -1,9 +1,8 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev approaching M1 -- 420 tests, all CI green
+## Project Status: v0.4.0 M1 shipped + SRT ingest -- 430 tests, all CI green
 
-**Last Updated**: 2026-04-16 (session 44: CORS fix, README
-refresh, M1 scope decision).
+**Last Updated**: 2026-04-16 (sessions 34-50 audited).
 
 ## Session 44 close (2026-04-16)
 
@@ -54,22 +53,71 @@ never-panic, valid timestamps). Fuzz target in lvqr-codec/fuzz.
 
 **v0.4.0** on `origin/main`. 429 tests, 0 failures.
 
-### Session 49 close (2026-04-16)
+### Sessions 49-50 close (2026-04-16)
 
-1. **Delete lvqr-wasm** (`58e1327`). Removed deprecated crate,
-   workspace member entry, CI WASM build job, README entry.
-   Saves ~30s per CI run.
+1. **Delete lvqr-wasm** (`58e1327`). Removed deprecated dead
+   code: crate directory, workspace member, CI WASM job, README
+   entry. -512 lines.
 2. **Fix SRT frame duration** (`7686d0a`). Video and audio
    frame durations now computed from PTS deltas instead of
-   hardcoded 3000/1024. Fixes A/V drift and incorrect EXTINF
-   values on real streams.
+   hardcoded 3000/1024. Fixes A/V drift on real streams.
+3. **SRT -> HLS E2E test** (`758960b`). Pushes synthetic
+   MPEG-TS (PAT + PMT + H.264 PES) over SRT via srt-tokio
+   caller, fetches HLS playlist from the HTTP surface, asserts
+   segments appear. SrtIngestServer gains bind() for ephemeral
+   port pre-binding. TestServerConfig gains with_srt().
 
-### Session 50 entry point
+### Ground truth (session 50 audit)
 
-* **SRT integration test** (ffmpeg SRT push -> verify HLS output).
-* **Wire fuzz targets to nightly CI** runner.
-* **HEVC in SRT** (the code path exists, just needs wiring).
-* **RTSP server** (Tier 2.9, last protocol gap vs MediaMTX).
+* **Head**: `758960b` on `origin/main`. v0.4.0.
+* **Tests**: 430 passed, 0 failed, 1 ignored, 90 test suites.
+* **Code**: 33,318 lines of Rust across 22 crates (lvqr-wasm
+  deleted). 37 commits since session 34 start (+4,126/-647).
+* **Contract**: 7 missing slots. 5 crates fully compliant
+  (lvqr-ingest, lvqr-codec, lvqr-cmaf, lvqr-hls, lvqr-dash).
+  Remaining: lvqr-record fuzz, lvqr-moq fuzz+conformance,
+  lvqr-fragment fuzz+conformance, lvqr-whip conformance,
+  lvqr-whep conformance.
+* **CI**: 4 workflows (CI, LL-HLS Conformance, Test Contract,
+  Fuzz). All passing on HEAD.
+
+### Protocols supported
+
+| Protocol | Direction | Crate | Status | E2E tested |
+|----------|-----------|-------|--------|------------|
+| RTMP | ingest | lvqr-ingest | DONE | yes |
+| WHIP | ingest | lvqr-whip | DONE | yes |
+| SRT | ingest | lvqr-srt | DONE (H.264+AAC) | yes |
+| WebSocket | ingest+egress | lvqr-cli | DONE | yes |
+| LL-HLS | egress | lvqr-hls | DONE | yes |
+| DASH | egress | lvqr-dash | DONE | yes |
+| WHEP | egress | lvqr-whep | DONE | yes |
+| MoQ | egress | lvqr-moq | DONE | yes |
+| RTSP | -- | -- | NOT STARTED | -- |
+
+### Known gaps
+
+1. **HEVC in SRT**: code path exists but returns early. Needs
+   VPS/SPS/PPS detection + write_hevc_init_segment wiring.
+2. **RTSP server** (Tier 2.9): no crate exists. Last protocol
+   gap vs MediaMTX.
+3. **Unified Fragment Model** (Tier 2.1): types exist but
+   ingress not migrated to fragment-stream-based dispatch.
+   Roadmap's #1 architectural decision.
+4. **Peer mesh media relay**: topology planning works (13 unit
+   tests), actual peer-to-peer media forwarding is Tier 4.
+5. **Tier 1 infra**: no playwright E2E, no 24h soak, no
+   MediaMTX comparison harness, no testcontainers.
+6. **Tiers 3-5**: cluster, observability, WASM, SDKs all not
+   started.
+
+### Session 51 entry point
+
+* **HEVC in SRT** (small, complete -- wire the existing code
+  path with VPS/SPS/PPS detection).
+* **RTSP server** (Tier 2.9 -- the last protocol gap).
+* **Criterion bench for TS demuxer** throughput.
+* **Tier 3 planning** (cluster, observability, webhooks).
 
 ## Sessions 34-43 audit (2026-04-16)
 
