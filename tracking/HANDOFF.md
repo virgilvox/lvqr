@@ -1,8 +1,174 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- FragmentBroadcaster primitive shipped, Tier 2.1 infra complete -- 510 tests, all green
+## Project Status: v0.4.0 -- FragmentBroadcasterRegistry shipped, Tier 2.1 lookup layer complete -- 520 tests, all green
 
-**Last Updated**: 2026-04-16 (session 54 close).
+**Last Updated**: 2026-04-16 (session 55 close).
+
+## Session 55 close (2026-04-16)
+
+### What shipped (2 commits, +444/-0 lines)
+
+1. **FragmentBroadcasterRegistry** (`77d602e`). Multi-track keyed
+   lookup layer for the Unified Fragment Model. A single
+   FragmentBroadcaster covers one logical track; a real server
+   hosts many concurrent broadcasts with video + audio + future
+   captions + simulcast layers. The registry is the
+   `(broadcast, track) -> Arc<FragmentBroadcaster>` lookup table
+   the ingest migration will dispatch through.
+
+   API: `get_or_create`, `get`, `subscribe` (convenience over
+   `get`), `remove`, `keys`, `len`, `is_empty`. Returns
+   `Arc<FragmentBroadcaster>` so racing `get_or_create` callers
+   on the same key all see pointer-equal handles. Thread-safe
+   via `RwLock<HashMap>`. Clone-cheap via `Arc`.
+
+   Design calls:
+
+   * Double-checked insertion under the write lock: two
+     concurrent `get_or_create` calls on the same key collapse
+     onto one broadcaster. Real-world scenario: two ingest peers
+     that accidentally publish the same `broadcast_id`. The
+     registry's contract is they fan out together onto one
+     broadcaster rather than splitting into silos.
+
+   * `remove` drops only the registry-side Arc; external clones
+     keep the broadcaster alive. Subscribers see `Closed` when
+     the last producer-side clone of the sender goes away,
+     matching the FragmentBroadcaster contract established in
+     session 54.
+
+   * Intentionally not a pub/sub topic space (no wildcards, no
+     patterns). Not a lifecycle manager; `BroadcastStarted` /
+     `Stopped` events continue to live on `lvqr_core::EventBus`.
+
+   8 inline unit tests covering identity under get_or_create,
+   key isolation, miss-returns-None, emission routing, remove
+   semantics, keys snapshot, clone sharing, is_empty tracking.
+
+2. **Registry proptest** (`7d96d30`). Two properties in
+   `tests/proptest_registry.rs`:
+
+   * **Convergence under racing get_or_create**. 2-8 tokio tasks
+     race to `get_or_create` the same key. Every returned Arc is
+     pointer-equal. `registry.len() == 1` after the race. A
+     single emit through any returned handle fans out to
+     subscribers taken through any other handle.
+
+   * **Multi-key isolation**. A randomized workload of up to 5
+     distinct `(broadcast, track)` pairs with per-pair plans of
+     up to 6 payloads each. Every key's subscriber receives
+     exactly that key's plan in order, with no cross-key
+     leakage, and every stream closes cleanly after the
+     producer side drops.
+
+### Ground truth (session 55 close)
+
+* **Head**: `7d96d30` on `main`. v0.4.0.
+* **Tests**: 520 passed, 0 failed, 1 ignored. Delta from session
+  54: +10 (lvqr-fragment: 26 -> 35 tests; 8 new inline unit, 2
+  new proptest).
+* **Code**: lvqr-fragment grew by +444 lines (registry.rs at
+  ~293 lines + proptest_registry.rs at ~151 lines).
+* **CI gates locally clean**: `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace` all green.
+* **lvqr-fragment public API**: now exports
+  `FragmentBroadcasterRegistry` alongside
+  `FragmentBroadcaster`, `BroadcasterStream`,
+  `DEFAULT_BROADCASTER_CAPACITY`, `MoqGroupStream`,
+  `MoqTrackStream`, `FragmentStream`, `MoqTrackSink`,
+  `MoqSinkError`, `Fragment`, `FragmentFlags`, `FragmentMeta`.
+
+### Tier 2.1 primitive surface: complete
+
+Every building block the ingest migration composes over now
+exists, is tested, and has a stable API:
+
+| Primitive                       | Session |
+|---------------------------------|---------|
+| Fragment / FragmentMeta / FragmentStream | 50 |
+| MoqTrackSink (Fragment -> MoQ)  | 50      |
+| MoqGroupStream / MoqTrackStream (MoQ -> Fragment) | 53 |
+| FragmentBroadcaster (fan-out)   | 54      |
+| FragmentBroadcasterRegistry (multi-track lookup) | 55 |
+
+The next step is actual wiring. Each ingest crate (RTMP, WHIP,
+SRT, RTSP) constructs a FragmentBroadcasterRegistry on startup,
+calls `get_or_create(broadcast, track, meta)` on first fragment,
+and emits via the returned broadcaster instead of calling
+FragmentObserver directly. The existing FragmentObserver becomes
+a subscriber shim: a tokio task per live broadcaster reads
+`next_fragment()` and re-invokes the observer callback. Once
+every ingest has moved and every consumer is broadcaster-native,
+the FragmentObserver + shim pair gets deleted.
+
+### Remaining work to reach Tier 4 (rough engineer-weeks)
+
+Mostly unchanged from session 54. Ingest migration now has no
+architectural blockers; it is wiring work against a fixed
+interface. Updated breakdown:
+
+* **Tier 2 leftover** (~3 weeks): ingest migration (1-2),
+  lvqr-cmaf standalone with mp4-atom (~1), Apple
+  mediastreamvalidator in CI (~1, biggest audit gap).
+* **Tier 1 leftover** (~3-4 weeks): playwright E2E, 24h soak rig,
+  MediaMTX comparison harness.
+* **Tier 3 full** (~13 weeks): chitchat cluster (4), DVR scrub UI
+  (1.5), webhook+OAuth+signed URLs (1.5), OTLP observability +
+  Grafana (2.5), hot config reload (1), captions+SCTE-35 (2),
+  stream key lifecycle (1).
+
+Total: ~18-20 focused engineer-weeks before Tier 4 entry.
+Tier 4 itself is 10-12 weeks. M4 at roughly week 28-32 of
+concentrated work from this point.
+
+### Protocols supported
+
+Unchanged from session 52/53/54. 10 protocols: RTMP + WHIP + SRT +
+RTSP ingest; LL-HLS + DASH + WHEP + MoQ + WebSocket egress.
+
+### Known gaps
+
+1. **Ingest migration to broadcaster dispatch**: every primitive
+   is shipped and tested; per-crate wiring deferred. Session 56
+   priority #1.
+2. **RTSP playback egress**: PLAY direction works at the
+   protocol level but does not packetize outbound RTP.
+3. **Peer mesh media relay**: topology works, forwarding is
+   Tier 4.
+4. **Tier 1 infra**: no playwright, no 24h soak, no MediaMTX
+   comparison harness.
+5. **Tiers 3-5**: cluster, observability, WASM, SDKs not
+   started.
+6. **Contract**: 7 missing slots across 5 crates.
+
+### Session 56 entry point
+
+Priority order:
+
+1. **Ingest migration, RTSP first**. Add
+   `FragmentBroadcasterRegistry` to the RTSP server state.
+   Replace the direct `observer.on_fragment(broadcast, track, &frag)`
+   calls in `process_video_rtp` / `process_audio_rtp` with
+   `broadcaster.emit(fragment)` where `broadcaster` comes from
+   `registry.get_or_create(...)`. Wire the existing observer as
+   a subscriber shim: spawn a tokio task per broadcaster that
+   reads `next_fragment()` and re-invokes the observer. On
+   `init_segment` emit, call the observer's `on_init` out-of-
+   band (since init is not a Fragment). Preserve every existing
+   test. Once RTSP is green, repeat for SRT (same shape),
+   WHIP (already partly fragment-shaped), RTMP last.
+
+2. **RTSP playback egress**: RTP packetization for the PLAY
+   direction. H.264 NAL -> single NAL / FU-A, HEVC -> FU,
+   AAC -> RFC 3640. Closes the last RTSP competitive gap.
+
+3. **Apple mediastreamvalidator in CI**: the biggest audit gap.
+   Wire as a GitHub Actions step against lvqr-hls-generated
+   playlists. Blocking LL-HLS changes until green.
+
+4. **Tier 3 planning**: cluster via chitchat (4 weeks), OTLP
+   observability (2.5 weeks).
 
 ## Session 54 close (2026-04-16)
 
