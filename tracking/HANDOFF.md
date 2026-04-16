@@ -1,10 +1,43 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- Disconnect story fully tested (420 tests)
+## Project Status: v0.4-dev -- Configurable LL-HLS timing (420 tests)
 
-**Last Updated**: 2026-04-16 (session 42 closed: DASH finalize
-unit tests + RTMP disconnect -> type="static" E2E test. 420
-tests across 88+ binaries, all egress disconnect paths verified).
+**Last Updated**: 2026-04-16 (session 43 closed: --hls-target-duration
++ --hls-part-target CLI flags for operator-tunable segment/partial
+timing, end-to-end from CLI through CmafPolicy, PlaylistBuilder,
+and ServerControl).
+
+## Session 43 close (2026-04-16)
+
+One commit on top of session 42's `b53069c`.
+
+### Session 43 commit
+
+1. **Configurable LL-HLS segment/partial timing** (`8b59fc9`).
+   `--hls-target-duration <secs>` (env `LVQR_HLS_TARGET_DURATION`,
+   default 2) and `--hls-part-target <ms>` (env
+   `LVQR_HLS_PART_TARGET`, default 200). The config flows
+   end-to-end: CLI -> `ServeConfig` -> `PlaylistBuilderConfig`
+   (`EXT-X-TARGETDURATION` + `PART-TARGET`) + `CmafPolicy`
+   (segmenter close threshold) + `ServerControl` (HOLD-BACK =
+   3 * target, PART-HOLD-BACK = 3 * part, CAN-SKIP-UNTIL =
+   6 * target auto-derived). `CmafPolicy::with_durations`
+   constructor converts millisecond values to timescale ticks.
+   The DVR window calculation respects the configured target
+   duration. All 420 tests pass unchanged.
+
+### Verification
+
+`cargo fmt --all --check` clean. `cargo clippy --workspace
+--all-targets -- -D warnings` clean. 420 tests passing.
+
+### Session 44 entry point
+
+* **SRT ingest** (Tier 2.8 -- biggest competitive gap).
+* **Byte-range partials for LL-HLS**.
+* **Self-hosted macOS runner for mediastreamvalidator**.
+
+
 
 ## Session 42 close (2026-04-16)
 
