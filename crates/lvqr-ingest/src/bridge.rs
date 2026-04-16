@@ -8,11 +8,12 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use lvqr_auth::{AuthContext, NoopAuthProvider, SharedAuth};
 use lvqr_core::{EventBus, RelayEvent};
-use lvqr_fragment::{Fragment, FragmentFlags, FragmentMeta, MoqTrackSink};
+use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta, MoqTrackSink};
 use lvqr_moq::Track;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use crate::dispatch::{publish_fragment, publish_init};
 use crate::observer::{SharedFragmentObserver, SharedRawSampleObserver};
 use crate::remux::{
     AudioConfig, FlvAudioTag, FlvVideoTag, VideoConfig, audio_init_segment, audio_segment, extract_resolution,
@@ -54,6 +55,9 @@ pub struct RtmpMoqBridge {
     events: Option<EventBus>,
     observer: Option<SharedFragmentObserver>,
     raw_observer: Option<SharedRawSampleObserver>,
+    /// Session-58 migration surface: every fragment is published here
+    /// alongside the legacy `FragmentObserver` callback.
+    registry: FragmentBroadcasterRegistry,
 }
 
 impl RtmpMoqBridge {
@@ -65,6 +69,7 @@ impl RtmpMoqBridge {
             events: None,
             observer: None,
             raw_observer: None,
+            registry: FragmentBroadcasterRegistry::new(),
         }
     }
 
@@ -77,7 +82,20 @@ impl RtmpMoqBridge {
             events: None,
             observer: None,
             raw_observer: None,
+            registry: FragmentBroadcasterRegistry::new(),
         }
+    }
+
+    /// Install an externally-owned broadcaster registry. Used when
+    /// multiple ingest protocols share one registry.
+    pub fn with_registry(mut self, registry: FragmentBroadcasterRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// Handle to the broadcaster registry.
+    pub fn registry(&self) -> FragmentBroadcasterRegistry {
+        self.registry.clone()
     }
 
     /// Replace the auth provider after construction.
@@ -145,6 +163,8 @@ impl RtmpMoqBridge {
         let observer_audio = self.observer.clone();
         let raw_observer_video = self.raw_observer.clone();
         let raw_observer_audio = self.raw_observer.clone();
+        let registry_video = self.registry.clone();
+        let registry_audio = self.registry.clone();
 
         let on_publish: StreamCallback = Arc::new(move |app: &str, key: &str| {
             let stream_name = format!("{app}/{key}");
@@ -252,13 +272,19 @@ impl RtmpMoqBridge {
                     stream.video_sink.set_init_segment(init.clone());
                     stream.video_config = Some(config);
                     stream.video_init = Some(init.clone());
-                    if let Some(obs) = observer_video.as_ref() {
-                        // Video init writer is hardcoded to 90 kHz
-                        // (see `video_init_segment_with_size` ->
-                        // `mvhd.timescale = 90000`), so the bridge
-                        // reports the same value here.
-                        obs.on_init(&stream_name, "0.mp4", 90_000, init);
-                    }
+                    // Video init writer is hardcoded to 90 kHz
+                    // (see `video_init_segment_with_size` ->
+                    // `mvhd.timescale = 90000`), so the bridge
+                    // reports the same value here.
+                    publish_init(
+                        observer_video.as_ref(),
+                        &registry_video,
+                        &stream_name,
+                        "0.mp4",
+                        "avc1",
+                        90_000,
+                        init,
+                    );
                     maybe_write_catalog(stream, &stream_name);
                 }
                 FlvVideoTag::Nalu {
@@ -326,9 +352,15 @@ impl RtmpMoqBridge {
                     if let Err(e) = stream.video_sink.push(&frag) {
                         debug!(error = ?e, "failed to push video fragment through sink");
                     }
-                    if let Some(obs) = observer_video.as_ref() {
-                        obs.on_fragment(&stream_name, "0.mp4", &frag);
-                    }
+                    publish_fragment(
+                        observer_video.as_ref(),
+                        &registry_video,
+                        &stream_name,
+                        "0.mp4",
+                        "avc1",
+                        90_000,
+                        frag,
+                    );
                 }
                 FlvVideoTag::EndOfSequence => {
                     stream.video_sink.finish_current_group();
@@ -357,9 +389,15 @@ impl RtmpMoqBridge {
                     stream.audio_sink.set_init_segment(init.clone());
                     stream.audio_config = Some(config);
                     stream.audio_init = Some(init.clone());
-                    if let Some(obs) = observer_audio.as_ref() {
-                        obs.on_init(&stream_name, "1.mp4", audio_timescale, init);
-                    }
+                    publish_init(
+                        observer_audio.as_ref(),
+                        &registry_audio,
+                        &stream_name,
+                        "1.mp4",
+                        "mp4a.40.2",
+                        audio_timescale,
+                        init,
+                    );
                     maybe_write_catalog(stream, &stream_name);
                 }
                 FlvAudioTag::RawAac(aac_data) => {
@@ -417,9 +455,16 @@ impl RtmpMoqBridge {
                     if let Err(e) = stream.audio_sink.push(&frag) {
                         debug!(error = ?e, "failed to push audio fragment through sink");
                     }
-                    if let Some(obs) = observer_audio.as_ref() {
-                        obs.on_fragment(&stream_name, "1.mp4", &frag);
-                    }
+                    let audio_timescale = stream.audio_config.as_ref().map(|c| c.sample_rate).unwrap_or(44100);
+                    publish_fragment(
+                        observer_audio.as_ref(),
+                        &registry_audio,
+                        &stream_name,
+                        "1.mp4",
+                        "mp4a.40.2",
+                        audio_timescale,
+                        frag,
+                    );
                     // Close the group immediately so every audio frame is
                     // its own group on the wire. Subsequent pushes will
                     // open fresh groups.
