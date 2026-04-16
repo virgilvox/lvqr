@@ -39,6 +39,12 @@
 //!   through a parallel catalog track or an init segment that contains the
 //!   timing edit list. This matches the existing sink-side contract; the
 //!   load-bearing guarantee is payload-byte lossless, not field-identity.
+//!
+//! * `group_id` on emitted fragments is the MoQ group sequence number, which
+//!   the sink assigns via `TrackProducer::append_group` on every keyframe and
+//!   which starts at 0 for each new track. The producer-side `group_id` the
+//!   original [`Fragment`] carried is lost. `object_id` is recounted from 0
+//!   per group, not carried across the round trip.
 
 use crate::fragment::{Fragment, FragmentFlags, FragmentMeta};
 use crate::stream::FragmentStream;

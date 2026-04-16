@@ -8,7 +8,7 @@
 //! fragment model rests on.
 
 use bytes::Bytes;
-use lvqr_fragment::{Fragment, FragmentFlags, FragmentMeta, MoqTrackSink};
+use lvqr_fragment::{Fragment, FragmentFlags, FragmentMeta, FragmentStream, MoqTrackSink, MoqTrackStream};
 use lvqr_moq::{OriginProducer, Track};
 use proptest::prelude::*;
 
@@ -140,6 +140,73 @@ fn sink_roundtrip_preserves_every_payload_byte() {
                     prop_assert_eq!(frame.as_ref(), expected_payload.as_slice());
                 }
             }
+            Ok(())
+        });
+        result?;
+    });
+}
+
+/// Track-stream round-trip: whatever bytes `MoqTrackSink::push` writes, a
+/// `MoqTrackStream` re-emits as Fragments whose payloads, in order, equal the
+/// original inputs. This is the symmetric guarantee to
+/// `sink_roundtrip_preserves_every_payload_byte` above and is what every
+/// relay-of-relays / DVR-fetch flow depends on.
+#[test]
+fn track_stream_roundtrip_preserves_every_payload_byte() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    proptest!(|(plan in fragment_plan_strategy())| {
+        let result: Result<(), TestCaseError> = rt.block_on(async {
+            let origin = OriginProducer::new();
+            let mut broadcast = origin
+                .create_broadcast("ts-rt")
+                .expect("create broadcast");
+            let track = broadcast
+                .create_track(Track::new("0.mp4"))
+                .expect("create track");
+            let meta = FragmentMeta::new("avc1.640028", 90000);
+            let mut sink = MoqTrackSink::new(track, meta.clone());
+
+            // Flat sequence of payloads to expect back, in push order. The
+            // MoqTrackStream flattens across group boundaries, so the round-
+            // trip comparison is against the original plan, not its grouping.
+            let expected: Vec<Vec<u8>> = plan.iter().map(|(_, p)| p.clone()).collect();
+
+            for (i, (is_key, payload)) in plan.iter().enumerate() {
+                let flags = if *is_key { FragmentFlags::KEYFRAME } else { FragmentFlags::DELTA };
+                let f = Fragment::new(
+                    "0.mp4", i as u64, i as u64, 0, i as u64, i as u64, 3000, flags,
+                    Bytes::from(payload.clone()),
+                );
+                sink.push(&f).expect("push fragment");
+            }
+            sink.finish_current_group();
+
+            // Subscribe while sink (TrackProducer) is still alive.
+            let consumer = origin.consume();
+            let bc = consumer
+                .consume_broadcast("ts-rt")
+                .expect("consume broadcast");
+            let track_consumer = bc
+                .subscribe_track(&Track::new("0.mp4"))
+                .expect("subscribe");
+
+            // No init segment was bound, so every group is payload-only.
+            let mut stream = MoqTrackStream::without_init_prefix("0.mp4", meta, track_consumer);
+
+            for (idx, expected_payload) in expected.iter().enumerate() {
+                let f = stream
+                    .next_fragment()
+                    .await
+                    .unwrap_or_else(|| panic!("track stream ended early at index {idx}"));
+                prop_assert_eq!(f.payload.as_ref(), expected_payload.as_slice());
+            }
+            // Drop the sink so the track finishes and the stream reports EOS.
+            drop(sink);
+            prop_assert!(stream.next_fragment().await.is_none(), "track stream exhausted");
             Ok(())
         });
         result?;
