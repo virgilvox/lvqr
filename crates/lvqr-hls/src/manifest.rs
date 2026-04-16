@@ -47,6 +47,14 @@ pub struct Segment {
     pub duration_ticks: u64,
     /// Parts that make up this segment, in DTS order.
     pub parts: Vec<Part>,
+    /// Wall-clock time for this segment as milliseconds since the
+    /// UNIX epoch. `Some` when the builder's
+    /// `PlaylistBuilderConfig::program_date_time_base` is set;
+    /// `None` otherwise. Rendered as an ISO 8601
+    /// `#EXT-X-PROGRAM-DATE-TIME` tag before the segment's first
+    /// `#EXT-X-PART` line. RFC 8216bis requires this tag on every
+    /// segment when `CAN-SKIP-UNTIL` is advertised.
+    pub program_date_time_millis: Option<u64>,
 }
 
 /// One partial segment (LL-HLS `#EXT-X-PART` entry).
@@ -197,6 +205,9 @@ impl Manifest {
             let _ = writeln!(out, "#EXT-X-SKIP:SKIPPED-SEGMENTS={skip_count}");
         }
         for seg in &self.segments[skip_count..] {
+            if let Some(millis) = seg.program_date_time_millis {
+                let _ = writeln!(out, "#EXT-X-PROGRAM-DATE-TIME:{}", format_program_date_time(millis));
+            }
             for part in &seg.parts {
                 let _ = writeln!(
                     out,
@@ -326,6 +337,16 @@ pub struct PlaylistBuilderConfig {
     /// can purge them from its byte cache after releasing the
     /// builder lock.
     pub max_segments: Option<usize>,
+    /// Wall-clock timestamp of the first media sample (DTS = 0) as
+    /// milliseconds since the UNIX epoch. When `Some`, the builder
+    /// computes an `#EXT-X-PROGRAM-DATE-TIME` for every closed
+    /// segment by adding the cumulative segment-duration offset to
+    /// this base. `None` omits the tag entirely.
+    ///
+    /// RFC 8216bis requires `EXT-X-PROGRAM-DATE-TIME` on every
+    /// segment when `CAN-SKIP-UNTIL` is advertised. Callers that
+    /// enable delta playlists should therefore always set this.
+    pub program_date_time_base: Option<u64>,
 }
 
 impl Default for PlaylistBuilderConfig {
@@ -338,6 +359,7 @@ impl Default for PlaylistBuilderConfig {
             target_duration_secs: 2,
             part_target_secs: 0.2,
             max_segments: None,
+            program_date_time_base: None,
         }
     }
 }
@@ -372,6 +394,11 @@ pub struct PlaylistBuilder {
     /// playlist. Contains both segment URIs and the constituent
     /// part URIs of every evicted segment.
     evicted_uris: Vec<String>,
+    /// Cumulative duration of all closed segments in milliseconds,
+    /// used to compute each segment's `program_date_time_millis`
+    /// offset from the config base. Only meaningful when
+    /// `config.program_date_time_base` is `Some`.
+    cumulative_duration_millis: u64,
 }
 
 impl PlaylistBuilder {
@@ -397,6 +424,7 @@ impl PlaylistBuilder {
             last_dts: None,
             part_index: 0,
             evicted_uris: Vec::new(),
+            cumulative_duration_millis: 0,
         }
     }
 
@@ -472,13 +500,24 @@ impl PlaylistBuilder {
         }
         let sequence = self.next_sequence;
         let uri = format!("{}seg-{}.m4s", self.config.uri_prefix, sequence);
+        let pdt_millis = self
+            .config
+            .program_date_time_base
+            .map(|base| base + self.cumulative_duration_millis);
+        let duration_millis = if self.config.timescale > 0 {
+            self.pending_duration_ticks * 1000 / self.config.timescale as u64
+        } else {
+            0
+        };
         let seg = Segment {
             sequence,
             uri,
             duration_ticks: self.pending_duration_ticks,
             parts: std::mem::take(&mut self.pending_parts),
+            program_date_time_millis: pdt_millis,
         };
         self.manifest.segments.push(seg);
+        self.cumulative_duration_millis += duration_millis;
         self.pending_duration_ticks = 0;
         self.next_sequence += 1;
         self.part_index = 0;
@@ -525,6 +564,30 @@ fn ticks_to_secs(ticks: u64, timescale: u32) -> f64 {
         return 0.0;
     }
     ticks as f64 / timescale as f64
+}
+
+/// Format milliseconds since the UNIX epoch as an ISO 8601 UTC
+/// datetime string for `#EXT-X-PROGRAM-DATE-TIME`. Uses Howard
+/// Hinnant's civil_from_days algorithm to avoid a chrono/time
+/// dependency.
+fn format_program_date_time(epoch_millis: u64) -> String {
+    let total_secs = (epoch_millis / 1000) as i64;
+    let millis = epoch_millis % 1000;
+    let day_secs = total_secs.rem_euclid(86400) as u32;
+    let h = day_secs / 3600;
+    let min = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    let z = total_secs.div_euclid(86400) + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}.{millis:03}Z")
 }
 
 #[cfg(test)]
@@ -714,6 +777,7 @@ mod tests {
                 uri: format!("seg-{i}.m4s"),
                 duration_ticks: 180_000,
                 parts: Vec::new(),
+                program_date_time_millis: None,
             })
             .collect();
         let m = Manifest {
@@ -831,6 +895,70 @@ mod tests {
         b.close_pending_segment();
         assert_eq!(b.manifest().segments.len(), 10);
         assert!(b.drain_evicted_uris().is_empty());
+    }
+
+    #[test]
+    fn render_emits_program_date_time_per_segment() {
+        // 2026-04-16T00:00:00.000Z in millis since epoch.
+        let base: u64 = 1_776_297_600_000;
+        let cfg = PlaylistBuilderConfig {
+            program_date_time_base: Some(base),
+            ..PlaylistBuilderConfig::default()
+        };
+        let mut b = PlaylistBuilder::new(cfg);
+        // Push 3 segments at 2 s each (180_000 ticks at 90 kHz).
+        for i in 0..3u64 {
+            b.push(&mk_chunk(i * 180_000, 180_000, CmafChunkKind::Segment)).unwrap();
+        }
+        b.close_pending_segment();
+
+        let text = b.manifest().render();
+        // First segment starts at the base.
+        assert!(
+            text.contains("#EXT-X-PROGRAM-DATE-TIME:2026-04-16T00:00:00.000Z"),
+            "seg-0 PDT missing; got:\n{text}"
+        );
+        // Second segment starts at base + 2 s.
+        assert!(
+            text.contains("#EXT-X-PROGRAM-DATE-TIME:2026-04-16T00:00:02.000Z"),
+            "seg-1 PDT missing; got:\n{text}"
+        );
+        // Third segment starts at base + 4 s.
+        assert!(
+            text.contains("#EXT-X-PROGRAM-DATE-TIME:2026-04-16T00:00:04.000Z"),
+            "seg-2 PDT missing; got:\n{text}"
+        );
+        // PDT tags appear exactly 3 times (one per closed segment).
+        assert_eq!(
+            text.matches("#EXT-X-PROGRAM-DATE-TIME:").count(),
+            3,
+            "expected exactly 3 PDT tags; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn program_date_time_omitted_when_base_is_none() {
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        b.push(&mk_chunk(0, 180_000, CmafChunkKind::Segment)).unwrap();
+        b.push(&mk_chunk(180_000, 180_000, CmafChunkKind::Segment)).unwrap();
+        let text = b.manifest().render();
+        assert!(
+            !text.contains("#EXT-X-PROGRAM-DATE-TIME"),
+            "PDT should not appear when base is None; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn format_program_date_time_known_epoch() {
+        // 2026-04-16T01:30:45.123Z
+        let millis = 1_776_303_045_123u64;
+        let formatted = super::format_program_date_time(millis);
+        assert_eq!(formatted, "2026-04-16T01:30:45.123Z");
+    }
+
+    #[test]
+    fn format_program_date_time_unix_epoch() {
+        assert_eq!(super::format_program_date_time(0), "1970-01-01T00:00:00.000Z");
     }
 
     #[test]

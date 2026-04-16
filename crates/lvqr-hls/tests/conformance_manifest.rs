@@ -44,6 +44,7 @@ async fn mediastreamvalidator_accepts_manifest_stub() {
         target_duration_secs: 2,
         part_target_secs: 0.2,
         max_segments: None,
+        program_date_time_base: None,
     });
 
     // Stub init bytes. The coalescer is not yet implemented, so we

@@ -55,6 +55,7 @@ async fn playlist_init_and_segment_round_trip() {
         target_duration_secs: 2,
         part_target_secs: 0.2,
         max_segments: None,
+        program_date_time_base: None,
     });
 
     // Publish an init segment and a full 200 ms-per-part 2 s
@@ -198,6 +199,7 @@ async fn sliding_window_purges_cache_and_advances_media_sequence() {
         target_duration_secs: 2,
         part_target_secs: 0.2,
         max_segments: Some(3),
+        program_date_time_base: None,
     });
     server.push_init(Bytes::from_static(b"\x00init")).await;
 

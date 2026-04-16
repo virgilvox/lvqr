@@ -67,7 +67,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Router,
@@ -618,8 +618,9 @@ impl MultiHlsServer {
         if let Some(existing) = map.get(broadcast) {
             return existing.video.clone();
         }
+        let cfg = stamp_pdt_now(&self.inner.config);
         let entry = BroadcastEntry {
-            video: HlsServer::new(self.inner.config.clone()),
+            video: HlsServer::new(cfg),
             audio: None,
         };
         let video = entry.video.clone();
@@ -650,12 +651,16 @@ impl MultiHlsServer {
             .broadcasts
             .lock()
             .expect("multi hls broadcasts mutex poisoned");
-        let entry = map.entry(broadcast.to_string()).or_insert_with(|| BroadcastEntry {
-            video: HlsServer::new(self.inner.config.clone()),
-            audio: None,
+        let entry = map.entry(broadcast.to_string()).or_insert_with(|| {
+            let cfg = stamp_pdt_now(&self.inner.config);
+            BroadcastEntry {
+                video: HlsServer::new(cfg),
+                audio: None,
+            }
         });
         if entry.audio.is_none() {
-            entry.audio = Some(HlsServer::new(audio_config_from(&self.inner.config, timescale)));
+            let cfg = stamp_pdt_now(&self.inner.config);
+            entry.audio = Some(HlsServer::new(audio_config_from(&cfg, timescale)));
         }
         entry.audio.clone().expect("audio just assigned")
     }
@@ -722,6 +727,21 @@ impl MultiHlsServer {
 /// `uri_prefix`, and timescale to values that match the audio
 /// track. Callers plumb `timescale` from the FLV AAC sequence
 /// header's `AudioConfig::sample_rate`.
+/// Stamp the current wall-clock time into a cloned config so the
+/// builder emits `#EXT-X-PROGRAM-DATE-TIME` from this point on.
+/// Called once per broadcast at `ensure_video` / `ensure_audio`
+/// creation time so each broadcast anchors independently.
+fn stamp_pdt_now(config: &PlaylistBuilderConfig) -> PlaylistBuilderConfig {
+    let now_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    PlaylistBuilderConfig {
+        program_date_time_base: Some(now_millis),
+        ..config.clone()
+    }
+}
+
 fn audio_config_from(video: &PlaylistBuilderConfig, timescale: u32) -> PlaylistBuilderConfig {
     PlaylistBuilderConfig {
         timescale,
@@ -731,6 +751,7 @@ fn audio_config_from(video: &PlaylistBuilderConfig, timescale: u32) -> PlaylistB
         target_duration_secs: video.target_duration_secs,
         part_target_secs: video.part_target_secs,
         max_segments: video.max_segments,
+        program_date_time_base: video.program_date_time_base,
     }
 }
 
