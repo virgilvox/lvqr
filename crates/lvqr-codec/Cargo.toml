@@ -18,3 +18,8 @@ tracing = { workspace = true }
 [dev-dependencies]
 proptest = "1"
 lvqr-conformance = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "ts_demuxer"
+harness = false
