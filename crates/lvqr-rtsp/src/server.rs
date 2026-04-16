@@ -26,11 +26,12 @@ const SUPPORTED_METHODS: &str = "OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, RECOR
 
 pub struct RtspServer {
     addr: SocketAddr,
+    pre_bound: Option<TcpListener>,
 }
 
 impl RtspServer {
     pub fn new(addr: SocketAddr) -> Self {
-        Self { addr }
+        Self { addr, pre_bound: None }
     }
 
     /// Pre-bind the TCP listener and return the actual local address.
@@ -41,11 +42,7 @@ impl RtspServer {
         let listener = TcpListener::bind(self.addr).await?;
         let bound = listener.local_addr()?;
         self.addr = bound;
-        // We store the listener temporarily by dropping it and
-        // re-binding in run(). For ephemeral ports this works
-        // because we update self.addr to the bound address.
-        // A future optimization could stash the listener.
-        drop(listener);
+        self.pre_bound = Some(listener);
         Ok(bound)
     }
 
@@ -55,7 +52,10 @@ impl RtspServer {
         events: EventBus,
         shutdown: CancellationToken,
     ) -> Result<(), std::io::Error> {
-        let listener = TcpListener::bind(self.addr).await?;
+        let listener = match self.pre_bound {
+            Some(l) => l,
+            None => TcpListener::bind(self.addr).await?,
+        };
         let local_addr = listener.local_addr()?;
         info!(addr = %local_addr, "RTSP server bound");
 
