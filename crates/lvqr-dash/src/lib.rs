@@ -3,11 +3,11 @@
 //! This is the Tier 2.6 crate in the roadmap: a typed Media
 //! Presentation Description (MPD) generator that reuses the
 //! `lvqr-cmaf` segmenter's CMAF fragments. The crate is deliberately
-//! shaped as a sibling of `lvqr-hls`: both egresses observe the same
-//! [`lvqr_ingest::FragmentObserver`] contract, both buffer segment
-//! bytes under predictable URIs, and both project an axum router from
-//! the buffered state. The difference is the on-the-wire manifest
-//! format.
+//! shaped as a sibling of `lvqr-hls`: both egresses subscribe to the
+//! same [`lvqr_fragment::FragmentBroadcasterRegistry`] surface the
+//! Tier 2.1 ingest migration landed, both buffer segment bytes under
+//! predictable URIs, and both project an axum router from the
+//! buffered state. The difference is the on-the-wire manifest format.
 //!
 //! Session 31 lands the MPD renderer and its unit tests. The HTTP
 //! surface (`DashServer`, `MultiDashServer`, axum router, segment
@@ -23,6 +23,14 @@
 //!   (VOD) profile and `SegmentTimeline` addressing are
 //!   future-session work when the DVR scrub story lands alongside
 //!   LL-HLS VOD windows.
+//! * **Broadcaster-native fragment consumer** (session 60). Ingest
+//!   crates publish fragments into a shared
+//!   [`lvqr_fragment::FragmentBroadcasterRegistry`]; the
+//!   [`bridge::BroadcasterDashBridge`] here installs an
+//!   `on_entry_created` callback and spawns one drain task per
+//!   `(broadcast, track)` that pumps fragments into a
+//!   [`server::MultiDashServer`]. The rendered MPD + segment cache
+//!   surface is unchanged.
 //! * **Hand-written XML** rather than a SerDe-backed `quick-xml`
 //!   serializer. The MPD surface is small (a Period, one to two
 //!   AdaptationSets, a Representation per track, a SegmentTemplate)
@@ -38,18 +46,21 @@
 //!   renderer uses, which means the two egresses pick up new codec
 //!   support the moment the `lvqr-cmaf` helpers learn it.
 //!
-//! ## Intended flow (target state once the server lands)
+//! ## Flow
 //!
-//! 1. A `DashFragmentBridge` implementing `FragmentObserver`
-//!    subscribes to every RTMP + WHIP bridge. `on_init` stashes the
-//!    init segment bytes under `init-<track>.m4s`. `on_fragment`
-//!    pushes partial / segment bytes into a sliding window under
-//!    `seg-<track>-<n>.m4s`.
-//! 2. `DashServer::router()` serves three routes per broadcast:
-//!    `/dash/{broadcast}/manifest.mpd`, `/dash/{broadcast}/init-*.m4s`,
+//! 1. [`bridge::BroadcasterDashBridge::install`] wires an
+//!    `on_entry_created` callback onto the shared
+//!    [`lvqr_fragment::FragmentBroadcasterRegistry`]. For every new
+//!    `(broadcast, track)` pair, the callback spawns a drain task
+//!    that reads the init segment off the broadcaster meta and pushes
+//!    each subsequent fragment into the per-broadcast
+//!    [`server::DashServer`] under a monotonic `$Number$` counter.
+//! 2. [`server::DashServer::router`] serves three routes per
+//!    broadcast: `/dash/{broadcast}/manifest.mpd`,
+//!    `/dash/{broadcast}/init-*.m4s`, and
 //!    `/dash/{broadcast}/seg-*-$n$.m4s`. The MPD is re-rendered per
-//!    request from the current in-memory state so the `minimumUpdatePeriod`
-//!    can be kept short for low-latency DASH.
+//!    request from the current in-memory state so
+//!    `minimumUpdatePeriod` can be kept short for low-latency DASH.
 //! 3. A typical LL-DASH client polls the MPD every few hundred ms,
 //!    follows the SegmentTemplate to the next segment URI, and
 //!    fetches the segment via chunked-transfer HTTP/1.1.
@@ -58,6 +69,6 @@ pub mod bridge;
 pub mod mpd;
 pub mod server;
 
-pub use bridge::DashFragmentBridge;
+pub use bridge::BroadcasterDashBridge;
 pub use mpd::{AdaptationSet, DashError, Mpd, MpdType, Period, Representation, SegmentTemplate, render_mpd};
 pub use server::{DashConfig, DashServer, MultiDashServer};

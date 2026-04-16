@@ -16,7 +16,7 @@
 //!
 //! Segment numbering follows the DASH live profile: each track has a
 //! monotonic counter the bridge stamps onto every pushed fragment
-//! (see `crate::bridge::DashFragmentBridge`). The MPD's
+//! (see `crate::bridge::BroadcasterDashBridge`). The MPD's
 //! `SegmentTemplate` uses `$Number$` addressing with `startNumber=1`,
 //! so a client resolves `seg-video-1.m4s`, `seg-video-2.m4s`, ...
 //! in order from the first produced fragment.

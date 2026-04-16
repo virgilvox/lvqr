@@ -13,7 +13,6 @@ categories = ["multimedia", "web-programming"]
 [dependencies]
 lvqr-cmaf = { workspace = true }
 lvqr-fragment = { workspace = true }
-lvqr-ingest = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }

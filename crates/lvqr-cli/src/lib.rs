@@ -23,7 +23,7 @@ use axum::routing::get;
 use bytes::Bytes;
 use lvqr_auth::{AuthContext, AuthDecision, NoopAuthProvider, SharedAuth};
 use lvqr_core::{EventBus, RelayEvent};
-use lvqr_dash::{DashConfig, DashFragmentBridge, MultiDashServer};
+use lvqr_dash::{BroadcasterDashBridge, DashConfig, MultiDashServer};
 use lvqr_fragment::FragmentBroadcasterRegistry;
 use lvqr_hls::{MultiHlsServer, PlaylistBuilderConfig};
 use lvqr_ingest::SharedFragmentObserver;
@@ -431,10 +431,23 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         );
     }
 
-    let mut fragment_observers: Vec<SharedFragmentObserver> = Vec::new();
-    if let Some(dash) = dash_server.clone() {
-        fragment_observers.push(Arc::new(DashFragmentBridge::new(dash)));
+    // Install the broadcaster-based DASH composition bridge. Same
+    // pattern as LL-HLS: the callback spawns a drain task per
+    // `(broadcast, track)` that stamps a monotonic `$Number$` counter
+    // onto every observed fragment and pushes it into the per-broadcast
+    // `DashServer`. Session 60: completes the consumer-side switchover.
+    if let Some(ref dash) = dash_server {
+        BroadcasterDashBridge::install(dash.clone(), &shared_registry);
     }
+
+    // Every Tier 2.1 consumer is now broadcaster-native (archive + HLS
+    // + DASH). The `fragment_observers` tee no longer has any members
+    // to collect; `shared_fragment_observer` stays `None` and no
+    // ingest crate is wired with `with_observer`. The observer branch
+    // is kept alive until the observer trait + dispatch branch get
+    // removed in a follow-up change so the `with_observer` API
+    // surface does not churn under consumers that already migrated.
+    let fragment_observers: Vec<SharedFragmentObserver> = Vec::new();
     let shared_fragment_observer: Option<SharedFragmentObserver> = match fragment_observers.len() {
         0 => None,
         1 => Some(fragment_observers.into_iter().next().expect("len checked")),
