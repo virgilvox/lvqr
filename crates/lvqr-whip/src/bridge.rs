@@ -37,8 +37,8 @@ use lvqr_cmaf::{
 };
 use lvqr_codec::hevc::{self as hevc_codec, HevcSps};
 use lvqr_core::{EventBus, RelayEvent};
-use lvqr_fragment::{Fragment, FragmentFlags, FragmentMeta, MoqTrackSink};
-use lvqr_ingest::{MediaCodec, SharedFragmentObserver, SharedRawSampleObserver};
+use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta, MoqTrackSink};
+use lvqr_ingest::{MediaCodec, SharedFragmentObserver, SharedRawSampleObserver, publish_fragment, publish_init};
 use lvqr_moq::{OriginProducer, Track};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
@@ -167,6 +167,11 @@ pub struct WhipMoqBridge {
     raw_observer: Option<SharedRawSampleObserver>,
     events: Option<EventBus>,
     audio_warn: AtomicBool,
+    /// Session-58 migration surface: every fragment is published here
+    /// alongside the legacy `FragmentObserver` callback. Consumers that
+    /// subscribe via `registry.subscribe(broadcast, track)` see the same
+    /// fragments as observer-side consumers.
+    registry: FragmentBroadcasterRegistry,
 }
 
 impl WhipMoqBridge {
@@ -178,6 +183,7 @@ impl WhipMoqBridge {
             raw_observer: None,
             events: None,
             audio_warn: AtomicBool::new(false),
+            registry: FragmentBroadcasterRegistry::new(),
         }
     }
 
@@ -194,6 +200,20 @@ impl WhipMoqBridge {
     pub fn with_raw_sample_observer(mut self, observer: SharedRawSampleObserver) -> Self {
         self.raw_observer = Some(observer);
         self
+    }
+
+    /// Install an externally-owned broadcaster registry. Used when multiple
+    /// ingest protocols share one registry so consumers can subscribe to
+    /// any broadcast regardless of which protocol fed it.
+    pub fn with_registry(mut self, registry: FragmentBroadcasterRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// Handle to the broadcaster registry. Consumers call
+    /// `registry.subscribe(broadcast, track)` to receive a `FragmentStream`.
+    pub fn registry(&self) -> FragmentBroadcasterRegistry {
+        self.registry.clone()
     }
 
     pub fn active_stream_count(&self) -> usize {
@@ -263,9 +283,15 @@ impl WhipMoqBridge {
         // indifferent. Session 28 then lifted the raw-sample
         // observer's guard (below) so WHEP egress gets the same
         // codec-aware routing.
-        if let Some(obs) = self.observer.as_ref() {
-            obs.on_init(broadcast, "0.mp4", 90_000, init);
-        }
+        publish_init(
+            self.observer.as_ref(),
+            &self.registry,
+            broadcast,
+            "0.mp4",
+            codec_fourcc,
+            90_000,
+            init,
+        );
 
         self.streams.insert(
             broadcast.to_string(),
@@ -346,9 +372,15 @@ impl WhipMoqBridge {
         // DashMap entry before the observer call to avoid the same
         // reentrancy footgun the video path already guards against.
         drop(entry);
-        if let Some(obs) = self.observer.as_ref() {
-            obs.on_init(broadcast, "1.mp4", 48_000, init);
-        }
+        publish_init(
+            self.observer.as_ref(),
+            &self.registry,
+            broadcast,
+            "1.mp4",
+            "Opus",
+            48_000,
+            init,
+        );
         true
     }
 
@@ -406,10 +438,21 @@ impl WhipMoqBridge {
         drop(entry);
         // Fragment observer (HLS + archive) fires for both codecs
         // after session 27. See the matching note in
-        // `ensure_initialized` for the rationale.
-        if let Some(obs) = self.observer.as_ref() {
-            obs.on_fragment(broadcast, "0.mp4", &frag);
-        }
+        // `ensure_initialized` for the rationale. Session 58 adds
+        // the broadcaster path alongside via publish_fragment.
+        let codec_fourcc = match sample.codec {
+            MediaCodec::H265 => "hev1",
+            _ => "avc1",
+        };
+        publish_fragment(
+            self.observer.as_ref(),
+            &self.registry,
+            broadcast,
+            "0.mp4",
+            codec_fourcc,
+            90_000,
+            frag,
+        );
     }
 }
 
@@ -518,10 +561,17 @@ impl WhipMoqBridge {
         // the last loose thread in the WHIP audio story. The HLS
         // audio rendition is codec-agnostic above the init
         // segment, so Opus fragments fan out through the same
-        // `HlsFragmentBridge` path AAC already uses.
-        if let Some(obs) = self.observer.as_ref() {
-            obs.on_fragment(broadcast, "1.mp4", &frag);
-        }
+        // `HlsFragmentBridge` path AAC already uses. Session 58
+        // adds broadcaster fan-out alongside.
+        publish_fragment(
+            self.observer.as_ref(),
+            &self.registry,
+            broadcast,
+            "1.mp4",
+            "Opus",
+            48_000,
+            frag,
+        );
     }
 }
 
@@ -980,5 +1030,97 @@ mod tests {
             },
         );
         assert_eq!(bridge.active_stream_count(), 1);
+    }
+
+    /// Session 58 dual-wire regression. Drive an AVC keyframe + an Opus
+    /// frame through the bridge; prove both the registry-side broadcaster
+    /// AND the observer spy see the init bytes and fragments for both
+    /// tracks. Pins the migration contract for WHIP: broadcaster-native
+    /// consumers see equivalent data to observer-native consumers.
+    #[tokio::test]
+    async fn dual_wire_broadcaster_matches_observer_for_video_and_audio() {
+        use lvqr_fragment::FragmentStream;
+
+        let origin = OriginProducer::new();
+        let obs = std::sync::Arc::new(RecordingObserver::default());
+        let shared: SharedFragmentObserver = obs.clone();
+        let registry = FragmentBroadcasterRegistry::new();
+        let bridge = WhipMoqBridge::new(origin)
+            .with_observer(shared)
+            .with_registry(registry.clone());
+
+        // Video keyframe -> broadcaster + observer both see init on 0.mp4
+        // and one fragment.
+        bridge.on_sample("live/dual-wire", avc_keyframe_sample());
+
+        // Opus audio -> broadcaster + observer both see init on 1.mp4
+        // and one fragment.
+        bridge.on_audio_sample(
+            "live/dual-wire",
+            IngestAudioSample {
+                dts_48k: 0,
+                duration_48k: 960,
+                payload: Bytes::from_static(&[0x78, 0x01, 0x02, 0x03]),
+            },
+        );
+
+        // Observer saw one init + one fragment per track.
+        assert_eq!(obs.init_calls.lock().unwrap().len(), 2);
+        assert_eq!(obs.frag_calls.lock().unwrap().len(), 2);
+
+        // Registry side: broadcasters exist for both tracks and meta
+        // carries an init segment.
+        let video_bc = registry
+            .get("live/dual-wire", "0.mp4")
+            .expect("video broadcaster created");
+        assert!(video_bc.meta().init_segment.is_some(), "video init carried on meta");
+        let audio_bc = registry
+            .get("live/dual-wire", "1.mp4")
+            .expect("audio broadcaster created");
+        assert!(audio_bc.meta().init_segment.is_some(), "audio init carried on meta");
+
+        // Subscribe now, then push another round of samples so the
+        // broadcaster sides deliver. (Both broadcasters were populated
+        // before we subscribed; we test the post-subscribe delivery
+        // path by emitting a second fragment.)
+        let mut video_sub = video_bc.subscribe();
+        let mut audio_sub = audio_bc.subscribe();
+        bridge.on_sample(
+            "live/dual-wire",
+            IngestSample {
+                dts_90k: 3000,
+                keyframe: false,
+                codec: MediaCodec::H264,
+                annex_b: avc_delta_annex_b(),
+            },
+        );
+        bridge.on_audio_sample(
+            "live/dual-wire",
+            IngestAudioSample {
+                dts_48k: 960,
+                duration_48k: 960,
+                payload: Bytes::from_static(&[0x79, 0x04, 0x05, 0x06]),
+            },
+        );
+
+        let v_frag = tokio::time::timeout(std::time::Duration::from_secs(2), video_sub.next_fragment())
+            .await
+            .expect("video sub not timed out")
+            .expect("video broadcaster frag");
+        assert_eq!(v_frag.track_id, "0.mp4");
+        assert!(!v_frag.flags.keyframe, "second video sample is delta");
+
+        let a_frag = tokio::time::timeout(std::time::Duration::from_secs(2), audio_sub.next_fragment())
+            .await
+            .expect("audio sub not timed out")
+            .expect("audio broadcaster frag");
+        assert_eq!(a_frag.track_id, "1.mp4");
+    }
+
+    fn avc_delta_annex_b() -> Bytes {
+        // Non-keyframe slice (NAL type 1 = non-IDR coded slice).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x41, 0xDD, 0xEE]);
+        Bytes::from(buf)
     }
 }
