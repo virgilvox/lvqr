@@ -1,8 +1,134 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- RTSP complete (H.264+HEVC+AAC, contract 5/5) -- 495 tests, all green
+## Project Status: v0.4.0 -- MoQ <-> Fragment bridge symmetric (Tier 2.1 adapters) -- 500 tests, all green
 
-**Last Updated**: 2026-04-16 (session 52 close).
+**Last Updated**: 2026-04-16 (session 53 close).
+
+## Session 53 close (2026-04-16)
+
+### What shipped (2 commits, +573/-1 lines)
+
+1. **MoQ -> FragmentStream adapters** (`e8d736a`).
+   `lvqr-fragment` gains `moq_stream` module with two new types:
+
+   * `MoqGroupStream` consumes a single `lvqr_moq::GroupConsumer`
+     and yields one `Fragment` per frame. When the meta carries an
+     init segment the first frame of the group is stripped as init
+     prefix; the next frame is flagged KEYFRAME, the rest DELTA.
+     `without_init_prefix` constructor skips that step when every
+     frame is a payload.
+
+   * `MoqTrackStream` composes `MoqGroupStream` across a
+     `lvqr_moq::TrackConsumer`. Pulls the next group, drains it,
+     pulls the next, presenting a flat Fragment sequence to
+     consumers. Keyframe flag resets per group boundary.
+
+   Round-trip is documented as payload-lossless but not
+   field-identity: dts/pts/duration/priority are zero on the
+   consumer side (sink does not encode them onto the wire), and
+   group_id / object_id are re-derived from the MoQ group sequence
+   rather than carried from the producer's Fragment.
+
+   Closes ROADMAP 2.1 deliverable line 154 "Adapter from
+   `moq_lite::Group` to `FragmentStream`". Enables future
+   relay-of-relays, DVR fetch, and cross-node fanout paths to
+   treat MoQ-sourced broadcasts identically to locally-ingested
+   ones via the same downstream sink interfaces.
+
+   3 unit tests inline (group init-prefix strip, group without
+   init, sink->track roundtrip through two groups).
+
+2. **Round-trip integration + proptest coverage** (`3976c4c`).
+
+   * `tests/moq_stream_roundtrip.rs`: one fixed scenario with a
+     late-binding init segment and two groups (kf1+d1+d2, kf2).
+     Symmetric partner of the existing `integration_sink.rs`.
+     Verifies group_id projects from MoQ sequence, object_id
+     resets per group, and the keyframe flag restarts at boundaries.
+
+   * Extended `tests/proptest_fragment.rs` with
+     `track_stream_roundtrip_preserves_every_payload_byte`: runs
+     the existing `fragment_plan_strategy` plans through
+     MoqTrackSink -> MoqTrackStream and asserts the flat payload
+     sequence comes back byte-for-byte across arbitrary keyframe /
+     delta interleavings. Consumer-side twin of the existing
+     `sink_roundtrip_preserves_every_payload_byte` property.
+
+### Ground truth (session 53 close)
+
+* **Head**: `3976c4c` on `main`. v0.4.0.
+* **Tests**: 500 passed, 0 failed, 1 ignored, 96+ suites. Delta
+  from session 52: +5 (lvqr-fragment: 11 -> 16 tests).
+* **Code**: lvqr-fragment grew to 820 lines (was ~530) across
+  5 source files (added `moq_stream.rs` at 253 lines) plus
+  expanded tests (+126 lines). Workspace still 23 crates.
+* **CI gates locally clean**: `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace` all green.
+* **lvqr-fragment public API**: now exports `MoqGroupStream` and
+  `MoqTrackStream` alongside the existing `Fragment`, `FragmentFlags`,
+  `FragmentMeta`, `FragmentStream`, `MoqTrackSink`, `MoqSinkError`.
+
+### Protocols supported
+
+Unchanged from session 52. 10 protocols total: RTMP + WHIP + SRT +
+RTSP ingest, LL-HLS + DASH + WHEP + MoQ + WebSocket egress.
+
+### Competitive position
+
+The MoQ bridge is now bidirectionally symmetric in the Fragment
+model: any MoQ track LVQR subscribes to can be re-projected into
+downstream sinks without a codec-specific path. MediaMTX and Ant
+Media have no unified-fragment equivalent; LiveKit has no MoQ at
+all. This is groundwork for Tier 3 cross-node MoQ relay.
+
+### Known gaps (rolling from session 52)
+
+1. **Ingest migration to FragmentStream dispatch**: SRT, RTSP,
+   RTMP, WHIP still emit fragments via the `FragmentObserver` hook
+   pattern rather than producing a shared `FragmentStream` the
+   MoqTrackSink and other consumers subscribe to. The types and
+   both directions of the MoQ bridge now exist; the remaining
+   piece is a multi-subscriber `FragmentBroadcaster` plus
+   per-crate wiring. This is deliberately deferred because it
+   ripples across four ingest crates and wants its own session's
+   attention for a clean commit sequence.
+2. **RTSP playback egress**: PLAY direction works at the RTSP
+   protocol level but does not packetize fragments into outbound
+   RTP.
+3. **Peer mesh media relay**: topology works, forwarding is Tier 4.
+4. **Tier 1 infra**: no playwright, no 24h soak, no comparison.
+5. **Tiers 3-5**: cluster, observability, WASM, SDKs not started.
+6. **Contract**: 7 missing slots across 5 crates (lvqr-record
+   fuzz, lvqr-moq fuzz+conformance, lvqr-fragment fuzz+conformance,
+   lvqr-whip conformance, lvqr-whep conformance). Note:
+   lvqr-fragment now has a clear proptest round-trip for both
+   directions of the MoQ bridge, which closes the bulk of the
+   proptest contract slot even though the formal contract file
+   may still list the crate as pending.
+
+### Session 54 entry point
+
+Priority order:
+
+1. **FragmentBroadcaster + ingest migration**. Introduce a
+   multi-subscriber `FragmentBroadcaster` in lvqr-fragment
+   (single producer, fan-out via `tokio::sync::broadcast` or a
+   conducer-style primitive so lagged subscribers do not block the
+   hot path). Migrate one ingest at a time (RTSP is the newest
+   and simplest, SRT next, WHIP/RTMP already have MoqTrackSink
+   wired internally so they are easier than they look). Keep the
+   existing `FragmentObserver` as a thin adapter over the
+   broadcaster for a migration-era backwards compat shim, then
+   delete it once every ingest has moved.
+
+2. **RTSP playback egress** -- RTP packetization for the PLAY
+   direction. H.264 NAL -> single NAL / FU-A, HEVC -> FU,
+   AAC -> RFC 3640. Would close the last RTSP competitive gap.
+
+3. **Tier 3 planning** -- cluster (chitchat), observability (OTLP).
+
+4. **Contract gaps** -- 7 missing slots. Close opportunistically.
 
 ## Session 52 close (2026-04-16)
 
