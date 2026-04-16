@@ -1,10 +1,124 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4-dev -- LL-HLS sliding-window eviction wired end-to-end
+## Project Status: v0.4-dev -- LL-HLS sliding-window eviction + two contract fuzz slots closed
 
-**Last Updated**: 2026-04-15 (session 34 closed: PlaylistBuilder
-sliding-window eviction + server-side cache purge + production
-cap at 60 segments in the lvqr-cli serve path).
+**Last Updated**: 2026-04-15 (session 35 closed: lvqr-hls +
+lvqr-cmaf cargo-fuzz skeletons, contract missing-slot count
+9 -> 7, on top of session 34's LL-HLS sliding-window eviction
+end-to-end).
+
+## Session 35 close (2026-04-15)
+
+Two concrete commits on top of session 34's `f9b0314`. The
+session closed two of the nine missing 5-artifact contract
+slots the session-30 maturity audit enumerated. No feature work;
+this was a disciplined Tier 1 test-infra push to build up the
+audit backlog the critical-path plan puts before v1.0 M1.
+
+### Session 35 commit list
+
+1. **lvqr-hls PlaylistBuilder fuzz skeleton** (`3466dcd`).
+   `crates/lvqr-hls/fuzz/` mirrors the session-33 `lvqr-dash`
+   fuzz layout. The `playlist_builder` target interprets the
+   fuzzer input as a sequence of `(duration, kind)` tuples and
+   feeds them into a `PlaylistBuilder` configured with
+   `max_segments=Some(4)` so any non-trivial input exercises
+   the session-34 sliding-window eviction path. DTS is forced
+   strictly monotonic by the target itself and durations are
+   forced non-zero; any error return from `push` is still
+   tolerated. After every successful push the target renders
+   the manifest and asserts the output begins with `#EXTM3U`
+   and contains exactly one header. At end-of-input it
+   force-closes the pending segment, drains the session-34
+   eviction buffer, and re-renders under the same invariants so
+   the end-of-stream coalesce + eviction paths are covered.
+   Excluded from the workspace like every other libfuzzer-sys
+   consumer; run with `cargo +nightly fuzz run playlist_builder`.
+
+2. **lvqr-cmaf codec-string-detector fuzz skeleton** (`bfc02dd`).
+   `crates/lvqr-cmaf/fuzz/` with a `detect_codec_strings` target
+   that drives both `detect_video_codec_string` and
+   `detect_audio_codec_string` with arbitrary bytes. These
+   functions parse a publisher-supplied fMP4 init segment and
+   extract an RFC 6381 codec string that feeds into the HLS
+   master playlist's `CODECS="..."` attribute and the DASH
+   Representation's `codecs` attribute. Ingest does not
+   schema-validate the init segment before calling them, so a
+   crash inside the parser is a publisher-triggered denial of
+   service against the egress surface. The target asserts
+   neither detector panics; libfuzzer's OOM sentinel enforces
+   the implicit no-unbounded-allocation invariant. Run with
+   `cargo +nightly fuzz run detect_codec_strings`.
+
+### Contract slot accounting
+
+`scripts/check_test_contract.sh` now reports **7 missing slot(s)**
+(down from 9 at session 34 close). Both `lvqr-cmaf` and
+`lvqr-hls` satisfy every slot. Remaining gaps, by crate:
+
+* `lvqr-record`: fuzz.
+* `lvqr-moq`: fuzz, conformance.
+* `lvqr-fragment`: fuzz, conformance.
+* `lvqr-whip`: conformance.
+* `lvqr-whep`: conformance.
+
+The remaining fuzz slots are all protocol-layer parsers
+(`lvqr-fragment` fMP4 boxes, `lvqr-moq` wire protocol,
+`lvqr-record` disk recorder); adding them is the same kind of
+mechanical libfuzzer-sys wiring this session used, and each
+one should stay its own commit so the reviewer can evaluate
+the target choice. The remaining conformance slots are the
+harder work: `lvqr-whip` / `lvqr-whep` want a WebRTC interop
+golden or a Chrome/Firefox spec vector, and `lvqr-moq` /
+`lvqr-fragment` need wire-protocol golden fixtures against the
+IETF draft.
+
+### Verification
+
+`cargo fmt --all --check` clean. `cargo clippy --workspace
+--all-targets -- -D warnings` clean. `cargo test --workspace`
+remains at 410 passing / 1 ignored / 0 failing across 88 test
+binaries (no new tests this session; fuzz targets are excluded
+from the workspace build and run only under nightly). Every
+session-35 commit is authored by `Moheeb Zara
+<hackbuildvideo@gmail.com>` alone.
+
+### Not-yet-pushed
+
+Session 34 + 35 together land **six commits** on local `main`
+that are not yet on `origin/main`:
+
+    87f1b41 Tier 2.5: LL-HLS PlaylistBuilder sliding-window eviction
+    54cd1bb Tier 2.5: LL-HLS server-side cache purge on sliding-window eviction
+    99b514d Tier 2.5: cap lvqr-cli production HLS sliding window at 60 segments
+    f9b0314 docs: session 34 close + LL-HLS sliding-window eviction
+    3466dcd Tier 1: cargo-fuzz skeleton for lvqr-hls PlaylistBuilder
+    bfc02dd Tier 1: cargo-fuzz skeleton for lvqr-cmaf detect_*_codec_string
+
+Next session must `git push origin main` before starting new
+work so the `hls-conformance.yml` required check runs against
+the session-34 eviction path.
+
+### Session 36 entry point
+
+Primary scope options, in priority order:
+
+* **Close more contract fuzz slots**. `lvqr-fragment` fMP4 box
+  parser is the highest-value target because it sits on the
+  publisher-reachable parse path and has a well-defined byte
+  surface. `lvqr-moq` wire parser is second. `lvqr-record`
+  disk recorder is third. Each one is its own commit.
+* **LL-HLS VOD / DVR archive surface**. Design decision
+  pending: `lvqr-hls` archive cache vs `lvqr-record` archive
+  index. Now that session 34's sliding window drops bytes for
+  good, a rewind-capable surface is a real gap.
+* **Byte-range partials** for LL-HLS (cuts per-partial HTTP
+  overhead; builds on the session-33 coalesce path).
+* **Self-hosted macOS runner with Apple HTTP Live Streaming
+  Tools** so `hls-conformance.yml` flips `mediastreamvalidator`
+  from soft-skip to primary signal.
+
+
 
 ## Session 34 close (2026-04-15)
 
