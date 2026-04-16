@@ -55,11 +55,23 @@ use std::sync::{Arc, RwLock};
 type RegistryKey = (String, String);
 type RegistryMap = HashMap<RegistryKey, Arc<FragmentBroadcaster>>;
 
+/// Callback invoked by [`FragmentBroadcasterRegistry::get_or_create`] on
+/// fresh insertion. Receives `(broadcast, track, broadcaster)` and runs
+/// with every registry lock released, so callbacks may freely call back
+/// into the registry (e.g. to subscribe) without deadlocking.
+///
+/// Typical use is the session-59 consumer-side wiring: a broadcaster-
+/// native consumer (archive indexer, LL-HLS bridge) registers a callback
+/// that spawns a tokio task per new broadcast, subscribes to it, and
+/// drains `next_fragment()` into its own sink.
+pub type EntryCallback = Arc<dyn Fn(&str, &str, &Arc<FragmentBroadcaster>) + Send + Sync + 'static>;
+
 /// Lookup table for `(broadcast, track)` -> [`FragmentBroadcaster`] handles.
 ///
 /// Thread-safe. Clone-cheap (internal state behind `Arc`).
 pub struct FragmentBroadcasterRegistry {
     inner: Arc<RwLock<RegistryMap>>,
+    callbacks: Arc<RwLock<Vec<EntryCallback>>>,
 }
 
 impl Default for FragmentBroadcasterRegistry {
@@ -72,7 +84,29 @@ impl FragmentBroadcasterRegistry {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            callbacks: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Register a callback to be invoked whenever
+    /// [`FragmentBroadcasterRegistry::get_or_create`] inserts a new
+    /// `(broadcast, track)` entry. Racing callers that collapse onto an
+    /// existing entry do NOT fire the callback; it runs exactly once per
+    /// new broadcaster.
+    ///
+    /// Callbacks run with every registry lock released so they may freely
+    /// call back into the registry (notably `subscribe`) without
+    /// deadlocking. They are invoked synchronously on the thread that wins
+    /// the double-checked insertion race; long work should be offloaded
+    /// via `tokio::spawn` from inside the callback.
+    pub fn on_entry_created<F>(&self, callback: F)
+    where
+        F: Fn(&str, &str, &Arc<FragmentBroadcaster>) + Send + Sync + 'static,
+    {
+        self.callbacks
+            .write()
+            .expect("FragmentBroadcasterRegistry callbacks lock poisoned")
+            .push(Arc::new(callback));
     }
 
     /// Look up an existing broadcaster for `(broadcast, track)` or create
@@ -95,17 +129,31 @@ impl FragmentBroadcasterRegistry {
         {
             return existing;
         }
-        let mut guard = self
-            .inner
-            .write()
-            .expect("FragmentBroadcasterRegistry write lock poisoned");
-        // Double-check: a racing caller may have installed the entry
-        // between our read and write-lock acquisition.
-        if let Some(existing) = guard.get(&key).cloned() {
-            return existing;
+        let bc = {
+            let mut guard = self
+                .inner
+                .write()
+                .expect("FragmentBroadcasterRegistry write lock poisoned");
+            // Double-check: a racing caller may have installed the entry
+            // between our read and write-lock acquisition.
+            if let Some(existing) = guard.get(&key).cloned() {
+                return existing;
+            }
+            let bc = Arc::new(FragmentBroadcaster::new(track, meta));
+            guard.insert(key, Arc::clone(&bc));
+            bc
+        };
+        // Write lock released. Snapshot callbacks and fire outside any
+        // registry lock so callbacks may freely subscribe / inspect the
+        // registry without deadlocking.
+        let callbacks: Vec<EntryCallback> = self
+            .callbacks
+            .read()
+            .expect("FragmentBroadcasterRegistry callbacks lock poisoned")
+            .clone();
+        for cb in &callbacks {
+            cb(broadcast, track, &bc);
         }
-        let bc = Arc::new(FragmentBroadcaster::new(track, meta));
-        guard.insert(key, Arc::clone(&bc));
         bc
     }
 
@@ -168,6 +216,7 @@ impl Clone for FragmentBroadcasterRegistry {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            callbacks: Arc::clone(&self.callbacks),
         }
     }
 }
@@ -287,5 +336,116 @@ mod tests {
         assert!(!reg.is_empty());
         reg.remove("bcast", "0.mp4");
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn on_entry_created_fires_exactly_once_per_new_entry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let reg = FragmentBroadcasterRegistry::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let seen_keys: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let c = Arc::clone(&counter);
+        let k = Arc::clone(&seen_keys);
+        reg.on_entry_created(move |b, t, _bc| {
+            c.fetch_add(1, Ordering::Relaxed);
+            k.lock().unwrap().push((b.to_string(), t.to_string()));
+        });
+
+        // Fires for first get_or_create.
+        let _ = reg.get_or_create("a", "0.mp4", mk_meta());
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // Does NOT fire for repeat get_or_create on same key.
+        let _ = reg.get_or_create("a", "0.mp4", mk_meta());
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "repeat get_or_create is not a fresh insert"
+        );
+
+        // Fires for a different key.
+        let _ = reg.get_or_create("a", "1.mp4", mk_meta());
+        let _ = reg.get_or_create("b", "0.mp4", mk_meta());
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+
+        let keys = seen_keys.lock().unwrap().clone();
+        assert_eq!(
+            keys,
+            vec![
+                ("a".to_string(), "0.mp4".to_string()),
+                ("a".to_string(), "1.mp4".to_string()),
+                ("b".to_string(), "0.mp4".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn on_entry_created_multiple_callbacks_all_fire() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let reg = FragmentBroadcasterRegistry::new();
+        let a = Arc::new(AtomicUsize::new(0));
+        let b = Arc::new(AtomicUsize::new(0));
+
+        let ac = Arc::clone(&a);
+        reg.on_entry_created(move |_, _, _| {
+            ac.fetch_add(1, Ordering::Relaxed);
+        });
+        let bc = Arc::clone(&b);
+        reg.on_entry_created(move |_, _, _| {
+            bc.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let _ = reg.get_or_create("x", "0.mp4", mk_meta());
+        assert_eq!(a.load(Ordering::Relaxed), 1);
+        assert_eq!(b.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn on_entry_created_callback_may_subscribe_without_deadlock() {
+        use crate::BroadcasterStream;
+        use crate::FragmentStream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let reg = FragmentBroadcasterRegistry::new();
+        let subscribed = Arc::new(AtomicBool::new(false));
+
+        // The callback both inspects the registry AND subscribes to the
+        // fresh broadcaster. Writing this without a deadlock is the load-
+        // bearing property: if get_or_create fired callbacks under the
+        // registry's write lock, the subscribe() + registry.get() here
+        // would deadlock or reach for re-entrant locks.
+        let reg_clone = reg.clone();
+        let sub_flag = Arc::clone(&subscribed);
+        let sub_holder: Arc<std::sync::Mutex<Option<BroadcasterStream>>> = Arc::new(std::sync::Mutex::new(None));
+        let sub_holder_c = Arc::clone(&sub_holder);
+        reg.on_entry_created(move |b, t, bc| {
+            assert!(reg_clone.get(b, t).is_some(), "entry is visible during callback");
+            let s = bc.subscribe();
+            *sub_holder_c.lock().unwrap() = Some(s);
+            sub_flag.store(true, Ordering::Relaxed);
+        });
+
+        let bc = reg.get_or_create("live", "0.mp4", mk_meta());
+        assert!(subscribed.load(Ordering::Relaxed), "callback ran");
+
+        // Confirm the subscription is live by emitting through bc and
+        // reading on the held sub.
+        bc.emit(Fragment::new(
+            "0.mp4",
+            0,
+            0,
+            0,
+            0,
+            0,
+            1000,
+            FragmentFlags::KEYFRAME,
+            Bytes::from_static(b"hello"),
+        ));
+        let mut sub = sub_holder.lock().unwrap().take().expect("sub stashed");
+        let f: Fragment = sub.next_fragment().await.expect("frag arrives");
+        assert_eq!(f.payload.as_ref(), b"hello");
     }
 }
