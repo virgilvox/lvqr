@@ -54,6 +54,7 @@ async fn playlist_init_and_segment_round_trip() {
         uri_prefix: String::new(),
         target_duration_secs: 2,
         part_target_secs: 0.2,
+        max_segments: None,
     });
 
     // Publish an init segment and a full 200 ms-per-part 2 s

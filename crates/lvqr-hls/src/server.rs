@@ -699,6 +699,7 @@ fn audio_config_from(video: &PlaylistBuilderConfig, timescale: u32) -> PlaylistB
         uri_prefix: "audio-".into(),
         target_duration_secs: video.target_duration_secs,
         part_target_secs: video.part_target_secs,
+        max_segments: video.max_segments,
     }
 }
 

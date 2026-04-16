@@ -317,6 +317,15 @@ pub struct PlaylistBuilderConfig {
     pub target_duration_secs: u32,
     /// `#EXT-X-PART-INF:PART-TARGET` in seconds.
     pub part_target_secs: f32,
+    /// Maximum number of closed segments the builder is allowed to
+    /// hold in `manifest.segments`. `None` preserves the day-one
+    /// unbounded behaviour; `Some(n)` makes `close_pending_segment`
+    /// evict oldest-first until the segment count is at most `n`.
+    /// Evicted segment URIs (and each evicted segment's constituent
+    /// part URIs) are stashed in `evicted_uris` so the server layer
+    /// can purge them from its byte cache after releasing the
+    /// builder lock.
+    pub max_segments: Option<usize>,
 }
 
 impl Default for PlaylistBuilderConfig {
@@ -328,6 +337,7 @@ impl Default for PlaylistBuilderConfig {
             uri_prefix: String::new(),
             target_duration_secs: 2,
             part_target_secs: 0.2,
+            max_segments: None,
         }
     }
 }
@@ -355,6 +365,13 @@ pub struct PlaylistBuilder {
     /// Part index inside the currently-open segment, used to build
     /// unique partial URIs.
     part_index: u32,
+    /// URIs evicted by the sliding-window policy in
+    /// `close_pending_segment`. The server layer drains this after
+    /// every mutation and removes each entry from the byte cache so
+    /// closed-segment and partial bytes do not outlive the rendered
+    /// playlist. Contains both segment URIs and the constituent
+    /// part URIs of every evicted segment.
+    evicted_uris: Vec<String>,
 }
 
 impl PlaylistBuilder {
@@ -379,6 +396,7 @@ impl PlaylistBuilder {
             next_sequence,
             last_dts: None,
             part_index: 0,
+            evicted_uris: Vec::new(),
         }
     }
 
@@ -470,6 +488,33 @@ impl PlaylistBuilder {
         // immediately after a segment boundary still knows which
         // URI to pre-fetch.
         self.manifest.preload_hint_uri = Some(self.next_part_uri());
+
+        // Sliding-window eviction: if the builder is configured
+        // with a bounded segment window, drain any overflow from
+        // the front of `segments`. Each evicted segment's own URI
+        // plus every part URI it carries is pushed into
+        // `evicted_uris` for the server layer to purge from the
+        // byte cache after the builder lock drops.
+        if let Some(max) = self.config.max_segments
+            && self.manifest.segments.len() > max
+        {
+            let overflow = self.manifest.segments.len() - max;
+            for dropped in self.manifest.segments.drain(..overflow) {
+                for p in &dropped.parts {
+                    self.evicted_uris.push(p.uri.clone());
+                }
+                self.evicted_uris.push(dropped.uri);
+            }
+        }
+    }
+
+    /// Drain the URIs the sliding-window eviction has queued since
+    /// the last call. The server layer calls this after every push
+    /// / close so the cache and the rendered playlist stay in
+    /// lock-step. Returns segment URIs and the part URIs that lived
+    /// inside each evicted segment, in eviction order.
+    pub fn drain_evicted_uris(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.evicted_uris)
     }
 }
 
@@ -713,6 +758,79 @@ mod tests {
             text.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"audio-part-0-1.m4s\""),
             "audio preload hint must carry the audio- prefix; got:\n{text}"
         );
+    }
+
+    #[test]
+    fn sliding_window_evicts_oldest_segments_and_reports_uris() {
+        let cfg = PlaylistBuilderConfig {
+            max_segments: Some(3),
+            ..PlaylistBuilderConfig::default()
+        };
+        let mut b = PlaylistBuilder::new(cfg);
+        // Push 6 segments. Each Segment-kind chunk after the first
+        // closes the prior segment, so the builder produces 5 closed
+        // segments during the pushes; the 6th close is explicit so
+        // all six segments exist before eviction math runs.
+        for i in 0..6u64 {
+            b.push(&mk_chunk(i * 30_000, 30_000, CmafChunkKind::Segment)).unwrap();
+        }
+        b.close_pending_segment();
+
+        let m = b.manifest();
+        assert_eq!(m.segments.len(), 3, "sliding window must cap at max_segments");
+        assert_eq!(
+            m.segments.first().unwrap().sequence,
+            3,
+            "oldest retained segment is sequence 3 after evicting 0..=2"
+        );
+        assert_eq!(
+            m.segments.last().unwrap().sequence,
+            5,
+            "newest segment is the most recent force-closed one",
+        );
+
+        let evicted = b.drain_evicted_uris();
+        // One part per segment (each Segment-kind chunk closes the
+        // prior pending segment, leaving one part behind). The part
+        // URI encodes the `(next_sequence, part_index)` tuple at the
+        // moment `push` built the part, which is why the part index
+        // inside seg-1 is 1 rather than 0: it was minted before the
+        // close that advanced `next_sequence`. Order: every evicted
+        // segment's parts come before the segment URI.
+        assert_eq!(
+            evicted,
+            vec![
+                "part-0-0.m4s".to_string(),
+                "seg-0.m4s".to_string(),
+                "part-0-1.m4s".to_string(),
+                "seg-1.m4s".to_string(),
+                "part-1-0.m4s".to_string(),
+                "seg-2.m4s".to_string(),
+            ],
+        );
+        // Drain is one-shot.
+        assert!(b.drain_evicted_uris().is_empty());
+
+        // Rendered playlist reflects the new head sequence.
+        let text = b.manifest().render();
+        assert!(
+            text.contains("#EXT-X-MEDIA-SEQUENCE:3"),
+            "rendered playlist must reflect evicted head; got:\n{text}"
+        );
+        assert!(!text.contains("seg-0.m4s"));
+        assert!(text.contains("seg-3.m4s"));
+        assert!(text.contains("seg-5.m4s"));
+    }
+
+    #[test]
+    fn sliding_window_default_is_unbounded() {
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        for i in 0..10u64 {
+            b.push(&mk_chunk(i * 30_000, 30_000, CmafChunkKind::Segment)).unwrap();
+        }
+        b.close_pending_segment();
+        assert_eq!(b.manifest().segments.len(), 10);
+        assert!(b.drain_evicted_uris().is_empty());
     }
 
     #[test]

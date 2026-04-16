@@ -36,6 +36,7 @@ fn six_part_segment_sequence_round_trips() {
         uri_prefix: "live/".into(),
         target_duration_secs: 2,
         part_target_secs: 0.2,
+        max_segments: None,
     };
     let mut b = PlaylistBuilder::new(cfg);
 

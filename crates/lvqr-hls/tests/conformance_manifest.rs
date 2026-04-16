@@ -43,6 +43,7 @@ async fn mediastreamvalidator_accepts_manifest_stub() {
         uri_prefix: String::new(),
         target_duration_secs: 2,
         part_target_secs: 0.2,
+        max_segments: None,
     });
 
     // Stub init bytes. The coalescer is not yet implemented, so we
