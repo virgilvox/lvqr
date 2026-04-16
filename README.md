@@ -6,21 +6,37 @@
 
 A Rust binary that relays live video using QUIC/MoQ. Built on moq-lite for zero-copy fan-out from ingest to delivery.
 
-## Status (v0.4-dev, session 34 close)
+## Status (v0.4-dev, session 44)
 
-Session 34 wired LL-HLS sliding-window eviction end-to-end. The
-`PlaylistBuilder` now takes a `max_segments: Option<usize>` cap
-and drains evicted segment and part URIs into a buffer the server
-layer purges from its byte cache under the same mutation. The
-`collect_coalesce_work` detection switched to sequence-based so
-the session-33 closed-segment coalesce path remains correct even
-when eviction shrinks `manifest.segments` from the front inside
-the same push. The `lvqr-cli` serve path runs with a 60-segment
-production cap (~120 s of history at the default 2 s target
-duration, matching the DVR scrub depth the archive path
-supports); `crates/lvqr-hls` tests stay on the unbounded default.
-`cargo test --workspace` reports 410 passing across 88 test
-binaries with 1 ignored doctest.
+420 tests, 0 failures, 88 test suites. CI green across all
+workflows.
+
+Sessions 34-43 made LL-HLS and DASH production-grade:
+
+- **LL-HLS**: every mandatory RFC 8216bis tag emitted
+  (EXT-X-PROGRAM-DATE-TIME, EXT-X-ENDLIST, CAN-SKIP-UNTIL
+  delta playlists, EXT-X-PRELOAD-HINT, blocking reload).
+  Sliding-window eviction with operator-tunable DVR depth
+  (`--hls-dvr-window`). Configurable segment and partial
+  timing (`--hls-target-duration`, `--hls-part-target`).
+  ServerControl timing auto-derived from configured durations.
+- **MPEG-DASH**: live-profile dynamic MPD with automatic
+  transition to `type="static"` when broadcaster disconnects.
+- **Disconnect handling**: both RTMP and WHIP disconnects emit
+  `BroadcastStopped` on the event bus. HLS appends
+  `#EXT-X-ENDLIST`; DASH switches to `type="static"`. Both
+  paths verified by E2E tests.
+- **CORS**: HLS, DASH, and admin routers serve permissive CORS
+  headers so browser-hosted players (hls.js, dash.js) work
+  cross-origin out of the box.
+- **Bench**: criterion microbench for PlaylistBuilder
+  (push ~630 ns, render ~43 us at production cap of 60
+  segments).
+- **Fuzz**: cargo-fuzz skeletons for `lvqr-hls`
+  (PlaylistBuilder) and `lvqr-cmaf` (codec string detectors).
+- **Contract**: 5 of 10 in-scope crates satisfy the full
+  5-artifact test contract (proptest + fuzz + integration +
+  E2E + conformance).
 
 ## Status (v0.4-dev, session 32 close)
 
@@ -285,10 +301,13 @@ cd test-app && python3 -m http.server 9000
                                              |
 OBS/ffmpeg --RTMP--> lvqr-ingest --Fragment--+-> lvqr-cli WS relay --WebSocket fMP4--> Browser
                     (FLV to CMAF)            |
-                                             +-> lvqr-hls MultiHlsServer --HTTP LL-HLS--> Browser
-                                             |   (master.m3u8 + audio rendition)
+Browser --WHIP----> lvqr-whip ----Fragment---+-> lvqr-hls MultiHlsServer --HTTP LL-HLS--> hls.js
+                   (H.264/HEVC/Opus)         |   (master.m3u8 + audio rendition + DVR window)
                                              |
-                                             +-> lvqr-whep Str0mAnswerer --WebRTC (ICE/DTLS/SRTP)--> Browser
+                                             +-> lvqr-dash MultiDashServer --HTTP DASH--> dash.js
+                                             |   (manifest.mpd + numbered segments)
+                                             |
+                                             +-> lvqr-whep Str0mAnswerer --WebRTC--> Browser
                                              |
                                              +-> lvqr-archive IndexingFragmentObserver
                                                  (redb segment index + on-disk fragments)
@@ -317,7 +336,9 @@ Supporting crates:
 | `lvqr-fragment` | `Fragment` + `FragmentMeta` + `MoqTrackSink` unified media interchange |
 | `lvqr-codec` | AVC / HEVC / AAC parsers (SPS, `AudioSpecificConfig`, `read_ue_v`) with proptest + fuzz coverage |
 | `lvqr-cmaf` | `RawSample`, `TrackCoalescer`, `CmafPolicy`, `build_moof_mdat`, AVC + HEVC + AAC init writers |
-| `lvqr-hls` | `PlaylistBuilder`, `HlsServer`, `MultiHlsServer` with master playlist and audio rendition group |
+| `lvqr-hls` | `PlaylistBuilder`, `HlsServer`, `MultiHlsServer` with master playlist, audio rendition, sliding-window eviction, per-segment PDT, EXT-X-ENDLIST, configurable DVR/timing |
+| `lvqr-dash` | `DashServer`, `MultiDashServer`, `DashFragmentBridge` with live/VOD MPD rendering and per-broadcast finalize |
+| `lvqr-whip` | WHIP ingest: `WhipMoqBridge` + `Str0mIngestAnswerer` with H.264/HEVC/Opus, BroadcastStopped on disconnect |
 | `lvqr-whep` | WHEP video egress: `WhepServer` axum router, `Str0mAnswerer` with sans-IO poll loop, `str0m::Writer`-driven media write with AVCC -> Annex B boundary conversion, proptest + fuzz + integration + loopback-E2E test coverage |
 | `lvqr-auth` | `AuthProvider` trait plus noop, static-token, and HS256 JWT providers |
 | `lvqr-relay` | MoQ relay wrapping `moq-lite` with auth, metrics, and connection callbacks |
@@ -328,7 +349,7 @@ Supporting crates:
 | `lvqr-signal` | WebRTC signaling server that pushes mesh assignments; validated peer IDs and tracks |
 | `lvqr-admin` | HTTP API: stats, streams, mesh, Prometheus metrics, admin auth + auth-failure metric |
 | `lvqr-conformance` | Reference fixtures (kvazaar HEVC, ffprobe corpus) and external-validator wrappers |
-| `lvqr-cli` | Single binary: relay + RTMP + WS ingest/relay + LL-HLS + admin + optional recorder + optional mesh |
+| `lvqr-cli` | Single binary: relay + RTMP + WHIP + WS ingest + LL-HLS + DASH + WHEP + admin + recorder + archive + mesh |
 | `lvqr-wasm` | **Deprecated**; use `@lvqr/core` and `@lvqr/player` instead |
 
 ### How It Works
@@ -352,23 +373,40 @@ Supporting crates:
 
 ```
 lvqr serve [OPTIONS]
-  --port <PORT>            QUIC/MoQ port [default: 4443]
-  --rtmp-port <PORT>       RTMP ingest port [default: 1935]
-  --admin-port <PORT>      Admin HTTP port [default: 8080]
-  --hls-port <PORT>        LL-HLS HTTP port; set to 0 to disable [default: 8888]
-  --whep-port <PORT>       WHEP HTTP port; set to 0 to disable [default: 0] (env: LVQR_WHEP_PORT)
-  --mesh-enabled           Enable peer mesh topology planner
-  --max-peers <N>          Max children per mesh peer [default: 3]
-  --tls-cert <PATH>        TLS certificate (auto-generates if omitted)
-  --tls-key <PATH>         TLS private key
-  --admin-token <TOKEN>    Bearer token for /api/v1/* (env: LVQR_ADMIN_TOKEN)
-  --publish-key <KEY>      Required RTMP / WS publish key (env: LVQR_PUBLISH_KEY)
-  --subscribe-token <TOK>  Required viewer token (env: LVQR_SUBSCRIBE_TOKEN)
-  --record-dir <PATH>      Directory to record broadcasts into (env: LVQR_RECORD_DIR)
-  --archive-dir <PATH>     DVR archive directory; enables /playback/* on the admin port (env: LVQR_ARCHIVE_DIR)
-  --jwt-secret <SECRET>    HS256 secret enabling JWT auth (env: LVQR_JWT_SECRET)
-  --jwt-issuer <ISS>       Expected JWT `iss` claim (env: LVQR_JWT_ISSUER)
-  --jwt-audience <AUD>     Expected JWT `aud` claim (env: LVQR_JWT_AUDIENCE)
+
+  Ports:
+  --port <PORT>              QUIC/MoQ port [default: 4443]
+  --rtmp-port <PORT>         RTMP ingest port [default: 1935]
+  --admin-port <PORT>        Admin HTTP port [default: 8080]
+  --hls-port <PORT>          LL-HLS HTTP port; 0 to disable [default: 8888]
+  --whep-port <PORT>         WHEP HTTP port; 0 to disable [default: 0]
+  --whip-port <PORT>         WHIP HTTP port; 0 to disable [default: 0]
+  --dash-port <PORT>         DASH HTTP port; 0 to disable [default: 0]
+
+  LL-HLS tuning:
+  --hls-dvr-window <SECS>    DVR rewind depth in seconds; 0 for unbounded [default: 120]
+  --hls-target-duration <S>  Segment duration in seconds [default: 2]
+  --hls-part-target <MS>     Partial duration in milliseconds [default: 200]
+
+  TLS:
+  --tls-cert <PATH>          TLS certificate PEM (auto-generates if omitted)
+  --tls-key <PATH>           TLS private key PEM
+
+  Auth:
+  --admin-token <TOKEN>      Bearer token for /api/v1/* (env: LVQR_ADMIN_TOKEN)
+  --publish-key <KEY>        Required RTMP / WS publish key (env: LVQR_PUBLISH_KEY)
+  --subscribe-token <TOK>    Required viewer token (env: LVQR_SUBSCRIBE_TOKEN)
+  --jwt-secret <SECRET>      HS256 secret enabling JWT auth (env: LVQR_JWT_SECRET)
+  --jwt-issuer <ISS>         Expected JWT iss claim (env: LVQR_JWT_ISSUER)
+  --jwt-audience <AUD>       Expected JWT aud claim (env: LVQR_JWT_AUDIENCE)
+
+  Recording:
+  --record-dir <PATH>        Directory to record broadcasts (env: LVQR_RECORD_DIR)
+  --archive-dir <PATH>       DVR archive directory; enables /playback/* (env: LVQR_ARCHIVE_DIR)
+
+  Mesh:
+  --mesh-enabled             Enable peer mesh topology planner
+  --max-peers <N>            Max children per mesh peer [default: 3]
 ```
 
 ## Admin API
