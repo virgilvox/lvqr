@@ -5,14 +5,16 @@
 //! broadcast encoders (OBS, vMix, Larix, ffmpeg), demuxes the
 //! MPEG-TS transport stream, extracts H.264/HEVC video and AAC
 //! audio elementary streams, and converts them to LVQR Fragments
-//! that flow through the same `FragmentObserver` chain the RTMP
-//! and WHIP bridges use.
+//! that publish onto the shared
+//! [`lvqr_fragment::FragmentBroadcasterRegistry`] the RTMP, WHIP,
+//! and RTSP bridges also feed.
 //!
 //! ## Usage
 //!
 //! ```text
-//! let listener = SrtIngestServer::bind("0.0.0.0:9000").await?;
-//! listener.run(origin, fragment_observer, events, shutdown).await;
+//! let mut listener = SrtIngestServer::with_registry(addr, registry);
+//! listener.bind().await?;
+//! listener.run(events, shutdown).await;
 //! ```
 //!
 //! Each accepted SRT connection spawns a tokio task that feeds

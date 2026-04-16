@@ -1,12 +1,12 @@
-//! Archive fragment observer: records every bridge-emitted fragment
-//! into a `lvqr_archive::RedbSegmentIndex` and writes the payload
-//! bytes to an on-disk file the index row points at.
+//! Archive fragment indexer: records every broadcaster-emitted
+//! fragment into a `lvqr_archive::RedbSegmentIndex` and writes the
+//! payload bytes to an on-disk file the index row points at.
 //!
 //! Wired by `lib.rs::start` when `ServeConfig::archive_dir` is
-//! `Some`. The observer is attached to the bridge through the same
-//! `FragmentObserver` pattern the LL-HLS bridge uses, composed via
-//! [`TeeFragmentObserver`] when HLS is also enabled so both
-//! consumers see every fragment.
+//! `Some`. Session 59 switched this path off the observer hook and
+//! onto the broadcaster registry surface; session 60 finished the
+//! HLS + DASH consumer switchovers so the registry is now the sole
+//! dispatch path.
 //!
 //! Each fragment becomes one row. The LVQR bridge currently emits
 //! one `moof+mdat` Fragment per video NAL / per AAC access unit, so
@@ -23,11 +23,9 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
-use bytes::Bytes;
 use lvqr_archive::{RedbSegmentIndex, SegmentIndex, SegmentRef};
 use lvqr_auth::{AuthContext, AuthDecision, SharedAuth};
-use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentStream};
-use lvqr_ingest::{FragmentObserver, SharedFragmentObserver};
+use lvqr_fragment::{FragmentBroadcasterRegistry, FragmentStream};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
@@ -173,34 +171,6 @@ impl BroadcasterArchiveIndexer {
 
     fn segment_path(root: &Path, broadcast: &str, track: &str, seq: u64) -> PathBuf {
         root.join(broadcast).join(track).join(format!("{seq:08}.m4s"))
-    }
-}
-
-/// Fan-out `FragmentObserver` that forwards every call to every
-/// inner observer in registration order. Used by `lvqr-cli` to
-/// compose the LL-HLS bridge with the archive indexer without
-/// widening the bridge's single-observer API.
-pub(crate) struct TeeFragmentObserver {
-    inner: Vec<SharedFragmentObserver>,
-}
-
-impl TeeFragmentObserver {
-    pub fn new(inner: Vec<SharedFragmentObserver>) -> Self {
-        Self { inner }
-    }
-}
-
-impl FragmentObserver for TeeFragmentObserver {
-    fn on_init(&self, broadcast: &str, track: &str, timescale: u32, init: Bytes) {
-        for obs in &self.inner {
-            obs.on_init(broadcast, track, timescale, init.clone());
-        }
-    }
-
-    fn on_fragment(&self, broadcast: &str, track: &str, fragment: &Fragment) {
-        for obs in &self.inner {
-            obs.on_fragment(broadcast, track, fragment);
-        }
     }
 }
 

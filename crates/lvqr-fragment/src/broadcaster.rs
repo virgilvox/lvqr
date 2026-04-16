@@ -1,20 +1,16 @@
 //! [`FragmentBroadcaster`]: single-producer, multi-subscriber fan-out of
 //! [`Fragment`] values.
 //!
-//! This is the primitive the Tier 2.1 ingest migration composes over. Today
-//! every ingest protocol (RTMP, WHIP, SRT, RTSP) pushes fragments into a
-//! shared [`crate::FragmentObserver`]-style callback. That pattern works but
-//! tightly couples producers to the set of consumers wired at startup, and
-//! every new downstream (archive, LL-HLS partial writer, cluster relay
-//! forwarder, WASM filter chain) has to be threaded through the same
-//! callback interface.
-//!
-//! The broadcaster inverts the relationship: the ingest produces into one
-//! [`FragmentBroadcaster`] per `(broadcast, track)`, and every consumer
-//! subscribes to that broadcaster and reads fragments through the uniform
-//! [`FragmentStream`] trait. Consumers are decoupled from producers; a new
-//! egress can be plugged in by calling [`FragmentBroadcaster::subscribe`]
-//! without touching ingest code.
+//! This is the primitive every Tier 2.1 ingest path produces into and
+//! every Tier 2.1 consumer subscribes through. One
+//! [`FragmentBroadcaster`] per `(broadcast, track)` sits behind a
+//! shared [`crate::FragmentBroadcasterRegistry`]; every ingest protocol
+//! (RTMP, WHIP, SRT, RTSP) publishes via
+//! [`crate::FragmentBroadcasterRegistry::get_or_create`] and every
+//! consumer (archive, LL-HLS, DASH) subscribes through the uniform
+//! [`FragmentStream`] trait. Consumers are decoupled from producers; a
+//! new egress can be plugged in by calling
+//! [`FragmentBroadcaster::subscribe`] without touching ingest code.
 //!
 //! Backpressure policy:
 //!

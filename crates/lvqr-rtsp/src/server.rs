@@ -11,7 +11,7 @@ use lvqr_cmaf::{
 use lvqr_codec::hevc as hevc_codec;
 use lvqr_core::{EventBus, RelayEvent};
 use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags};
-use lvqr_ingest::{SharedFragmentObserver, publish_fragment, publish_init};
+use lvqr_ingest::{publish_fragment, publish_init};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -70,12 +70,7 @@ impl RtspServer {
         Ok(bound)
     }
 
-    pub async fn run(
-        self,
-        observer: Option<SharedFragmentObserver>,
-        events: EventBus,
-        shutdown: CancellationToken,
-    ) -> Result<(), std::io::Error> {
+    pub async fn run(self, events: EventBus, shutdown: CancellationToken) -> Result<(), std::io::Error> {
         let Self {
             addr,
             pre_bound,
@@ -101,15 +96,14 @@ impl RtspServer {
                         }
                     };
                     info!(%remote, "RTSP connection accepted");
-                    let obs = observer.clone();
                     let ev = events.clone();
                     let conn_shutdown = shutdown.clone();
                     let server_addr = local_addr;
                     let conn_registry = registry.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(
-                            socket, remote, server_addr, obs.as_ref(), &ev, &conn_registry, conn_shutdown,
-                        ).await {
+                        if let Err(e) =
+                            handle_connection(socket, remote, server_addr, &ev, &conn_registry, conn_shutdown).await
+                        {
                             debug!(%remote, error = %e, "RTSP connection ended with error");
                         }
                     });
@@ -146,7 +140,6 @@ async fn handle_connection(
     mut socket: TcpStream,
     remote: SocketAddr,
     server_addr: SocketAddr,
-    observer: Option<&SharedFragmentObserver>,
     events: &EventBus,
     registry: &FragmentBroadcasterRegistry,
     shutdown: CancellationToken,
@@ -195,7 +188,7 @@ async fn handle_connection(
                         // Interleaved RTP/RTCP frame.
                         match rtp::parse_interleaved_frame(&read_buf) {
                             Some((frame, consumed)) => {
-                                process_rtp_frame(&mut conn, &frame, observer, registry);
+                                process_rtp_frame(&mut conn, &frame, registry);
                                 read_buf.drain(..consumed);
                             }
                             None => break, // incomplete
@@ -239,7 +232,6 @@ async fn handle_connection(
 fn process_rtp_frame(
     conn: &mut ConnectionState,
     frame: &rtp::InterleavedFrame,
-    observer: Option<&SharedFragmentObserver>,
     registry: &FragmentBroadcasterRegistry,
 ) {
     // Odd channels are RTCP -- skip for now.
@@ -267,18 +259,10 @@ fn process_rtp_frame(
 
     match media_type {
         crate::session::MediaType::Audio => {
-            process_audio_rtp(conn, &broadcast, rtp_payload, &header, observer, registry);
+            process_audio_rtp(conn, &broadcast, rtp_payload, &header, registry);
         }
         crate::session::MediaType::Video => {
-            process_video_rtp(
-                conn,
-                &broadcast,
-                rtp_payload,
-                &header,
-                frame.channel,
-                observer,
-                registry,
-            );
+            process_video_rtp(conn, &broadcast, rtp_payload, &header, frame.channel, registry);
         }
     }
 }
@@ -312,7 +296,6 @@ fn process_video_rtp(
     rtp_payload: &[u8],
     header: &rtp::RtpHeader,
     channel: u8,
-    obs: Option<&SharedFragmentObserver>,
     registry: &FragmentBroadcasterRegistry,
 ) {
     let codec = conn
@@ -349,8 +332,8 @@ fn process_video_rtp(
     );
 
     match codec {
-        TrackCodec::H265 => process_hevc_nalus(conn, broadcast, &result, obs, registry),
-        _ => process_h264_nalus(conn, broadcast, &result, obs, registry),
+        TrackCodec::H265 => process_hevc_nalus(conn, broadcast, &result, registry),
+        _ => process_h264_nalus(conn, broadcast, &result, registry),
     }
 }
 
@@ -359,7 +342,6 @@ fn process_audio_rtp(
     broadcast: &str,
     rtp_payload: &[u8],
     header: &rtp::RtpHeader,
-    obs: Option<&SharedFragmentObserver>,
     registry: &FragmentBroadcasterRegistry,
 ) {
     let Some(result) = conn.aac_depack.depacketize(rtp_payload, header) else {
@@ -405,7 +387,7 @@ fn process_audio_rtp(
             warn!(%broadcast, error = %e, "RTSP: failed to write AAC init segment");
             return;
         }
-        publish_init(obs, registry, broadcast, "1.mp4", "mp4a.40.2", timescale, buf.freeze());
+        publish_init(registry, broadcast, "1.mp4", "mp4a.40.2", timescale, buf.freeze());
         conn.audio_init_emitted = true;
         conn.audio_timescale = timescale;
         info!(%broadcast, %timescale, "RTSP: audio init emitted");
@@ -441,15 +423,7 @@ fn process_audio_rtp(
             FragmentFlags::AUDIO,
             moof_mdat,
         );
-        publish_fragment(
-            obs,
-            registry,
-            broadcast,
-            "1.mp4",
-            "mp4a.40.2",
-            conn.audio_timescale,
-            frag,
-        );
+        publish_fragment(registry, broadcast, "1.mp4", "mp4a.40.2", conn.audio_timescale, frag);
     }
 }
 
@@ -457,7 +431,6 @@ fn process_h264_nalus(
     conn: &mut ConnectionState,
     broadcast: &str,
     result: &rtp::DepackResult,
-    obs: Option<&SharedFragmentObserver>,
     registry: &FragmentBroadcasterRegistry,
 ) {
     for nalu in &result.nalus {
@@ -488,7 +461,7 @@ fn process_h264_nalus(
             warn!(%broadcast, error = %e, "RTSP: failed to write AVC init segment");
             return;
         }
-        publish_init(obs, registry, broadcast, "0.mp4", "avc1", 90_000, buf.freeze());
+        publish_init(registry, broadcast, "0.mp4", "avc1", 90_000, buf.freeze());
         conn.video_init_emitted = true;
         info!(%broadcast, "RTSP: H.264 video init emitted");
     }
@@ -497,14 +470,13 @@ fn process_h264_nalus(
     if avcc.is_empty() {
         return;
     }
-    emit_video_fragment(conn, broadcast, result, avcc, "avc1", obs, registry);
+    emit_video_fragment(conn, broadcast, result, avcc, "avc1", registry);
 }
 
 fn process_hevc_nalus(
     conn: &mut ConnectionState,
     broadcast: &str,
     result: &rtp::DepackResult,
-    obs: Option<&SharedFragmentObserver>,
     registry: &FragmentBroadcasterRegistry,
 ) {
     for nalu in &result.nalus {
@@ -543,7 +515,7 @@ fn process_hevc_nalus(
             warn!(%broadcast, error = %e, "RTSP: failed to write HEVC init segment");
             return;
         }
-        publish_init(obs, registry, broadcast, "0.mp4", "hev1", 90_000, buf.freeze());
+        publish_init(registry, broadcast, "0.mp4", "hev1", 90_000, buf.freeze());
         conn.video_init_emitted = true;
         info!(%broadcast, "RTSP: HEVC video init emitted");
     }
@@ -552,7 +524,7 @@ fn process_hevc_nalus(
     if hvcc.is_empty() {
         return;
     }
-    emit_video_fragment(conn, broadcast, result, hvcc, "hev1", obs, registry);
+    emit_video_fragment(conn, broadcast, result, hvcc, "hev1", registry);
 }
 
 fn emit_video_fragment(
@@ -561,7 +533,6 @@ fn emit_video_fragment(
     result: &rtp::DepackResult,
     payload: Vec<u8>,
     codec: &str,
-    obs: Option<&SharedFragmentObserver>,
     registry: &FragmentBroadcasterRegistry,
 ) {
     let dts = result.timestamp as u64;
@@ -597,7 +568,7 @@ fn emit_video_fragment(
         },
         moof_mdat,
     );
-    publish_fragment(obs, registry, broadcast, "0.mp4", codec, 90_000, frag);
+    publish_fragment(registry, broadcast, "0.mp4", codec, 90_000, frag);
 }
 
 #[derive(Clone, Copy)]
@@ -1026,29 +997,9 @@ mod tests {
         assert_eq!(&avcc[4..7], &idr[..]);
     }
 
-    #[test]
-    fn fragment_emission_from_rtp() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::sync::{Arc, Mutex};
-
-        struct SpyObserver {
-            init_count: AtomicU32,
-            fragments: Mutex<Vec<Fragment>>,
-        }
-        impl lvqr_ingest::FragmentObserver for SpyObserver {
-            fn on_init(&self, _broadcast: &str, _track: &str, _timescale: u32, _init: Bytes) {
-                self.init_count.fetch_add(1, Ordering::Relaxed);
-            }
-            fn on_fragment(&self, _broadcast: &str, _track: &str, fragment: &Fragment) {
-                self.fragments.lock().unwrap().push(fragment.clone());
-            }
-        }
-
-        let spy = Arc::new(SpyObserver {
-            init_count: AtomicU32::new(0),
-            fragments: Mutex::new(Vec::new()),
-        });
-        let obs: SharedFragmentObserver = spy.clone();
+    #[tokio::test]
+    async fn fragment_emission_from_rtp() {
+        use lvqr_fragment::{FragmentMeta, FragmentStream};
 
         let mut conn = ConnectionState {
             sessions: HashMap::new(),
@@ -1076,6 +1027,10 @@ mod tests {
         session.record().unwrap();
         conn.sessions.insert(session_id, session);
 
+        let registry = FragmentBroadcasterRegistry::new();
+        let bc = registry.get_or_create("test/cam1", "0.mp4", FragmentMeta::new("avc1", 90_000));
+        let mut sub = bc.subscribe();
+
         // Build a STAP-A packet with SPS + PPS.
         let sps = vec![0x67, 0x42, 0x00, 0x1F];
         let pps = vec![0x68, 0xCE, 0x38, 0x80];
@@ -1086,31 +1041,27 @@ mod tests {
         stap_payload.extend_from_slice(&pps);
 
         let stap_frame = make_interleaved_rtp(0, 96, 1, 90000, false, &stap_payload);
-        let registry = FragmentBroadcasterRegistry::new();
-        process_rtp_frame(&mut conn, &stap_frame, Some(&obs), &registry);
-        // SPS/PPS stored, init emitted (SPS+PPS are enough to build init segment).
+        process_rtp_frame(&mut conn, &stap_frame, &registry);
+        // SPS/PPS stored, init emitted. No fragment yet -- STAP-A only
+        // carried parameter sets.
         assert!(conn.sps.is_some());
         assert!(conn.pps.is_some());
         assert!(conn.video_init_emitted);
-        assert_eq!(spy.init_count.load(Ordering::Relaxed), 1);
-        // No fragment yet -- STAP-A only had param sets, no VCL NALs.
-        assert_eq!(spy.fragments.lock().unwrap().len(), 0);
+        assert!(bc.meta().init_segment.is_some(), "registry carries AVC init bytes");
 
-        // Send an IDR slice (keyframe).
-        let idr_payload = vec![0x65, 0xAA, 0xBB, 0xCC]; // NAL type 5
+        // Send an IDR slice (keyframe). Drains into the subscriber.
+        let idr_payload = vec![0x65, 0xAA, 0xBB, 0xCC];
         let idr_frame = make_interleaved_rtp(0, 96, 2, 93000, true, &idr_payload);
-        process_rtp_frame(&mut conn, &idr_frame, Some(&obs), &registry);
-        assert!(conn.video_init_emitted);
-        assert_eq!(spy.init_count.load(Ordering::Relaxed), 1);
-        assert_eq!(spy.fragments.lock().unwrap().len(), 1);
-        assert!(spy.fragments.lock().unwrap()[0].flags.keyframe);
+        process_rtp_frame(&mut conn, &idr_frame, &registry);
+        let frag0 = sub.next_fragment().await.expect("keyframe delivered");
+        assert!(frag0.flags.keyframe);
 
-        // Send a P-frame (non-keyframe).
-        let p_payload = vec![0x41, 0xDD, 0xEE]; // NAL type 1
+        // Send a P-frame.
+        let p_payload = vec![0x41, 0xDD, 0xEE];
         let p_frame = make_interleaved_rtp(0, 96, 3, 96000, true, &p_payload);
-        process_rtp_frame(&mut conn, &p_frame, Some(&obs), &registry);
-        assert_eq!(spy.fragments.lock().unwrap().len(), 2);
-        assert!(!spy.fragments.lock().unwrap()[1].flags.keyframe);
+        process_rtp_frame(&mut conn, &p_frame, &registry);
+        let frag1 = sub.next_fragment().await.expect("delta delivered");
+        assert!(!frag1.flags.keyframe);
     }
 
     /// Build an interleaved RTP frame for testing.

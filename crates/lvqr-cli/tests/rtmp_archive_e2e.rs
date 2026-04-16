@@ -233,7 +233,7 @@ async fn publish_two_keyframes(addr: SocketAddr, app: &str, key: &str) -> (TcpSt
 }
 
 /// Real end-to-end: RTMP publish -> RtmpMoqBridge ->
-/// `IndexingFragmentObserver` -> `<archive_dir>/<broadcast>/<track>/<seq>.m4s`
+/// `BroadcasterArchiveIndexer` -> `<archive_dir>/<broadcast>/<track>/<seq>.m4s`
 /// and `<archive_dir>/archive.redb`. Verifies the index has at
 /// least one row for the video track, the rows are ordered by
 /// `start_dts`, every row's `path` points at an existing file whose

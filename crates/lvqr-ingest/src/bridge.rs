@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::dispatch::{publish_fragment, publish_init};
-use crate::observer::{SharedFragmentObserver, SharedRawSampleObserver};
+use crate::observer::SharedRawSampleObserver;
 use crate::remux::{
     AudioConfig, FlvAudioTag, FlvVideoTag, VideoConfig, audio_init_segment, audio_segment, extract_resolution,
     generate_catalog, parse_audio_tag, parse_video_tag, video_init_segment_with_size,
@@ -53,10 +53,11 @@ pub struct RtmpMoqBridge {
     streams: Arc<DashMap<String, ActiveStream>>,
     auth: SharedAuth,
     events: Option<EventBus>,
-    observer: Option<SharedFragmentObserver>,
     raw_observer: Option<SharedRawSampleObserver>,
-    /// Session-58 migration surface: every fragment is published here
-    /// alongside the legacy `FragmentObserver` callback.
+    /// Broadcaster registry every emitted fragment is published on.
+    /// Consumers (archive, LL-HLS, DASH) subscribe through
+    /// `on_entry_created` callbacks and drain fragments out of the
+    /// per-broadcaster streams.
     registry: FragmentBroadcasterRegistry,
 }
 
@@ -67,7 +68,6 @@ impl RtmpMoqBridge {
             streams: Arc::new(DashMap::new()),
             auth: Arc::new(NoopAuthProvider),
             events: None,
-            observer: None,
             raw_observer: None,
             registry: FragmentBroadcasterRegistry::new(),
         }
@@ -80,7 +80,6 @@ impl RtmpMoqBridge {
             streams: Arc::new(DashMap::new()),
             auth,
             events: None,
-            observer: None,
             raw_observer: None,
             registry: FragmentBroadcasterRegistry::new(),
         }
@@ -117,22 +116,6 @@ impl RtmpMoqBridge {
         self.events = Some(events);
     }
 
-    /// Attach a [`crate::FragmentObserver`] so the bridge fans every
-    /// emitted [`Fragment`] (and the corresponding init segment) out
-    /// to a non-MoQ consumer such as the LL-HLS server in `lvqr-cli`.
-    /// The observer is invoked synchronously from inside the RTMP
-    /// callback path, so implementations must be cheap.
-    pub fn with_observer(mut self, observer: SharedFragmentObserver) -> Self {
-        self.observer = Some(observer);
-        self
-    }
-
-    /// Attach or replace the [`crate::FragmentObserver`] after
-    /// construction.
-    pub fn set_observer(&mut self, observer: SharedFragmentObserver) {
-        self.observer = Some(observer);
-    }
-
     /// Attach a [`crate::RawSampleObserver`] so the bridge fans every
     /// per-NAL video sample and every raw AAC audio access unit out
     /// to a consumer that needs pre-mux access (notably the future
@@ -159,8 +142,6 @@ impl RtmpMoqBridge {
         let events_publish = self.events.clone();
         let events_unpublish = self.events.clone();
 
-        let observer_video = self.observer.clone();
-        let observer_audio = self.observer.clone();
         let raw_observer_video = self.raw_observer.clone();
         let raw_observer_audio = self.raw_observer.clone();
         let registry_video = self.registry.clone();
@@ -276,15 +257,7 @@ impl RtmpMoqBridge {
                     // (see `video_init_segment_with_size` ->
                     // `mvhd.timescale = 90000`), so the bridge
                     // reports the same value here.
-                    publish_init(
-                        observer_video.as_ref(),
-                        &registry_video,
-                        &stream_name,
-                        "0.mp4",
-                        "avc1",
-                        90_000,
-                        init,
-                    );
+                    publish_init(&registry_video, &stream_name, "0.mp4", "avc1", 90_000, init);
                     maybe_write_catalog(stream, &stream_name);
                 }
                 FlvVideoTag::Nalu {
@@ -352,15 +325,7 @@ impl RtmpMoqBridge {
                     if let Err(e) = stream.video_sink.push(&frag) {
                         debug!(error = ?e, "failed to push video fragment through sink");
                     }
-                    publish_fragment(
-                        observer_video.as_ref(),
-                        &registry_video,
-                        &stream_name,
-                        "0.mp4",
-                        "avc1",
-                        90_000,
-                        frag,
-                    );
+                    publish_fragment(&registry_video, &stream_name, "0.mp4", "avc1", 90_000, frag);
                 }
                 FlvVideoTag::EndOfSequence => {
                     stream.video_sink.finish_current_group();
@@ -390,7 +355,6 @@ impl RtmpMoqBridge {
                     stream.audio_config = Some(config);
                     stream.audio_init = Some(init.clone());
                     publish_init(
-                        observer_audio.as_ref(),
                         &registry_audio,
                         &stream_name,
                         "1.mp4",
@@ -457,7 +421,6 @@ impl RtmpMoqBridge {
                     }
                     let audio_timescale = stream.audio_config.as_ref().map(|c| c.sample_rate).unwrap_or(44100);
                     publish_fragment(
-                        observer_audio.as_ref(),
                         &registry_audio,
                         &stream_name,
                         "1.mp4",

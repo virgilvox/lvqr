@@ -74,9 +74,10 @@ struct ServeArgs {
     /// this port exposing `/dash/{broadcast}/manifest.mpd`,
     /// `/dash/{broadcast}/init-{video,audio}.m4s`, and the numbered
     /// `seg-{video,audio}-<n>.m4s` segment URIs the MPD references.
-    /// The bridge is observer-based: every RTMP + WHIP publisher
-    /// feeds the same `MultiDashServer` through a `DashFragmentBridge`
-    /// without any additional wiring per protocol.
+    /// Every ingest protocol (RTMP, WHIP, SRT, RTSP) feeds the same
+    /// `MultiDashServer` through the shared
+    /// `FragmentBroadcasterRegistry` and a `BroadcasterDashBridge`
+    /// install, with no per-protocol wiring on the egress side.
     #[arg(long, default_value = "0", env = "LVQR_DASH_PORT")]
     dash_port: u16,
 

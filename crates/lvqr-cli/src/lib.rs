@@ -26,7 +26,6 @@ use lvqr_core::{EventBus, RelayEvent};
 use lvqr_dash::{BroadcasterDashBridge, DashConfig, MultiDashServer};
 use lvqr_fragment::FragmentBroadcasterRegistry;
 use lvqr_hls::{MultiHlsServer, PlaylistBuilderConfig};
-use lvqr_ingest::SharedFragmentObserver;
 use lvqr_moq::Track;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -36,7 +35,7 @@ use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
-use crate::archive::{BroadcasterArchiveIndexer, TeeFragmentObserver, playback_router};
+use crate::archive::{BroadcasterArchiveIndexer, playback_router};
 use crate::hls::BroadcasterHlsBridge;
 
 /// Configuration passed to [`start`] to bring up a full-stack LVQR server.
@@ -345,10 +344,10 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let (mut moq_server, relay_bound) = relay.init_server()?;
     tracing::info!(addr = %relay_bound, "MoQ relay bound");
 
-    // Optional multi-broadcast LL-HLS server. Built before the bridge
-    // so we can hand the bridge a `FragmentObserver` that pumps
-    // fragments into the shared `MultiHlsServer` state. Each
-    // broadcast gets its own per-broadcast `HlsServer` on first
+    // Optional multi-broadcast LL-HLS server. The broadcaster-native
+    // HLS bridge (installed below) subscribes on the shared registry
+    // and pumps fragments into the shared `MultiHlsServer` state.
+    // Each broadcast gets its own per-broadcast `HlsServer` on first
     // publish; the axum router demultiplexes requests under
     // `/hls/{broadcast}/...`.
     let target_dur = config.hls_target_duration_secs;
@@ -368,21 +367,18 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     });
 
     // Optional multi-broadcast MPEG-DASH server. Sibling of the
-    // LL-HLS fan-out above: a single `MultiDashServer` observes
-    // the shared fragment stream and projects it onto a per-broadcast
-    // axum router mounted under `/dash/{broadcast}/...`. Both RTMP
-    // and WHIP publishers feed it through the same
-    // `DashFragmentBridge` the `SharedFragmentObserver` list below
-    // composes into its tee.
+    // LL-HLS fan-out above: a single `MultiDashServer` subscribes
+    // on the shared registry and projects fragments onto a
+    // per-broadcast axum router mounted under `/dash/{broadcast}/...`.
+    // Every ingest protocol (RTMP, WHIP, SRT, RTSP) feeds DASH via
+    // the same `BroadcasterDashBridge` install below.
     let dash_server = config.dash_addr.map(|_| MultiDashServer::new(DashConfig::default()));
 
-    // Shared FragmentBroadcasterRegistry used by every ingest crate.
-    // Session 59 consumer-side switchover: the archive indexer now
-    // subscribes via the registry instead of implementing
-    // FragmentObserver; every ingest protocol publishes to this one
-    // registry so a single consumer task per (broadcast, track) drains
-    // fragments regardless of which protocol produced them. HLS + DASH
-    // stay on the observer path until their own switchovers land.
+    // Shared FragmentBroadcasterRegistry used by every ingest crate
+    // and every consumer. Session 60 completed the Tier 2.1 migration:
+    // every ingest protocol publishes to this one registry, and every
+    // consumer (archive, LL-HLS, DASH) installs an on_entry_created
+    // callback against it.
     let shared_registry = FragmentBroadcasterRegistry::new();
 
     // RTMP ingest bridged to MoQ. Pre-bind the TCP listener so we can
@@ -440,23 +436,6 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         BroadcasterDashBridge::install(dash.clone(), &shared_registry);
     }
 
-    // Every Tier 2.1 consumer is now broadcaster-native (archive + HLS
-    // + DASH). The `fragment_observers` tee no longer has any members
-    // to collect; `shared_fragment_observer` stays `None` and no
-    // ingest crate is wired with `with_observer`. The observer branch
-    // is kept alive until the observer trait + dispatch branch get
-    // removed in a follow-up change so the `with_observer` API
-    // surface does not churn under consumers that already migrated.
-    let fragment_observers: Vec<SharedFragmentObserver> = Vec::new();
-    let shared_fragment_observer: Option<SharedFragmentObserver> = match fragment_observers.len() {
-        0 => None,
-        1 => Some(fragment_observers.into_iter().next().expect("len checked")),
-        _ => Some(Arc::new(TeeFragmentObserver::new(fragment_observers)) as SharedFragmentObserver),
-    };
-    if let Some(ref obs) = shared_fragment_observer {
-        bridge_builder = bridge_builder.with_observer(obs.clone());
-    }
-
     // Optional WHEP surface. Constructed before the bridge is
     // frozen into an `Arc` so we can attach the `WhepServer` as a
     // `RawSampleObserver`; both the observer clone and the axum
@@ -475,19 +454,14 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     };
 
     // Optional WHIP ingest surface. The bridge side is a sibling
-    // of `RtmpMoqBridge`: it owns its own `BroadcastProducer`
-    // state but fans fragments through the exact same
-    // `SharedFragmentObserver` and `SharedRawSampleObserver`
-    // instances the RTMP bridge uses, so every existing egress
-    // (MoQ, LL-HLS, WHEP, disk record, DVR archive) picks up WHIP
-    // publishers with zero additional wiring.
+    // of `RtmpMoqBridge`: it owns its own `BroadcastProducer` state
+    // but publishes fragments onto the same shared registry, so every
+    // existing egress (MoQ, LL-HLS, DASH, disk record, DVR archive)
+    // picks up WHIP publishers with zero additional wiring.
     let (whip_server, whip_bridge) = if let Some(addr) = config.whip_addr {
         let mut whip_bridge = lvqr_whip::WhipMoqBridge::new(relay.origin().clone())
             .with_events(events.clone())
             .with_registry(shared_registry.clone());
-        if let Some(ref obs) = shared_fragment_observer {
-            whip_bridge = whip_bridge.with_observer(obs.clone());
-        }
         if let Some(ref server) = whep_server {
             let raw_observer: lvqr_ingest::SharedRawSampleObserver = Arc::new(server.clone());
             whip_bridge = whip_bridge.with_raw_sample_observer(raw_observer);
@@ -503,9 +477,9 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         (None, None)
     };
 
-    // Optional SRT ingest server. Like WHIP, the SRT bridge fans
-    // fragments through the shared FragmentObserver so every egress
-    // picks up SRT publishers automatically.
+    // Optional SRT ingest server. Publishes to the shared registry;
+    // every broadcaster-native consumer picks up SRT publishers
+    // automatically.
     let (srt_server, srt_bound) = if let Some(addr) = config.srt_addr {
         let mut server = lvqr_srt::SrtIngestServer::with_registry(addr, shared_registry.clone());
         let bound = server.bind().await?;
@@ -514,12 +488,11 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     } else {
         (None, None)
     };
-    let shared_fragment_observer_for_srt = shared_fragment_observer.clone();
     let srt_events_clone = events.clone();
     let srt_shutdown_token = shutdown.clone();
 
-    // Optional RTSP ingest server. Like SRT, the RTSP bridge fans
-    // depacketized H.264/HEVC through the shared FragmentObserver.
+    // Optional RTSP ingest server. Publishes to the shared registry
+    // alongside every other ingest protocol.
     let (rtsp_server, rtsp_bound) = if let Some(addr) = config.rtsp_addr {
         let mut server = lvqr_rtsp::RtspServer::with_registry(addr, shared_registry.clone());
         let bound = server.bind().await?;
@@ -528,7 +501,6 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     } else {
         (None, None)
     };
-    let shared_fragment_observer_for_rtsp = shared_fragment_observer.clone();
     let rtsp_events_clone = events.clone();
     let rtsp_shutdown_token = shutdown.clone();
 
@@ -930,24 +902,22 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         };
 
         let srt_shutdown = bg_shutdown_for_task.clone();
-        let srt_obs = shared_fragment_observer_for_srt;
         let srt_events = srt_events_clone;
         let srt_cancel = srt_shutdown_token;
         let srt_fut = async move {
             let Some(server) = srt_server else { return };
-            if let Err(e) = server.run(srt_obs, srt_events, srt_cancel).await {
+            if let Err(e) = server.run(srt_events, srt_cancel).await {
                 tracing::error!(error = %e, "SRT server error");
             }
             srt_shutdown.cancel();
         };
 
         let rtsp_shutdown = bg_shutdown_for_task.clone();
-        let rtsp_obs = shared_fragment_observer_for_rtsp;
         let rtsp_events = rtsp_events_clone;
         let rtsp_cancel = rtsp_shutdown_token;
         let rtsp_fut = async move {
             let Some(server) = rtsp_server else { return };
-            if let Err(e) = server.run(rtsp_obs, rtsp_events, rtsp_cancel).await {
+            if let Err(e) = server.run(rtsp_events, rtsp_cancel).await {
                 tracing::error!(error = %e, "RTSP server error");
             }
             rtsp_shutdown.cancel();

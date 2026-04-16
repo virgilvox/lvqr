@@ -615,7 +615,7 @@ impl SessionHandle for Str0mSessionHandle {
     }
 
     fn on_raw_sample(&self, track: &str, codec: MediaCodec, sample: &RawSample) {
-        // Track convention matches `lvqr-ingest::FragmentObserver`:
+        // Track convention matches `lvqr-ingest::RawSampleObserver`:
         // `0.mp4` is video, `1.mp4` is audio. Anything else is a
         // future track slot we do not know how to write yet.
         // Session 30 removed the old hard-drop on non-video
