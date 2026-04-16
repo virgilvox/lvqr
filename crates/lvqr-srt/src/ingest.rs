@@ -12,8 +12,8 @@ use lvqr_cmaf::{
 use lvqr_codec::hevc::{self as hevc_codec, HevcNalType};
 use lvqr_codec::ts::{PesPacket, StreamType, TsDemuxer};
 use lvqr_core::{EventBus, RelayEvent};
-use lvqr_fragment::{Fragment, FragmentFlags};
-use lvqr_ingest::SharedFragmentObserver;
+use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags};
+use lvqr_ingest::{SharedFragmentObserver, publish_fragment, publish_init};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -22,11 +22,34 @@ use tracing::{debug, info, warn};
 pub struct SrtIngestServer {
     addr: SocketAddr,
     pre_bound: Option<tokio::net::UdpSocket>,
+    registry: FragmentBroadcasterRegistry,
 }
 
 impl SrtIngestServer {
     pub fn new(addr: SocketAddr) -> Self {
-        Self { addr, pre_bound: None }
+        Self {
+            addr,
+            pre_bound: None,
+            registry: FragmentBroadcasterRegistry::new(),
+        }
+    }
+
+    /// Construct with an externally-owned broadcaster registry. Used when
+    /// multiple ingest protocols share one registry so consumers can
+    /// subscribe to any broadcast regardless of which protocol fed it.
+    pub fn with_registry(addr: SocketAddr, registry: FragmentBroadcasterRegistry) -> Self {
+        Self {
+            addr,
+            pre_bound: None,
+            registry,
+        }
+    }
+
+    /// Handle to the broadcaster registry. Consumers call
+    /// `registry.subscribe(broadcast, track)` to receive a `FragmentStream`
+    /// for any ingest-produced broadcast the SRT server has seen.
+    pub fn registry(&self) -> FragmentBroadcasterRegistry {
+        self.registry.clone()
     }
 
     /// Pre-bind the UDP socket and return the actual local address.
@@ -48,13 +71,18 @@ impl SrtIngestServer {
         events: EventBus,
         shutdown: CancellationToken,
     ) -> Result<(), std::io::Error> {
+        let Self {
+            addr,
+            pre_bound,
+            registry,
+        } = self;
         let builder = srt_tokio::SrtListener::builder();
-        let (mut listener, mut incoming) = match self.pre_bound {
-            Some(socket) => builder.socket(socket).bind(self.addr).await?,
-            None => builder.bind(self.addr).await?,
+        let (mut listener, mut incoming) = match pre_bound {
+            Some(socket) => builder.socket(socket).bind(addr).await?,
+            None => builder.bind(addr).await?,
         };
 
-        info!(addr = %self.addr, "SRT ingest bound");
+        info!(%addr, "SRT ingest bound");
 
         loop {
             tokio::select! {
@@ -82,8 +110,9 @@ impl SrtIngestServer {
                     let ev = events.clone();
                     let bc = broadcast.clone();
                     let conn_shutdown = shutdown.clone();
+                    let conn_registry = registry.clone();
                     tokio::spawn(async move {
-                        handle_connection(socket, &bc, obs.as_ref(), &ev, conn_shutdown).await;
+                        handle_connection(socket, &bc, obs.as_ref(), &ev, &conn_registry, conn_shutdown).await;
                     });
                 }
             }
@@ -120,6 +149,7 @@ async fn handle_connection(
     broadcast: &str,
     observer: Option<&SharedFragmentObserver>,
     events: &EventBus,
+    registry: &FragmentBroadcasterRegistry,
     shutdown: CancellationToken,
 ) {
     let mut state = ConnectionState {
@@ -145,7 +175,7 @@ async fn handle_connection(
                     Some(Ok((_instant, data))) => {
                         let pes_packets = state.demux.feed(&data);
                         for pes in pes_packets {
-                            process_pes(&mut state, broadcast, &pes, observer);
+                            process_pes(&mut state, broadcast, &pes, observer, registry);
                         }
                     }
                     Some(Err(e)) => {
@@ -172,11 +202,12 @@ fn process_pes(
     broadcast: &str,
     pes: &PesPacket,
     observer: Option<&SharedFragmentObserver>,
+    registry: &FragmentBroadcasterRegistry,
 ) {
     match pes.stream_type {
-        StreamType::H264 => process_h264(state, broadcast, pes, observer),
-        StreamType::Aac => process_aac(state, broadcast, pes, observer),
-        StreamType::H265 => process_hevc(state, broadcast, pes, observer),
+        StreamType::H264 => process_h264(state, broadcast, pes, observer, registry),
+        StreamType::Aac => process_aac(state, broadcast, pes, observer, registry),
+        StreamType::H265 => process_hevc(state, broadcast, pes, observer, registry),
         StreamType::Unknown(st) => {
             debug!(%broadcast, stream_type = st, "SRT unknown stream type; dropping PES");
         }
@@ -188,11 +219,8 @@ fn process_h264(
     broadcast: &str,
     pes: &PesPacket,
     observer: Option<&SharedFragmentObserver>,
+    registry: &FragmentBroadcasterRegistry,
 ) {
-    let obs = match observer {
-        Some(o) => o,
-        None => return,
-    };
     let payload = &pes.payload;
     let nalus = split_annex_b(payload);
 
@@ -224,8 +252,7 @@ fn process_h264(
             warn!(%broadcast, error = %e, "SRT: failed to write AVC init segment");
             return;
         }
-        let init = buf.freeze();
-        obs.on_init(broadcast, "0.mp4", 90_000, init);
+        publish_init(observer, registry, broadcast, "0.mp4", "avc1", 90_000, buf.freeze());
         state.video_init_emitted = true;
         info!(%broadcast, "SRT: video init emitted");
     }
@@ -269,7 +296,7 @@ fn process_h264(
         },
         moof_mdat,
     );
-    obs.on_fragment(broadcast, "0.mp4", &frag);
+    publish_fragment(observer, registry, broadcast, "0.mp4", "avc1", 90_000, frag);
 }
 
 fn process_hevc(
@@ -277,11 +304,8 @@ fn process_hevc(
     broadcast: &str,
     pes: &PesPacket,
     observer: Option<&SharedFragmentObserver>,
+    registry: &FragmentBroadcasterRegistry,
 ) {
-    let obs = match observer {
-        Some(o) => o,
-        None => return,
-    };
     let payload = &pes.payload;
     let nalus = split_annex_b(payload);
 
@@ -321,8 +345,7 @@ fn process_hevc(
             warn!(%broadcast, error = %e, "SRT: failed to write HEVC init segment");
             return;
         }
-        let init = buf.freeze();
-        obs.on_init(broadcast, "0.mp4", 90_000, init);
+        publish_init(observer, registry, broadcast, "0.mp4", "hev1", 90_000, buf.freeze());
         state.video_init_emitted = true;
         info!(%broadcast, "SRT: HEVC video init emitted");
     }
@@ -372,7 +395,7 @@ fn process_hevc(
         },
         moof_mdat,
     );
-    obs.on_fragment(broadcast, "0.mp4", &frag);
+    publish_fragment(observer, registry, broadcast, "0.mp4", "hev1", 90_000, frag);
 }
 
 fn process_aac(
@@ -380,12 +403,8 @@ fn process_aac(
     broadcast: &str,
     pes: &PesPacket,
     observer: Option<&SharedFragmentObserver>,
+    registry: &FragmentBroadcasterRegistry,
 ) {
-    let obs = match observer {
-        Some(o) => o,
-        None => return,
-    };
-
     if !state.audio_init_emitted {
         let payload = &pes.payload;
         if payload.len() < 7 {
@@ -424,8 +443,15 @@ fn process_aac(
             warn!(%broadcast, error = %e, "SRT: failed to write AAC init segment");
             return;
         }
-        let init = buf.freeze();
-        obs.on_init(broadcast, "1.mp4", sample_rate, init);
+        publish_init(
+            observer,
+            registry,
+            broadcast,
+            "1.mp4",
+            "mp4a.40.2",
+            sample_rate,
+            buf.freeze(),
+        );
         state.audio_init_emitted = true;
         state.audio_timescale = sample_rate;
         info!(%broadcast, %sample_rate, "SRT: audio init emitted");
@@ -475,7 +501,15 @@ fn process_aac(
             FragmentFlags::AUDIO,
             moof_mdat,
         );
-        obs.on_fragment(broadcast, "1.mp4", &frag);
+        publish_fragment(
+            observer,
+            registry,
+            broadcast,
+            "1.mp4",
+            "mp4a.40.2",
+            state.audio_timescale,
+            frag,
+        );
         offset += frame_len;
     }
 }
@@ -583,6 +617,96 @@ mod tests {
         let out = annex_b_to_avcc(&data);
         assert_eq!(out.len(), 4 + 2);
         assert_eq!(&out[4..6], &[0x65, 0xCC]);
+    }
+
+    /// Session 57 dual-wire regression: synthetic H.264 PES packets driven
+    /// through `process_h264` publish to both the legacy observer AND the
+    /// FragmentBroadcasterRegistry. Broadcaster-side subscribers see the
+    /// same fragments the observer sees, with init segment carried on
+    /// broadcaster.meta().
+    #[tokio::test]
+    async fn dual_wire_h264_publishes_to_observer_and_broadcaster() {
+        use lvqr_codec::ts::PesPacket;
+        use lvqr_fragment::{FragmentMeta, FragmentStream};
+        use lvqr_ingest::FragmentObserver;
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct Spy {
+            init_count: AtomicU32,
+            fragments: StdMutex<Vec<Fragment>>,
+        }
+        impl FragmentObserver for Spy {
+            fn on_init(&self, _b: &str, _t: &str, _ts: u32, _init: Bytes) {
+                self.init_count.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_fragment(&self, _b: &str, _t: &str, f: &Fragment) {
+                self.fragments.lock().unwrap().push(f.clone());
+            }
+        }
+
+        let spy = Arc::new(Spy {
+            init_count: AtomicU32::new(0),
+            fragments: StdMutex::new(Vec::new()),
+        });
+        let obs: SharedFragmentObserver = spy.clone();
+        let registry = FragmentBroadcasterRegistry::new();
+
+        // Subscribe to the broadcaster slot up-front so the first emit is
+        // captured. The subscribe-before-broadcaster-exists pattern: we
+        // create it with a placeholder meta and later the publish path
+        // updates init via set_init_segment.
+        let bc = registry.get_or_create("srt_dual_wire", "0.mp4", FragmentMeta::new("avc1", 90_000));
+        let mut sub = bc.subscribe();
+
+        let mut state = ConnectionState {
+            demux: TsDemuxer::new(),
+            video_init_emitted: false,
+            audio_init_emitted: false,
+            video_seq: 0,
+            audio_seq: 0,
+            sps: None,
+            pps: None,
+            vps: None,
+            prev_video_dts: None,
+            prev_audio_dts: None,
+            audio_timescale: 44100,
+        };
+
+        // Synthetic PES with SPS + PPS + IDR slice in Annex B.
+        let mut annex_b = Vec::new();
+        annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F]); // SPS
+        annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x38, 0x80]); // PPS
+        annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB, 0xCC]); // IDR
+
+        let pes = PesPacket {
+            pid: 256,
+            stream_type: StreamType::H264,
+            pts: Some(90000),
+            dts: Some(90000),
+            payload: annex_b,
+        };
+
+        process_h264(&mut state, "srt_dual_wire", &pes, Some(&obs), &registry);
+
+        // Observer saw 1 init + 1 fragment.
+        assert_eq!(spy.init_count.load(Ordering::Relaxed), 1);
+        assert_eq!(spy.fragments.lock().unwrap().len(), 1);
+        let obs_frag = spy.fragments.lock().unwrap()[0].clone();
+        assert!(obs_frag.flags.keyframe);
+
+        // Broadcaster side: init segment carried on meta, fragment on sub.
+        let meta = bc.meta();
+        assert!(meta.init_segment.is_some(), "broadcaster carries AVC init bytes");
+
+        let bc_frag = sub.next_fragment().await.expect("broadcaster frag");
+        assert!(bc_frag.flags.keyframe);
+        assert_eq!(
+            bc_frag.payload.as_ref(),
+            obs_frag.payload.as_ref(),
+            "payload bytes agree"
+        );
     }
 
     #[test]
