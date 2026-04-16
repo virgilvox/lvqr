@@ -1,8 +1,57 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- RTSP fully wired (H.264+HEVC ingest -> HLS) -- 473 tests, all green
+## Project Status: v0.4.0 -- RTSP complete (H.264+HEVC+AAC ingest) -- 493 tests, all green
 
-**Last Updated**: 2026-04-16 (session 52 close).
+**Last Updated**: 2026-04-16 (session 52 final).
+
+## Session 52 final (2026-04-16)
+
+### What shipped after session 52 close (3 additional commits, +610 lines)
+
+5. **Proptest for RTSP/RTP parsers** (`952f616`). 9 property tests
+   (later 11) covering every parser that handles untrusted network
+   input: RTSP request, Transport header, interleaved framing, RTP
+   header, H.264/HEVC/AAC depacketizers, FU reassembly sequences,
+   fmtp config parser, plus interleaved round-trip. Fills the
+   proptest slot of the 5-artifact contract.
+
+6. **AAC RTP depacketizer + audio fragment emission** (`8b656b6`).
+   `AacDepacketizer` for RFC 3640 AAC-hbr mode: parses AU headers,
+   extracts Access Units. `parse_aac_config_from_fmtp` extracts
+   hex-encoded AudioSpecificConfig from SDP fmtp lines. Server
+   detects audio vs video by interleaved channel-to-track mapping,
+   emits AAC init segments + per-AU fragments on track "1.mp4".
+   RTSP now handles H.264 + HEVC + AAC.
+
+7. **Integration tests + contract coverage** (`69ecf80`). 3 real-TCP
+   integration tests (OPTIONS, DESCRIBE, full ingest handshake with
+   spy observer). Enabled lvqr-rtsp in contract checker scope.
+   Updated CONTRACT.md. 58 tests in lvqr-rtsp (44 unit + 3
+   integration + 11 proptest), plus 1 E2E in lvqr-cli.
+
+### Ground truth (session 52 final)
+
+* **Head**: `69ecf80` on `main`. v0.4.0.
+* **Tests**: 493 passed, 0 failed, 1 ignored.
+* **Code**: 37,192 lines of Rust across 23 crates.
+* **CI**: `cargo fmt`, `cargo clippy --workspace -D warnings`,
+  `cargo test --workspace` all clean.
+* **Contract**: lvqr-rtsp has 3/5 artifacts (proptest, integration,
+  E2E). Fuzz and conformance remain open.
+
+### Session 53 entry point
+
+Priority order:
+
+1. **Remaining contract gaps** -- 9 missing slots across 6 crates
+   (see `scripts/check_test_contract.sh`). Most are low-value
+   (pure value types, external tool dependencies). lvqr-rtsp fuzz
+   target would add long-run coverage over the parser surfaces.
+
+2. **Tier 2.1 unified fragment model** -- migrate ingest paths to
+   fragment-stream-based dispatch.
+
+3. **Tier 3 planning** -- cluster (chitchat), observability (OTLP).
 
 ## Session 52 close (2026-04-16)
 
@@ -56,7 +105,7 @@
 | RTMP | ingest | lvqr-ingest | DONE | yes |
 | WHIP | ingest | lvqr-whip | DONE | yes |
 | SRT | ingest | lvqr-srt | DONE (H.264+HEVC+AAC) | yes |
-| RTSP | ingest | lvqr-rtsp | DONE (H.264+HEVC) | yes |
+| RTSP | ingest | lvqr-rtsp | DONE (H.264+HEVC+AAC) | yes |
 | WebSocket | ingest+egress | lvqr-cli | DONE | yes |
 | LL-HLS | egress | lvqr-hls | DONE | yes |
 | DASH | egress | lvqr-dash | DONE | yes |
@@ -65,34 +114,29 @@
 
 ### Known gaps
 
-1. **RTSP audio**: AAC RTP depacketization not yet implemented.
-   Ingest is video-only. Follow RFC 3640 (AAC in RTP).
-2. **RTSP playback egress**: PLAY direction works at the RTSP
+1. **RTSP playback egress**: PLAY direction works at the RTSP
    protocol level (state machine, DESCRIBE/SETUP/PLAY handshake)
    but does not packetize fragments into outbound RTP.
-3. **Unified Fragment Model** (Tier 2.1): types exist but ingress
+2. **Unified Fragment Model** (Tier 2.1): types exist but ingress
    not migrated to fragment-stream-based dispatch.
-4. **Peer mesh media relay**: topology works, forwarding is Tier 4.
-5. **Tier 1 infra**: no playwright, no 24h soak, no comparison.
-6. **Tiers 3-5**: cluster, observability, WASM, SDKs not started.
-7. **Contract**: 7 missing slots across 5 crates.
+3. **Peer mesh media relay**: topology works, forwarding is Tier 4.
+4. **Tier 1 infra**: no playwright, no 24h soak, no comparison.
+5. **Tiers 3-5**: cluster, observability, WASM, SDKs not started.
+6. **Contract**: 9 missing slots across 6 crates (mostly low-value
+   fuzz for pure value types and external-tool conformance).
 
 ### Session 53 entry point
 
 Priority order:
 
-1. **Contract gaps** -- 7 missing slots across 5 crates. Fuzz
-   targets for lvqr-record, lvqr-moq, lvqr-fragment; conformance
-   tests for lvqr-whip, lvqr-whep.
+1. **Contract gaps** -- 9 missing slots across 6 crates. Fuzz
+   targets for lvqr-record, lvqr-moq, lvqr-fragment, lvqr-rtsp;
+   conformance tests for lvqr-whip, lvqr-whep, lvqr-rtsp.
 
-2. **RTSP audio (AAC)** -- add AAC RTP depacketizer to rtp module
-   per RFC 3640. Wire audio fragment emission mirroring SRT's
-   `process_aac`. Add audio track to E2E test.
-
-3. **Tier 2.1 unified fragment model** -- migrate ingest paths
+2. **Tier 2.1 unified fragment model** -- migrate ingest paths
    to fragment-stream-based dispatch.
 
-4. **Tier 3 planning** -- cluster (chitchat), observability (OTLP).
+3. **Tier 3 planning** -- cluster (chitchat), observability (OTLP).
 
 ## Session 51 close (2026-04-16)
 
