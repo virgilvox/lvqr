@@ -54,12 +54,22 @@ never-panic, valid timestamps). Fuzz target in lvqr-codec/fuzz.
 
 **v0.4.0** on `origin/main`. 429 tests, 0 failures.
 
-### Session 48 entry point
+### Session 49 close (2026-04-16)
 
-* **Create crates/lvqr-srt** with `srt-tokio` dependency and
-  `SrtListener::accept` -> `TsDemuxer` -> Fragment bridge.
-* **Self-hosted macOS runner** for mediastreamvalidator.
-* **Criterion bench for TS demuxer** throughput.
+1. **Delete lvqr-wasm** (`58e1327`). Removed deprecated crate,
+   workspace member entry, CI WASM build job, README entry.
+   Saves ~30s per CI run.
+2. **Fix SRT frame duration** (`7686d0a`). Video and audio
+   frame durations now computed from PTS deltas instead of
+   hardcoded 3000/1024. Fixes A/V drift and incorrect EXTINF
+   values on real streams.
+
+### Session 50 entry point
+
+* **SRT integration test** (ffmpeg SRT push -> verify HLS output).
+* **Wire fuzz targets to nightly CI** runner.
+* **HEVC in SRT** (the code path exists, just needs wiring).
+* **RTSP server** (Tier 2.9, last protocol gap vs MediaMTX).
 
 ## Sessions 34-43 audit (2026-04-16)
 
