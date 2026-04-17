@@ -587,15 +587,46 @@ async fn handle_uri(
 /// so a simple `/hls/{broadcast}/...` pattern would not capture them.
 /// The handler splits the tail off and matches on the filename to
 /// dispatch between video and audio renditions.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MultiHlsServer {
     inner: Arc<MultiHlsState>,
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for MultiHlsServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiHlsServer")
+            .field("broadcast_count", &self.broadcast_count())
+            .field(
+                "owner_resolver",
+                &self.inner.owner_resolver.as_ref().map(|_| "<resolver>"),
+            )
+            .finish()
+    }
+}
+
+/// Future returned by an [`OwnerResolver`]. Producing an owned
+/// `String` keeps the callback object-safe without needing HRTBs
+/// on the return type.
+pub type RedirectFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
+
+/// Callback that resolves an unknown broadcast name to the base
+/// URL of the owning node's HLS endpoint (e.g.
+/// `"http://a.local:8888"`). Returning `Some(url)` triggers a 302
+/// to `"<url>/hls/<broadcast>/<tail>"`; returning `None` falls
+/// through to the existing 404 path.
+///
+/// The resolver is called from inside the axum handler so it
+/// should be fast-ish; the expected implementation is a chitchat
+/// KV lookup via [`lvqr_cluster::Cluster::find_owner_endpoints`],
+/// which takes a single mutex acquisition.
+pub type OwnerResolver = Arc<dyn Fn(String) -> RedirectFuture + Send + Sync>;
+
 struct MultiHlsState {
     config: PlaylistBuilderConfig,
     broadcasts: std::sync::Mutex<HashMap<String, BroadcastEntry>>,
+    /// Optional callback consulted when an incoming request names a
+    /// broadcast this node does not host. See [`OwnerResolver`].
+    owner_resolver: Option<OwnerResolver>,
 }
 
 /// Per-broadcast state tracked by [`MultiHlsServer`].
@@ -621,8 +652,34 @@ impl MultiHlsServer {
             inner: Arc::new(MultiHlsState {
                 config,
                 broadcasts: std::sync::Mutex::new(HashMap::new()),
+                owner_resolver: None,
             }),
         }
+    }
+
+    /// Build a new multi-broadcast server with an
+    /// [`OwnerResolver`] already installed. Used by `lvqr-cli`
+    /// when clustering is enabled; the resolver wraps a
+    /// `Cluster::find_owner_endpoints` lookup so requests for a
+    /// broadcast hosted on a peer redirect with `302` instead of
+    /// `404`.
+    pub fn with_owner_resolver(config: PlaylistBuilderConfig, resolver: OwnerResolver) -> Self {
+        Self {
+            inner: Arc::new(MultiHlsState {
+                config,
+                broadcasts: std::sync::Mutex::new(HashMap::new()),
+                owner_resolver: Some(resolver),
+            }),
+        }
+    }
+
+    /// Resolve a redirect target for `broadcast`. Returns `None`
+    /// when no resolver is installed or when the resolver yields
+    /// `None`. Pulled out of the handler so it is unit-testable
+    /// without spinning an axum request.
+    async fn resolve_redirect_base(&self, broadcast: &str) -> Option<String> {
+        let resolver = self.inner.owner_resolver.as_ref()?;
+        resolver(broadcast.to_string()).await
     }
 
     /// Producer-side entry point for the video rendition of
@@ -825,6 +882,17 @@ async fn handle_multi_get(
     let Some((broadcast, tail)) = split_broadcast_path(&path) else {
         return (StatusCode::NOT_FOUND, "malformed hls path").into_response();
     };
+
+    // If the broadcast is unknown on this node AND an owner resolver
+    // is wired (clustering enabled), try to redirect the subscriber
+    // to the owning node's HLS surface before 404'ing. Resolver
+    // misses fall through to the existing not-found paths.
+    if multi.video(broadcast).is_none() && multi.audio(broadcast).is_none() {
+        if let Some(base) = multi.resolve_redirect_base(broadcast).await {
+            return redirect_to_owner(&base, &path);
+        }
+    }
+
     if tail == "master.m3u8" {
         return handle_master_playlist(&multi, broadcast).await;
     }
@@ -867,6 +935,23 @@ async fn handle_multi_get(
         "init.mp4" | "audio-init.mp4" => render_init(&state).await,
         other => render_uri(&state, other).await,
     }
+}
+
+/// Build a 302 response redirecting to `<base>/hls/<path>`.
+/// `base` is expected to already carry the scheme + authority
+/// (e.g. `"http://a.local:8888"`) with no trailing slash; the
+/// helper is tolerant of one stray trailing slash and silently
+/// strips it. `path` is the tail the handler received, already
+/// `{broadcast}/{filename}` shaped.
+fn redirect_to_owner(base: &str, path: &str) -> Response {
+    let base = base.trim_end_matches('/');
+    let location = format!("{base}/hls/{path}");
+    (
+        StatusCode::FOUND,
+        [(axum::http::header::LOCATION, location)],
+        "broadcast lives on another cluster node",
+    )
+        .into_response()
 }
 
 /// Build a one-element rendition report slice for a sibling
@@ -984,5 +1069,145 @@ mod tests {
             "cache: {:?}",
             cache.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn redirect_to_owner_includes_full_path_and_302() {
+        let resp = redirect_to_owner("http://a.local:8888", "live/test/master.m3u8");
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("location")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(loc, "http://a.local:8888/hls/live/test/master.m3u8");
+    }
+
+    #[tokio::test]
+    async fn redirect_to_owner_tolerates_trailing_slash_on_base() {
+        let resp = redirect_to_owner("http://a.local:8888/", "x/init.mp4");
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(loc, "http://a.local:8888/hls/x/init.mp4");
+    }
+
+    #[tokio::test]
+    async fn resolve_redirect_base_returns_none_without_resolver() {
+        let multi = MultiHlsServer::new(PlaylistBuilderConfig::default());
+        assert!(multi.resolve_redirect_base("live/test").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_redirect_base_invokes_installed_resolver() {
+        let resolver: OwnerResolver = Arc::new(|broadcast| {
+            Box::pin(async move {
+                if broadcast == "live/test" {
+                    Some("http://a.local:8888".to_string())
+                } else {
+                    None
+                }
+            })
+        });
+        let multi = MultiHlsServer::with_owner_resolver(PlaylistBuilderConfig::default(), resolver);
+        assert_eq!(
+            multi.resolve_redirect_base("live/test").await,
+            Some("http://a.local:8888".to_string())
+        );
+        assert_eq!(multi.resolve_redirect_base("live/other").await, None);
+    }
+
+    #[tokio::test]
+    async fn unknown_broadcast_redirects_to_owner_via_router() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let resolver: OwnerResolver = Arc::new(|broadcast| {
+            Box::pin(async move {
+                if broadcast == "live/test" {
+                    Some("http://a.local:8888".to_string())
+                } else {
+                    None
+                }
+            })
+        });
+        let multi = MultiHlsServer::with_owner_resolver(PlaylistBuilderConfig::default(), resolver);
+        let app = multi.router();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/hls/live/test/master.m3u8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(loc, "http://a.local:8888/hls/live/test/master.m3u8");
+    }
+
+    #[tokio::test]
+    async fn unknown_broadcast_without_resolver_match_returns_404() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let resolver: OwnerResolver = Arc::new(|_b| Box::pin(async move { None }));
+        let multi = MultiHlsServer::with_owner_resolver(PlaylistBuilderConfig::default(), resolver);
+        let app = multi.router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/hls/unknown/master.m3u8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn known_broadcast_skips_resolver_and_serves_locally() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // Resolver would redirect if consulted, but the broadcast
+        // is hosted locally so the redirect path MUST NOT trigger.
+        let resolver: OwnerResolver =
+            Arc::new(|_b| Box::pin(async move { Some("http://elsewhere.invalid".to_string()) }));
+        let multi = MultiHlsServer::with_owner_resolver(PlaylistBuilderConfig::default(), resolver);
+        // Ensure a local broadcast exists so the "unknown" guard
+        // is not triggered. master.m3u8 for a fresh broadcast with
+        // no init segment responds with a syntactically valid
+        // variant (video codec falls through to the default).
+        let _video = multi.ensure_video("live/local");
+        let app = multi.router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/hls/live/local/master.m3u8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

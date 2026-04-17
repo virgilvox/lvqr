@@ -15,14 +15,14 @@
 //! The two crates have no API overlap; neither depends on the
 //! other; a deployed LVQR node may enable neither, either, or both.
 //!
-//! ## Scope as of session 75
+//! ## Scope as of session 76 (Tier 3 session F1)
 //!
 //! * [`Cluster::bootstrap`] spins up a local chitchat gossip node
 //!   on a UDP port.
 //! * [`Cluster::self_node`] returns this node's identity.
 //! * [`Cluster::members`] returns every live peer chitchat reports
 //!   (self included) with each peer's most recent advertised
-//!   [`NodeCapacity`] attached.
+//!   [`NodeCapacity`] and [`NodeEndpoints`] attached.
 //! * [`Cluster::shutdown`] is an explicit graceful shutdown that
 //!   waits for both the capacity advertiser and the gossip task to
 //!   exit.
@@ -39,9 +39,14 @@
 //!   [`Cluster::list_config`] implement the cluster-wide config
 //!   channel. Writes are timestamped on the setter's self node;
 //!   cross-node conflicts resolve by LWW on the timestamp.
+//! * [`Cluster::set_endpoints`], [`Cluster::node_endpoints`], and
+//!   [`Cluster::find_owner_endpoints`] implement per-node endpoint
+//!   advertisement so the redirect-to-owner egress paths
+//!   (`lvqr-hls`, `lvqr-dash`, `lvqr-rtsp`) can resolve a
+//!   broadcast's owner to a reachable URL.
 //!
-//! Wiring through `lvqr-cli serve` + the RTSP/HLS/DASH redirect
-//! fall-back path lands in session 76.
+//! CLI wiring (`lvqr-cli serve` flags + HLS/DASH/RTSP handler
+//! redirect paths) lands in session 77 (F2).
 //!
 //! ## Load-bearing invariants preserved
 //!
@@ -56,6 +61,7 @@
 mod broadcast;
 mod capacity;
 mod config;
+mod endpoints;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -74,6 +80,7 @@ use tracing::{debug, info};
 pub use broadcast::{BROADCAST_KEY_PREFIX, BroadcastSummary, Claim, MIN_LEASE};
 pub use capacity::{CAPACITY_KEY, CapacityGauge, NodeCapacity};
 pub use config::{CONFIG_KEY_PREFIX, ConfigEntry};
+pub use endpoints::{ENDPOINTS_KEY, NodeEndpoints};
 
 /// Default UDP port for the chitchat gossip transport. Matches the
 /// upstream chitchat example's convention. No LVQR listener today
@@ -320,6 +327,11 @@ pub struct ClusterNode {
     /// booted, first tick has not fired) or if the entry failed to
     /// decode.
     pub capacity: Option<NodeCapacity>,
+    /// Externally-reachable egress URLs this node has advertised.
+    /// `None` when the node has not called
+    /// [`Cluster::set_endpoints`](Cluster::set_endpoints) yet or
+    /// when the gossipped entry failed to decode.
+    pub endpoints: Option<NodeEndpoints>,
 }
 
 /// Handle to a running cluster node.
@@ -396,6 +408,7 @@ impl Cluster {
             generation,
             gossip_addr: advertise,
             capacity: None,
+            endpoints: None,
         };
 
         let capacity_gauge = CapacityGauge::new();
@@ -454,15 +467,19 @@ impl Cluster {
         let mut out: Vec<ClusterNode> = guard
             .live_nodes()
             .map(|cid| {
-                let capacity = guard
-                    .node_state(cid)
+                let state = guard.node_state(cid);
+                let capacity = state
                     .and_then(|state| state.get(CAPACITY_KEY))
                     .and_then(NodeCapacity::decode);
+                let endpoints = state
+                    .and_then(|state| state.get(ENDPOINTS_KEY))
+                    .and_then(NodeEndpoints::decode);
                 ClusterNode {
                     id: NodeId(cid.node_id.clone()),
                     generation: cid.generation_id,
                     gossip_addr: cid.gossip_advertise_addr,
                     capacity,
+                    endpoints,
                 }
             })
             .collect();
@@ -552,6 +569,34 @@ impl Cluster {
     /// `/admin/cluster/config` endpoint.
     pub async fn list_config(&self) -> Vec<ConfigEntry> {
         config::list(self.handle()).await
+    }
+
+    /// Advertise this node's externally-reachable egress URLs.
+    /// Overwrites the previous entry if one exists; gossip
+    /// propagates the new value to every peer within a couple of
+    /// rounds. Idempotent -- calling with the same value twice is
+    /// a no-op.
+    pub async fn set_endpoints(&self, endpoints: &NodeEndpoints) -> Result<()> {
+        endpoints::set(self.handle(), endpoints).await
+    }
+
+    /// Read a specific node's advertised endpoints via chitchat KV.
+    /// Returns `None` if the node is unknown, has not yet
+    /// advertised, or its entry failed to decode.
+    pub async fn node_endpoints(&self, node_id: &NodeId) -> Option<NodeEndpoints> {
+        endpoints::get(self.handle(), node_id).await
+    }
+
+    /// Convenience helper that resolves a redirect target for a
+    /// broadcast in one step: looks up the current owner via
+    /// [`Self::find_broadcast_owner`], then fetches that owner's
+    /// advertised [`NodeEndpoints`]. Returns `None` if either step
+    /// fails -- for example no node owns the broadcast, or the
+    /// owner has not advertised its endpoints yet.
+    pub async fn find_owner_endpoints(&self, broadcast: &str) -> Option<(NodeId, NodeEndpoints)> {
+        let owner = self.find_broadcast_owner(broadcast).await?;
+        let endpoints = self.node_endpoints(&owner).await?;
+        Some((owner, endpoints))
     }
 }
 
