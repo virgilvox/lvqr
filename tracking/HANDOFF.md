@@ -1,8 +1,136 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 sessions A+B landed; lvqr-cluster bootstraps + two nodes converge; 628 tests, 24 crates
+## Project Status: v0.4.0 -- Tier 3 sessions A+B+C landed; broadcast-ownership KV live; 640 tests, 24 crates
 
-**Last Updated**: 2026-04-17 (session 72 close + cross-session audit).
+**Last Updated**: 2026-04-17 (session 73 close -- Tier 3 session C).
+
+## Session 73 close (2026-04-17)
+
+### What shipped (1 commit, +588 / -5 lines)
+
+1. **Tier 3 session C: broadcast-ownership KV** (`a0c1b58`).
+   Executes the third slot of the `tracking/TIER_3_PLAN.md`
+   decomposition. Introduces `Cluster::claim_broadcast` +
+   `Cluster::find_broadcast_owner` plus the `Claim` handle that
+   keeps a lease renewed in the background and releases it
+   (best-effort tombstone + natural expiry) on drop.
+
+   New module `crates/lvqr-cluster/src/broadcast.rs`:
+   * `broadcast_key("live/test")` -> `"broadcast.live/test"`.
+   * `Lease { owner, expires_at_ms }` serialized as flat JSON so
+     the chitchat admin dump is human-readable. Decode failures
+     are logged + skipped (forward-compat with any future schema
+     bump).
+   * `spawn_renewer` runs the lease-extension loop: `tokio::select`
+     between a `MissedTickBehavior::Delay` ticker at `lease / 4`
+     and a `oneshot::Receiver` for the stop signal. On stop, it
+     acquires the chitchat mutex, calls `self_node_state().delete`,
+     and exits. Pattern copied from session 64's RTCP SR timer.
+   * `select_winner` picks the live lease with the latest
+     `expires_at_ms`; ties break lexicographically on `owner`.
+     Extracted as a pure function so the tiebreak is unit-testable
+     without a running chitchat.
+   * `MIN_LEASE = 100ms` floor: leases shorter than this quantize
+     renew intervals below chitchat's gossip cadence, which is
+     wasteful without buying liveness. Callers asking for a
+     shorter lease are silently bumped up.
+
+   New integration tests at
+   `crates/lvqr-cluster/tests/ownership.rs`:
+   * `claim_visible_to_peer` -- A claims `"live/test"`; A's self
+     lookup returns `Some(A)` synchronously (the initial write
+     happens inside `claim_broadcast` before it returns); B's
+     lookup resolves to `Some(A)` within one or two gossip rounds
+     (50 ms cadence, 3 s timeout). A never-claimed name resolves
+     to `None`.
+   * `drop_releases_claim` -- dropping the `Claim` fires the stop
+     signal, the renewer tombstones the key, and B's lookup
+     eventually returns `None`. 5 s timeout tolerates a single
+     lost gossip round.
+
+   Library changes in `crates/lvqr-cluster/src/lib.rs`:
+   * `mod broadcast;` + `pub use broadcast::{Claim, BROADCAST_KEY_PREFIX, MIN_LEASE};`.
+   * `Cluster::claim_broadcast(&self, name, lease) -> Result<Claim>`
+     and `Cluster::find_broadcast_owner(&self, name) -> Option<NodeId>`
+     wrap the free functions in `broadcast`.
+   * Crate docs section "Scope this session" renamed to "Scope as
+     of session 73" and updated to list the four landed methods
+     plus the two still-pending deliverables (capacity + admin
+     HTTP).
+
+   Cargo.toml: adds `serde` + `serde_json` workspace deps.
+
+### Ground truth (session 73 close)
+
+* **Head**: `a0c1b58` on `main`. v0.4.0. **32 commits queued but
+  NOT pushed to origin/main** (sessions 62-73 all unpushed).
+* **Tests**: 640 passed, 0 failed, 1 ignored. Delta from session
+  72: +12 (5 select_winner filter/tiebreak unit tests, 5
+  Lease/to_unix_ms/broadcast_key unit tests, 2 ownership
+  integration tests).
+* **Code**: +588 / -5 net. New files: `broadcast.rs` (407 lines),
+  `tests/ownership.rs` (137 lines).
+* **Workspace**: 24 crates, unchanged.
+* **CI gates locally clean**: fmt, clippy
+  (`--all-targets --benches -D warnings`), test --workspace all
+  green on a fresh run.
+
+### Tier 3 progress
+
+| Session | Deliverable | Status |
+|---|---|---|
+| A (71) | lvqr-cluster scaffold + single-node bootstrap | DONE |
+| B (72) | Two-node integration test: both see each other | DONE |
+| C (73) | Broadcast-ownership KV (claim_broadcast, find_broadcast_owner) | DONE |
+| D (74) | Capacity advertisement | pending |
+| E (75) | Cluster-wide config channel + admin endpoints | pending |
+| F (76) | Wire Cluster through lvqr-cli serve + RTSP/HLS/DASH redirect | pending |
+| G (77) | lvqr-observability scaffold + OTLP env-var gating | pending |
+| H (78) | OTLP span exporter + in-memory collector test | pending |
+| I (79) | OTLP metric exporter | pending |
+| J (80) | JSON log + trace_id correlation | pending |
+
+**3 of 10 Tier 3 sessions complete.** Remaining 7 sessions at the
+observed pace = ~3 calendar days of focused work before Tier 4
+becomes the critical-path tier.
+
+### Known flakes / risks
+
+* `rtsp_play_emits_rtcp_sender_report_after_interval` in
+  `lvqr-rtsp` flaked once during a workspace run this session and
+  passed on the immediate retry. Pre-existing timing-sensitive
+  test not touched by this session's changes. Two consecutive
+  `cargo test --workspace` runs afterwards both came up clean. If
+  it keeps surfacing, bump the SR-interval budget; otherwise leave
+  alone.
+* `drop_releases_claim` times out if chitchat gossip fails to
+  propagate the tombstone within 5 s. At 50 ms gossip interval and
+  500 ms marked-for-deletion grace, happy path is ~150 ms; the
+  timeout tolerates one lost round. If CI flakes, bump the budget
+  rather than relaxing the `None` assertion.
+
+### Session 74 entry point
+
+**Tier 3 session D: capacity advertisement.**
+
+Deliverable per `tracking/TIER_3_PLAN.md` session D row:
+1. Publish CPU %, memory RSS, and outbound bandwidth to chitchat
+   KV every 5 s from each node.
+2. Expose the advertised fields on `ClusterNode` so `members()`
+   returns them.
+3. Integration test: boot two nodes, wait for one gossip round,
+   assert both nodes see non-zero capacity fields for each peer.
+
+Expected scope: ~200-300 lines. One feat commit + session-close
+doc.
+
+The CPU + RSS sampler already exists in `lvqr-soak`
+(`crates/lvqr-soak/src/`) and can be lifted or re-exported.
+Outbound bandwidth will need a simple counter reset + delta per
+interval since LVQR does not currently aggregate per-egress bytes
+centrally; start from `metrics::counter!("bytes_sent_total")`
+readings if the exporter supports it, otherwise hook into the
+per-drain RTP stats the RTSP crate already keeps.
 
 ## Session 72 close (2026-04-17)
 
