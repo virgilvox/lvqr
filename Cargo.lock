@@ -1778,6 +1778,7 @@ dependencies = [
  "lvqr-ingest",
  "lvqr-mesh",
  "lvqr-moq",
+ "lvqr-observability",
  "lvqr-record",
  "lvqr-relay",
  "lvqr-rtsp",
@@ -1978,6 +1979,15 @@ dependencies = [
  "moq-lite",
  "proptest",
  "tokio",
+]
+
+[[package]]
+name = "lvqr-observability"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

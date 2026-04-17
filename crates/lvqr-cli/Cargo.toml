@@ -48,6 +48,7 @@ lvqr-archive = { workspace = true }
 lvqr-rtsp = { workspace = true }
 lvqr-srt = { workspace = true }
 lvqr-cluster = { workspace = true, optional = true }
+lvqr-observability = { workspace = true }
 
 axum = { workspace = true }
 bytes = { workspace = true }

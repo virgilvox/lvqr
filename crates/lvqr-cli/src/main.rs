@@ -208,11 +208,15 @@ struct ServeArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "lvqr=info".parse().unwrap()),
-        )
-        .init();
+    // Install the observability subsystem at the top of `main`.
+    // Today this is the same stdout fmt subscriber the previous
+    // inline `tracing_subscriber::fmt()` call produced, but
+    // behind the `lvqr_observability` facade so Tier 3 sessions
+    // H (OTLP spans), I (OTLP metrics), and J (JSON + trace_id
+    // correlation) can layer on without touching this call
+    // site. The handle is held for the full `main` scope so
+    // future OTLP background flushers do not leak.
+    let _observability = lvqr_observability::init(lvqr_observability::ObservabilityConfig::from_env())?;
 
     let cli = Cli::parse();
 

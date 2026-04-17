@@ -36,6 +36,7 @@ members = [
     "crates/lvqr-srt",
     "crates/lvqr-cli",
     "crates/lvqr-cluster",
+    "crates/lvqr-observability",
     "crates/lvqr-soak",
     "crates/lvqr-test-utils",
 ]
@@ -145,6 +146,7 @@ lvqr-srt = { version = "0.4.0", path = "crates/lvqr-srt" }
 lvqr-test-utils = { version = "0.4.0", path = "crates/lvqr-test-utils" }
 lvqr-cli = { version = "0.4.0", path = "crates/lvqr-cli" }
 lvqr-cluster = { version = "0.4.0", path = "crates/lvqr-cluster" }
+lvqr-observability = { version = "0.4.0", path = "crates/lvqr-observability" }
 lvqr-soak = { version = "0.4.0", path = "crates/lvqr-soak" }
 
 [profile.release]
