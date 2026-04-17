@@ -1,8 +1,127 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- RTSP PLAY + RTCP SR + full soak harness + first criterion benches; 620 tests, 24 crates
+## Project Status: v0.4.0 -- RTSP PLAY + RTCP SR + full soak + criterion benches in lvqr-rtsp + lvqr-cmaf; 620 tests, 24 crates
 
-**Last Updated**: 2026-04-17 (session 68 close).
+**Last Updated**: 2026-04-17 (session 69 close).
+
+## Session 69 close (2026-04-17)
+
+### What shipped (1 commit, +228 lines)
+
+1. **Criterion benches for `lvqr-cmaf`** (`b396455`). Second bench
+   crate wired to the session-68 template. Covers the two hot
+   paths outside the packet loop: per-fragment `build_moof_mdat`
+   and per-PLAY-session init parsing.
+
+   Benches (`crates/lvqr-cmaf/benches/cmaf.rs`):
+   * `build_moof_mdat_1_sample_10KB` -- typical H.264 IDR
+     fragment (per-fragment ingest cost).
+   * `build_moof_mdat_10_samples_256B` -- multi-AU audio batch
+     so per-sample cost is separable from the fixed moof header.
+   * `write_avc_init_segment`, `write_hevc_init_segment` --
+     emitted once per `publish_init`.
+   * `extract_avc_parameter_sets`, `extract_hevc_parameter_sets`,
+     `extract_aac_config`, `extract_opus_config` -- RTSP
+     DESCRIBE / SDP synthesis path.
+
+   Baseline numbers (laptop, `--quick`):
+   | bench | time |
+   |---|---|
+   | build_moof_mdat_1_sample_10KB | ~386 ns |
+   | build_moof_mdat_10_samples_256B | ~637 ns (~51 ns / sample) |
+   | write_avc_init_segment | ~836 ns |
+   | write_hevc_init_segment | ~973 ns |
+   | extract_avc_parameter_sets | ~1.6 µs |
+   | extract_hevc_parameter_sets | ~2.0 µs |
+   | extract_aac_config | ~1.5 µs |
+   | extract_opus_config | ~1.4 µs |
+
+   Per-fragment moof+mdat sits at ~400 ns at 10 KB payloads
+   (~2.5M fragments/sec single-threaded) -- comfortably above
+   any realistic ingest rate. DESCRIBE-time extract calls hit
+   1.4-2 µs: the full SDP synthesis path fits well inside the
+   1 ms budget before a subscriber notices first-byte latency.
+
+### Ground truth (session 69 close)
+
+* **Head**: `b396455` on `main`. v0.4.0. **23 commits queued
+  but NOT pushed to origin/main** (sessions 62-69 all unpushed).
+* **Tests**: 620 passed, 0 failed, 1 ignored. Unchanged -- the
+  cmaf benches are bench-profile only.
+* **Code**: +228 lines in `crates/lvqr-cmaf/`.
+* **CI gates locally clean**: fmt, clippy
+  (`--all-targets --benches -D warnings`), test --workspace all
+  green. `cargo bench -p lvqr-cmaf --bench cmaf -- --test`
+  reports all 8 benches Success.
+
+### Bench coverage
+
+| Crate | Benches |
+|---|---|
+| lvqr-rtsp  | 7 (session 68): RTP packetizers for H.264 / HEVC / AAC / Opus |
+| lvqr-cmaf  | 8 (session 69): moof+mdat writer, init writers, init extractors |
+
+15 benches across two crates; template established for future
+hot-path coverage.
+
+### Load-bearing invariants (all still pinned)
+
+Unchanged from session 60. Benches are non-functional; they only
+exercise public surface the integration tests already cover.
+
+### Protocols supported
+
+Unchanged. 11 protocols. Feature-complete for every codec.
+
+### Known gaps
+
+1. **mediastreamvalidator binary on CI runner**: still the
+   biggest audit gap. User-bound.
+2. **Actual 24 h nightly soak run**: harness complete; no CI
+   job runs it nightly yet.
+3. **MediaMTX comparison harness**: not started.
+4. **Tier 3**: cluster + observability not started.
+5. **Carry-over tech debt**: `lvqr-wasm` scaffold deletion,
+   `TrackId` newtype, CORS restrictive default.
+6. **Bench coverage for FragmentBroadcaster fanout** and
+   **LL-HLS playlist render** are the next tractable bench
+   targets.
+
+### Session 70 entry point
+
+Priority order:
+
+1. **mediastreamvalidator self-hosted runner** (unchanged).
+   Infra; user-bound.
+
+2. **MediaMTX comparison harness**. New `crates/lvqr-compare/`
+   that spawns MediaMTX (docker or binary on PATH), publishes
+   an identical synthetic stream to both servers, and diffs
+   subscriber-side fragment counts / sequence wraps / latency
+   histograms. Soft-skip the MediaMTX side when the binary is
+   absent.
+
+3. **Benches for `lvqr-fragment::FragmentBroadcaster` fanout**.
+   Measures emit cost as subscriber count grows -- directly
+   relevant to the soak / multi-subscriber path.
+
+4. **Benches for `lvqr-hls` playlist rendering**. LL-HLS
+   playlist-serialization cost at different window / partial
+   depths. Matters for the EXT-X-PRELOAD-HINT path.
+
+5. **Carry-over tech debt**: cheapest first --
+   `lvqr-wasm` scaffold deletion (confirm dead, remove),
+   CORS restrictive default, then TrackId newtype (large).
+
+### Velocity note
+
+Session 69 landed one small bench-only commit (228 lines). The
+bench surface area grew from 7 to 15 benches across two crates.
+Tier 1 test infrastructure is now feature-complete for
+long-duration soak + baseline performance tracking on the
+RTP + fMP4 hot paths. Realistic M4 ETA unchanged: 3-5 calendar
+weeks of sustained sessions, bounded chiefly by user-controlled
+items.
 
 ## Session 68 close (2026-04-17)
 
