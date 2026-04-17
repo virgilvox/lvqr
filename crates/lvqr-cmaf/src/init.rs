@@ -968,6 +968,99 @@ pub fn extract_avc_parameter_sets(init: &[u8]) -> Option<AvcParameterSets> {
 /// Empty VPS / SPS / PPS lists in the returned struct are possible
 /// if the init writer emits arrays with no NALs, but the LVQR init
 /// writer always populates all three.
+/// AAC AudioSpecificConfig extracted from an fMP4 `mp4a` sample
+/// entry. Consumed by the RTSP PLAY SDP builder in `lvqr-rtsp`:
+/// AAC has no in-stream parameter sets, so the decoder config lives
+/// only in the SDP's `a=fmtp:<pt> config=<hex>` attribute that a
+/// PLAY client reads once before the first RTP frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AacConfig {
+    /// Raw AudioSpecificConfig bytes. Typically 2 bytes for AAC-LC
+    /// on standard sample rates; can grow to 5 bytes if the
+    /// extension escape (freq_index=15) is used. LVQR's writer
+    /// today emits the short 2-byte form.
+    pub asc: Vec<u8>,
+    /// AAC object type (e.g. 2 for AAC-LC). Rendered verbatim into
+    /// the codec string `mp4a.40.<object_type>`.
+    pub object_type: u8,
+    /// Sample rate in Hz, resolved from the 4-bit `freq_index`.
+    /// Used for the SDP `rtpmap` clock rate.
+    pub sample_rate: u32,
+    /// Channel count from the 4-bit `chan_conf`.
+    pub channels: u8,
+}
+
+/// Map an ISO/IEC 14496-3 `freq_index` to the sample rate in Hz per
+/// Table 1.16. Returns 0 for the reserved or escape indexes; callers
+/// treat a 0 as "unknown".
+fn aac_sample_rate_from_freq_index(freq_index: u8) -> u32 {
+    match freq_index {
+        0 => 96_000,
+        1 => 88_200,
+        2 => 64_000,
+        3 => 48_000,
+        4 => 44_100,
+        5 => 32_000,
+        6 => 24_000,
+        7 => 22_050,
+        8 => 16_000,
+        9 => 12_000,
+        10 => 11_025,
+        11 => 8_000,
+        12 => 7_350,
+        _ => 0,
+    }
+}
+
+/// Reconstruct the 2-byte AudioSpecificConfig from the decomposed
+/// mp4-atom `DecoderSpecific` fields. Matches the bit layout
+/// `write_aac_init_segment` produces so the round-trip is
+/// byte-identical for LVQR-written inits.
+///
+/// Bit layout:
+/// ```text
+///   [5 bits profile] [4 bits freq_index] [4 bits chan_conf] [3 bits padding]
+/// ```
+fn build_short_asc(profile: u8, freq_index: u8, chan_conf: u8) -> Vec<u8> {
+    let b0 = (profile << 3) | (freq_index >> 1);
+    let b1 = ((freq_index & 1) << 7) | (chan_conf << 3);
+    vec![b0, b1]
+}
+
+/// Decode an fMP4 init segment (ftyp + moov) and return the AAC
+/// AudioSpecificConfig from the first `mp4a` sample entry found.
+///
+/// Returns `None` on parse failure or when no trak carries an
+/// `mp4a` entry. Also returns `None` if the `freq_index` is the
+/// reserved 13/14 or the escape 15 (no short-form ASC available);
+/// LVQR's writer never produces either, but a hostile third-party
+/// init might.
+pub fn extract_aac_config(init: &[u8]) -> Option<AacConfig> {
+    use mp4_atom::Decode;
+
+    let mut cursor = std::io::Cursor::new(init);
+    mp4_atom::Ftyp::decode(&mut cursor).ok()?;
+    let moov = Moov::decode(&mut cursor).ok()?;
+    for trak in &moov.trak {
+        for codec in &trak.mdia.minf.stbl.stsd.codecs {
+            if let Codec::Mp4a(mp4a) = codec {
+                let ds = &mp4a.esds.es_desc.dec_config.dec_specific;
+                let sample_rate = aac_sample_rate_from_freq_index(ds.freq_index);
+                if sample_rate == 0 {
+                    return None;
+                }
+                return Some(AacConfig {
+                    asc: build_short_asc(ds.profile, ds.freq_index, ds.chan_conf),
+                    object_type: ds.profile,
+                    sample_rate,
+                    channels: ds.chan_conf,
+                });
+            }
+        }
+    }
+    None
+}
+
 pub fn extract_hevc_parameter_sets(init: &[u8]) -> Option<HevcParameterSets> {
     use mp4_atom::Decode;
 
@@ -1446,5 +1539,58 @@ mod tests {
         let mut buf = BytesMut::new();
         write_avc_init_segment(&mut buf, &params).expect("encode");
         assert!(extract_hevc_parameter_sets(&buf).is_none());
+    }
+
+    #[test]
+    fn extract_aac_config_round_trips_aac_lc_44100_stereo() {
+        // The ASC bytes the writer already emits for AAC-LC 44100 Hz
+        // stereo. build_short_asc must recover the same two bytes.
+        let params = AudioInitParams {
+            asc: vec![0x12, 0x10],
+            timescale: 44_100,
+        };
+        let mut buf = BytesMut::new();
+        write_aac_init_segment(&mut buf, &params).expect("encode");
+
+        let extracted = extract_aac_config(&buf).expect("extract");
+        assert_eq!(extracted.asc, vec![0x12, 0x10]);
+        assert_eq!(extracted.object_type, 2, "AAC-LC");
+        assert_eq!(extracted.sample_rate, 44_100);
+        assert_eq!(extracted.channels, 2);
+    }
+
+    #[test]
+    fn extract_aac_config_round_trips_aac_lc_48000_stereo() {
+        // ASC for 48 kHz (freq_idx=3) AAC-LC stereo: 0x11 0x90.
+        let params = AudioInitParams {
+            asc: vec![0x11, 0x90],
+            timescale: 48_000,
+        };
+        let mut buf = BytesMut::new();
+        write_aac_init_segment(&mut buf, &params).expect("encode");
+
+        let extracted = extract_aac_config(&buf).expect("extract");
+        assert_eq!(extracted.asc, vec![0x11, 0x90]);
+        assert_eq!(extracted.sample_rate, 48_000);
+        assert_eq!(extracted.channels, 2);
+    }
+
+    #[test]
+    fn extract_aac_config_returns_none_for_avc_init() {
+        let params = VideoInitParams {
+            sps: SPS.to_vec(),
+            pps: PPS.to_vec(),
+            width: 1280,
+            height: 720,
+            timescale: 90_000,
+        };
+        let mut buf = BytesMut::new();
+        write_avc_init_segment(&mut buf, &params).expect("encode");
+        assert!(extract_aac_config(&buf).is_none());
+    }
+
+    #[test]
+    fn extract_aac_config_rejects_empty_buffer() {
+        assert!(extract_aac_config(&[]).is_none());
     }
 }

@@ -20,7 +20,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use lvqr_cmaf::{AvcParameterSets, HevcParameterSets};
+use lvqr_cmaf::{AacConfig, AvcParameterSets, HevcParameterSets};
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
@@ -62,6 +62,20 @@ pub enum VideoTrackDescription {
     Hevc(HevcTrackDescription),
 }
 
+/// SDP for an AAC audio track on the PLAY response. Rendered as the
+/// AAC-hbr mode from RFC 3640 -- the `a=fmtp` line carries the
+/// `sizelength=13;indexlength=3;indexdeltalength=3;config=<hex>`
+/// descriptor the [`crate::rtp::AacPacketizer`] output is designed
+/// to match.
+#[derive(Debug, Clone)]
+pub struct AacTrackDescription {
+    pub payload_type: u8,
+    /// Relative control URI the client uses on SETUP, e.g. `"track2"`.
+    pub control: String,
+    /// AAC decoder configuration extracted from the init segment.
+    pub config: AacConfig,
+}
+
 /// Top-level SDP description rendered in response to DESCRIBE.
 #[derive(Debug, Clone)]
 pub struct PlaySdp {
@@ -73,6 +87,9 @@ pub struct PlaySdp {
     /// Video description, present when a video broadcaster exists
     /// for the requested broadcast.
     pub video: Option<VideoTrackDescription>,
+    /// Audio description, present when a `1.mp4` broadcaster
+    /// carries an AAC init segment.
+    pub audio: Option<AacTrackDescription>,
 }
 
 impl PlaySdp {
@@ -99,6 +116,9 @@ impl PlaySdp {
             Some(VideoTrackDescription::H264(v)) => render_h264_block(&mut out, addr_family, v),
             Some(VideoTrackDescription::Hevc(v)) => render_hevc_block(&mut out, addr_family, v),
             None => {}
+        }
+        if let Some(ref a) = self.audio {
+            render_aac_block(&mut out, addr_family, a);
         }
         out
     }
@@ -165,6 +185,42 @@ fn join_base64(nalus: &[Vec<u8>]) -> String {
     nalus.iter().map(|n| BASE64.encode(n)).collect::<Vec<_>>().join(",")
 }
 
+fn render_aac_block(out: &mut String, addr_family: &str, a: &AacTrackDescription) {
+    let _ = writeln!(out, "m=audio 0 RTP/AVP {}\r", a.payload_type);
+    let _ = writeln!(out, "c=IN {addr_family} 0.0.0.0\r");
+    // RFC 3640 rtpmap: `mpeg4-generic/<sample_rate>[/<channels>]`.
+    // LVQR always emits the optional channel count so clients that
+    // rely on it for downmix decisions never see an empty field.
+    let _ = writeln!(
+        out,
+        "a=rtpmap:{} mpeg4-generic/{}/{}\r",
+        a.payload_type, a.config.sample_rate, a.config.channels
+    );
+    // Hex-encode the ASC bytes uppercase; RFC 3640 examples use
+    // uppercase and ffplay / vlc accept either.
+    let config_hex: String = a.config.asc.iter().map(|b| format!("{b:02X}")).collect();
+    let fmtp_parts = [
+        "streamtype=5".to_string(),
+        format!("profile-level-id={}", aac_profile_level_id(&a.config)),
+        "mode=AAC-hbr".to_string(),
+        "sizelength=13".to_string(),
+        "indexlength=3".to_string(),
+        "indexdeltalength=3".to_string(),
+        format!("config={config_hex}"),
+    ];
+    let _ = writeln!(out, "a=fmtp:{} {}\r", a.payload_type, fmtp_parts.join(";"));
+    let _ = writeln!(out, "a=control:{}\r", a.control);
+}
+
+/// Conservative `profile-level-id` for the AAC fmtp line. The full
+/// MPEG-4 Audio profile/level table is long; every LVQR publisher
+/// today ships AAC-LC which maps to profile-level-id=1 ("Main
+/// audio profile L1") under most client tolerance matrices. A
+/// follow-up can pick a finer value per object type + sample rate.
+fn aac_profile_level_id(_config: &AacConfig) -> u8 {
+    1
+}
+
 /// Hex-encode the 3-byte profile_level_id (AVCProfileIndication,
 /// profile_compatibility, AVCLevelIndication) the DESCRIBE fmtp line
 /// needs. Pulls the bytes off the first SPS NAL unit in the
@@ -223,6 +279,7 @@ mod tests {
                 control: "track1".into(),
                 params: sample_avc_params(),
             })),
+            audio: None,
         };
         let rendered = sdp.render();
         eprintln!("--- SDP ---\n{rendered}--- end ---");
@@ -250,6 +307,7 @@ mod tests {
             session_name: "live/cam1".into(),
             host_ip: "127.0.0.1".parse().unwrap(),
             video: None,
+            audio: None,
         };
         let rendered = sdp.render();
         assert!(!rendered.contains("m=video"));
@@ -264,6 +322,7 @@ mod tests {
             session_name: "live/v6".into(),
             host_ip: "::1".parse().unwrap(),
             video: None,
+            audio: None,
         };
         let rendered = sdp.render();
         assert!(rendered.contains("o=- 0 0 IN IP6 ::1\r\n"));
@@ -306,6 +365,7 @@ mod tests {
                 control: "track1".into(),
                 params: sample_avc_params(),
             })),
+            audio: None,
         };
         let rendered = sdp.render();
         let tracks = crate::session::parse_sdp_tracks(&rendered);
@@ -343,6 +403,7 @@ mod tests {
                 control: "track1".into(),
                 params: sample_hevc_params(),
             })),
+            audio: None,
         };
         let rendered = sdp.render();
 
@@ -375,6 +436,7 @@ mod tests {
                 control: "track1".into(),
                 params: sample_hevc_params(),
             })),
+            audio: None,
         };
         let rendered = sdp.render();
         let tracks = crate::session::parse_sdp_tracks(&rendered);
@@ -386,6 +448,67 @@ mod tests {
         assert!(fmtp.contains("sprop-vps="));
         assert!(fmtp.contains("sprop-sps="));
         assert!(fmtp.contains("sprop-pps="));
+    }
+
+    // --- AAC audio tests ---
+
+    fn sample_aac_config() -> AacConfig {
+        AacConfig {
+            asc: vec![0x12, 0x10],
+            object_type: 2,
+            sample_rate: 44_100,
+            channels: 2,
+        }
+    }
+
+    #[test]
+    fn render_aac_audio_block_per_rfc_3640() {
+        let sdp = PlaySdp {
+            session_name: "live/av".into(),
+            host_ip: "127.0.0.1".parse().unwrap(),
+            video: None,
+            audio: Some(AacTrackDescription {
+                payload_type: 97,
+                control: "track2".into(),
+                config: sample_aac_config(),
+            }),
+        };
+        let rendered = sdp.render();
+
+        assert!(rendered.contains("m=audio 0 RTP/AVP 97\r\n"));
+        assert!(rendered.contains("a=rtpmap:97 mpeg4-generic/44100/2\r\n"));
+        assert!(rendered.contains("streamtype=5"));
+        assert!(rendered.contains("mode=AAC-hbr"));
+        assert!(rendered.contains("sizelength=13"));
+        assert!(rendered.contains("indexlength=3"));
+        assert!(rendered.contains("indexdeltalength=3"));
+        assert!(rendered.contains("config=1210"));
+        assert!(rendered.contains("a=control:track2"));
+    }
+
+    #[test]
+    fn render_video_and_audio_together() {
+        let sdp = PlaySdp {
+            session_name: "live/av".into(),
+            host_ip: "127.0.0.1".parse().unwrap(),
+            video: Some(VideoTrackDescription::H264(H264TrackDescription {
+                payload_type: 96,
+                clock_rate: 90_000,
+                control: "track1".into(),
+                params: sample_avc_params(),
+            })),
+            audio: Some(AacTrackDescription {
+                payload_type: 97,
+                control: "track2".into(),
+                config: sample_aac_config(),
+            }),
+        };
+        let rendered = sdp.render();
+        assert!(rendered.contains("m=video"));
+        assert!(rendered.contains("m=audio"));
+        // Track control URIs are independent.
+        assert!(rendered.contains("a=control:track1"));
+        assert!(rendered.contains("a=control:track2"));
     }
 
     #[test]
@@ -401,6 +524,7 @@ mod tests {
                 control: "track1".into(),
                 params,
             })),
+            audio: None,
         };
         let rendered = sdp.render();
         assert!(rendered.contains("tier-flag=1"));

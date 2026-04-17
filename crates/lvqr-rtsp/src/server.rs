@@ -714,10 +714,25 @@ fn handle_describe(conn: &ConnectionState, req: &proto::Request, cseq: u32) -> R
         }
     });
 
+    // Audio block comes from the `1.mp4` broadcaster if present.
+    // Uses the AAC extractor since that is the only codec this
+    // path supports today; Opus SDP lands in a follow-up.
+    let audio = conn
+        .registry
+        .get(&broadcast, "1.mp4")
+        .and_then(|bc| bc.meta().init_segment.clone())
+        .and_then(|init| lvqr_cmaf::extract_aac_config(&init))
+        .map(|config| crate::sdp::AacTrackDescription {
+            payload_type: 97,
+            control: "track2".to_string(),
+            config,
+        });
+
     let sdp = crate::sdp::PlaySdp {
         session_name: broadcast,
         host_ip: conn.server_addr.ip(),
         video,
+        audio,
     }
     .render();
 
@@ -790,48 +805,79 @@ fn handle_play(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) -> R
     }
     let session_id_owned = session_id.to_string();
     let broadcast = session.broadcast.clone();
-    // Resolve the RTP interleaved channel the client negotiated at
-    // SETUP. Every track transport stores (rtp_channel, rtcp_channel);
-    // take the first track's RTP side. Clients that SETUP without an
-    // explicit `interleaved=...` fall through to channel 0 via the
-    // default the SETUP handler installs.
-    let rtp_channel = session
-        .tracks
-        .first()
-        .and_then(|t| session.transports.get(&t.control))
+    // Resolve the per-track interleaved channels the client
+    // negotiated at SETUP. Clients that SETUPped only one track
+    // (video or audio) get one channel resolved; the other drain
+    // is skipped. SETUP currently stamps the transport under the
+    // track control URI -- matching DESCRIBE's emitted "track1" /
+    // "track2" URIs is how we route each drain.
+    let video_channel = session
+        .transports
+        .get("track1")
         .and_then(|t| t.interleaved)
-        .or_else(|| session.transports.values().find_map(|t| t.interleaved))
-        .map(|(rtp, _)| rtp)
-        .unwrap_or(0);
+        .or_else(|| {
+            // Clients that only setup one track (video) with no
+            // explicit track URI get the first transport registered.
+            if session.transports.len() == 1 && !session.transports.contains_key("track2") {
+                session.transports.values().find_map(|t| t.interleaved)
+            } else {
+                None
+            }
+        })
+        .map(|(rtp, _)| rtp);
+    let audio_channel = session
+        .transports
+        .get("track2")
+        .and_then(|t| t.interleaved)
+        .map(|(rtp, _)| rtp);
 
-    // Pick the drain that matches the broadcaster's codec. Try HEVC
-    // first (its extractor returns None on an AVC init) so an HEVC
-    // publisher gets the HEVC drain; fall back to H.264 otherwise.
-    // If neither matches (no broadcaster / empty init), default to
-    // H.264: the drain will itself notice the absent broadcaster
-    // and exit immediately.
-    let init = conn
+    // Pick the video drain variant that matches the broadcaster's
+    // codec. Try HEVC first (its extractor returns None on an AVC
+    // init) so an HEVC publisher gets the HEVC drain; fall back to
+    // H.264 otherwise. If neither matches, default to H.264; the
+    // drain will itself notice the absent broadcaster and exit.
+    let video_init = conn
         .registry
         .get(&broadcast, "0.mp4")
         .and_then(|bc| bc.meta().init_segment.clone());
-    let is_hevc = init
+    let is_hevc = video_init
         .as_ref()
         .is_some_and(|bytes| lvqr_cmaf::extract_hevc_parameter_sets(bytes).is_some());
 
     let registry = conn.registry.clone();
-    let writer_tx = conn.writer_tx.clone();
     let cancel = conn.conn_cancel.clone();
-    if is_hevc {
-        tokio::spawn(crate::play::play_drain_hevc(
-            broadcast.clone(),
-            rtp_channel,
-            registry,
-            writer_tx,
-            cancel,
-        ));
-    } else {
-        tokio::spawn(crate::play::play_drain_h264(
-            broadcast.clone(),
+
+    if let Some(rtp_channel) = video_channel {
+        let writer_tx = conn.writer_tx.clone();
+        let registry = registry.clone();
+        let cancel = cancel.clone();
+        let broadcast = broadcast.clone();
+        if is_hevc {
+            tokio::spawn(crate::play::play_drain_hevc(
+                broadcast,
+                rtp_channel,
+                registry,
+                writer_tx,
+                cancel,
+            ));
+        } else {
+            tokio::spawn(crate::play::play_drain_h264(
+                broadcast,
+                rtp_channel,
+                registry,
+                writer_tx,
+                cancel,
+            ));
+        }
+    }
+
+    if let Some(rtp_channel) = audio_channel {
+        let writer_tx = conn.writer_tx.clone();
+        let registry = registry.clone();
+        let cancel = cancel.clone();
+        let broadcast = broadcast.clone();
+        tokio::spawn(crate::play::play_drain_aac(
+            broadcast,
             rtp_channel,
             registry,
             writer_tx,
@@ -842,9 +888,10 @@ fn handle_play(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) -> R
     info!(
         session = %session_id_owned,
         %broadcast,
-        rtp_channel,
+        ?video_channel,
+        ?audio_channel,
         codec = if is_hevc { "H265" } else { "H264" },
-        "RTSP PLAY started, drain spawned"
+        "RTSP PLAY started, drains spawned"
     );
     Response::ok().with_cseq(cseq).with_header("Session", &session_id_owned)
 }

@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::fmp4;
-use crate::rtp::{H264Packetizer, HevcPacketizer};
+use crate::rtp::{AacPacketizer, H264Packetizer, HevcPacketizer};
 
 /// Default dynamic RTP payload type for the video track. Both the
 /// H.264 and HEVC SDP blocks emit PT 96 because only one of the two
@@ -30,6 +30,11 @@ use crate::rtp::{H264Packetizer, HevcPacketizer};
 const VIDEO_PAYLOAD_TYPE: u8 = 96;
 const H264_PAYLOAD_TYPE: u8 = VIDEO_PAYLOAD_TYPE;
 const HEVC_PAYLOAD_TYPE: u8 = VIDEO_PAYLOAD_TYPE;
+
+/// Default dynamic RTP payload type for the AAC audio track. 97 is
+/// the second dynamic slot and keeps the video / audio payload
+/// types separate so clients that key per-PT do not get confused.
+const AAC_PAYLOAD_TYPE: u8 = 97;
 
 /// Sequence-number seed for the video RTP stream. RFC 3550 suggests
 /// a random initial value; a constant is fine for tests and the
@@ -250,6 +255,61 @@ pub async fn play_drain_hevc(
         }
     }
     info!(%broadcast, "play_drain: HEVC egress terminated");
+}
+
+/// Drive one PLAY session over the registry's AAC audio broadcaster.
+///
+/// Shape mirrors [`play_drain_h264`]. Key differences:
+/// * No parameter-set re-injection. AAC carries its decoder config
+///   only in SDP (`a=fmtp config=<hex>`); the DESCRIBE response is
+///   the one-shot delivery channel.
+/// * Each fMP4 fragment is exactly one AAC access unit (that is
+///   what LVQR's ingest path produces: one AU per Fragment). The
+///   `mdat` body is the raw AU bytes, no AVCC length prefix. The
+///   drain packetizes each AU into a single RTP packet.
+/// * RTP timestamp is the fragment's PTS cast to `u32`, in the
+///   AAC sample rate clock (not 90 kHz).
+///
+/// Terminates on cancel / broadcaster close / writer-channel close
+/// same as the video drain.
+pub async fn play_drain_aac(
+    broadcast: String,
+    rtp_channel: u8,
+    registry: FragmentBroadcasterRegistry,
+    writer_tx: mpsc::Sender<Vec<u8>>,
+    cancel: CancellationToken,
+) {
+    let Some(bc) = registry.get(&broadcast, "1.mp4") else {
+        debug!(%broadcast, "play_drain (aac): no audio broadcaster; exiting");
+        return;
+    };
+    let mut sub = bc.subscribe();
+    let mut packetizer = AacPacketizer::new(DEFAULT_SSRC ^ 0x0001_0000, AAC_PAYLOAD_TYPE, INITIAL_RTP_SEQUENCE);
+
+    info!(%broadcast, "play_drain: AAC egress started");
+
+    loop {
+        let fragment = tokio::select! {
+            _ = cancel.cancelled() => break,
+            f = sub.next_fragment() => f,
+        };
+        let Some(fragment) = fragment else {
+            break;
+        };
+
+        let Some(body) = fmp4::extract_mdat_body(&fragment.payload) else {
+            continue;
+        };
+        if body.is_empty() {
+            continue;
+        }
+        let rtp_ts = fragment.pts as u32;
+        let pkt = packetizer.packetize(body, rtp_ts);
+        if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
+            return;
+        }
+    }
+    info!(%broadcast, "play_drain: AAC egress terminated");
 }
 
 #[cfg(test)]
@@ -512,6 +572,118 @@ mod tests {
 
         cancel.cancel();
         let _ = handle.await;
+    }
+
+    // --- AAC drain tests ---
+
+    /// Emit one AAC AU through the broadcaster and verify the drain
+    /// produces a single RTP packet with marker=1, PT=97, timestamp
+    /// matching the fragment PTS, and a body that depacks back
+    /// into the original AU bytes through AacDepacketizer.
+    #[tokio::test]
+    async fn play_drain_aac_packetizes_single_au_roundtrip() {
+        use crate::rtp::{AacDepacketizer, parse_rtp_header};
+        use bytes::BytesMut;
+        use lvqr_cmaf::AudioInitParams;
+
+        let registry = FragmentBroadcasterRegistry::new();
+        let bc = registry.get_or_create("live/aac", "1.mp4", FragmentMeta::new("mp4a.40.2", 44_100));
+
+        // Populate an init segment so DESCRIBE could read it; the
+        // drain itself does not need SPS-style re-injection.
+        let mut init = BytesMut::new();
+        lvqr_cmaf::write_aac_init_segment(
+            &mut init,
+            &AudioInitParams {
+                asc: vec![0x12, 0x10],
+                timescale: 44_100,
+            },
+        )
+        .expect("write aac init");
+        bc.set_init_segment(init.freeze());
+
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(16);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(play_drain_aac(
+            "live/aac".to_string(),
+            2,
+            registry.clone(),
+            writer_tx,
+            cancel.clone(),
+        ));
+
+        // Wait for the drain to subscribe. Unlike the video drains,
+        // the AAC path emits no pre-roll (no parameter-set packets),
+        // so we must synchronize via `subscriber_count` or a zero
+        // emit would race ahead of the drain's receive loop.
+        for _ in 0..100 {
+            if bc.subscriber_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(bc.subscriber_count() > 0, "drain subscribed");
+
+        // Emit one AAC access unit.
+        let au = vec![0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
+        let fragment_payload = build_moof_mdat(
+            1,
+            2,
+            1024,
+            std::slice::from_ref(&RawSample {
+                track_id: 2,
+                dts: 1024,
+                cts_offset: 0,
+                duration: 1024,
+                payload: Bytes::from(au.clone()),
+                keyframe: true,
+            }),
+        );
+        bc.emit(Fragment::new(
+            "1.mp4",
+            1,
+            0,
+            0,
+            1024,
+            1024,
+            1024,
+            FragmentFlags::KEYFRAME,
+            fragment_payload,
+        ));
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), writer_rx.recv())
+            .await
+            .expect("aac rtp timeout")
+            .expect("aac channel open");
+        assert_eq!(frame[0], 0x24);
+        assert_eq!(frame[1], 2, "interleaved on channel 2");
+
+        let rtp = &frame[4..];
+        let hdr = parse_rtp_header(rtp).expect("rtp header");
+        assert_eq!(hdr.payload_type, AAC_PAYLOAD_TYPE);
+        assert_eq!(hdr.timestamp, 1024);
+        assert!(hdr.marker, "AAC packetizer sets marker per RFC 3640");
+
+        let result = AacDepacketizer::new()
+            .depacketize(&rtp[hdr.header_len..], &hdr)
+            .expect("depack");
+        assert_eq!(result.frames, vec![au]);
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn play_drain_aac_exits_when_broadcaster_missing() {
+        let registry = FragmentBroadcasterRegistry::new();
+        let (writer_tx, _writer_rx) = mpsc::channel::<Vec<u8>>(4);
+        let cancel = CancellationToken::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            play_drain_aac("no/aac".into(), 2, registry, writer_tx, cancel),
+        )
+        .await
+        .expect("aac drain exits promptly when no 1.mp4 broadcaster");
     }
 
     #[tokio::test]
