@@ -34,6 +34,7 @@ members = [
     "crates/lvqr-rtsp",
     "crates/lvqr-srt",
     "crates/lvqr-cli",
+    "crates/lvqr-cluster",
     "crates/lvqr-soak",
     "crates/lvqr-test-utils",
 ]
@@ -97,6 +98,9 @@ url = "2"
 # Benchmarks
 criterion = "0.5"
 
+# Cluster gossip (Tier 3)
+chitchat = "0.10"
+
 # RTMP
 rml_rtmp = "0.8"
 
@@ -139,6 +143,7 @@ lvqr-rtsp = { version = "0.4.0", path = "crates/lvqr-rtsp" }
 lvqr-srt = { version = "0.4.0", path = "crates/lvqr-srt" }
 lvqr-test-utils = { version = "0.4.0", path = "crates/lvqr-test-utils" }
 lvqr-cli = { version = "0.4.0", path = "crates/lvqr-cli" }
+lvqr-cluster = { version = "0.4.0", path = "crates/lvqr-cluster" }
 lvqr-soak = { version = "0.4.0", path = "crates/lvqr-soak" }
 
 [profile.release]

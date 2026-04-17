@@ -1,0 +1,24 @@
+[package]
+name = "lvqr-cluster"
+description = "Cluster-membership and broadcast-ownership plane for LVQR (chitchat-backed)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["cluster", "gossip", "chitchat", "streaming", "lvqr"]
+categories = ["network-programming", "multimedia"]
+
+[dependencies]
+lvqr-core = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+chitchat = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "net"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

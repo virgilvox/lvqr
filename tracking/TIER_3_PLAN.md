@@ -340,19 +340,33 @@ gets its own session.
 * **Admin write APIs**. `/admin/cluster/*` endpoints are read-only
   this tier.
 
-## Open questions (to resolve before session 71)
+## Resolved questions (session 71, before code)
 
-1. Gossip port default: pick one. 7000 is chitchat's documented
-   default; confirm no collision with other LVQR surfaces.
-2. Broadcast ownership lease default: 10 s is a reasonable
-   starting point; verify against the worst-case publisher
-   reconnect window the existing ingest protocols tolerate.
-3. OTLP exporter protocol: default to gRPC (port 4317) per
-   OpenTelemetry convention. HTTP (4318) as an explicit
-   opt-in only.
-4. How does `lvqr-cluster` interact with the existing
-   `lvqr-mesh` crate? `lvqr-mesh` today is topology-only
-   (WebRTC peer-mesh signaling for browser clients). It does
-   NOT participate in server-side clustering. The two crates
-   stay orthogonal; document this in the `lvqr-cluster` crate
-   docs to prevent future confusion.
+1. **Gossip port default = UDP/10007** (match the chitchat
+   examples). LVQR's existing listeners cover: RTMP 1935, RTSP
+   554, HLS 80/443, DASH 80/443, WHEP 80/443, WHIP 80/443,
+   QUIC/MoQ 443, SRT 8890, admin 8080. None collide with 10007.
+   The TCP interleaved / QUIC datagrams are all streams; 10007
+   is UDP-only so no collision by protocol either.
+2. **Broadcast-ownership lease = 10 s with 2.5 s renew interval**
+   (4× renew-to-expire ratio). 10 s bounds the brain-split
+   window on owner crash to ~10 s, which is tolerable for a
+   cluster that explicitly chose eventual consistency. 2.5 s
+   renewals survive one gossip round miss (default gossip
+   interval = 1 s) and still leave 7.5 s of slack before
+   expiry. Rationale: matches the "lease > 3× renew > gossip"
+   rule of thumb from the Cassandra / Riak playbooks.
+3. **OTLP default = gRPC on :4317** per the OpenTelemetry
+   specification's recommendation. HTTP protobuf on :4318 is
+   enabled via an explicit `LVQR_OTLP_PROTOCOL=http/protobuf`
+   override; we do NOT support `http/json` (per spec it is
+   optional and no major collector mandates it).
+4. **`lvqr-mesh` vs `lvqr-cluster` orthogonality**: `lvqr-mesh`
+   is browser-facing WebRTC peer-mesh signaling (clients
+   federating to offload video from the server). `lvqr-cluster`
+   is server-facing node coordination (nodes federating so a
+   single logical service can span processes). Zero API
+   overlap; neither crate depends on the other. A deployed
+   LVQR node can run both, one, or neither. The `lvqr-cluster`
+   crate docs call this out at the top to prevent future
+   confusion.
