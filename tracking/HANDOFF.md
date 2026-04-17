@@ -1,8 +1,184 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 sessions A+B+C+D landed; broadcast-ownership KV + capacity advertisement live; 649 tests, 24 crates
+## Project Status: v0.4.0 -- Tier 3 sessions A-E landed; cluster-wide config + /api/v1/cluster/* live; 663 tests, 24 crates
 
-**Last Updated**: 2026-04-17 (session 74 close -- Tier 3 session D).
+**Last Updated**: 2026-04-17 (session 75 close -- Tier 3 session E).
+
+## Session 75 close (2026-04-17)
+
+### What shipped (1 commit, +855 / -15 lines)
+
+1. **Tier 3 session E: cluster-wide config + admin routes**
+   (`803c1f0`). Executes the fifth slot of the
+   `tracking/TIER_3_PLAN.md` decomposition. Adds the config
+   channel to `lvqr-cluster`, a bulk `list_broadcasts`
+   enumerator on the existing broadcast module, and three
+   read-only `/api/v1/cluster/{nodes,broadcasts,config}`
+   endpoints in `lvqr-admin` behind a default-on `cluster`
+   feature flag.
+
+   New module `crates/lvqr-cluster/src/config.rs`:
+   * `ConfigValue { value, ts_ms }` (private, on wire) and
+     `ConfigEntry { key, value, ts_ms }` (public, returned by
+     `list_config`).
+   * `CONFIG_KEY_PREFIX = "config."`. Per-node KV entries go
+     under `config.<key>` on the setter's own state; gossip
+     carries them to every peer.
+   * `set(handle, key, value)` -- writes a timestamped entry to
+     the self node's state.
+   * `get(handle, key) -> Option<String>` -- scans every node's
+     state for `config.<key>`, picks the LWW winner (highest
+     `ts_ms`; tie-broken by lexicographically larger value so
+     every reader converges on the same answer).
+   * `list(handle) -> Vec<ConfigEntry>` -- enumerates every
+     `config.*` key across the cluster, reduced to the LWW
+     winner per key. Sorted by key via `BTreeMap`.
+   * Unit tests cover key prefixing, JSON roundtrip, garbage-
+     input rejection, and `select_winner` across all branches
+     (empty, latest-ts, value-lexicographic tiebreak,
+     insertion-order determinism).
+
+   Additions in `broadcast.rs`:
+   * `BroadcastSummary { name, owner, expires_at_ms }` (public).
+   * `list_owners(handle) -> Vec<BroadcastSummary>` -- bulk
+     counterpart to `find_owner`. Iterates `broadcast.*` KV
+     entries across every node, filters expired leases,
+     reduces to LWW-winner per name. Sorted by name.
+
+   `Cluster` API additions:
+   * `claim_broadcast`, `find_broadcast_owner`,
+     `list_broadcasts`
+   * `config_set`, `config_get`, `list_config`
+
+   `lvqr-admin` changes:
+   * New `cluster` default feature. `--no-default-features`
+     gives a lean admin build without the cluster dep.
+   * `AdminState` gains an optional `Arc<lvqr_cluster::Cluster>`
+     (feature-gated) + `with_cluster` constructor method.
+   * New `cluster_routes.rs` module defines
+     `/api/v1/cluster/{nodes,broadcasts,config}`. Handlers
+     reply 500 when the feature is compiled in but no
+     `Arc<Cluster>` was wired (deployment miswiring). 503
+     would suggest transient unavailability instead.
+   * `ClusterNodeView` wraps `ClusterNode` for JSON output
+     (stringifies the `SocketAddr` so admin output is
+     grep-friendly).
+
+   Path deviation from the plan: the plan proposed
+   `/admin/cluster/*`. LVQR's existing admin API lives under
+   `/api/v1/*`; for auth-middleware uniformity the new routes
+   follow the existing convention. The JSON surface is the
+   deliverable; the path is an implementation detail.
+
+   Watch API (`Cluster::config_watch`) deferred. The plan's
+   API sketch mentions it but the session E acceptance row does
+   not require it. A proper implementation needs either
+   ListenerHandle lifecycle plumbing through chitchat's
+   `subscribe_event` or a dedicated translator task plumbing a
+   `tokio::sync::watch` channel. Deferred to avoid expanding
+   session scope beyond the budget.
+
+   Secondary changes:
+   * `NodeId` derives `Serialize`/`Deserialize`
+     (`#[serde(transparent)]`) so `BroadcastSummary` +
+     `ClusterNodeView` round-trip through admin HTTP without
+     a manual adapter.
+
+### Ground truth (session 75 close)
+
+* **Head**: `803c1f0` on `main`. v0.4.0. **34 commits queued
+  but NOT pushed to origin/main** (sessions 62-75 all
+  unpushed).
+* **Tests**: 663 passed, 0 failed, 1 ignored. Delta from
+  session 74: +14 (7 config unit tests, 3 config integration
+  tests, 4 admin cluster-route tests).
+* **Code**: +855 / -15 net. New files: `config.rs` (261
+  lines), `tests/config.rs` (198 lines),
+  `cluster_routes.rs` (239 lines).
+* **Workspace**: 24 crates, unchanged.
+* **CI gates locally clean**: fmt, clippy
+  (`--all-targets --benches -D warnings`), test --workspace
+  all green.
+
+### Tier 3 progress
+
+| Session | Deliverable | Status |
+|---|---|---|
+| A (71) | lvqr-cluster scaffold + single-node bootstrap | DONE |
+| B (72) | Two-node integration test: both see each other | DONE |
+| C (73) | Broadcast-ownership KV | DONE |
+| D (74) | Capacity advertisement | DONE |
+| E (75) | Cluster-wide config channel + admin endpoints | DONE |
+| F (76) | Wire Cluster through lvqr-cli serve + RTSP/HLS/DASH redirect | pending |
+| G (77) | lvqr-observability scaffold + OTLP env-var gating | pending |
+| H (78) | OTLP span exporter + in-memory collector test | pending |
+| I (79) | OTLP metric exporter | pending |
+| J (80) | JSON log + trace_id correlation | pending |
+
+**5 of 10 Tier 3 sessions complete.** Remaining 5 sessions at
+the observed pace = ~2 calendar days of focused work before
+Tier 4 becomes the critical-path tier.
+
+### Deferred items
+
+* **`Cluster::config_watch`** (API sketch in the plan; not in
+  session E acceptance). Consumers that need reactive feature
+  flags can poll `config_get` on an interval. A proper watch
+  implementation should hook into chitchat's `subscribe_event`
+  with `ListenerHandle` lifecycle tied to `Cluster`.
+* **`Cluster::config_delete`** with tombstone. Callers can
+  currently emulate deletion by setting a sentinel value.
+* **Admin path alignment**. If the operator-facing docs are
+  written against `/admin/cluster/*`, either rewrite them to
+  `/api/v1/cluster/*` or introduce a parallel alias route.
+  The crate-level rationale is documented in
+  `lvqr-admin/src/cluster_routes.rs`.
+
+### Known flakes / risks
+
+* `rtsp_play_emits_rtcp_sender_report_after_interval` flaked
+  once in session 73, clean since. Pre-existing timing-
+  sensitive test.
+* `config_lww_prefers_later_write` relies on `tokio::time::sleep(5ms)`
+  between the two writes so `ts_ms` differs. On an
+  underprovisioned CI host where wall time resolution is
+  coarser than 5 ms, the LWW tiebreak could fall through to
+  the lexicographic value tiebreak (still deterministic; the
+  test's assertions are unchanged because `"b-wrote-second" >
+  "a-wrote-first"` lexicographically). Test is defensive.
+
+### Session 76 entry point
+
+**Tier 3 session F: wire `Cluster` through `lvqr-cli serve` +
+RTSP/HLS/DASH redirect-to-owner.**
+
+Deliverable per `tracking/TIER_3_PLAN.md` session F row:
+1. `lvqr-cli serve` grows an optional `--cluster-listen`,
+   `--cluster-seeds`, `--cluster-node-id` set of flags. When
+   any are supplied, the cli constructs a `Cluster` and passes
+   it to every protocol crate that needs it.
+2. `lvqr-ingest` crates call `cluster.claim_broadcast(...)`
+   when the first fragment lands; hold the `Claim` for the
+   publisher session lifetime.
+3. `lvqr-hls` / `lvqr-dash` / `lvqr-rtsp` handlers, when the
+   local registry has no broadcaster for a requested name,
+   call `cluster.find_broadcast_owner()` and emit a
+   302/Location (HLS/DASH) or RTSP redirect response.
+4. End-to-end two-node integration test: publisher on A,
+   subscriber on B requesting the same broadcast via HTTP;
+   subscriber gets a 302 to A and follows it.
+
+Expected scope: ~400-600 lines across lvqr-cli, lvqr-hls,
+lvqr-dash, lvqr-rtsp, and a new integration test. This is the
+largest session in the cluster plane; may warrant splitting
+into F1 (cli wiring + ingest claim) and F2 (redirect path +
+e2e test) if the single-session budget is tight.
+
+Wire-up risk: each protocol crate currently has its own
+broadcaster registry. Plumbing `cluster` handles through
+without regressing single-node flows needs care. The feature
+flag (default off) should gate every new code path so a
+cluster-less deployment is byte-identical to before.
 
 ## Session 74 close (2026-04-17)
 
