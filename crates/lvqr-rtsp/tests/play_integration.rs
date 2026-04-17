@@ -516,19 +516,26 @@ async fn rtsp_play_aac_audio_track_delivers_access_unit() {
 
 /// Every PLAY drain spawns a Sender Report timer on top of the RTP
 /// stream. Drive the H.264 handshake end-to-end, emit one IDR so the
-/// drain accumulates packet+octet counters, advance the tokio clock
-/// past the default 5 s SR interval, and assert an SR arrives on the
-/// odd RTCP interleaved channel with plausible counts.
+/// drain accumulates packet+octet counters, wait past the default
+/// 5 s SR interval, and assert an SR arrives on the odd RTCP
+/// interleaved channel with plausible counts.
 ///
-/// Uses `start_paused = true` so the 5 s wait collapses to a single
-/// `advance()` call. Real I/O still progresses because socket events
-/// do not depend on virtual time.
-#[tokio::test(start_paused = true)]
+/// Runs under real wall-clock time rather than `start_paused`: the
+/// shared `rtsp_request_headers` helper wraps each read in a
+/// `tokio::time::timeout`, and under `start_paused=true` tokio's
+/// auto-advance fires those timeouts as the runtime finds nothing
+/// else to run while waiting on real I/O. The resulting
+/// "read timed out" panic flakes ~80% of runs. Real-time makes the
+/// test take ~6 s but removes the race entirely (audited in session
+/// 80). A future session can thread an `sr_interval` setting
+/// through `RtspServer` so tests override it to 100 ms and go back
+/// to sub-second.
+#[tokio::test]
 async fn rtsp_play_emits_rtcp_sender_report_after_interval() {
     // Inline server setup: the shared `start_rtsp_server` helper uses
-    // `tokio::time::sleep(50ms)` which would hang forever under paused
-    // time. Pre-bind is enough on its own since the OS queues
-    // incoming connections until accept() runs.
+    // `tokio::time::sleep(50ms)` which we avoid here on principle;
+    // pre-bind is enough on its own since the OS queues incoming
+    // connections until accept() runs.
     let registry = FragmentBroadcasterRegistry::new();
     let (expected_sps, expected_pps) = make_avc_broadcaster(&registry, "live/srtest");
     let shutdown = CancellationToken::new();
@@ -612,9 +619,10 @@ async fn rtsp_play_emits_rtcp_sender_report_after_interval() {
     let idr_hdr = parse_rtp_header(&idr_rtp).expect("idr hdr");
     assert_eq!(idr_hdr.timestamp, 9000, "last RTP timestamp carried in SR");
 
-    // Collapse the 5 s wait. `start_paused = true` pins the clock at
-    // t=0 for the runtime; `advance(>5s)` triggers the SR ticker.
-    tokio::time::advance(Duration::from_secs(6)).await;
+    // Real-time wait past the default 5 s SR interval so the
+    // ticker fires. Slow (takes ~6 s) but deterministic; see the
+    // fn doc for the start_paused tradeoff.
+    tokio::time::sleep(Duration::from_secs(6)).await;
 
     // Next interleaved frame on the socket is the SR on channel 1.
     let (ch, sr) = read_interleaved_frame(&mut stream, &mut pending).await;
