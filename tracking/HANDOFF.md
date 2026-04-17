@@ -1,8 +1,175 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 sessions A-E + F1 + F2a landed; end-to-end HLS redirect working; 678 tests, 24 crates
+## Project Status: v0.4.0 -- Tier 3 sessions A-E + F1 + F2a + F2b landed; HLS + DASH + RTSP redirect-to-owner e2e; 691 tests, 24 crates
 
-**Last Updated**: 2026-04-17 (session 77 close -- Tier 3 session F2a).
+**Last Updated**: 2026-04-17 (session 78 close -- Tier 3 session F2b).
+
+## Session 78 close (2026-04-17)
+
+### What shipped (1 commit, +686 / -15 lines)
+
+1. **Tier 3 session F2b: DASH + RTSP redirect + e2e** (`c2deb0d`).
+   Completes the Tier 3 session F split. F1 (76) delivered
+   library plumbing + HLS; F2a (77) wired through lvqr-cli +
+   HLS e2e; F2b (this session) mirrors the redirect pattern on
+   DASH and RTSP and delivers two more in-process e2e tests.
+
+   lvqr-dash:
+   * `OwnerResolver` + `RedirectFuture` type aliases
+     (re-exported at the crate root). Shape matches
+     lvqr-hls exactly.
+   * `MultiDashServer::with_owner_resolver(config, resolver)`.
+     On unknown-broadcast requests, `handle_multi_get`
+     consults the resolver and emits `302 Found` with
+     `Location: <base>/dash/<path>` on a hit; existing 404
+     path on a miss.
+   * `MultiDashServer` drops `derive(Debug)` for a manual
+     impl (the callback Arc is not Debug).
+   * 7 new unit tests covering the redirect helper, the
+     resolver dispatch, the router 302 and 404 paths, and the
+     guard that keeps local broadcasts from redirecting.
+
+   lvqr-rtsp:
+   * `OwnerResolver` + `RedirectFuture` type aliases
+     (re-exported at the crate root).
+   * `RtspServer::with_owner_resolver(resolver)` chained
+     constructor.
+   * `ConnectionState.owner_resolver` plumbed through
+     `handle_connection`.
+   * `handle_request` is now `async` (propagates a single
+     `.await` to the one call site in the server loop).
+   * On DESCRIBE / PLAY for a broadcast with no local
+     publisher, the resolver short-circuits to
+     `RTSP/1.0 302 Moved Temporarily` +
+     `Location: <url>/<broadcast>`. The synthetic-empty-SDP
+     fallback now only runs when the resolver misses.
+   * New `Response::found(location)` constructor in
+     `proto.rs`.
+   * 4 new unit tests covering the 302 emission path, the
+     resolver-miss fall-through, the local-broadcast guard
+     (resolver MUST NOT be consulted when the broadcast is
+     hosted locally), and the trailing-slash tolerance on
+     the base URL.
+   * Three existing tests that constructed `ConnectionState`
+     directly received `owner_resolver: None`.
+
+   lvqr-cli:
+   * `ServeConfig` gains `cluster_advertise_dash` and
+     `cluster_advertise_rtsp` (plus matching CLI flags).
+     `set_endpoints` in `start()` now publishes all three
+     optional URLs in one KV write when any is configured.
+   * `start()` builds `dash_owner_resolver` +
+     `rtsp_owner_resolver` closures that wrap
+     `Cluster::find_owner_endpoints` and extract `.dash` /
+     `.rtsp`. Installed on `MultiDashServer::with_owner_resolver`
+     and `RtspServer::with_owner_resolver` when clustering is
+     enabled.
+
+   End-to-end tests in `crates/lvqr-cli/tests/cluster_redirect.rs`:
+   * `dash_redirect_to_cluster_peer_end_to_end` -- A claims
+     and advertises DASH; B's
+     `GET /dash/live/test/manifest.mpd` returns 302 with
+     Location pointing at A's DASH URL.
+   * `rtsp_redirect_to_cluster_peer_end_to_end` -- same shape
+     for RTSP. Raw DESCRIBE over TCP reads only until
+     `\r\n\r\n` (RTSP keeps the TCP connection open, so
+     `read_to_end` would hang); bounded 5 s timeout catches
+     a stuck server.
+
+### Ground truth (session 78 close)
+
+* **Head**: `c2deb0d` on `main`. v0.4.0. **39 commits queued
+  but NOT pushed to origin/main** (sessions 62-78 all
+  unpushed).
+* **Tests**: 691 passed, 0 failed, 1 ignored. Delta from
+  session 77: +13 (7 DASH unit, 4 RTSP unit, 2 new e2e).
+* **Code**: +686 / -15 net across five crates.
+* **Workspace**: 24 crates, unchanged.
+* **CI gates locally clean**: fmt, clippy
+  (`--all-targets --benches -D warnings`), test --workspace
+  all green.
+
+### Tier 3 progress
+
+| Session | Deliverable | Status |
+|---|---|---|
+| A (71) | lvqr-cluster scaffold + single-node bootstrap | DONE |
+| B (72) | Two-node integration test | DONE |
+| C (73) | Broadcast-ownership KV | DONE |
+| D (74) | Capacity advertisement | DONE |
+| E (75) | Cluster-wide config + `/api/v1/cluster/*` | DONE |
+| F1 (76) | Endpoints KV + HLS redirect mechanism | DONE |
+| F2a (77) | lvqr-cli wiring + HLS redirect e2e | DONE |
+| F2b (78) | DASH + RTSP redirect + e2e | DONE |
+| F2c (79) | Ingest auto-claim + ffmpeg-subprocess full-stack e2e | pending |
+| G (80) | lvqr-observability scaffold + OTLP gating | pending |
+| H (81) | OTLP span exporter | pending |
+| I (82) | OTLP metric exporter | pending |
+| J (83) | JSON log + trace_id correlation | pending |
+
+Tier 3 total slots: 13 (original 10, session F split into F1
++ F2, F2 further split into F2a / F2b / F2c as the surface
+area became clear across sessions 76-78).
+
+**8 of 13 Tier 3 sessions complete.** Remaining 5 (F2c +
+G-J).
+
+### Cluster plane status (as landed today)
+
+* Membership gossip (chitchat) ✓
+* Broadcast-ownership KV with lease renewal ✓
+* Per-node capacity advertisement ✓
+* Cluster-wide config LWW ✓
+* Read-only `/api/v1/cluster/{nodes,broadcasts,config}` admin
+  routes ✓
+* Per-node endpoints KV ✓
+* HLS + DASH + RTSP redirect-to-owner wired through
+  lvqr-cli::start ✓
+* In-process two-node e2e for each redirect ✓
+* Ingest auto-claim on publish (so the ownership KV reflects
+  reality without operator intervention) -- pending (F2c)
+* ffmpeg-subprocess full-stack e2e -- pending (F2c)
+
+### Known flakes / risks
+
+* Carried forward: `config_lww_prefers_later_write` (5 ms
+  sleep, session 75) and the observed-once
+  `rtsp_play_emits_rtcp_sender_report_after_interval` flake
+  (session 73).
+* `rtsp_redirect_to_cluster_peer_end_to_end` opens a TCP
+  connection to the RTSP server and reads only until the
+  header terminator. If the server's response-write path
+  stalls, the test's 5 s timeout fails the test instead of
+  hanging indefinitely -- no indefinite hangs on CI.
+* Ports 20801-20806 reserved for the cluster redirect e2e
+  suite. A leaked earlier run caused a "spawn chitchat" boot
+  failure during session 78 development; `lsof -nP -iUDP:20805`
+  surfaces this if it recurs.
+
+### Session 79 entry point
+
+**Tier 3 session F2c: ingest auto-claim + ffmpeg-subprocess e2e.**
+
+Deliverable:
+1. Hook `Cluster::Claim` into the fragment-broadcaster
+   registry's `on_entry_created` callback so every publisher
+   session (RTMP, WHIP, SRT, RTSP-ingest, WebSocket ingest)
+   automatically claims the broadcast when the first
+   fragment lands and holds the `Claim` for the publisher
+   session lifetime. Today the redirect path works only
+   when the operator manually calls `claim_broadcast`; after
+   F2c it works unconditionally.
+2. Multi-process ffmpeg-subprocess e2e: spin two `lvqr`
+   subprocesses via `tokio::process::Command`, ffmpeg RTMP
+   push to A, curl against B's HLS URL, follow the 302,
+   and validate the playlist parses.
+3. Document (in `tracking/TIER_3_PLAN.md`) that the cluster
+   plane is complete after F2c; G-J start the observability
+   plane.
+
+Expected scope: ~300-500 lines. Ingest claim hookup lives in
+`lvqr-cli` (since each protocol already registers a
+`FragmentBroadcasterRegistry` there), not per-protocol.
 
 ## Session 77 close (2026-04-17)
 
