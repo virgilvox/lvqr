@@ -715,18 +715,34 @@ fn handle_describe(conn: &ConnectionState, req: &proto::Request, cseq: u32) -> R
     });
 
     // Audio block comes from the `1.mp4` broadcaster if present.
-    // Uses the AAC extractor since that is the only codec this
-    // path supports today; Opus SDP lands in a follow-up.
-    let audio = conn
+    // Try Opus first (its extractor returns None on an AAC init) so a
+    // WebRTC Opus publisher is described correctly, then fall back to
+    // AAC. PT 98 keeps Opus distinct from AAC's PT 97 so a future
+    // client-side PT-keyed dispatcher does not confuse them.
+    let audio_init = conn
         .registry
         .get(&broadcast, "1.mp4")
-        .and_then(|bc| bc.meta().init_segment.clone())
-        .and_then(|init| lvqr_cmaf::extract_aac_config(&init))
-        .map(|config| crate::sdp::AacTrackDescription {
-            payload_type: 97,
-            control: "track2".to_string(),
-            config,
-        });
+        .and_then(|bc| bc.meta().init_segment.clone());
+
+    let audio = audio_init.as_ref().and_then(|init| {
+        if let Some(config) = lvqr_cmaf::extract_opus_config(init) {
+            Some(crate::sdp::AudioTrackDescription::Opus(
+                crate::sdp::OpusTrackDescription {
+                    payload_type: 98,
+                    control: "track2".to_string(),
+                    config,
+                },
+            ))
+        } else {
+            lvqr_cmaf::extract_aac_config(init).map(|config| {
+                crate::sdp::AudioTrackDescription::Aac(crate::sdp::AacTrackDescription {
+                    payload_type: 97,
+                    control: "track2".to_string(),
+                    config,
+                })
+            })
+        }
+    });
 
     let sdp = crate::sdp::PlaySdp {
         session_name: broadcast,
@@ -844,6 +860,18 @@ fn handle_play(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) -> R
         .as_ref()
         .is_some_and(|bytes| lvqr_cmaf::extract_hevc_parameter_sets(bytes).is_some());
 
+    // Dispatch the audio drain the same way: Opus first (its
+    // extractor returns None on an AAC init), fall through to AAC.
+    // A broadcaster with neither codec on the 1.mp4 init just
+    // exits the drain on first subscribe.
+    let audio_init = conn
+        .registry
+        .get(&broadcast, "1.mp4")
+        .and_then(|bc| bc.meta().init_segment.clone());
+    let is_opus = audio_init
+        .as_ref()
+        .is_some_and(|bytes| lvqr_cmaf::extract_opus_config(bytes).is_some());
+
     let registry = conn.registry.clone();
     let cancel = conn.conn_cancel.clone();
 
@@ -876,13 +904,23 @@ fn handle_play(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) -> R
         let registry = registry.clone();
         let cancel = cancel.clone();
         let broadcast = broadcast.clone();
-        tokio::spawn(crate::play::play_drain_aac(
-            broadcast,
-            rtp_channel,
-            registry,
-            writer_tx,
-            cancel,
-        ));
+        if is_opus {
+            tokio::spawn(crate::play::play_drain_opus(
+                broadcast,
+                rtp_channel,
+                registry,
+                writer_tx,
+                cancel,
+            ));
+        } else {
+            tokio::spawn(crate::play::play_drain_aac(
+                broadcast,
+                rtp_channel,
+                registry,
+                writer_tx,
+                cancel,
+            ));
+        }
     }
 
     info!(
@@ -890,7 +928,8 @@ fn handle_play(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) -> R
         %broadcast,
         ?video_channel,
         ?audio_channel,
-        codec = if is_hevc { "H265" } else { "H264" },
+        video_codec = if is_hevc { "H265" } else { "H264" },
+        audio_codec = if is_opus { "Opus" } else { "AAC" },
         "RTSP PLAY started, drains spawned"
     );
     Response::ok().with_cseq(cseq).with_header("Session", &session_id_owned)

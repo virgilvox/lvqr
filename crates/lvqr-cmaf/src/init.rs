@@ -1095,6 +1095,74 @@ pub fn extract_hevc_parameter_sets(init: &[u8]) -> Option<HevcParameterSets> {
     None
 }
 
+/// Opus configuration extracted from an fMP4 `Opus` sample entry's
+/// `dOps` box. Consumed by the RTSP PLAY SDP builder in `lvqr-rtsp`
+/// (RFC 7587): the channel count drives the `opus/48000/<ch>`
+/// rtpmap, and the remaining fields are carried verbatim so a
+/// forward-looking SDP builder (or an out-of-band signaling path)
+/// can surface them without re-decoding the init segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpusConfig {
+    /// Output channel count, read from the dOps `OutputChannelCount`.
+    /// LVQR producers emit 1 or 2 (channel_mapping_family = 0).
+    pub channels: u8,
+    /// Pre-skip samples at 48 kHz, from the dOps `PreSkip`.
+    pub pre_skip: u16,
+    /// Nominal encoder input sample rate in Hz. Metadata only; Opus
+    /// itself always operates at 48 kHz internally.
+    pub input_sample_rate: u32,
+    /// Output gain in Q7.8 dB, from the dOps `OutputGain`. LVQR
+    /// producers leave this at zero.
+    pub output_gain: i16,
+    /// Serialized dOps box body (starting at the Version byte, length
+    /// 11 for channel_mapping_family = 0). Callers that need to echo
+    /// the raw bytes into an out-of-band signaling blob can use this
+    /// directly; the RTSP SDP builder ignores it.
+    pub dops_bytes: Vec<u8>,
+}
+
+/// Decode an fMP4 init segment (ftyp + moov) and return the Opus
+/// configuration from the first `Opus` sample entry found.
+///
+/// Returns `None` on parse failure or when no trak carries an `Opus`
+/// entry. Mirrors [`extract_aac_config`] so callers can dispatch
+/// audio drains by trying Opus first and falling back to AAC.
+///
+/// The `dops_bytes` field contains the 11-byte body of the dOps box
+/// (Version=0 + OutputChannelCount + PreSkip + InputSampleRate +
+/// OutputGain + ChannelMappingFamily=0). mp4-atom's `Dops` decoder
+/// rejects non-zero mapping families, so LVQR only ever sees the
+/// 11-byte form here.
+pub fn extract_opus_config(init: &[u8]) -> Option<OpusConfig> {
+    use mp4_atom::Decode;
+
+    let mut cursor = std::io::Cursor::new(init);
+    mp4_atom::Ftyp::decode(&mut cursor).ok()?;
+    let moov = Moov::decode(&mut cursor).ok()?;
+    for trak in &moov.trak {
+        for codec in &trak.mdia.minf.stbl.stsd.codecs {
+            if let Codec::Opus(opus) = codec {
+                let dops = &opus.dops;
+                let mut dops_bytes = Vec::with_capacity(11);
+                dops_bytes.push(0u8); // Version
+                dops_bytes.push(dops.output_channel_count);
+                dops_bytes.extend_from_slice(&dops.pre_skip.to_be_bytes());
+                dops_bytes.extend_from_slice(&dops.input_sample_rate.to_be_bytes());
+                dops_bytes.extend_from_slice(&dops.output_gain.to_be_bytes());
+                dops_bytes.push(0u8); // ChannelMappingFamily (0 = mono/stereo)
+                return Some(OpusConfig {
+                    channels: dops.output_channel_count,
+                    pre_skip: dops.pre_skip,
+                    input_sample_rate: dops.input_sample_rate,
+                    output_gain: dops.output_gain,
+                    dops_bytes,
+                });
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1592,5 +1660,98 @@ mod tests {
     #[test]
     fn extract_aac_config_rejects_empty_buffer() {
         assert!(extract_aac_config(&[]).is_none());
+    }
+
+    #[test]
+    fn extract_opus_config_round_trips_stereo_48khz() {
+        // Exercises the writer -> extractor loop against a realistic
+        // WebRTC-Opus parameter set: stereo, 312-sample pre-skip, 48
+        // kHz input sample rate, zero output gain.
+        let params = OpusInitParams {
+            channel_count: 2,
+            pre_skip: 312,
+            input_sample_rate: 48_000,
+            timescale: 48_000,
+        };
+        let mut buf = BytesMut::new();
+        write_opus_init_segment(&mut buf, &params).expect("encode");
+
+        let extracted = extract_opus_config(&buf).expect("extract");
+        assert_eq!(extracted.channels, 2);
+        assert_eq!(extracted.pre_skip, 312);
+        assert_eq!(extracted.input_sample_rate, 48_000);
+        assert_eq!(extracted.output_gain, 0);
+        // dops body: version(1) + channels(1) + pre_skip(2) +
+        // input_sr(4) + output_gain(2) + family(1) = 11 bytes.
+        assert_eq!(extracted.dops_bytes.len(), 11);
+        assert_eq!(extracted.dops_bytes[0], 0, "Version");
+        assert_eq!(extracted.dops_bytes[1], 2, "OutputChannelCount");
+        assert_eq!(
+            u16::from_be_bytes([extracted.dops_bytes[2], extracted.dops_bytes[3]]),
+            312
+        );
+        assert_eq!(
+            u32::from_be_bytes([
+                extracted.dops_bytes[4],
+                extracted.dops_bytes[5],
+                extracted.dops_bytes[6],
+                extracted.dops_bytes[7],
+            ]),
+            48_000
+        );
+        assert_eq!(
+            i16::from_be_bytes([extracted.dops_bytes[8], extracted.dops_bytes[9]]),
+            0
+        );
+        assert_eq!(extracted.dops_bytes[10], 0, "ChannelMappingFamily");
+    }
+
+    #[test]
+    fn extract_opus_config_round_trips_mono_48khz() {
+        let params = OpusInitParams {
+            channel_count: 1,
+            pre_skip: 0,
+            input_sample_rate: 48_000,
+            timescale: 48_000,
+        };
+        let mut buf = BytesMut::new();
+        write_opus_init_segment(&mut buf, &params).expect("encode");
+
+        let extracted = extract_opus_config(&buf).expect("extract");
+        assert_eq!(extracted.channels, 1);
+        assert_eq!(extracted.pre_skip, 0);
+    }
+
+    #[test]
+    fn extract_opus_config_returns_none_for_aac_init() {
+        // An AAC-only init must not be picked up by the Opus extractor;
+        // mirror the AAC-returns-None-for-AVC invariant that pins the
+        // dispatch order in handle_describe.
+        let params = AudioInitParams {
+            asc: vec![0x12, 0x10],
+            timescale: 44_100,
+        };
+        let mut buf = BytesMut::new();
+        write_aac_init_segment(&mut buf, &params).expect("encode");
+        assert!(extract_opus_config(&buf).is_none());
+    }
+
+    #[test]
+    fn extract_opus_config_returns_none_for_avc_init() {
+        let params = VideoInitParams {
+            sps: SPS.to_vec(),
+            pps: PPS.to_vec(),
+            width: 1280,
+            height: 720,
+            timescale: 90_000,
+        };
+        let mut buf = BytesMut::new();
+        write_avc_init_segment(&mut buf, &params).expect("encode");
+        assert!(extract_opus_config(&buf).is_none());
+    }
+
+    #[test]
+    fn extract_opus_config_rejects_empty_buffer() {
+        assert!(extract_opus_config(&[]).is_none());
     }
 }

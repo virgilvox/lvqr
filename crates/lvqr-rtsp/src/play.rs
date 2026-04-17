@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::fmp4;
-use crate::rtp::{AacPacketizer, H264Packetizer, HevcPacketizer};
+use crate::rtp::{AacPacketizer, H264Packetizer, HevcPacketizer, OpusPacketizer};
 
 /// Default dynamic RTP payload type for the video track. Both the
 /// H.264 and HEVC SDP blocks emit PT 96 because only one of the two
@@ -35,6 +35,11 @@ const HEVC_PAYLOAD_TYPE: u8 = VIDEO_PAYLOAD_TYPE;
 /// the second dynamic slot and keeps the video / audio payload
 /// types separate so clients that key per-PT do not get confused.
 const AAC_PAYLOAD_TYPE: u8 = 97;
+
+/// Dynamic RTP payload type for the Opus audio track. PT 98 keeps
+/// Opus distinct from AAC (PT 97) so a future client-side PT-keyed
+/// dispatcher never confuses the two audio codecs.
+const OPUS_PAYLOAD_TYPE: u8 = 98;
 
 /// Sequence-number seed for the video RTP stream. RFC 3550 suggests
 /// a random initial value; a constant is fine for tests and the
@@ -310,6 +315,71 @@ pub async fn play_drain_aac(
         }
     }
     info!(%broadcast, "play_drain: AAC egress terminated");
+}
+
+/// Drive one PLAY session over the registry's Opus audio broadcaster.
+///
+/// Shape mirrors [`play_drain_aac`]. Key differences:
+/// * The packetizer is [`OpusPacketizer`] (RFC 7587) and emits one
+///   RTP packet per Opus frame with marker=1 on every packet.
+/// * RTP timestamp is the fragment PTS cast to `u32` in the 48 kHz
+///   Opus RTP clock. LVQR's Opus producers already carry PTS in that
+///   clock so no rescaling is needed here.
+/// * No parameter-set re-injection. Opus decoder state comes from
+///   the dOps box carried on the SDP (DESCRIBE) path, not from the
+///   RTP stream.
+///
+/// Like every other PLAY drain, this function holds only a
+/// `BroadcasterStream` receiver -- never a strong
+/// `Arc<FragmentBroadcaster>`. A keepalive Arc would keep the
+/// `broadcast::Sender` alive and `recv()` would never see `Closed`
+/// after every ingest clone dropped, leaking resources.
+///
+/// Terminates on cancel / broadcaster close / writer-channel close
+/// same as the video and AAC drains.
+pub async fn play_drain_opus(
+    broadcast: String,
+    rtp_channel: u8,
+    registry: FragmentBroadcasterRegistry,
+    writer_tx: mpsc::Sender<Vec<u8>>,
+    cancel: CancellationToken,
+) {
+    let Some(bc) = registry.get(&broadcast, "1.mp4") else {
+        debug!(%broadcast, "play_drain (opus): no audio broadcaster; exiting");
+        return;
+    };
+    let mut sub = bc.subscribe();
+    // SSRC is XOR'd with a codec-specific nibble to keep Opus
+    // distinct from AAC and H.264 streams on the same session. The
+    // exact value is not observable to clients that key on channel
+    // only, but Wireshark traces during interop testing read better
+    // when each track has a distinct SSRC.
+    let mut packetizer = OpusPacketizer::new(DEFAULT_SSRC ^ 0x0002_0000, OPUS_PAYLOAD_TYPE, INITIAL_RTP_SEQUENCE);
+
+    info!(%broadcast, "play_drain: Opus egress started");
+
+    loop {
+        let fragment = tokio::select! {
+            _ = cancel.cancelled() => break,
+            f = sub.next_fragment() => f,
+        };
+        let Some(fragment) = fragment else {
+            break;
+        };
+
+        let Some(body) = fmp4::extract_mdat_body(&fragment.payload) else {
+            continue;
+        };
+        if body.is_empty() {
+            continue;
+        }
+        let rtp_ts = fragment.pts as u32;
+        let pkt = packetizer.packetize(body, rtp_ts);
+        if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
+            return;
+        }
+    }
+    info!(%broadcast, "play_drain: Opus egress terminated");
 }
 
 #[cfg(test)]
@@ -684,6 +754,119 @@ mod tests {
         )
         .await
         .expect("aac drain exits promptly when no 1.mp4 broadcaster");
+    }
+
+    // --- Opus drain tests ---
+
+    /// Emit one Opus frame through the broadcaster and verify the
+    /// drain produces a single RTP packet with marker=1, PT=98,
+    /// timestamp matching the fragment PTS, and a body that depacks
+    /// back into the original Opus frame bytes through
+    /// OpusDepacketizer.
+    #[tokio::test]
+    async fn play_drain_opus_packetizes_single_frame_roundtrip() {
+        use crate::rtp::{OpusDepacketizer, parse_rtp_header};
+        use bytes::BytesMut;
+        use lvqr_cmaf::{OpusInitParams, write_opus_init_segment};
+
+        let registry = FragmentBroadcasterRegistry::new();
+        let bc = registry.get_or_create("live/opus", "1.mp4", FragmentMeta::new("opus", 48_000));
+
+        // Populate the broadcaster with a real Opus init segment so a
+        // DESCRIBE against the same registry would see a dOps-backed
+        // SDP audio block.
+        let mut init = BytesMut::new();
+        write_opus_init_segment(
+            &mut init,
+            &OpusInitParams {
+                channel_count: 2,
+                pre_skip: 312,
+                input_sample_rate: 48_000,
+                timescale: 48_000,
+            },
+        )
+        .expect("write opus init");
+        bc.set_init_segment(init.freeze());
+
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(16);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(play_drain_opus(
+            "live/opus".to_string(),
+            2,
+            registry.clone(),
+            writer_tx,
+            cancel.clone(),
+        ));
+
+        // Opus has no pre-roll (no parameter-set re-injection). Wait
+        // for the drain to subscribe so the emit below is not a race.
+        for _ in 0..100 {
+            if bc.subscriber_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(bc.subscriber_count() > 0, "opus drain subscribed");
+
+        let frame_bytes = vec![0xFC, 0xE1, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE];
+        let fragment_payload = build_moof_mdat(
+            1,
+            2,
+            960,
+            std::slice::from_ref(&RawSample {
+                track_id: 2,
+                dts: 960,
+                cts_offset: 0,
+                duration: 960,
+                payload: Bytes::from(frame_bytes.clone()),
+                keyframe: true,
+            }),
+        );
+        bc.emit(Fragment::new(
+            "1.mp4",
+            1,
+            0,
+            0,
+            960,
+            960,
+            960,
+            FragmentFlags::KEYFRAME,
+            fragment_payload,
+        ));
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), writer_rx.recv())
+            .await
+            .expect("opus rtp timeout")
+            .expect("opus channel open");
+        assert_eq!(frame[0], 0x24);
+        assert_eq!(frame[1], 2, "interleaved on channel 2");
+
+        let rtp = &frame[4..];
+        let hdr = parse_rtp_header(rtp).expect("rtp header");
+        assert_eq!(hdr.payload_type, OPUS_PAYLOAD_TYPE);
+        assert_eq!(hdr.timestamp, 960);
+        assert!(hdr.marker, "Opus packetizer sets marker per packet");
+
+        let result = OpusDepacketizer::new()
+            .depacketize(&rtp[hdr.header_len..], &hdr)
+            .expect("depack");
+        assert_eq!(result.frame, frame_bytes);
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn play_drain_opus_exits_when_broadcaster_missing() {
+        let registry = FragmentBroadcasterRegistry::new();
+        let (writer_tx, _writer_rx) = mpsc::channel::<Vec<u8>>(4);
+        let cancel = CancellationToken::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            play_drain_opus("no/opus".into(), 2, registry, writer_tx, cancel),
+        )
+        .await
+        .expect("opus drain exits promptly when no 1.mp4 broadcaster");
     }
 
     #[tokio::test]

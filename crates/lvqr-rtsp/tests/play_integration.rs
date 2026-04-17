@@ -15,13 +15,15 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use lvqr_cmaf::{
-    AudioInitParams, HevcInitParams, RawSample, VideoInitParams, build_moof_mdat, write_aac_init_segment,
-    write_avc_init_segment, write_hevc_init_segment,
+    AudioInitParams, HevcInitParams, OpusInitParams, RawSample, VideoInitParams, build_moof_mdat,
+    write_aac_init_segment, write_avc_init_segment, write_hevc_init_segment, write_opus_init_segment,
 };
 use lvqr_core::EventBus;
 use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta};
 use lvqr_rtsp::RtspServer;
-use lvqr_rtsp::rtp::{AacDepacketizer, H264Depacketizer, HevcDepacketizer, parse_interleaved_frame, parse_rtp_header};
+use lvqr_rtsp::rtp::{
+    AacDepacketizer, H264Depacketizer, HevcDepacketizer, OpusDepacketizer, parse_interleaved_frame, parse_rtp_header,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
@@ -506,6 +508,111 @@ async fn rtsp_play_aac_audio_track_delivers_access_unit() {
     let depack = AacDepacketizer::new();
     let result = depack.depacketize(&rtp[hdr.header_len..], &hdr).expect("aac depack");
     assert_eq!(result.frames, vec![au]);
+
+    shutdown.cancel();
+}
+
+// ---------- Opus PLAY end-to-end ----------
+
+fn make_opus_broadcaster(registry: &FragmentBroadcasterRegistry, broadcast: &str) {
+    let mut init = BytesMut::new();
+    write_opus_init_segment(
+        &mut init,
+        &OpusInitParams {
+            channel_count: 2,
+            pre_skip: 312,
+            input_sample_rate: 48_000,
+            timescale: 48_000,
+        },
+    )
+    .expect("write opus init");
+    let bc = registry.get_or_create(broadcast, "1.mp4", FragmentMeta::new("opus", 48_000));
+    bc.set_init_segment(init.freeze());
+}
+
+/// Real end-to-end Opus PLAY. DESCRIBE pulls an RFC 7587 audio block
+/// off the dOps-bearing init segment, SETUP negotiates interleaved
+/// 2-3, PLAY spawns the drain, and a single synthetic Opus frame
+/// round-trips through OpusDepacketizer.
+#[tokio::test]
+async fn rtsp_play_opus_audio_track_delivers_frame() {
+    let registry = FragmentBroadcasterRegistry::new();
+    make_opus_broadcaster(&registry, "live/opustest");
+    let (addr, shutdown) = start_rtsp_server(registry.clone()).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let base_uri = format!("rtsp://{addr}/live/opustest");
+    let mut pending = Vec::<u8>::new();
+
+    // DESCRIBE must carry an Opus audio block keyed at PT 98.
+    let describe = format!("DESCRIBE {base_uri} RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+    let describe_resp = rtsp_request_headers(&mut stream, &describe, &mut pending).await;
+    let content_length = parse_content_length(&describe_resp).expect("Content-Length");
+    let sdp = String::from_utf8(drain_body(&mut stream, &mut pending, content_length).await).expect("utf8");
+    assert!(sdp.contains("m=audio 0 RTP/AVP 98"), "Opus SDP: {sdp}");
+    assert!(sdp.contains("a=rtpmap:98 opus/48000/2"));
+    assert!(sdp.contains("sprop-stereo=1"));
+    assert!(sdp.contains("useinbandfec=1"));
+    assert!(sdp.contains("a=control:track2"));
+    // Must not leak AAC-only keys into the Opus block.
+    assert!(!sdp.contains("mode=AAC-hbr"));
+
+    let setup = format!(
+        "SETUP {base_uri}/track2 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n"
+    );
+    let setup_resp = rtsp_request_headers(&mut stream, &setup, &mut pending).await;
+    let session_id = extract_session_header(&setup_resp).expect("Session");
+    let play_req = format!("PLAY {base_uri} RTSP/1.0\r\nCSeq: 3\r\nSession: {session_id}\r\n\r\n");
+    let play_resp = rtsp_request_headers(&mut stream, &play_req, &mut pending).await;
+    assert!(play_resp.contains("RTSP/1.0 200"));
+
+    // Wait for the drain to subscribe: Opus has no pre-roll.
+    let bc = registry.get("live/opustest", "1.mp4").expect("opus broadcaster");
+    for _ in 0..100 {
+        if bc.subscriber_count() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(bc.subscriber_count() > 0, "opus drain subscribed");
+
+    // Synthetic Opus frame -- bytes are not a real decodable frame
+    // (the depacketizer is byte-transparent per RFC 7587, so any
+    // non-empty payload round-trips). The 48 kHz RTP timestamp
+    // matches a standard 20 ms Opus frame (960 samples).
+    let frame_bytes = vec![0xFC, 0xE1, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE];
+    let sample = RawSample {
+        track_id: 2,
+        dts: 960,
+        cts_offset: 0,
+        duration: 960,
+        payload: Bytes::from(frame_bytes.clone()),
+        keyframe: true,
+    };
+    let fragment_payload = build_moof_mdat(1, 2, 960, std::slice::from_ref(&sample));
+    bc.emit(Fragment::new(
+        "1.mp4",
+        1,
+        0,
+        0,
+        960,
+        960,
+        960,
+        FragmentFlags::KEYFRAME,
+        fragment_payload,
+    ));
+
+    let (ch, rtp) = read_interleaved_frame(&mut stream, &mut pending).await;
+    assert_eq!(ch, 2, "Opus on the SETUP-negotiated channel");
+    let hdr = parse_rtp_header(&rtp).expect("rtp header");
+    assert_eq!(hdr.payload_type, 98, "Opus PT distinct from AAC PT 97");
+    assert_eq!(hdr.timestamp, 960);
+    assert!(hdr.marker, "RFC 7587: marker set on every packet");
+
+    let result = OpusDepacketizer::new()
+        .depacketize(&rtp[hdr.header_len..], &hdr)
+        .expect("opus depack");
+    assert_eq!(result.frame, frame_bytes);
 
     shutdown.cancel();
 }

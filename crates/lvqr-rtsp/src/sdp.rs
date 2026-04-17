@@ -20,7 +20,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use lvqr_cmaf::{AacConfig, AvcParameterSets, HevcParameterSets};
+use lvqr_cmaf::{AacConfig, AvcParameterSets, HevcParameterSets, OpusConfig};
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
@@ -76,6 +76,31 @@ pub struct AacTrackDescription {
     pub config: AacConfig,
 }
 
+/// SDP for an Opus audio track on the PLAY response per RFC 7587.
+/// The `a=rtpmap` clock rate is fixed at 48 kHz (the Opus RTP
+/// timestamp clock regardless of encoder input rate) and the
+/// channel count encodes the mono/stereo choice. The `a=fmtp`
+/// declares `sprop-stereo` (stereo capability) and
+/// `useinbandfec=1` (in-band forward error correction enabled),
+/// matching what WebRTC Opus encoders typically produce.
+#[derive(Debug, Clone)]
+pub struct OpusTrackDescription {
+    pub payload_type: u8,
+    /// Relative control URI the client uses on SETUP, e.g. `"track2"`.
+    pub control: String,
+    /// Opus configuration extracted from the init segment's dOps box.
+    pub config: OpusConfig,
+}
+
+/// Either AAC or Opus audio for the PLAY SDP. Modeled after
+/// [`VideoTrackDescription`]: exactly one audio codec is described
+/// per broadcast, so an enum enforces that statically.
+#[derive(Debug, Clone)]
+pub enum AudioTrackDescription {
+    Aac(AacTrackDescription),
+    Opus(OpusTrackDescription),
+}
+
 /// Top-level SDP description rendered in response to DESCRIBE.
 #[derive(Debug, Clone)]
 pub struct PlaySdp {
@@ -88,8 +113,8 @@ pub struct PlaySdp {
     /// for the requested broadcast.
     pub video: Option<VideoTrackDescription>,
     /// Audio description, present when a `1.mp4` broadcaster
-    /// carries an AAC init segment.
-    pub audio: Option<AacTrackDescription>,
+    /// carries a decodable AAC or Opus init segment.
+    pub audio: Option<AudioTrackDescription>,
 }
 
 impl PlaySdp {
@@ -117,8 +142,10 @@ impl PlaySdp {
             Some(VideoTrackDescription::Hevc(v)) => render_hevc_block(&mut out, addr_family, v),
             None => {}
         }
-        if let Some(ref a) = self.audio {
-            render_aac_block(&mut out, addr_family, a);
+        match self.audio.as_ref() {
+            Some(AudioTrackDescription::Aac(a)) => render_aac_block(&mut out, addr_family, a),
+            Some(AudioTrackDescription::Opus(o)) => render_opus_block(&mut out, addr_family, o),
+            None => {}
         }
         out
     }
@@ -210,6 +237,26 @@ fn render_aac_block(out: &mut String, addr_family: &str, a: &AacTrackDescription
     ];
     let _ = writeln!(out, "a=fmtp:{} {}\r", a.payload_type, fmtp_parts.join(";"));
     let _ = writeln!(out, "a=control:{}\r", a.control);
+}
+
+fn render_opus_block(out: &mut String, addr_family: &str, o: &OpusTrackDescription) {
+    let _ = writeln!(out, "m=audio 0 RTP/AVP {}\r", o.payload_type);
+    let _ = writeln!(out, "c=IN {addr_family} 0.0.0.0\r");
+    // RFC 7587 section 7: rtpmap is fixed at 48 kHz regardless of
+    // encoder input rate; the `/<channels>` field encodes the SDP
+    // offer's mono/stereo choice. WebRTC Opus is almost always 2;
+    // clamp to at least 1 so we never emit a pathological `/0`.
+    let ch = o.config.channels.max(1);
+    let _ = writeln!(out, "a=rtpmap:{} opus/48000/{}\r", o.payload_type, ch);
+    // fmtp parameters per RFC 7587 section 6.1:
+    //   sprop-stereo: encoder output is stereo (1) or mono (0).
+    //   useinbandfec: encoder can produce in-band FEC; default on for WebRTC.
+    // LVQR does not negotiate CBR / maxaveragebitrate today; clients
+    // that want those can add them post-SETUP.
+    let stereo_flag: u8 = if o.config.channels >= 2 { 1 } else { 0 };
+    let fmtp_parts = [format!("sprop-stereo={stereo_flag}"), "useinbandfec=1".to_string()];
+    let _ = writeln!(out, "a=fmtp:{} {}\r", o.payload_type, fmtp_parts.join(";"));
+    let _ = writeln!(out, "a=control:{}\r", o.control);
 }
 
 /// Conservative `profile-level-id` for the AAC fmtp line. The full
@@ -467,11 +514,11 @@ mod tests {
             session_name: "live/av".into(),
             host_ip: "127.0.0.1".parse().unwrap(),
             video: None,
-            audio: Some(AacTrackDescription {
+            audio: Some(AudioTrackDescription::Aac(AacTrackDescription {
                 payload_type: 97,
                 control: "track2".into(),
                 config: sample_aac_config(),
-            }),
+            })),
         };
         let rendered = sdp.render();
 
@@ -497,11 +544,11 @@ mod tests {
                 control: "track1".into(),
                 params: sample_avc_params(),
             })),
-            audio: Some(AacTrackDescription {
+            audio: Some(AudioTrackDescription::Aac(AacTrackDescription {
                 payload_type: 97,
                 control: "track2".into(),
                 config: sample_aac_config(),
-            }),
+            })),
         };
         let rendered = sdp.render();
         assert!(rendered.contains("m=video"));
@@ -509,6 +556,59 @@ mod tests {
         // Track control URIs are independent.
         assert!(rendered.contains("a=control:track1"));
         assert!(rendered.contains("a=control:track2"));
+    }
+
+    fn sample_opus_config() -> OpusConfig {
+        OpusConfig {
+            channels: 2,
+            pre_skip: 312,
+            input_sample_rate: 48_000,
+            output_gain: 0,
+            dops_bytes: vec![0x00, 0x02, 0x01, 0x38, 0x00, 0x00, 0xBB, 0x80, 0x00, 0x00, 0x00],
+        }
+    }
+
+    #[test]
+    fn render_opus_audio_block_per_rfc_7587() {
+        let sdp = PlaySdp {
+            session_name: "live/opus".into(),
+            host_ip: "127.0.0.1".parse().unwrap(),
+            video: None,
+            audio: Some(AudioTrackDescription::Opus(OpusTrackDescription {
+                payload_type: 98,
+                control: "track2".into(),
+                config: sample_opus_config(),
+            })),
+        };
+        let rendered = sdp.render();
+
+        assert!(rendered.contains("m=audio 0 RTP/AVP 98\r\n"), "opus m=: {rendered}");
+        assert!(rendered.contains("a=rtpmap:98 opus/48000/2\r\n"));
+        assert!(rendered.contains("sprop-stereo=1"));
+        assert!(rendered.contains("useinbandfec=1"));
+        assert!(rendered.contains("a=control:track2"));
+        // Must not leak AAC-only fmtp keys into the Opus block.
+        assert!(!rendered.contains("mode=AAC-hbr"));
+        assert!(!rendered.contains("sizelength=13"));
+    }
+
+    #[test]
+    fn render_opus_mono_clears_stereo_flag() {
+        let mut config = sample_opus_config();
+        config.channels = 1;
+        let sdp = PlaySdp {
+            session_name: "live/opus-mono".into(),
+            host_ip: "127.0.0.1".parse().unwrap(),
+            video: None,
+            audio: Some(AudioTrackDescription::Opus(OpusTrackDescription {
+                payload_type: 98,
+                control: "track2".into(),
+                config,
+            })),
+        };
+        let rendered = sdp.render();
+        assert!(rendered.contains("a=rtpmap:98 opus/48000/1\r\n"));
+        assert!(rendered.contains("sprop-stereo=0"));
     }
 
     #[test]

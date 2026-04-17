@@ -705,6 +705,81 @@ impl AacPacketizer {
     }
 }
 
+/// Opus RTP packetizer per RFC 7587.
+///
+/// One Opus frame per RTP packet, no framing octets. The packet body
+/// is the raw Opus frame bytes. Marker bit is set on every packet
+/// (RFC 7587 section 4.2 lets the marker indicate the start of a
+/// talk-spurt, but for LVQR's egress every packet is a standalone AU
+/// so setting it unconditionally is the simplest and most tolerant
+/// choice). Timestamp is carried in the 48 kHz Opus RTP clock
+/// regardless of encoder input sample rate.
+#[derive(Debug)]
+pub struct OpusPacketizer {
+    pub ssrc: u32,
+    pub payload_type: u8,
+    pub sequence: u16,
+}
+
+impl OpusPacketizer {
+    pub fn new(ssrc: u32, payload_type: u8, initial_sequence: u16) -> Self {
+        Self {
+            ssrc,
+            payload_type,
+            sequence: initial_sequence,
+        }
+    }
+
+    /// Packetize one Opus frame into a single RTP packet. `frame`
+    /// holds the raw Opus frame bytes (the compressed audio payload,
+    /// not wrapped in Ogg or MP4 framing). `timestamp` is the 48 kHz
+    /// Opus RTP timestamp. Empty frames are rejected by RFC 7587 but
+    /// this helper tolerates them by emitting a header-only packet;
+    /// callers are expected to drop empty frames upstream.
+    pub fn packetize(&mut self, frame: &[u8], timestamp: u32) -> Vec<u8> {
+        let mut pkt = Vec::with_capacity(12 + frame.len());
+        write_rtp_header(&mut pkt, self.payload_type, self.sequence, timestamp, self.ssrc, true);
+        pkt.extend_from_slice(frame);
+        self.sequence = self.sequence.wrapping_add(1);
+        pkt
+    }
+}
+
+/// Opus RTP depacketizer per RFC 7587. The packet body is the Opus
+/// frame verbatim, so the only work here is copying the payload out
+/// of the parsed RTP packet and surfacing the timestamp + marker for
+/// the caller's jitter buffer.
+#[derive(Debug)]
+pub struct OpusDepackResult {
+    pub frame: Vec<u8>,
+    pub timestamp: u32,
+    pub marker: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct OpusDepacketizer;
+
+impl OpusDepacketizer {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Depacketize one RTP packet containing an Opus frame. Returns
+    /// `None` only when the payload is empty, which RFC 7587 forbids
+    /// but some encoders still emit during silence suppression; the
+    /// caller should drop the packet in that case.
+    pub fn depacketize(&self, rtp_payload: &[u8], header: &RtpHeader) -> Option<OpusDepackResult> {
+        if rtp_payload.is_empty() {
+            return None;
+        }
+        Some(OpusDepackResult {
+            frame: rtp_payload.to_vec(),
+            timestamp: header.timestamp,
+            marker: header.marker,
+        })
+    }
+}
+
 /// Parse the hex-encoded AudioSpecificConfig from an RFC 3640 fmtp line.
 /// Returns the decoded bytes, e.g. `[0x12, 0x10]` for `config=1210`.
 pub fn parse_aac_config_from_fmtp(fmtp: &str) -> Option<Vec<u8>> {
@@ -1381,5 +1456,55 @@ mod tests {
         let mut pack = AacPacketizer::new(1, 97, 0);
         let oversize = vec![0u8; 0x2000]; // 8192 bytes, exceeds 13-bit max of 8191
         let _ = pack.packetize(&oversize, 0);
+    }
+
+    // --- Opus packetizer tests (round-tripped through OpusDepacketizer
+    // to pin the RFC 7587 wire format without re-encoding it in prose). ---
+
+    #[test]
+    fn opus_packetize_single_frame_roundtrip() {
+        let frame = vec![0xFC, 0xE1, 0x34, 0x56, 0x78, 0x9A];
+        let mut pack = OpusPacketizer::new(0xCAFEBABE, 98, 42);
+        let pkt = pack.packetize(&frame, 960);
+
+        let hdr = parse_rtp_header(&pkt).expect("header");
+        assert_eq!(hdr.payload_type, 98);
+        assert_eq!(hdr.sequence, 42);
+        assert_eq!(hdr.timestamp, 960);
+        assert_eq!(hdr.ssrc, 0xCAFEBABE);
+        assert!(hdr.marker, "RFC 7587: marker set on every egress packet");
+
+        let depack = OpusDepacketizer::new();
+        let result = depack.depacketize(rtp_payload(&pkt), &hdr).expect("depack");
+        assert_eq!(result.frame, frame);
+        assert_eq!(result.timestamp, 960);
+        assert!(result.marker);
+        assert_eq!(pack.sequence, 43, "sequence bumped");
+    }
+
+    #[test]
+    fn opus_packetize_bumps_sequence_per_packet() {
+        let mut pack = OpusPacketizer::new(1, 98, 1000);
+        let a = pack.packetize(&[0x01, 0x02, 0x03], 0);
+        let b = pack.packetize(&[0x04, 0x05, 0x06], 960);
+        let c = pack.packetize(&[0x07, 0x08, 0x09], 1920);
+        assert_eq!(parse_rtp_header(&a).unwrap().sequence, 1000);
+        assert_eq!(parse_rtp_header(&b).unwrap().sequence, 1001);
+        assert_eq!(parse_rtp_header(&c).unwrap().sequence, 1002);
+        assert_eq!(parse_rtp_header(&b).unwrap().timestamp, 960);
+    }
+
+    #[test]
+    fn opus_depack_rejects_empty_payload() {
+        let depack = OpusDepacketizer::new();
+        let hdr = RtpHeader {
+            payload_type: 98,
+            sequence: 0,
+            timestamp: 0,
+            ssrc: 0,
+            marker: true,
+            header_len: 12,
+        };
+        assert!(depack.depacketize(&[], &hdr).is_none());
     }
 }
