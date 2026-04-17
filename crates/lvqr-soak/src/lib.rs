@@ -219,6 +219,12 @@ pub struct MetricsSample {
     pub rss_bytes: Option<u64>,
     /// Open file descriptor count.
     pub fd_count: Option<usize>,
+    /// Cumulative user + system CPU ticks since process start,
+    /// from `/proc/self/stat` (fields 14 + 15). Ticks per second
+    /// are the POSIX `_SC_CLK_TCK` value -- 100 on every Linux
+    /// kernel LVQR is expected to run on. `None` outside Linux or
+    /// on a parse failure.
+    pub cpu_ticks: Option<u64>,
 }
 
 /// Complete soak outcome. `passed` is true iff every subscriber met
@@ -276,6 +282,17 @@ impl SoakReport {
                     a,
                     b,
                     b as i128 - a as i128,
+                ));
+            }
+            if let (Some(a), Some(b)) = (first.cpu_ticks, last.cpu_ticks) {
+                let ticks_consumed = b.saturating_sub(a);
+                let cpu_seconds = ticks_consumed as f64 / CLK_TCK_PER_SEC as f64;
+                let wall_seconds = self.wall_duration.as_secs_f64().max(f64::EPSILON);
+                out.push_str(&format!(
+                    "cpu over window : {:.3} s cpu / {:.3} s wall ({:.1}% busy)\n",
+                    cpu_seconds,
+                    wall_seconds,
+                    100.0 * cpu_seconds / wall_seconds,
                 ));
             }
         }
@@ -718,6 +735,35 @@ fn page_size() -> u64 {
     4096
 }
 
+/// Cumulative user + system CPU ticks for the current process.
+///
+/// Reads `/proc/self/stat`, locates the last `)` to skip past the
+/// `comm` field (which may itself contain spaces or parens), then
+/// pulls `utime` (field 14) and `stime` (field 15) per `proc(5)`.
+///
+/// Returns `None` on non-Linux targets or on any parse failure. A
+/// delta between two samples divided by [`CLK_TCK_PER_SEC`] yields
+/// the CPU seconds consumed across the window.
+fn read_cpu_ticks() -> Option<u64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let raw = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let rparen = raw.rfind(')')?;
+    let tail = &raw[rparen + 1..];
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    // `tail` starts with the state char; index 11 = utime, 12 = stime.
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// POSIX `_SC_CLK_TCK` for the Linux kernel. Hard-coded 100 so the
+/// soak crate avoids a `libc` dependency. Kernels with
+/// `CONFIG_HZ_250` or higher still expose 100 at the sysconf layer
+/// (userspace-visible clock ticks are decoupled from jiffies).
+pub const CLK_TCK_PER_SEC: u64 = 100;
+
 // ---- public entry point ----
 
 /// Run the soak as described in `config`. Returns a [`SoakReport`]
@@ -778,6 +824,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<SoakReport> {
             elapsed: Duration::ZERO,
             rss_bytes: read_rss_bytes(),
             fd_count: read_fd_count(),
+            cpu_ticks: read_cpu_ticks(),
         });
         ticker.tick().await; // drop the immediate tick; sample again at t+interval
         loop {
@@ -791,6 +838,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<SoakReport> {
                         elapsed: run_start.elapsed(),
                         rss_bytes: read_rss_bytes(),
                         fd_count: read_fd_count(),
+                        cpu_ticks: read_cpu_ticks(),
                     });
                 }
             }
@@ -829,6 +877,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<SoakReport> {
         elapsed: start_wall.elapsed(),
         rss_bytes: read_rss_bytes(),
         fd_count: read_fd_count(),
+        cpu_ticks: read_cpu_ticks(),
     });
     metrics_stop.store(true, Ordering::SeqCst);
     let _ = metrics_handle.await;

@@ -78,6 +78,34 @@ async fn soak_opus_runs_for_short_duration_and_reports_traffic() {
     assert_traffic_flows(short_config(Codec::Opus, "live/smoke-opus")).await;
 }
 
+/// MetricsSample.cpu_ticks is populated on Linux and `None` on every
+/// other platform. Verifies the sampling path is wired correctly per
+/// target OS without asserting on an absolute CPU value (which is
+/// too noisy on a 2 s smoke run).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn soak_cpu_sampling_matches_platform_expectation() {
+    let report = run_soak(short_config(Codec::H264, "live/cpu-smoke"))
+        .await
+        .expect("run_soak completes");
+    assert!(!report.metrics.is_empty(), "metrics must have at least one sample");
+    for sample in &report.metrics {
+        if cfg!(target_os = "linux") {
+            assert!(
+                sample.cpu_ticks.is_some(),
+                "Linux cpu_ticks must be Some, got None at t={:?}",
+                sample.elapsed
+            );
+        } else {
+            assert!(
+                sample.cpu_ticks.is_none(),
+                "non-Linux cpu_ticks must be None, got {:?} at t={:?}",
+                sample.cpu_ticks,
+                sample.elapsed
+            );
+        }
+    }
+}
+
 /// With an absurdly high RTP threshold the report should pass=false
 /// even though traffic flowed. Pins the pass/fail logic against a
 /// future change that accidentally lets a zero-packet run through.
