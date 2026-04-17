@@ -1752,6 +1752,7 @@ name = "lvqr-cmaf"
 version = "0.4.0"
 dependencies = [
  "bytes",
+ "criterion",
  "lvqr-codec",
  "lvqr-conformance",
  "lvqr-core",

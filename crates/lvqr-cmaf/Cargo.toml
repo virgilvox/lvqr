@@ -30,5 +30,10 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 proptest = "1"
+criterion = { workspace = true }
 lvqr-test-utils = { workspace = true }
 lvqr-conformance = { workspace = true }
+
+[[bench]]
+name = "cmaf"
+harness = false
