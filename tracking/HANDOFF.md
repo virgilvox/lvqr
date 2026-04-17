@@ -1,8 +1,135 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- RTSP PLAY + RTCP SR + `lvqr-soak` with per-sample CPU tracking; 620 tests, 24 crates
+## Project Status: v0.4.0 -- RTSP PLAY + RTCP SR + full soak harness + first criterion benches; 620 tests, 24 crates
 
-**Last Updated**: 2026-04-17 (session 67 close).
+**Last Updated**: 2026-04-17 (session 68 close).
+
+## Session 68 close (2026-04-17)
+
+### What shipped (1 commit, +135 lines)
+
+1. **First criterion benches for the RTP packetizer hot path**
+   (`9a8894c`). Workspace had zero benches before this commit;
+   the roadmap's Tier 4 performance claims need a measurement
+   foundation. Lands the template plus a representative sample
+   for every RTP packetizer LVQR ships.
+
+   New `crates/lvqr-rtsp/benches/rtp_packetizer.rs`:
+   * `h264_single_nal_500B` -- single-NAL packet, common case.
+   * `h264_fu_a_4500B` -- FU-A over the default 1400 MTU (4
+     packets).
+   * `h264_fu_a_64KB` -- long FU-A chain so per-fragment cost
+     is separable from the fixed first-packet overhead.
+   * `hevc_single_nal_500B` -- single-NAL HEVC packet.
+   * `hevc_fu_4500B` -- HEVC FU fragmentation.
+   * `aac_256B_au` -- RFC 3640 AAC-hbr packetization.
+   * `opus_80B_frame` -- RFC 7587 Opus packetization
+     (20 ms / 32 kbps).
+
+   `lvqr-rtsp/Cargo.toml` gains `criterion = { workspace = true }`
+   in dev-deps plus a `[[bench]]` entry with `harness = false`.
+   The workspace's existing `criterion = "0.5"` dep (unused since
+   v0.2) finally has a consumer.
+
+   Baseline numbers (laptop, `--quick` mode):
+   | bench | time | per-packet |
+   |---|---|---|
+   | h264_single_nal_500B | ~94 ns | ~94 ns |
+   | h264_fu_a_4500B | ~571 ns / 4 pkts | ~143 ns |
+   | h264_fu_a_64KB | ~7.9 µs / 47 pkts | ~168 ns |
+   | hevc_single_nal_500B | ~88 ns | ~88 ns |
+   | hevc_fu_4500B | ~688 ns / 4 pkts | ~172 ns |
+   | aac_256B_au | ~111 ns | ~111 ns |
+   | opus_80B_frame | ~29 ns | ~29 ns |
+
+   Opus is cheapest (no framing). AAC adds ~20 ns for the
+   AU-headers-length + AU-header prefix. H.264/HEVC FU-A scales
+   linearly with packet count (~143-172 ns per fragment) so the
+   packetizer is well below the TCP-write ceiling a single
+   drain task can push at default MTU.
+
+### Ground truth (session 68 close)
+
+* **Head**: `9a8894c` on `main`. v0.4.0. **21 commits queued
+  but NOT pushed to origin/main** (sessions 62-68 all unpushed).
+* **Tests**: 620 passed, 0 failed, 1 ignored. Unchanged from
+  session 67 -- benches are bench-profile only.
+* **Code**: +135 lines inside `crates/lvqr-rtsp/` (Cargo.toml
+  dev-deps + benches dir).
+* **CI gates locally clean**: fmt, clippy (`-D warnings`) on
+  `--all-targets --benches`, test --workspace all green.
+  `cargo bench --bench rtp_packetizer -- --test` reports all
+  7 benches Success.
+
+### Load-bearing invariants (all still pinned)
+
+Unchanged from session 60. Benches are non-functional; they only
+exercise the public packetizer surface through `&mut self`
+operations that the integration tests already cover.
+
+### Protocols supported
+
+Unchanged. 11 protocols. Feature-complete for every codec.
+
+### Perf baseline tracking
+
+The session-68 numbers are the first published numbers against
+the RTP packetizer. Subsequent tiers (especially io_uring zero-
+copy datapath work and WASM filter hooks) should re-run this
+bench on the same host and report the delta. Criterion's default
+output at `target/criterion/` produces a comparison table when a
+named baseline is saved -- use
+`cargo bench --bench rtp_packetizer -- --save-baseline pre-ioruring`
+before invasive hot-path changes land.
+
+### Known gaps
+
+1. **mediastreamvalidator binary on CI runner**: still the
+   biggest audit gap. User-bound.
+2. **Actual 24 h nightly soak run**: harness is complete; no CI
+   job runs it nightly yet.
+3. **MediaMTX comparison harness**: not started.
+4. **Tier 3**: cluster + observability not started.
+5. **Carry-over tech debt**: `lvqr-wasm` scaffold deletion,
+   `TrackId` newtype, CORS restrictive default. Benches for
+   other crates (fragment broadcaster fanout, cmaf moof+mdat
+   writer, HLS playlist serialization) are also worth adding
+   now that the template exists.
+
+### Session 69 entry point
+
+Priority order:
+
+1. **mediastreamvalidator self-hosted runner** (unchanged).
+   Infra; user-bound.
+
+2. **MediaMTX comparison harness**. Sibling to `lvqr-soak`; new
+   `crates/lvqr-compare/` that spawns MediaMTX (via docker or
+   the `mediamtx` binary on PATH), publishes an identical
+   synthetic stream to both servers, and diffs subscriber-side
+   fragment counts / RTP sequence wraps / latency histograms.
+   Soft-skip the MediaMTX side when the binary is absent.
+
+3. **More criterion benches**. The template now exists. Next
+   targets: `lvqr_cmaf::build_moof_mdat` (per-fragment cost of
+   the fMP4 writer), `lvqr_fragment::FragmentBroadcaster` fanout
+   to N subscribers, `lvqr_hls::LlHlsPlaylist` render.
+
+4. **Tier 3 planning**. Requires a planning document first; do
+   not start mid-session.
+
+5. **Carry-over tech debt**: cheapest first -- `lvqr-wasm`
+   scaffold deletion if confirmed dead, CORS restrictive
+   default, then the TrackId newtype refactor (large).
+
+### Velocity note
+
+Session 68 landed one small commit (135 lines). Tier 1 test
+infrastructure now covers long-duration soak + first baseline
+benchmarks. Remaining Tier 1 items are harness-diversity (new
+codecs on comparison paths) and multi-host coverage. Realistic
+M4 ETA unchanged: 3-5 calendar weeks of sustained sessions,
+bounded chiefly by user-controlled items.
 
 ## Session 67 close (2026-04-17)
 
