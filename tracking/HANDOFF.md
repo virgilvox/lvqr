@@ -2,7 +2,39 @@
 
 ## Project Status: v0.4.0 -- Cluster plane COMPLETE; observability G scaffolded; 706 tests, 25 crates
 
-**Last Updated**: 2026-04-17 (session 80 close -- cross-session audit 73-79 + Tier 3 session G).
+**Last Updated**: 2026-04-17 (session 80 close + push event -- cross-session audit 73-79 + Tier 3 session G, then 48 commits pushed to origin/main).
+
+## Push event (2026-04-17, after session 80 close)
+
+After session 80 closed, the 48-commit backlog that had been
+sitting on local `main` since session 62 (the backlog itself
+accumulated because the "push only on direct instruction"
+rule means the runtime never pushed opportunistically) was
+pushed to `origin/main`. The per-session close blocks below
+record their ground-truth state at session-close time --
+"N commits queued but NOT pushed" -- which is historically
+accurate but no longer the current state. The current state
+is: local `main` and `origin/main` are both at `23df772`;
+zero commits queued.
+
+Verification done before `git push origin main`:
+
+* `git log origin/main..HEAD --format='%an <%ae>' | sort -u`
+  -> exactly one line: `Moheeb Zara <hackbuildvideo@gmail.com>`.
+* `git log origin/main..HEAD --format='%(trailers:key=Co-authored-by)'`
+  -> empty. Zero `Co-authored-by` trailers across the 48
+  commits.
+* Grep for `claude|anthropic|assistant|co-authored` in commit
+  messages -> only false positives (audit-report text
+  saying "no Claude attribution was added").
+
+Post-push:
+
+* `git rev-list --count origin/main..HEAD` -> `0`.
+* Tip commit on both local and origin: `23df772` (docs
+  session 80 close).
+
+
 
 ## Session 80 close (2026-04-17)
 
