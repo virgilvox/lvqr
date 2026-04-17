@@ -1,8 +1,142 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- RTSP PLAY + RTCP SR + full soak + 15 benches + Tier 3 plan; 620 tests, 24 crates
+## Project Status: v0.4.0 -- RTSP PLAY + RTCP SR + soak + benches + Tier 3 session A landed; 625 tests, 25 crates
 
-**Last Updated**: 2026-04-17 (session 70 close).
+**Last Updated**: 2026-04-17 (session 71 close).
+
+## Session 71 close (2026-04-17)
+
+### What shipped (1 commit, +531 / -18 lines)
+
+1. **Tier 3 session A: `lvqr-cluster` scaffold +
+   single-node bootstrap** (`ca4ec7c`). Executes the first slot of
+   the session decomposition in `tracking/TIER_3_PLAN.md`.
+
+   Also resolves the four open questions the plan flagged for
+   session 71 to decide before writing code:
+   * **Gossip port = UDP 10007** (matches chitchat upstream
+     example; no collision with existing LVQR listeners).
+   * **Ownership lease = 10 s / 2.5 s renew** (4× renew-to-expire
+     ratio; survives one gossip-round miss).
+   * **OTLP default = gRPC :4317** per OpenTelemetry spec. HTTP
+     protobuf :4318 opt-in via `LVQR_OTLP_PROTOCOL=http/protobuf`.
+   * **`lvqr-mesh` vs `lvqr-cluster`**: explicitly orthogonal
+     (browser WebRTC peer-mesh vs server-side node coordination).
+     Crate-level docs pin this at the top to prevent future
+     confusion.
+
+   New crate `crates/lvqr-cluster/` (published at workspace root
+   alongside every other lvqr-* crate):
+
+   * `NodeId` newtype over `String` so callers cannot confuse a
+     broadcast name with a node name. `NodeId::random()` yields
+     `lvqr-<16-char alphanumeric>`.
+   * `ClusterConfig` with sensible defaults and a `for_test()`
+     preset (ephemeral loopback, 100 ms gossip interval, 2 s GC
+     grace) so every integration test stays fast.
+   * `ClusterNode` mirrors `chitchat::ChitchatId` without exposing
+     chitchat in the public API -- crate consumers depend on
+     `lvqr-cluster` alone.
+   * `Cluster::bootstrap` spawns a chitchat UDP gossip server.
+     `bootstrap_with_transport` variant accepts
+     `chitchat::transport::ChannelTransport` for in-process
+     multi-node integration tests (session 72's surface).
+   * `self_node()`, `self_id()`, `members()`, `shutdown()`.
+     `members()` merges the self node into chitchat's
+     `live_nodes()` output so callers do not have to reason about
+     the peer-vs-self distinction.
+
+   Five new unit tests:
+   * `bootstrap_single_node_reports_itself_in_members` -- happy
+     path smoke.
+   * `explicit_node_id_survives_bootstrap` -- override plumbing.
+   * `node_id_random_generates_fresh_identifiers` -- random ID
+     sanity.
+   * `default_cluster_config_binds_to_default_port` -- default
+     port / cluster id pinned.
+   * `for_test_config_uses_ephemeral_port_and_loopback` --
+     test-mode preset pinned.
+
+### Ground truth (session 71 close)
+
+* **Head**: `ca4ec7c` on `main`. v0.4.0. **27 commits queued
+  but NOT pushed to origin/main** (sessions 62-71 all unpushed).
+* **Tests**: 625 passed, 0 failed, 1 ignored. Delta from
+  session 70: +5 (lvqr-cluster unit tests).
+* **Code**: +531 / -18 net lines. New crate
+  `crates/lvqr-cluster/` + workspace Cargo.toml entries.
+* **Workspace**: now 25 crates (was 24).
+* **CI gates locally clean**: fmt, clippy
+  (`--all-targets --benches -D warnings`), test --workspace all
+  green.
+
+### Tier 3 progress
+
+| Session | Deliverable | Status |
+|---|---|---|
+| A (71) | lvqr-cluster scaffold + single-node bootstrap | DONE |
+| B (72) | Two-node integration test: both see each other via `members()` | pending |
+| C (73) | Broadcast-ownership KV (claim_broadcast, find_broadcast_owner) | pending |
+| D (74) | Capacity advertisement | pending |
+| E (75) | Cluster-wide config channel + admin endpoints | pending |
+| F (76) | Wire Cluster through lvqr-cli serve + RTSP/HLS/DASH redirect | pending |
+| G (77) | lvqr-observability scaffold + OTLP env-var gating | pending |
+| H (78) | OTLP span exporter + in-memory collector test | pending |
+| I (79) | OTLP metric exporter | pending |
+| J (80) | JSON log + trace_id correlation | pending |
+
+One of twelve Tier 3 sessions complete. At the observed pace this
+is ~1 calendar week of focused Tier 3 work; post-Tier 3, M4
+(LiveKit alternative milestone) depends only on the Tier 4
+differentiator MVPs (WASM filters, in-process AI, K8s operator).
+
+### Load-bearing invariants (all still pinned)
+
+* LBD #3 (control vs hot path): every `Cluster` method is async
+  control-plane. No method sits on a per-fragment hot path.
+* LBD #5 (chitchat scope discipline): session-A surface exposes
+  membership only. No fast-changing state flows through chitchat.
+
+### Protocols supported
+
+Unchanged. 11 protocols. Feature-complete for every codec.
+
+### Known gaps
+
+1. **mediastreamvalidator runner**: still the biggest audit gap.
+   User-bound.
+2. **Actual 24 h nightly soak**: harness exists; no CI job yet.
+3. **MediaMTX comparison harness**: deferred to keep the Tier 3
+   critical path clear.
+4. **Tier 3 sessions B-J** (11 remaining).
+5. **Carry-over tech debt**: `lvqr-wasm` deletion, CORS default,
+   `TrackId` newtype. Deferred until Tier 3 is complete.
+
+### Session 72 entry point
+
+Tier 3 session B per `tracking/TIER_3_PLAN.md`.
+
+Deliverable: two-node integration test. Both chitchat nodes use
+`chitchat::transport::ChannelTransport` for in-process gossip so
+we do not have to reserve real UDP ports. Assertions:
+
+1. Each node's `members()` eventually contains the other (within
+   ~5× gossip interval).
+2. One node's `shutdown()` causes the other to drop it from
+   `members()` after the marked_for_deletion grace period.
+3. Happy-path shutdown of both nodes returns cleanly.
+
+Expected scope: ~150 lines of integration test + 0 library code
+(the `bootstrap_with_transport` surface landed in session A in
+anticipation). One commit.
+
+### Velocity note
+
+Session 71 landed one commit (+531 lines) plus a small
+TIER_3_PLAN.md edit. Tier 3 session A clears the scaffold /
+chitchat-dep-pinning risk the plan flagged. Subsequent Tier 3
+sessions are tighter-scoped (integration tests + feature
+slices on top of the scaffold).
 
 ## Session 70 close (2026-04-17)
 
