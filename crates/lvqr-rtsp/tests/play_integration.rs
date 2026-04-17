@@ -14,11 +14,14 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use lvqr_cmaf::{RawSample, VideoInitParams, build_moof_mdat, write_avc_init_segment};
+use lvqr_cmaf::{
+    AudioInitParams, HevcInitParams, RawSample, VideoInitParams, build_moof_mdat, write_aac_init_segment,
+    write_avc_init_segment, write_hevc_init_segment,
+};
 use lvqr_core::EventBus;
 use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta};
 use lvqr_rtsp::RtspServer;
-use lvqr_rtsp::rtp::{H264Depacketizer, parse_interleaved_frame, parse_rtp_header};
+use lvqr_rtsp::rtp::{AacDepacketizer, H264Depacketizer, HevcDepacketizer, parse_interleaved_frame, parse_rtp_header};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
@@ -273,4 +276,236 @@ fn extract_session_header(headers: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ---------- HEVC PLAY end-to-end ----------
+
+/// Real HEVC NAL units captured from x265. Same bytes the lvqr-cmaf
+/// init tests use so the writer/extractor/depacketizer triplet
+/// round-trips over the network path.
+const HEVC_VPS: &[u8] = &[
+    0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+    0x00, 0x3c, 0x95, 0x94, 0x09,
+];
+const HEVC_SPS: &[u8] = &[
+    0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0,
+    0x0a, 0x08, 0x0f, 0x16, 0x59, 0x59, 0x52, 0x93, 0x0b, 0xc0, 0x5a, 0x02, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00,
+    0x03, 0x00, 0x3c, 0x10,
+];
+const HEVC_PPS: &[u8] = &[0x44, 0x01, 0xc0, 0x73, 0xc1, 0x89];
+
+fn hevc_sps_info() -> lvqr_codec::hevc::HevcSps {
+    lvqr_codec::hevc::HevcSps {
+        general_profile_space: 0,
+        general_tier_flag: false,
+        general_profile_idc: 1,
+        general_profile_compatibility_flags: 0x60000000,
+        general_level_idc: 60,
+        chroma_format_idc: 1,
+        pic_width_in_luma_samples: 320,
+        pic_height_in_luma_samples: 240,
+    }
+}
+
+fn make_hevc_broadcaster(registry: &FragmentBroadcasterRegistry, broadcast: &str) {
+    let mut init = BytesMut::new();
+    write_hevc_init_segment(
+        &mut init,
+        &HevcInitParams {
+            vps: HEVC_VPS.to_vec(),
+            sps: HEVC_SPS.to_vec(),
+            pps: HEVC_PPS.to_vec(),
+            sps_info: hevc_sps_info(),
+            timescale: 90_000,
+        },
+    )
+    .expect("write hevc init");
+    let bc = registry.get_or_create(broadcast, "0.mp4", FragmentMeta::new("hev1", 90_000));
+    bc.set_init_segment(init.freeze());
+}
+
+#[tokio::test]
+async fn rtsp_play_hevc_handshake_delivers_vps_sps_pps_and_idr() {
+    let registry = FragmentBroadcasterRegistry::new();
+    make_hevc_broadcaster(&registry, "live/hevctest");
+    let (addr, shutdown) = start_rtsp_server(registry.clone()).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let base_uri = format!("rtsp://{addr}/live/hevctest");
+    let mut pending = Vec::<u8>::new();
+
+    let describe = format!("DESCRIBE {base_uri} RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+    let describe_resp = rtsp_request_headers(&mut stream, &describe, &mut pending).await;
+    assert!(describe_resp.contains("RTSP/1.0 200"));
+    let content_length = parse_content_length(&describe_resp).expect("Content-Length");
+    let sdp = String::from_utf8(drain_body(&mut stream, &mut pending, content_length).await).expect("utf8");
+    assert!(sdp.contains("a=rtpmap:96 H265/90000"), "HEVC SDP: {sdp}");
+    assert!(sdp.contains("sprop-vps="));
+    assert!(sdp.contains("sprop-sps="));
+    assert!(sdp.contains("sprop-pps="));
+    assert!(sdp.contains("profile-id=1"));
+
+    let setup = format!(
+        "SETUP {base_uri}/track1 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n"
+    );
+    let setup_resp = rtsp_request_headers(&mut stream, &setup, &mut pending).await;
+    let session_id = extract_session_header(&setup_resp).expect("Session");
+    let play_req = format!("PLAY {base_uri} RTSP/1.0\r\nCSeq: 3\r\nSession: {session_id}\r\n\r\n");
+    let play_resp = rtsp_request_headers(&mut stream, &play_req, &mut pending).await;
+    assert!(play_resp.contains("RTSP/1.0 200"));
+
+    // Three preamble packets (VPS, SPS, PPS) followed by IDR. Each
+    // fits in the default MTU so they come through as single-NAL
+    // packets; depacketize into Vec<u8> and compare byte-for-byte
+    // against the original NALs.
+    let mut depack = HevcDepacketizer::new();
+    let mut recovered: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..3 {
+        let (_ch, rtp) = read_interleaved_frame(&mut stream, &mut pending).await;
+        let hdr = parse_rtp_header(&rtp).expect("rtp header");
+        let result = depack
+            .depacketize(&rtp[hdr.header_len..], &hdr)
+            .expect("hevc preamble depacks");
+        recovered.push(result.nalus.into_iter().next().expect("one nal"));
+    }
+    assert_eq!(recovered[0], HEVC_VPS);
+    assert_eq!(recovered[1], HEVC_SPS);
+    assert_eq!(recovered[2], HEVC_PPS);
+
+    // Emit one HEVC IDR fragment. NAL type 19 = IDR_W_RADL, the
+    // HEVC depacketizer treats that as a keyframe.
+    let mut idr_nal = vec![0x26, 0x01]; // nal_header for type 19
+    idr_nal.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+    let sample = RawSample {
+        track_id: 1,
+        dts: 3000,
+        cts_offset: 0,
+        duration: 3000,
+        payload: Bytes::from({
+            let mut v = (idr_nal.len() as u32).to_be_bytes().to_vec();
+            v.extend_from_slice(&idr_nal);
+            v
+        }),
+        keyframe: true,
+    };
+    let fragment_payload = build_moof_mdat(1, 1, 3000, std::slice::from_ref(&sample));
+    registry
+        .get("live/hevctest", "0.mp4")
+        .expect("hevc broadcaster")
+        .emit(Fragment::new(
+            "0.mp4",
+            1,
+            0,
+            0,
+            3000,
+            3000,
+            3000,
+            FragmentFlags::KEYFRAME,
+            fragment_payload,
+        ));
+
+    let (_ch, idr_rtp) = read_interleaved_frame(&mut stream, &mut pending).await;
+    let hdr = parse_rtp_header(&idr_rtp).expect("idr header");
+    let result = depack
+        .depacketize(&idr_rtp[hdr.header_len..], &hdr)
+        .expect("idr depacks");
+    assert!(result.keyframe, "IDR flagged on depack");
+    assert_eq!(result.nalus.into_iter().next().unwrap(), idr_nal);
+
+    shutdown.cancel();
+}
+
+// ---------- AAC PLAY end-to-end ----------
+
+fn make_aac_broadcaster(registry: &FragmentBroadcasterRegistry, broadcast: &str) {
+    let mut init = BytesMut::new();
+    write_aac_init_segment(
+        &mut init,
+        &AudioInitParams {
+            asc: vec![0x12, 0x10],
+            timescale: 44_100,
+        },
+    )
+    .expect("write aac init");
+    let bc = registry.get_or_create(broadcast, "1.mp4", FragmentMeta::new("mp4a.40.2", 44_100));
+    bc.set_init_segment(init.freeze());
+}
+
+#[tokio::test]
+async fn rtsp_play_aac_audio_track_delivers_access_unit() {
+    let registry = FragmentBroadcasterRegistry::new();
+    make_aac_broadcaster(&registry, "live/aactest");
+    let (addr, shutdown) = start_rtsp_server(registry.clone()).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let base_uri = format!("rtsp://{addr}/live/aactest");
+    let mut pending = Vec::<u8>::new();
+
+    // DESCRIBE: the SDP carries an audio block (track2 control,
+    // mpeg4-generic, config=1210) even without a video broadcaster.
+    let describe = format!("DESCRIBE {base_uri} RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+    let describe_resp = rtsp_request_headers(&mut stream, &describe, &mut pending).await;
+    let content_length = parse_content_length(&describe_resp).expect("Content-Length");
+    let sdp = String::from_utf8(drain_body(&mut stream, &mut pending, content_length).await).expect("utf8");
+    assert!(sdp.contains("m=audio 0 RTP/AVP 97"), "AAC SDP: {sdp}");
+    assert!(sdp.contains("a=rtpmap:97 mpeg4-generic/44100/2"));
+    assert!(sdp.contains("config=1210"));
+    assert!(sdp.contains("a=control:track2"));
+
+    // SETUP the audio track on interleaved 2-3 (the conventional
+    // second pair after video's 0-1 even when video is absent).
+    let setup = format!(
+        "SETUP {base_uri}/track2 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n"
+    );
+    let setup_resp = rtsp_request_headers(&mut stream, &setup, &mut pending).await;
+    let session_id = extract_session_header(&setup_resp).expect("Session");
+    let play_req = format!("PLAY {base_uri} RTSP/1.0\r\nCSeq: 3\r\nSession: {session_id}\r\n\r\n");
+    let play_resp = rtsp_request_headers(&mut stream, &play_req, &mut pending).await;
+    assert!(play_resp.contains("RTSP/1.0 200"));
+
+    // Wait for the drain to subscribe before emitting. Parallels the
+    // in-crate unit test: AAC has no pre-roll so a race-free emit
+    // needs the subscriber_count() check.
+    let bc = registry.get("live/aactest", "1.mp4").expect("aac broadcaster");
+    for _ in 0..100 {
+        if bc.subscriber_count() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(bc.subscriber_count() > 0, "aac drain subscribed");
+
+    let au = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+    let sample = RawSample {
+        track_id: 2,
+        dts: 1024,
+        cts_offset: 0,
+        duration: 1024,
+        payload: Bytes::from(au.clone()),
+        keyframe: true,
+    };
+    let fragment_payload = build_moof_mdat(1, 2, 1024, std::slice::from_ref(&sample));
+    bc.emit(Fragment::new(
+        "1.mp4",
+        1,
+        0,
+        0,
+        1024,
+        1024,
+        1024,
+        FragmentFlags::KEYFRAME,
+        fragment_payload,
+    ));
+
+    let (ch, rtp) = read_interleaved_frame(&mut stream, &mut pending).await;
+    assert_eq!(ch, 2, "AAC on the SETUP-negotiated channel");
+    let hdr = parse_rtp_header(&rtp).expect("rtp header");
+    assert_eq!(hdr.payload_type, 97);
+    assert_eq!(hdr.timestamp, 1024);
+
+    let depack = AacDepacketizer::new();
+    let result = depack.depacketize(&rtp[hdr.header_len..], &hdr).expect("aac depack");
+    assert_eq!(result.frames, vec![au]);
+
+    shutdown.cancel();
 }
