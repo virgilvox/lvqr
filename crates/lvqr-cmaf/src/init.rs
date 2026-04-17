@@ -890,6 +890,94 @@ fn hvc1_codec_string(hvcc: &mp4_atom::Hvcc) -> String {
     }
 }
 
+/// AVC parameter-set NAL units extracted from an `avcC` configuration.
+///
+/// Consumed by the RTSP PLAY egress path in `lvqr-rtsp`: the ingest
+/// side strips SPS / PPS from fragment payloads because they already
+/// live on the init segment, so the PLAY drain must re-inject them
+/// via RTP before the first IDR fragment. Each `Vec<u8>` is a bare
+/// NAL unit (no Annex B start code, no AVCC length prefix).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AvcParameterSets {
+    pub sps_list: Vec<Vec<u8>>,
+    pub pps_list: Vec<Vec<u8>>,
+}
+
+/// HEVC parameter-set NAL units extracted from an `hvcC`
+/// configuration. Mirrors [`AvcParameterSets`] with the VPS that HEVC
+/// additionally carries. NAL types 32 (VPS), 33 (SPS), 34 (PPS) per
+/// ISO/IEC 14496-15 section 8.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HevcParameterSets {
+    pub vps_list: Vec<Vec<u8>>,
+    pub sps_list: Vec<Vec<u8>>,
+    pub pps_list: Vec<Vec<u8>>,
+}
+
+/// Decode an fMP4 init segment (ftyp + moov) and return the AVC
+/// parameter sets from the first `avcC` sample entry found on any
+/// trak.
+///
+/// Returns `None` when the buffer does not parse as ftyp+moov, or
+/// when no trak carries an AVC sample entry.
+///
+/// Cheap in comparison to per-fragment work but not free (decodes
+/// the full moov). Callers should invoke once per PLAY session on
+/// the init bytes pulled off the broadcaster meta and cache the
+/// result for the duration of the session.
+pub fn extract_avc_parameter_sets(init: &[u8]) -> Option<AvcParameterSets> {
+    use mp4_atom::Decode;
+
+    let mut cursor = std::io::Cursor::new(init);
+    mp4_atom::Ftyp::decode(&mut cursor).ok()?;
+    let moov = Moov::decode(&mut cursor).ok()?;
+    for trak in &moov.trak {
+        for codec in &trak.mdia.minf.stbl.stsd.codecs {
+            if let Codec::Avc1(avc1) = codec {
+                return Some(AvcParameterSets {
+                    sps_list: avc1.avcc.sequence_parameter_sets.clone(),
+                    pps_list: avc1.avcc.picture_parameter_sets.clone(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Decode an fMP4 init segment (ftyp + moov) and return the HEVC
+/// parameter sets from the first `hvcC` sample entry found on any
+/// trak.
+///
+/// Returns `None` when the buffer does not parse as ftyp+moov, or
+/// when no trak carries an HEVC sample entry (`hev1` / `hvc1`).
+/// Empty VPS / SPS / PPS lists in the returned struct are possible
+/// if the init writer emits arrays with no NALs, but the LVQR init
+/// writer always populates all three.
+pub fn extract_hevc_parameter_sets(init: &[u8]) -> Option<HevcParameterSets> {
+    use mp4_atom::Decode;
+
+    let mut cursor = std::io::Cursor::new(init);
+    mp4_atom::Ftyp::decode(&mut cursor).ok()?;
+    let moov = Moov::decode(&mut cursor).ok()?;
+    for trak in &moov.trak {
+        for codec in &trak.mdia.minf.stbl.stsd.codecs {
+            if let Codec::Hev1(hev1) = codec {
+                let mut out = HevcParameterSets::default();
+                for array in &hev1.hvcc.arrays {
+                    match array.nal_unit_type {
+                        32 => out.vps_list.extend(array.nalus.iter().cloned()),
+                        33 => out.sps_list.extend(array.nalus.iter().cloned()),
+                        34 => out.pps_list.extend(array.nalus.iter().cloned()),
+                        _ => {}
+                    }
+                }
+                return Some(out);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1250,5 +1338,77 @@ mod tests {
         assert_eq!(moov.mvhd.timescale, 90_000);
         assert_eq!(moov.trak.len(), 1);
         assert_eq!(moov.trak[0].tkhd.track_id, 1);
+    }
+
+    #[test]
+    fn extract_avc_parameter_sets_round_trips() {
+        let params = VideoInitParams {
+            sps: SPS.to_vec(),
+            pps: PPS.to_vec(),
+            width: 1280,
+            height: 720,
+            timescale: 90_000,
+        };
+        let mut buf = BytesMut::new();
+        write_avc_init_segment(&mut buf, &params).expect("encode");
+
+        let extracted = extract_avc_parameter_sets(&buf).expect("extract");
+        assert_eq!(extracted.sps_list, vec![SPS.to_vec()]);
+        assert_eq!(extracted.pps_list, vec![PPS.to_vec()]);
+    }
+
+    #[test]
+    fn extract_avc_parameter_sets_rejects_empty() {
+        assert!(extract_avc_parameter_sets(&[]).is_none());
+        assert!(extract_avc_parameter_sets(&[0; 8]).is_none());
+    }
+
+    #[test]
+    fn extract_avc_parameter_sets_returns_none_for_hevc_init() {
+        // An HEVC init segment has no AVC sample entry; the AVC
+        // extractor must return None rather than silently pick up
+        // an HEVC avcC lookalike.
+        let params = HevcInitParams {
+            vps: HEVC_VPS_X265.to_vec(),
+            sps: HEVC_SPS_X265_NAL.to_vec(),
+            pps: HEVC_PPS_X265.to_vec(),
+            sps_info: hevc_sps_x265_info(),
+            timescale: 90_000,
+        };
+        let mut buf = BytesMut::new();
+        write_hevc_init_segment(&mut buf, &params).expect("encode");
+        assert!(extract_avc_parameter_sets(&buf).is_none());
+    }
+
+    #[test]
+    fn extract_hevc_parameter_sets_round_trips() {
+        let params = HevcInitParams {
+            vps: HEVC_VPS_X265.to_vec(),
+            sps: HEVC_SPS_X265_NAL.to_vec(),
+            pps: HEVC_PPS_X265.to_vec(),
+            sps_info: hevc_sps_x265_info(),
+            timescale: 90_000,
+        };
+        let mut buf = BytesMut::new();
+        write_hevc_init_segment(&mut buf, &params).expect("encode");
+
+        let extracted = extract_hevc_parameter_sets(&buf).expect("extract");
+        assert_eq!(extracted.vps_list, vec![HEVC_VPS_X265.to_vec()]);
+        assert_eq!(extracted.sps_list, vec![HEVC_SPS_X265_NAL.to_vec()]);
+        assert_eq!(extracted.pps_list, vec![HEVC_PPS_X265.to_vec()]);
+    }
+
+    #[test]
+    fn extract_hevc_parameter_sets_returns_none_for_avc_init() {
+        let params = VideoInitParams {
+            sps: SPS.to_vec(),
+            pps: PPS.to_vec(),
+            width: 1280,
+            height: 720,
+            timescale: 90_000,
+        };
+        let mut buf = BytesMut::new();
+        write_avc_init_segment(&mut buf, &params).expect("encode");
+        assert!(extract_hevc_parameter_sets(&buf).is_none());
     }
 }
