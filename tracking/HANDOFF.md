@@ -1,8 +1,164 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 sessions A-E + F1 + F2a + F2b landed; HLS + DASH + RTSP redirect-to-owner e2e; 691 tests, 24 crates
+## Project Status: v0.4.0 -- Tier 3 cluster plane COMPLETE (A through F2c); auto-claim + all three redirect protocols wired; 694 tests, 24 crates
 
-**Last Updated**: 2026-04-17 (session 78 close -- Tier 3 session F2b).
+**Last Updated**: 2026-04-17 (session 79 close -- Tier 3 session F2c).
+
+## Session 79 close (2026-04-17)
+
+### What shipped (1 commit, +435 / -10 lines)
+
+1. **Tier 3 session F2c: ingest auto-claim on first broadcast**
+   (`3d08a66`). Closes out the cluster plane. Publishers no
+   longer need to call `Cluster::claim_broadcast` manually --
+   the CLI wires a callback on the
+   `FragmentBroadcasterRegistry::on_entry_created` hook that
+   auto-claims every new broadcast and holds the claim for the
+   lifetime of the broadcaster.
+
+   New module `crates/lvqr-cli/src/cluster_claim.rs`:
+   * `install_cluster_claim_bridge(cluster, lease, registry)`.
+   * Dedups per broadcast name (one claim covers both video
+     and audio tracks).
+   * Spawns one drain task per broadcast that holds only a
+     `BroadcasterStream` (session-64 invariant: no strong
+     `Arc<FragmentBroadcaster>`). Drain exits when every
+     ingest publisher disconnects; dropping the `Claim` fires
+     the renewer's oneshot stop channel which tombstones the
+     KV entry so peers see the broadcast freed within one
+     gossip round.
+   * `DEFAULT_CLAIM_LEASE = 10s`, matching the
+     session-71 resolved-questions "lease > 3× renew >
+     gossip" with renew = lease/4 = 2.5s and gossip = 1s.
+   * Module placement rationale: the bridge crosses
+     `lvqr-fragment` (protocol-agnostic broadcaster registry)
+     and `lvqr-cluster` (gossip plane). Neither crate should
+     depend on the other per LBD #5, so the glue lives in
+     `lvqr-cli` where the two wires meet in a real deployment.
+
+   `lvqr-cli::start` wiring: one-line install in the
+   `#[cfg(feature = "cluster")]` block after `shared_registry`
+   exists and before any bridge (archive / HLS / DASH)
+   subscribes. Guarded by `config.cluster_listen.is_some()` so
+   single-node serves pay nothing for the bridge.
+
+   New integration test at
+   `crates/lvqr-cli/tests/cluster_claim_bridge.rs` (3 tests):
+   * `auto_claim_fires_on_first_broadcast` -- two real-UDP
+     clusters; bridge installed on A; a single `get_or_create`
+     on A's registry triggers auto-claim; A sees itself as
+     owner synchronously; B converges via gossip inside 5 s.
+   * `auto_claim_deduplicates_across_tracks` -- two
+     `get_or_create` calls for the same broadcast (video +
+     audio) produce exactly one claim; `list_broadcasts`
+     reports exactly one entry.
+   * `auto_claim_released_when_broadcaster_closes` -- dropping
+     the broadcaster `Arc` and the registry releases the
+     claim; both nodes converge on `None`.
+
+   `tracking/TIER_3_PLAN.md` updated:
+   * Cluster-plane table now reflects the F1 / F2a / F2b / F2c
+     decomposition across sessions 76-79, status column marks
+     every row DONE.
+   * New "Cluster plane is complete" block documents the
+     ffmpeg-subprocess deferral (in-process tests cover the
+     wire path without external-binary flakiness).
+
+### Ground truth (session 79 close)
+
+* **Head**: `3d08a66` on `main`. v0.4.0. **41 commits queued
+  but NOT pushed to origin/main** (sessions 62-79 all
+  unpushed).
+* **Tests**: 694 passed, 0 failed, 1 ignored. Delta from
+  session 78: +3 (the three auto-claim integration tests).
+* **Code**: +435 / -10 net. New files:
+  `cluster_claim.rs` (140 lines),
+  `tests/cluster_claim_bridge.rs` (250 lines).
+* **Workspace**: 24 crates, unchanged.
+* **CI gates locally clean**: fmt, clippy
+  (`--all-targets --benches -D warnings`), test --workspace
+  all green.
+
+### Cluster plane capabilities (end state)
+
+Landed across sessions 71-79:
+
+| Capability | Surface | Landed |
+|---|---|---|
+| Node membership + failure detection | `Cluster::members()` / `.shutdown()` | session 72 |
+| Broadcast ownership KV | `claim_broadcast` / `find_broadcast_owner` / `list_broadcasts` | 73 |
+| Capacity advertisement | `capacity_gauge()` / `NodeCapacity` | 74 |
+| Cluster-wide config LWW | `config_set` / `config_get` / `list_config` | 75 |
+| Read-only admin routes | `/api/v1/cluster/{nodes,broadcasts,config}` | 75 |
+| Per-node endpoints KV | `set_endpoints` / `node_endpoints` / `find_owner_endpoints` | F1 (76) |
+| HLS redirect-to-owner | `lvqr_hls::MultiHlsServer::with_owner_resolver` + CLI wiring | F2a (77) |
+| DASH + RTSP redirect-to-owner | `lvqr_dash::MultiDashServer::with_owner_resolver`, `RtspServer::with_owner_resolver`, CLI wiring | F2b (78) |
+| Ingest auto-claim on first broadcast | `lvqr_cli::cluster_claim::install_cluster_claim_bridge` | F2c (79) |
+
+### Tier 3 progress
+
+| Session | Deliverable | Status |
+|---|---|---|
+| A-B-C-D-E (71-75) | Scaffold, 2-node, ownership, capacity, config + admin | DONE |
+| F1 (76) | Endpoints KV + HLS redirect mechanism | DONE |
+| F2a (77) | lvqr-cli wiring + HLS redirect e2e | DONE |
+| F2b (78) | DASH + RTSP redirect + e2e | DONE |
+| F2c (79) | Ingest auto-claim on first broadcast | DONE |
+| G (80) | lvqr-observability scaffold + OTLP env-var gating | pending |
+| H (81) | OTLP span exporter | pending |
+| I (82) | OTLP metric exporter | pending |
+| J (83) | JSON log + trace_id correlation | pending |
+
+**9 of 13 Tier 3 sessions complete.** Remaining 4 are the
+observability plane (G-J). Cluster plane is done.
+
+### Deferred from Tier 3 F
+
+* **ffmpeg-subprocess full-stack e2e**. In-process
+  integration tests exercise the wire path for every protocol
+  (HLS, DASH, RTSP) and every lifecycle step (claim,
+  advertise, resolve, redirect, auto-claim, release). A
+  subprocess test would validate operational glue (binary
+  path, process lifecycle, external ffmpeg availability) that
+  is mostly environment noise. Revisit if a demo / marketing
+  script needs it.
+
+### Known flakes / risks
+
+* Carried forward: `config_lww_prefers_later_write` (5 ms
+  sleep; session 75) and one-time
+  `rtsp_play_emits_rtcp_sender_report_after_interval` flake
+  (session 73).
+* Reserved UDP gossip port ranges (documented so we do not
+  double-book):
+  * 20001-20006 (`two_nodes.rs`, session 72)
+  * 20101-20106 (`ownership.rs`, session 73)
+  * 20201-20206 (`capacity.rs`, session 74)
+  * 20301-20306 (`config.rs`, session 75)
+  * 20401-20406 (`lvqr-admin cluster_routes` tests, 75)
+  * 20501-20506 (`endpoints.rs`, session 76)
+  * 20801-20806 (`lvqr-cli cluster_redirect.rs`, 77+78)
+  * 20901-20906 (`cluster_claim_bridge.rs`, session 79)
+
+### Session 80 entry point
+
+**Tier 3 session G: `lvqr-observability` scaffold + OTLP env-var gating.**
+
+Deliverable per `tracking/TIER_3_PLAN.md` observability plane:
+1. New `crates/lvqr-observability/` with
+   `ObservabilityConfig::from_env` + stdout fmt layer.
+2. `ObservabilityHandle` that holds the tracer + meter
+   provider guards for the process lifetime.
+3. Wire into `lvqr-cli::main` so `init(ObservabilityConfig::from_env())`
+   fires at the top before any other init runs.
+4. Regression test: existing tests unchanged; start logs
+   still render.
+
+No OTLP wire traffic yet (sessions H-I). This session only
+adds the scaffolding so the OTLP feature-flag gates for
+future sessions compile clean.
+
+Expected scope: ~200-300 lines.
 
 ## Session 78 close (2026-04-17)
 
