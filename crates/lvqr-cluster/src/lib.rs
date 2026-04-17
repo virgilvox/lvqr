@@ -15,7 +15,7 @@
 //! The two crates have no API overlap; neither depends on the
 //! other; a deployed LVQR node may enable neither, either, or both.
 //!
-//! ## Scope as of session 74
+//! ## Scope as of session 75
 //!
 //! * [`Cluster::bootstrap`] spins up a local chitchat gossip node
 //!   on a UDP port.
@@ -26,20 +26,22 @@
 //! * [`Cluster::shutdown`] is an explicit graceful shutdown that
 //!   waits for both the capacity advertiser and the gossip task to
 //!   exit.
-//! * [`Cluster::claim_broadcast`] publishes a `(broadcast → self)`
-//!   lease into chitchat KV and keeps it fresh via a background
-//!   renewer. Dropping the returned [`Claim`] tombstones the key
-//!   (best-effort) so peers see the slot freed within one gossip
-//!   round.
-//! * [`Cluster::find_broadcast_owner`] scans every known node's KV
-//!   state for a non-expired lease on the given broadcast.
+//! * [`Cluster::claim_broadcast`], [`Cluster::find_broadcast_owner`],
+//!   and [`Cluster::list_broadcasts`] manage the per-broadcast
+//!   ownership KV. Dropping the returned [`Claim`] tombstones the
+//!   key (best-effort) so peers see the slot freed within one
+//!   gossip round.
 //! * [`Cluster::capacity_gauge`] exposes a shared handle to this
 //!   node's advertised capacity. Samplers update the gauge; the
 //!   advertiser task publishes snapshots every
 //!   `capacity_advertise_interval`.
+//! * [`Cluster::config_set`], [`Cluster::config_get`], and
+//!   [`Cluster::list_config`] implement the cluster-wide config
+//!   channel. Writes are timestamped on the setter's self node;
+//!   cross-node conflicts resolve by LWW on the timestamp.
 //!
-//! Cluster-wide config gossip and the `/admin/cluster/*` HTTP
-//! surface land in sessions 75-76.
+//! Wiring through `lvqr-cli serve` + the RTSP/HLS/DASH redirect
+//! fall-back path lands in session 76.
 //!
 //! ## Load-bearing invariants preserved
 //!
@@ -53,6 +55,7 @@
 
 mod broadcast;
 mod capacity;
+mod config;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -68,8 +71,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-pub use broadcast::{BROADCAST_KEY_PREFIX, Claim, MIN_LEASE};
+pub use broadcast::{BROADCAST_KEY_PREFIX, BroadcastSummary, Claim, MIN_LEASE};
 pub use capacity::{CAPACITY_KEY, CapacityGauge, NodeCapacity};
+pub use config::{CONFIG_KEY_PREFIX, ConfigEntry};
 
 /// Default UDP port for the chitchat gossip transport. Matches the
 /// upstream chitchat example's convention. No LVQR listener today
@@ -109,7 +113,8 @@ pub const DEFAULT_CAPACITY_ADVERTISE_INTERVAL: Duration = Duration::from_secs(5)
 /// name with a node name -- both are string-shaped in the wild.
 /// Stored unchanged on the chitchat wire; chitchat imposes no
 /// character constraint beyond UTF-8.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct NodeId(pub String);
 
 impl NodeId {
@@ -517,6 +522,36 @@ impl Cluster {
     /// garbage-collects the node state.
     pub async fn find_broadcast_owner(&self, name: &str) -> Option<NodeId> {
         broadcast::find_owner(self.handle(), name).await
+    }
+
+    /// Snapshot every broadcast any node in the cluster is
+    /// currently claiming, filtered to non-expired leases. Used by
+    /// the `/admin/cluster/broadcasts` endpoint.
+    pub async fn list_broadcasts(&self) -> Vec<BroadcastSummary> {
+        broadcast::list_owners(self.handle()).await
+    }
+
+    /// Set a cluster-wide config key. Writes a timestamped entry
+    /// onto the self node's state; gossip carries the entry to
+    /// every peer. Cross-node conflicts resolve by LWW on the
+    /// timestamp.
+    pub async fn config_set(&self, key: &str, value: &str) -> Result<()> {
+        config::set(self.handle(), key, value).await
+    }
+
+    /// Read the current cluster-wide value for `key`, resolving
+    /// conflicts across nodes by picking the most recently written
+    /// entry (highest `ts_ms`). Returns `None` if no node has ever
+    /// set the key.
+    pub async fn config_get(&self, key: &str) -> Option<String> {
+        config::get(self.handle(), key).await
+    }
+
+    /// Enumerate every cluster-wide config key any node has ever
+    /// set, reduced to the LWW winner per key. Used by the
+    /// `/admin/cluster/config` endpoint.
+    pub async fn list_config(&self) -> Vec<ConfigEntry> {
+        config::list(self.handle()).await
     }
 }
 

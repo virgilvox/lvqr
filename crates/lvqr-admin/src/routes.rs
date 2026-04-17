@@ -39,6 +39,12 @@ pub struct AdminState {
     get_mesh: Arc<dyn Fn() -> MeshState + Send + Sync>,
     auth: SharedAuth,
     metrics_render: Option<MetricsRender>,
+    /// Optional cluster handle. Populated by [`AdminState::with_cluster`];
+    /// consumed by the `/api/v1/cluster/*` routes defined in
+    /// [`crate::cluster_routes`]. Feature-gated so callers that do
+    /// not run clustering pay no cost for the dep.
+    #[cfg(feature = "cluster")]
+    cluster: Option<Arc<lvqr_cluster::Cluster>>,
 }
 
 impl AdminState {
@@ -56,6 +62,8 @@ impl AdminState {
             }),
             auth: Arc::new(NoopAuthProvider),
             metrics_render: None,
+            #[cfg(feature = "cluster")]
+            cluster: None,
         }
     }
 
@@ -75,6 +83,22 @@ impl AdminState {
     pub fn with_metrics(mut self, render: MetricsRender) -> Self {
         self.metrics_render = Some(render);
         self
+    }
+
+    /// Wire an `Arc<Cluster>` so the `/api/v1/cluster/*` routes can
+    /// answer against it. Without this call, the cluster routes
+    /// return 503.
+    #[cfg(feature = "cluster")]
+    pub fn with_cluster(mut self, cluster: Arc<lvqr_cluster::Cluster>) -> Self {
+        self.cluster = Some(cluster);
+        self
+    }
+
+    /// Borrow the configured cluster handle, if any. Used by the
+    /// `cluster_routes` module.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn cluster(&self) -> Option<&Arc<lvqr_cluster::Cluster>> {
+        self.cluster.as_ref()
     }
 }
 
@@ -100,11 +124,17 @@ impl IntoResponse for AdminError {
 /// Build the admin API router.
 pub fn build_router(state: AdminState) -> Router {
     let auth = state.auth.clone();
-    let api_routes = Router::new()
+    let mut api_routes: Router<AdminState> = Router::new()
         .route("/api/v1/stats", get(get_stats))
         .route("/api/v1/streams", get(list_streams))
-        .route("/api/v1/mesh", get(get_mesh))
-        .layer(middleware::from_fn_with_state(auth, auth_middleware));
+        .route("/api/v1/mesh", get(get_mesh));
+
+    #[cfg(feature = "cluster")]
+    {
+        api_routes = api_routes.merge(crate::cluster_routes::cluster_router());
+    }
+
+    let api_routes = api_routes.layer(middleware::from_fn_with_state(auth, auth_middleware));
 
     Router::new()
         .route("/healthz", get(healthz))

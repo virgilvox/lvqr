@@ -13,6 +13,7 @@ categories = ["multimedia", "network-programming"]
 [dependencies]
 lvqr-core = { workspace = true }
 lvqr-auth = { workspace = true }
+lvqr-cluster = { workspace = true, optional = true }
 
 axum = { workspace = true }
 tower = { workspace = true }
@@ -24,6 +25,17 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 metrics = { workspace = true }
 
+[features]
+default = ["cluster"]
+# Enables the read-only `/api/v1/cluster/{nodes,broadcasts,config}`
+# admin routes. Requires the caller to supply an `Arc<Cluster>` via
+# `AdminState::with_cluster`. Default-on so a full LVQR build picks
+# up the endpoints without extra configuration; deployments that do
+# not cluster-enable LVQR can drop the dep with
+# `--no-default-features`.
+cluster = ["dep:lvqr-cluster"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json = { workspace = true }
+chitchat = { workspace = true }

@@ -1,5 +1,8 @@
 pub mod routes;
 
+#[cfg(feature = "cluster")]
+pub mod cluster_routes;
+
 pub use routes::{AdminError, AdminState, MeshState, MetricsRender, StreamInfo, build_router};
 
 /// Configuration for the admin HTTP server.

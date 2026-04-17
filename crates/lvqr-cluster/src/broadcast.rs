@@ -315,6 +315,66 @@ pub(crate) async fn find_owner(handle: &ChitchatHandle, name: &str) -> Option<No
         .await
 }
 
+/// One broadcast's current owner, as returned by
+/// [`Cluster::list_broadcasts`](crate::Cluster::list_broadcasts).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BroadcastSummary {
+    /// Broadcast name without the `broadcast.` prefix.
+    pub name: String,
+    /// Current owner per LWW tiebreak across the cluster.
+    pub owner: NodeId,
+    /// Unix milliseconds at which the winning lease expires if not
+    /// renewed. Admin tooling uses this for staleness hints.
+    pub expires_at_ms: u64,
+}
+
+/// Enumerate every broadcast any node is currently claiming,
+/// filtered to non-expired leases and reduced to the LWW winner
+/// per name. Sorted by name for stable admin output.
+pub(crate) async fn list_owners(handle: &ChitchatHandle) -> Vec<BroadcastSummary> {
+    let now_ms = now_unix_ms();
+    handle
+        .with_chitchat(|c| {
+            let mut winners: std::collections::BTreeMap<String, Lease> = Default::default();
+            for state in c.node_states().values() {
+                for (raw_key, raw_value) in state.iter_prefix(BROADCAST_KEY_PREFIX) {
+                    let Some(name) = raw_key.strip_prefix(BROADCAST_KEY_PREFIX) else {
+                        continue;
+                    };
+                    let Some(lease) = Lease::decode(&raw_value.value) else {
+                        warn!(full_key = %raw_key, "broadcast KV entry failed to decode; skipping");
+                        continue;
+                    };
+                    if lease.expires_at_ms <= now_ms {
+                        continue;
+                    }
+                    let name = name.to_string();
+                    match winners.get(&name) {
+                        None => {
+                            winners.insert(name, lease);
+                        }
+                        Some(current) => {
+                            if lease.expires_at_ms > current.expires_at_ms
+                                || (lease.expires_at_ms == current.expires_at_ms && lease.owner > current.owner)
+                            {
+                                winners.insert(name, lease);
+                            }
+                        }
+                    }
+                }
+            }
+            winners
+                .into_iter()
+                .map(|(name, lease)| BroadcastSummary {
+                    name,
+                    owner: NodeId::new(lease.owner),
+                    expires_at_ms: lease.expires_at_ms,
+                })
+                .collect()
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
