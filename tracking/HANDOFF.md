@@ -1,8 +1,156 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- RTSP PLAY egress complete for 4 codecs + RTCP SR + `lvqr-soak` harness; 616 tests, 24 crates
+## Project Status: v0.4.0 -- RTSP PLAY + RTCP SR + `lvqr-soak` covering every codec; 619 tests, 24 crates
 
-**Last Updated**: 2026-04-17 (session 65 close).
+**Last Updated**: 2026-04-17 (session 66 close).
+
+## Session 66 close (2026-04-17)
+
+### What shipped (1 commit, +321 / -70 lines, net +251)
+
+1. **`lvqr-soak` extended to HEVC / AAC / Opus** (`4f8adeb`).
+   Session 65 landed an H.264-only soak; this session generalizes
+   the harness so every PLAY drain gets the same loopback soak
+   coverage. Long-running verification of HEVC / AAC / Opus is
+   no longer a manual ad-hoc integration run.
+
+   Surface changes:
+   * New `pub enum Codec { H264, Hevc, Aac, Opus }` derived
+     `clap::ValueEnum`, with helpers `track_key`,
+     `setup_control`, `interleaved`, `timescale`, `track_id`,
+     `meta_codec`. One-line-per-codec routing encodes the
+     convention every other crate already follows (0.mp4
+     video / track1 / 0-1, 1.mp4 audio / track2 / 2-3).
+   * `SoakConfig` gains a `codec: Codec` field (default H264).
+   * CLI gains `--codec <h264|hevc|aac|opus>`.
+
+   Publisher refactor:
+   * `setup_broadcaster` dispatches to
+     `write_{avc,hevc,aac,opus}_init_segment` based on
+     `config.codec`. HEVC init uses the x265 Main 6.0 L60
+     fixture already in `play_integration.rs`; AAC uses a
+     44.1 kHz stereo ASC; Opus uses stereo / 48 kHz /
+     `pre_skip=312`.
+   * `publisher_task` takes `codec`. DTS step derives from
+     `codec.timescale() / fragment_hz` so audio and video
+     emit timestamps in their native clock.
+   * New `make_synthetic_fragment` produces the right body per
+     codec: AVCC-wrapped NAL (H.264 0x65, HEVC 0x26,0x01
+     IDR_W_RADL) for video; raw AU bytes for AAC; raw Opus
+     frame bytes.
+
+   Subscriber refactor:
+   * `subscriber_task` + `subscribe_and_read` take `codec`.
+   * SETUP URI is `{base_uri}/{control}`; interleaved pair is
+     codec-derived. DESCRIBE / PLAY / frame-count loop stay
+     codec-agnostic.
+
+   Smoke tests (`tests/smoke.rs`):
+   * One 2 s / 2 subscribers / 30 Hz traffic-flow test per
+     codec (`H264`, `Hevc`, `Aac`, `Opus`), refactored behind
+     a shared `assert_traffic_flows(config)` helper.
+   * Threshold-failure test retained.
+
+   Hand-verified each codec with a 3 s / 2 subscriber run:
+   * **H.264**: 91 fragments, 91 RTP per sub, `passed=yes`.
+   * **HEVC**: 91 fragments, 92 RTP per sub (VPS + SPS + PPS
+     re-injection accounts for the extra packet), `passed=yes`.
+   * **AAC**: 91 fragments, 90 RTP per sub, `passed=yes`.
+   * **Opus**: 91 fragments, 89 RTP per sub, `passed=yes`.
+
+### Ground truth (session 66 close)
+
+* **Head**: `4f8adeb` on `main`. v0.4.0. **17 commits queued
+  but NOT pushed to origin/main** (sessions 62-66 all unpushed).
+* **Tests**: 619 passed, 0 failed, 1 ignored. Delta from
+  session 65: +3 (three new per-codec soak smokes).
+* **Code**: +321 / -70 within `crates/lvqr-soak/`.
+* **CI gates locally clean**: fmt, clippy (`-D warnings`),
+  test --workspace all green.
+
+### Soak harness coverage
+
+| Piece                                             | Status |
+|---------------------------------------------------|--------|
+| H.264 PLAY soak                                   | DONE   |
+| HEVC PLAY soak                                    | DONE   |
+| AAC PLAY soak                                     | DONE   |
+| Opus PLAY soak                                    | DONE   |
+| RTP + RTCP counts per subscriber                  | DONE (session 65) |
+| Resource samples (RSS + FD, Linux)                | DONE (session 65) |
+| Pass/fail thresholds (CLI-tunable)                | DONE (session 65) |
+| Per-codec 2 s smoke tests in workspace CI         | DONE   |
+| Actual 24 h nightly run                           | infra, deferred |
+| CPU sampling                                      | deferred |
+| Multi-host jitter / latency harness               | deferred |
+
+### Load-bearing invariants (all still pinned)
+
+Unchanged from session 60. The session-66 refactor is contained
+to `lvqr-soak` and consumes only the public surface
+(`write_*_init_segment`, `FragmentBroadcasterRegistry`,
+`RtspServer::with_registry`, `Fragment::new`, `build_moof_mdat`);
+nothing invariant-adjacent moved.
+
+### Protocols supported
+
+Unchanged from session 64. 11 protocols. Feature-complete for
+every codec.
+
+### Known gaps
+
+1. **mediastreamvalidator binary on CI runner**: still the
+   biggest audit gap (unchanged from session 64). Requires a
+   self-hosted macOS runner or a pre-baked custom image with
+   Apple HTTP Live Streaming Tools. User-bound.
+2. **Actual 24 h nightly soak run**: harness exists for every
+   codec now, but no CI job runs it nightly yet.
+3. **MediaMTX comparison harness**: not started. Would sit
+   next to `lvqr-soak` in a new `crates/lvqr-compare`, spawn
+   MediaMTX, publish an identical synthetic stream to both,
+   and diff subscriber-side fragment counts / sequence wraps.
+4. **CPU sampling in soak harness**: deferred from session 65.
+5. **Tier 3**: cluster (chitchat) + observability (OTLP) not
+   started.
+
+### Session 67 entry point
+
+Priority order:
+
+1. **mediastreamvalidator self-hosted runner** (unchanged).
+   Infra; user-bound.
+
+2. **MediaMTX comparison harness**. Sibling to `lvqr-soak`: a
+   new `crates/lvqr-compare/` that spawns MediaMTX (via its
+   published docker image or the `mediamtx` binary on PATH),
+   publishes an identical synthetic stream to both servers,
+   and diffs subscriber-side fragment counts / RTP sequence
+   wraps / latency histograms. Gives the roadmap claims a real
+   head-to-head number.
+
+3. **CPU sampling in soak harness**. Add a tokio-worker CPU %
+   sample to `MetricsSample` via `sysinfo` (new dep). Small
+   scope; probably under 100 lines.
+
+4. **Tier 3 planning**. Cluster (chitchat) + observability
+   (OTLP). Still "do not start mid-session" without a planning
+   document first.
+
+5. **Carry-over tech debt**: `lvqr-wasm` scaffold deletion,
+   `TrackId` newtype over stringly-typed `"0.mp4"` /
+   `"1.mp4"`, CORS restrictive default, first criterion
+   benches.
+
+### Velocity note
+
+Session 66 landed one self-contained extension commit (~321
+lines net). Observed pace stays ~10-15 sessions per calendar
+week at ~1-3 commits. Tier 1 soak coverage is now
+feature-complete for every codec LVQR ships. Realistic M4
+("LiveKit alternative for new projects") ETA remains 3-5
+calendar weeks of sustained sessions, bounded chiefly by
+user-controlled items (mediastreamvalidator runner, multi-node
+cluster debugging, 24 h nightly CI slot).
 
 ## Session 65 close (2026-04-17)
 
