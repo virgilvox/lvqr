@@ -1,8 +1,146 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- RTP packetizers landed for PLAY direction; 544 tests, all green
+## Project Status: v0.4.0 -- RTSP PLAY egress end-to-end (H.264 video); 575 tests, all green
 
-**Last Updated**: 2026-04-16 (session 61 close).
+**Last Updated**: 2026-04-16 (session 62 close).
+
+## Session 62 close (2026-04-16)
+
+### What shipped (6 commits, +1770 / -37 lines, net +1733)
+
+1. **Test doc cleanup** (`344fce6`). Audit pass caught stale
+   references to the deleted `HlsFragmentBridge` /
+   `DashFragmentBridge` in the cli integration-test module
+   comments. Refreshed to describe the broadcaster-native
+   pipeline session 60 landed.
+
+2. **fMP4 demux helpers** (`0369120`). New
+   `lvqr_rtsp::fmp4` module with `extract_mdat_body` and
+   `split_avcc_nalus`. 15 tests including round-trips against
+   the live output of `lvqr_cmaf::build_moof_mdat`.
+
+3. **Init-segment parameter-set extractors** (`5f7e01f`).
+   `lvqr_cmaf::{AvcParameterSets, HevcParameterSets,
+   extract_avc_parameter_sets, extract_hevc_parameter_sets}`.
+   Reuses the existing `mp4-atom` decode path so `lvqr-rtsp`
+   consumes the ergonomic `Vec<Vec<u8>>` interface without
+   pulling `mp4-atom` into its own dep tree. 5 tests: AVC +
+   HEVC round-trip, cross-codec None, empty-input None.
+
+4. **DESCRIBE SDP from broadcaster meta** (`7bb83f2`). New
+   `lvqr_rtsp::sdp` module with `PlaySdp` + `H264TrackDescription`
+   and a `render()` that emits RFC 6184-compliant SDP with
+   `profile-level-id`, `packetization-mode=1`,
+   `sprop-parameter-sets`. `handle_describe` now reads the init
+   bytes off the shared registry and renders a real video `m=`
+   block when the broadcaster exists; a DESCRIBE before any
+   publisher returns a session-only SDP (no `m=` line) rather
+   than a 404. 7 SDP tests + 2 updated server tests.
+
+5. **PLAY drain wiring** (`308de54`). New `lvqr_rtsp::play`
+   module with `play_drain_h264` composing session-61 RTP
+   packetizers with session-62 mdat + param-set extractors. The
+   drain subscribes to the broadcaster, re-injects SPS + PPS as
+   single-NAL RTP packets before the first IDR, then loops:
+   extract mdat -> split AVCC -> packetize (marker on the last
+   NAL of each access unit) -> wrap in interleaved frame ->
+   send via writer channel. `handle_connection` refactored to an
+   mpsc-driven write model so responses and drain frames both
+   flow through a single writer with natural TCP back-pressure.
+   `handle_play` spawns the drain with the session's negotiated
+   interleaved channel. Drain terminates on per-connection
+   cancel, broadcaster close, or writer-channel close. Holds
+   only a `BroadcasterStream` receiver -- no strong
+   `Arc<FragmentBroadcaster>`, matching the invariant the
+   archive / HLS / DASH drains already document.
+
+6. **End-to-end PLAY integration test** (`4f63186`). Real TCP
+   client drives an `RtspServer` backed by a shared registry
+   through OPTIONS -> DESCRIBE -> SETUP -> PLAY, then emits
+   one IDR fragment through the broadcaster and verifies:
+   SDP carries H.264 `m=` block with `sprop-parameter-sets`,
+   SETUP accepts `interleaved=0-1`, PLAY spawns the drain,
+   two RTP packets carry the re-injected SPS + PPS on
+   channel 0, the IDR packet depacks through
+   `H264Depacketizer` with keyframe=true and byte-identical
+   NAL bytes.
+
+### Ground truth (session 62 close)
+
+* **Head**: `4f63186` on `main` (unpushed; sessions 60-61
+  pushed earlier in the cycle). v0.4.0.
+* **Tests**: 575 passed, 0 failed, 1 ignored. Delta from
+  session 61: +31 (15 fmp4 + 5 cmaf extractors + 7 SDP +
+  2 play module + 2 server describe + -1 net server test
+  rename + 1 integration).
+* **Code**: +1770 / -37 net lines across the 6 commits.
+* **CI gates locally clean**: fmt, clippy (`-D warnings`),
+  test --workspace all green.
+
+### RTSP PLAY status (session 62 end)
+
+| Piece                                             | Status |
+|---------------------------------------------------|--------|
+| RTP packetizers (H.264 / HEVC / AAC)              | DONE   |
+| fMP4 mdat extractor + AVCC NAL splitter           | DONE   |
+| SPS/PPS/VPS extraction from init                  | DONE   |
+| DESCRIBE SDP from broadcaster meta (H.264)        | DONE   |
+| PLAY drain: subscribe + packetize + interleaved   | DONE   |
+| Parameter-set re-injection before first IDR       | DONE   |
+| TEARDOWN cancel propagation to drain              | DONE   |
+| End-to-end integration test (real TCP client)     | DONE   |
+| HEVC PLAY drain + SDP                             | pending |
+| Audio (AAC / Opus) PLAY drain + SDP               | pending |
+| RTCP SR generation                                | pending |
+
+First-pass PLAY is done for H.264 video. HEVC + audio layer
+on top of the same `play_drain_h264` skeleton once they're
+prioritized.
+
+### Load-bearing invariants (all four still pinned)
+
+Unchanged from session 60. The session-62 `play_drain_h264` is
+built with the same invariant as every prior drain: it owns
+only a `BroadcasterStream` receiver, never a strong
+`Arc<FragmentBroadcaster>`. Documented in `play.rs` source
+comment so a future refactor does not regress.
+
+### Protocols supported
+
+Now 11 protocols: RTMP + WHIP + SRT + RTSP ingest;
+LL-HLS + DASH + WHEP + MoQ + WebSocket + **RTSP PLAY (H.264)**
+egress.
+
+### Known gaps
+
+1. **HEVC + audio PLAY**: first-pass is H.264 video only.
+2. **RTCP**: no SR / RR generation on the PLAY direction.
+   Most clients tolerate absence for short sessions.
+3. **Apple mediastreamvalidator in CI**: biggest audit gap.
+4. **Tier 1 infra**: no playwright, no 24h soak, no MediaMTX
+   comparison harness.
+5. **Tiers 3-5**: not started.
+
+### Session 63 entry point
+
+Priority order:
+
+1. **Apple mediastreamvalidator in CI**. GitHub Actions job
+   that runs Apple's validator against `lvqr-hls`-generated
+   playlists and blocks merges on validator-red.
+
+2. **HEVC + audio PLAY drain**. Extend `play_drain_h264` into a
+   codec-aware drain (or sibling `play_drain_hevc` /
+   `play_drain_aac`) using the HEVC + AAC packetizers session
+   61 already landed. DESCRIBE needs to emit matching SDP
+   blocks (hvcC -> `sprop-vps/sps/pps`; esds -> `config`).
+
+3. **lvqr-cmaf with mp4-atom**. Swap the hand-rolled fMP4
+   writer for mp4-atom once AV1 + timed text becomes load-
+   bearing.
+
+4. **Tier 3 planning**. Cluster (chitchat) + observability
+   (OTLP).
 
 ## Session 61 close (2026-04-16)
 
