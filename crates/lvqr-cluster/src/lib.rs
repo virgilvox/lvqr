@@ -15,7 +15,7 @@
 //! The two crates have no API overlap; neither depends on the
 //! other; a deployed LVQR node may enable neither, either, or both.
 //!
-//! ## Scope this session
+//! ## Scope as of session 73
 //!
 //! * [`Cluster::bootstrap`] spins up a local chitchat gossip node
 //!   on a UDP port.
@@ -24,11 +24,16 @@
 //!   peer chitchat reports.
 //! * [`Cluster::shutdown`] is an explicit graceful shutdown that
 //!   waits for the background gossip task to exit.
+//! * [`Cluster::claim_broadcast`] publishes a `(broadcast → self)`
+//!   lease into chitchat KV and keeps it fresh via a background
+//!   renewer. Dropping the returned [`Claim`] tombstones the key
+//!   (best-effort) so peers see the slot freed within one gossip
+//!   round.
+//! * [`Cluster::find_broadcast_owner`] scans every known node's KV
+//!   state for a non-expired lease on the given broadcast.
 //!
-//! Broadcast ownership (claims + leases), capacity advertisement,
-//! cluster-wide config gossip, and the admin HTTP surface all land
-//! in sessions 72-76. This session's smoke test asserts only that a
-//! single node boots, reports itself, and shuts down cleanly.
+//! Capacity advertisement, cluster-wide config gossip, and the
+//! `/admin/cluster/*` HTTP surface land in sessions 74-76.
 //!
 //! ## Load-bearing invariants preserved
 //!
@@ -39,6 +44,8 @@
 //! * **LBD #3 (control vs hot path)**: every API here is an
 //!   `async` control-plane operation. No method sits on a per-
 //!   fragment hot path.
+
+mod broadcast;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -51,6 +58,8 @@ use chitchat::{
 use rand::Rng;
 use rand::distributions::Alphanumeric;
 use tracing::{debug, info};
+
+pub use broadcast::{BROADCAST_KEY_PREFIX, Claim, MIN_LEASE};
 
 /// Default UDP port for the chitchat gossip transport. Matches the
 /// upstream chitchat example's convention. No LVQR listener today
@@ -388,6 +397,32 @@ impl Cluster {
     pub async fn shutdown(self) -> Result<()> {
         debug!(node = %self.self_node.id, "cluster shutdown requested");
         self.handle.shutdown().await.context("chitchat shutdown")
+    }
+
+    /// Claim ownership of `name` for the duration of `lease`. The
+    /// returned [`Claim`] renews the lease every `lease / 4` in the
+    /// background; drop it to release (best-effort tombstone write
+    /// + natural lease expiry).
+    ///
+    /// Chitchat is eventually consistent: two nodes that race on the
+    /// same name during a partition both succeed here, and readers
+    /// break the tie deterministically by picking the latest-expiry
+    /// entry. Callers that need stronger semantics should layer a
+    /// reconciliation pass on top of this API (a Tier 4 item).
+    pub async fn claim_broadcast(&self, name: &str, lease: Duration) -> Result<Claim> {
+        broadcast::claim(&self.handle, &self.self_node.id, name, lease).await
+    }
+
+    /// Look up the current non-expired owner of `name` by scanning
+    /// every known node's KV state. Returns `None` if no live lease
+    /// exists anywhere in the cluster.
+    ///
+    /// Entries whose `expires_at_ms` is in the past are filtered
+    /// out: a crashed owner's stale lease will not produce a false
+    /// positive once the deadline passes, even before chitchat
+    /// garbage-collects the node state.
+    pub async fn find_broadcast_owner(&self, name: &str) -> Option<NodeId> {
+        broadcast::find_owner(&self.handle, name).await
     }
 }
 
