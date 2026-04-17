@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use lvqr_soak::{SoakConfig, run_soak};
+use lvqr_soak::{Codec, SoakConfig, run_soak};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone, Parser)]
@@ -46,6 +46,10 @@ struct Cli {
     /// Broadcast identifier.
     #[arg(long, default_value = "live/soak")]
     broadcast: String,
+
+    /// Codec the synthetic publisher emits.
+    #[arg(long, value_enum, default_value_t = Codec::H264)]
+    codec: Codec,
 }
 
 fn init_tracing() {
@@ -66,6 +70,7 @@ async fn main() -> Result<ExitCode> {
         rtcp_packets_per_subscriber_min: cli.min_rtcp_per_subscriber,
         metrics_interval: Duration::from_secs(cli.metrics_interval_secs),
         broadcast: cli.broadcast,
+        codec: cli.codec,
         video_width: 1280,
         video_height: 720,
     };

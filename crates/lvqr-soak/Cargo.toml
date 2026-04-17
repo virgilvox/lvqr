@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 lvqr-core = { workspace = true }
 lvqr-cmaf = { workspace = true }
+lvqr-codec = { workspace = true }
 lvqr-fragment = { workspace = true }
 lvqr-rtsp = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "process"] }

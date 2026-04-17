@@ -1988,6 +1988,7 @@ dependencies = [
  "bytes",
  "clap",
  "lvqr-cmaf",
+ "lvqr-codec",
  "lvqr-core",
  "lvqr-fragment",
  "lvqr-rtsp",

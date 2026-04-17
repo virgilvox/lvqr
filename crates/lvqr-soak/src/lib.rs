@@ -41,7 +41,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::{Bytes, BytesMut};
-use lvqr_cmaf::{RawSample, VideoInitParams, build_moof_mdat, write_avc_init_segment};
+use lvqr_cmaf::{
+    AudioInitParams, HevcInitParams, OpusInitParams, RawSample, VideoInitParams, build_moof_mdat,
+    write_aac_init_segment, write_avc_init_segment, write_hevc_init_segment, write_opus_init_segment,
+};
+use lvqr_codec::hevc::HevcSps;
 use lvqr_core::EventBus;
 use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta};
 use lvqr_rtsp::RtspServer;
@@ -50,6 +54,86 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+/// Which codec the synthetic publisher emits and the PLAY
+/// subscribers negotiate.
+///
+/// Every codec shares the same soak plumbing (publisher + N
+/// subscribers + RTP/RTCP counters); what differs is the init
+/// segment shape, the fragment body, the broadcaster track key,
+/// and the RTSP control URI + interleaved channel pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Codec {
+    /// H.264 video on `0.mp4` / track1 / channels 0-1.
+    H264,
+    /// HEVC video on `0.mp4` / track1 / channels 0-1.
+    Hevc,
+    /// AAC-LC audio on `1.mp4` / track2 / channels 2-3.
+    Aac,
+    /// Opus audio on `1.mp4` / track2 / channels 2-3.
+    Opus,
+}
+
+impl Codec {
+    /// Broadcaster track key the publisher emits to and the drain
+    /// subscribes on. Matches the convention used everywhere else
+    /// in LVQR: `0.mp4` for video, `1.mp4` for audio.
+    pub fn track_key(self) -> &'static str {
+        match self {
+            Self::H264 | Self::Hevc => "0.mp4",
+            Self::Aac | Self::Opus => "1.mp4",
+        }
+    }
+
+    /// RTSP control URI suffix the subscriber SETUPs against. The
+    /// DESCRIBE-rendered SDP carries these `a=control:` lines for
+    /// the matching media block.
+    pub fn setup_control(self) -> &'static str {
+        match self {
+            Self::H264 | Self::Hevc => "track1",
+            Self::Aac | Self::Opus => "track2",
+        }
+    }
+
+    /// Interleaved RTP / RTCP channel pair. RFC 2326 convention is
+    /// RTP on an even channel and RTCP on the immediately-following
+    /// odd channel.
+    pub fn interleaved(self) -> (u8, u8) {
+        match self {
+            Self::H264 | Self::Hevc => (0, 1),
+            Self::Aac | Self::Opus => (2, 3),
+        }
+    }
+
+    /// Media timescale in Hz. RTP timestamps and the fMP4 `mdhd`
+    /// field both tick at this rate.
+    pub fn timescale(self) -> u32 {
+        match self {
+            Self::H264 | Self::Hevc => 90_000,
+            Self::Aac => 44_100,
+            Self::Opus => 48_000,
+        }
+    }
+
+    /// `RawSample::track_id` the publisher stamps on samples.
+    pub fn track_id(self) -> u32 {
+        match self {
+            Self::H264 | Self::Hevc => 1,
+            Self::Aac | Self::Opus => 2,
+        }
+    }
+
+    /// Codec string stamped on [`FragmentMeta::new`] and surfaced
+    /// in the broadcaster metadata.
+    pub fn meta_codec(self) -> &'static str {
+        match self {
+            Self::H264 => "avc1",
+            Self::Hevc => "hev1",
+            Self::Aac => "mp4a.40.2",
+            Self::Opus => "opus",
+        }
+    }
+}
 
 /// Soak configuration. Populate with [`SoakConfig::default`] and
 /// override the fields you care about; defaults target a 60-second
@@ -77,10 +161,15 @@ pub struct SoakConfig {
     pub metrics_interval: Duration,
     /// Broadcast identifier the synthetic publisher writes to.
     pub broadcast: String,
-    /// Video init segment width reported in the AVC init. Cosmetic;
-    /// the soak harness does not decode the stream.
+    /// Codec the synthetic publisher emits. Every codec shares the
+    /// soak scaffold but swaps the init segment writer, the
+    /// fragment body shape, and the RTSP transport pair.
+    pub codec: Codec,
+    /// Video init segment width reported in the AVC / HEVC init.
+    /// Ignored for audio codecs.
     pub video_width: u16,
-    /// Video init segment height reported in the AVC init.
+    /// Video init segment height reported in the AVC / HEVC init.
+    /// Ignored for audio codecs.
     pub video_height: u16,
 }
 
@@ -94,6 +183,7 @@ impl Default for SoakConfig {
             rtcp_packets_per_subscriber_min: None,
             metrics_interval: Duration::from_secs(5),
             broadcast: "live/soak".to_string(),
+            codec: Codec::H264,
             video_width: 1280,
             video_height: 720,
         }
@@ -202,25 +292,106 @@ impl SoakReport {
 
 // ---- internal helpers ----
 
-const INITIAL_SPS: &[u8] = &[0x67, 0x42, 0x00, 0x1F, 0xD9, 0x40, 0x50, 0x04, 0xFB, 0x01, 0x10, 0x00];
-const INITIAL_PPS: &[u8] = &[0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0];
+// AVC parameter-set NALs from the lvqr-cmaf x264 corpus. A valid
+// SPS + PPS pair is required so DESCRIBE's SDP renders a complete
+// H.264 fmtp line.
+const AVC_SPS: &[u8] = &[0x67, 0x42, 0x00, 0x1F, 0xD9, 0x40, 0x50, 0x04, 0xFB, 0x01, 0x10, 0x00];
+const AVC_PPS: &[u8] = &[0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0];
 
-/// Build and register an AVC init segment on the broadcaster. Returns
-/// the `FragmentBroadcaster` handle for use by the publisher task.
-fn setup_broadcaster(registry: &FragmentBroadcasterRegistry, broadcast: &str, width: u16, height: u16) -> Result<()> {
+// HEVC parameter sets from the lvqr-cmaf x265 corpus (320x240
+// Main 6.0 Level L60). Same bytes the play_integration.rs test
+// uses; keeping a local copy avoids pulling a test-utils dep
+// into the soak crate.
+const HEVC_VPS: &[u8] = &[
+    0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+    0x00, 0x3c, 0x95, 0x94, 0x09,
+];
+const HEVC_SPS: &[u8] = &[
+    0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0,
+    0x0a, 0x08, 0x0f, 0x16, 0x59, 0x59, 0x52, 0x93, 0x0b, 0xc0, 0x5a, 0x02, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00,
+    0x03, 0x00, 0x3c, 0x10,
+];
+const HEVC_PPS: &[u8] = &[0x44, 0x01, 0xc0, 0x73, 0xc1, 0x89];
+
+// 2-byte AAC-LC AudioSpecificConfig for 44.1 kHz stereo.
+const AAC_ASC_44100_STEREO: &[u8] = &[0x12, 0x10];
+
+fn hevc_sps_info() -> HevcSps {
+    HevcSps {
+        general_profile_space: 0,
+        general_tier_flag: false,
+        general_profile_idc: 1,
+        general_profile_compatibility_flags: 0x60000000,
+        general_level_idc: 60,
+        chroma_format_idc: 1,
+        pic_width_in_luma_samples: 320,
+        pic_height_in_luma_samples: 240,
+    }
+}
+
+/// Build and register the correct init segment on the registry
+/// for the configured codec. The broadcaster metadata carries the
+/// codec-appropriate track key + fourcc + timescale so the RTSP
+/// server's DESCRIBE handler can synthesize a valid SDP even
+/// before the first fragment lands.
+fn setup_broadcaster(registry: &FragmentBroadcasterRegistry, config: &SoakConfig) -> Result<()> {
+    let codec = config.codec;
     let mut init = BytesMut::new();
-    write_avc_init_segment(
-        &mut init,
-        &VideoInitParams {
-            sps: INITIAL_SPS.to_vec(),
-            pps: INITIAL_PPS.to_vec(),
-            width,
-            height,
-            timescale: 90_000,
-        },
-    )
-    .context("write avc init")?;
-    let bc = registry.get_or_create(broadcast, "0.mp4", FragmentMeta::new("avc1", 90_000));
+    match codec {
+        Codec::H264 => {
+            write_avc_init_segment(
+                &mut init,
+                &VideoInitParams {
+                    sps: AVC_SPS.to_vec(),
+                    pps: AVC_PPS.to_vec(),
+                    width: config.video_width,
+                    height: config.video_height,
+                    timescale: codec.timescale(),
+                },
+            )
+            .context("write avc init")?;
+        }
+        Codec::Hevc => {
+            write_hevc_init_segment(
+                &mut init,
+                &HevcInitParams {
+                    vps: HEVC_VPS.to_vec(),
+                    sps: HEVC_SPS.to_vec(),
+                    pps: HEVC_PPS.to_vec(),
+                    sps_info: hevc_sps_info(),
+                    timescale: codec.timescale(),
+                },
+            )
+            .context("write hevc init")?;
+        }
+        Codec::Aac => {
+            write_aac_init_segment(
+                &mut init,
+                &AudioInitParams {
+                    asc: AAC_ASC_44100_STEREO.to_vec(),
+                    timescale: codec.timescale(),
+                },
+            )
+            .context("write aac init")?;
+        }
+        Codec::Opus => {
+            write_opus_init_segment(
+                &mut init,
+                &OpusInitParams {
+                    channel_count: 2,
+                    pre_skip: 312,
+                    input_sample_rate: 48_000,
+                    timescale: codec.timescale(),
+                },
+            )
+            .context("write opus init")?;
+        }
+    }
+    let bc = registry.get_or_create(
+        &config.broadcast,
+        codec.track_key(),
+        FragmentMeta::new(codec.meta_codec(), codec.timescale()),
+    );
     bc.set_init_segment(init.freeze());
     Ok(())
 }
@@ -233,26 +404,74 @@ fn avcc_wrap(nal: &[u8]) -> Vec<u8> {
     v
 }
 
+/// Produce the codec-specific fMP4 sample payload for one
+/// synthetic fragment.
+///
+/// Video codecs go into `mdat` as a length-prefixed AVCC NAL unit;
+/// audio codecs go in as the raw access-unit / Opus frame bytes.
+/// The contents are deliberately not decodable — the soak harness
+/// only counts bytes that flow through RTP, so scrambling the
+/// payload per sequence is enough to defeat any downstream dedup.
+fn make_synthetic_fragment(codec: Codec, seq: u64) -> Bytes {
+    match codec {
+        Codec::H264 => {
+            // IDR slice NAL: header 0x65 (nal_ref_idc=3, type=5) + 31 bytes.
+            let mut nal = Vec::with_capacity(32);
+            nal.push(0x65u8);
+            nal.extend_from_slice(&seq.to_be_bytes());
+            nal.extend(std::iter::repeat_n((seq & 0xFF) as u8, 23));
+            Bytes::from(avcc_wrap(&nal))
+        }
+        Codec::Hevc => {
+            // IDR_W_RADL NAL: header 0x26, 0x01 (type=19) + 30 bytes.
+            let mut nal = Vec::with_capacity(32);
+            nal.push(0x26u8);
+            nal.push(0x01u8);
+            nal.extend_from_slice(&seq.to_be_bytes());
+            nal.extend(std::iter::repeat_n((seq & 0xFF) as u8, 22));
+            Bytes::from(avcc_wrap(&nal))
+        }
+        Codec::Aac => {
+            // Raw AAC access unit body: 32 synthetic bytes.
+            let mut au = Vec::with_capacity(32);
+            au.extend_from_slice(&seq.to_be_bytes());
+            au.extend(std::iter::repeat_n((seq & 0xFF) as u8, 24));
+            Bytes::from(au)
+        }
+        Codec::Opus => {
+            // Raw Opus frame: 16 synthetic bytes. RFC 7587 treats
+            // the body as opaque on the wire.
+            let mut frame = Vec::with_capacity(16);
+            frame.extend_from_slice(&seq.to_be_bytes());
+            frame.extend(std::iter::repeat_n((seq & 0xFF) as u8, 8));
+            Bytes::from(frame)
+        }
+    }
+}
+
 /// Fire fragments into the broadcaster at `fragment_hz` for the
-/// soak duration. Every fragment is a single IDR-shaped NAL so the
-/// PLAY drain on the subscriber side treats it as a keyframe (any
-/// fragment is fine for the drain; marking them keyframes keeps the
-/// packet-counting logic identical on the client).
+/// soak duration. DTS steps are derived from the codec's timescale
+/// so audio and video RTP timestamps tick at the encoder clock the
+/// downstream drain expects.
 ///
 /// Returns the total fragment count the publisher emitted.
 async fn publisher_task(
     registry: FragmentBroadcasterRegistry,
     broadcast: String,
+    codec: Codec,
     fragment_hz: u32,
     cancel: CancellationToken,
 ) -> u64 {
-    let Some(bc) = registry.get(&broadcast, "0.mp4") else {
-        warn!(%broadcast, "publisher: broadcaster missing at start");
+    let Some(bc) = registry.get(&broadcast, codec.track_key()) else {
+        warn!(%broadcast, track = codec.track_key(), "publisher: broadcaster missing at start");
         return 0;
     };
-    let period = Duration::from_secs_f64(1.0 / f64::from(fragment_hz.max(1)));
-    let ticks_per_second = u64::from(fragment_hz.max(1));
-    let dts_step = 90_000u64 / ticks_per_second.max(1);
+    let hz = fragment_hz.max(1);
+    let period = Duration::from_secs_f64(1.0 / f64::from(hz));
+    let timescale = u64::from(codec.timescale());
+    let dts_step = (timescale / u64::from(hz)).max(1);
+    let track_id = codec.track_id();
+    let track_key = codec.track_key();
     let mut seq: u64 = 0;
     let mut dts: u64 = 0;
     let mut next_deadline = tokio::time::Instant::now();
@@ -264,24 +483,19 @@ async fn publisher_task(
         }
         next_deadline += period;
 
-        // Deterministic synthetic IDR NAL: header byte 0x65 (IDR slice)
-        // + 31 payload bytes. Varying the payload per-sequence defeats
-        // any downstream dedup the broadcaster might apply.
-        let mut nal = vec![0x65u8];
-        nal.extend_from_slice(&seq.to_be_bytes());
-        nal.extend(std::iter::repeat_n((seq & 0xFF) as u8, 23));
+        let payload = make_synthetic_fragment(codec, seq);
         let sample = RawSample {
-            track_id: 1,
+            track_id,
             dts,
             cts_offset: 0,
             duration: dts_step as u32,
-            payload: Bytes::from(avcc_wrap(&nal)),
+            payload,
             keyframe: true,
         };
         seq += 1;
-        let moof = build_moof_mdat(seq as u32, 1, dts, std::slice::from_ref(&sample));
+        let moof = build_moof_mdat(seq as u32, track_id, dts, std::slice::from_ref(&sample));
         bc.emit(Fragment::new(
-            "0.mp4",
+            track_key,
             seq,
             0,
             0,
@@ -304,6 +518,7 @@ async fn subscriber_task(
     id: usize,
     server_addr: SocketAddr,
     broadcast: String,
+    codec: Codec,
     cancel: CancellationToken,
 ) -> SubscriberStats {
     let mut stats = SubscriberStats {
@@ -314,7 +529,7 @@ async fn subscriber_task(
         first_rtp_after: None,
         error: None,
     };
-    match subscribe_and_read(id, server_addr, &broadcast, &mut stats, cancel).await {
+    match subscribe_and_read(id, server_addr, &broadcast, codec, &mut stats, cancel).await {
         Ok(()) => {}
         Err(e) => {
             stats.error = Some(e.to_string());
@@ -328,6 +543,7 @@ async fn subscribe_and_read(
     id: usize,
     server_addr: SocketAddr,
     broadcast: &str,
+    codec: Codec,
     stats: &mut SubscriberStats,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -349,10 +565,12 @@ async fn subscribe_and_read(
         drain_body(&mut stream, &mut pending, content_length).await?;
     }
 
-    // SETUP interleaved=0-1 so RTP arrives on channel 0 and RTCP SR
-    // on channel 1.
+    // SETUP on the codec's canonical control URI + interleaved pair
+    // (0-1 for video on track1, 2-3 for audio on track2).
+    let (rtp_ch, rtcp_ch) = codec.interleaved();
     let setup = format!(
-        "SETUP {base_uri}/track1 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n"
+        "SETUP {base_uri}/{control} RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved={rtp_ch}-{rtcp_ch}\r\n\r\n",
+        control = codec.setup_control(),
     );
     let setup_resp = read_response_headers(&mut stream, setup.as_bytes(), &mut pending)
         .await
@@ -509,7 +727,7 @@ fn page_size() -> u64 {
 pub async fn run_soak(config: SoakConfig) -> Result<SoakReport> {
     let start_wall = Instant::now();
     let registry = FragmentBroadcasterRegistry::new();
-    setup_broadcaster(&registry, &config.broadcast, config.video_width, config.video_height)?;
+    setup_broadcaster(&registry, &config)?;
 
     let mut server = RtspServer::with_registry("127.0.0.1:0".parse().unwrap(), registry.clone());
     let server_addr = server.bind().await.context("bind RTSP server")?;
@@ -528,6 +746,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<SoakReport> {
     let publisher_handle = tokio::spawn(publisher_task(
         registry.clone(),
         config.broadcast.clone(),
+        config.codec,
         config.fragment_hz,
         cancel.clone(),
     ));
@@ -538,6 +757,7 @@ pub async fn run_soak(config: SoakConfig) -> Result<SoakReport> {
             id,
             server_addr,
             config.broadcast.clone(),
+            config.codec,
             cancel.clone(),
         ));
         subscriber_handles.push(handle);
