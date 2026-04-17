@@ -120,9 +120,16 @@ struct ConnectionState {
     server_addr: SocketAddr,
     /// Shared broadcaster registry. The DESCRIBE handler reads init
     /// bytes off broadcaster meta to synthesize an SDP response; the
-    /// (future) PLAY path subscribes through it to drain fragments
-    /// into RTP.
+    /// PLAY drain task subscribes through it to produce RTP.
     registry: FragmentBroadcasterRegistry,
+    /// Sink for bytes the main loop should write to the TCP socket.
+    /// RTSP responses and interleaved RTP frames from PLAY drain
+    /// tasks both flow through this channel so the socket is
+    /// never written to from more than one place.
+    writer_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Per-connection cancel token. Cancelled when the main loop
+    /// exits; observed by drain tasks so they stop promptly.
+    conn_cancel: CancellationToken,
     h264_depack: H264Depacketizer,
     hevc_depack: HevcDepacketizer,
     aac_depack: AacDepacketizer,
@@ -151,10 +158,21 @@ async fn handle_connection(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = vec![0u8; 8192];
     let mut read_buf = Vec::with_capacity(8192);
+
+    // Per-connection writer channel. RTSP responses and interleaved
+    // RTP frames from any PLAY drain both fan through this channel
+    // to the main loop, which owns the single writable end of the
+    // TCP socket. Bounded so a slow client gives the drain natural
+    // back-pressure via `writer_tx.send().await`.
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    let conn_cancel = shutdown.child_token();
+
     let mut conn = ConnectionState {
         sessions: HashMap::new(),
         server_addr,
         registry: registry.clone(),
+        writer_tx: writer_tx.clone(),
+        conn_cancel: conn_cancel.clone(),
         h264_depack: H264Depacketizer::new(),
         hevc_depack: HevcDepacketizer::new(),
         aac_depack: AacDepacketizer::new(),
@@ -170,11 +188,22 @@ async fn handle_connection(
         audio_timescale: 44100,
         prev_audio_dts: None,
     };
+    // Drop the local writer_tx so the only remaining senders are the
+    // one on `conn` (cloned into drain tasks) plus any drains already
+    // spawned. When the main loop exits, conn drops and the drain
+    // tasks' remaining clones die on their next send, terminating
+    // them naturally.
+    drop(writer_tx);
 
     loop {
         tokio::select! {
-            biased;
             _ = shutdown.cancelled() => break,
+            Some(bytes) = writer_rx.recv() => {
+                if socket.write_all(&bytes).await.is_err() {
+                    debug!(%remote, "RTSP socket write failed; closing connection");
+                    break;
+                }
+            }
             n = socket.read(&mut buf) => {
                 let n = n?;
                 if n == 0 {
@@ -191,7 +220,7 @@ async fn handle_connection(
                         break;
                     }
                     if read_buf[0] == 0x24 {
-                        // Interleaved RTP/RTCP frame.
+                        // Interleaved RTP/RTCP frame (ingest path).
                         match rtp::parse_interleaved_frame(&read_buf) {
                             Some((frame, consumed)) => {
                                 process_rtp_frame(&mut conn, &frame, registry);
@@ -204,14 +233,20 @@ async fn handle_connection(
                             Ok((req, consumed)) => {
                                 debug!(%remote, method = %req.method, uri = %req.uri, "RTSP request");
                                 let resp = handle_request(&mut conn, &req);
-                                socket.write_all(&resp.serialize()).await?;
+                                // `send().await` over a bounded mpsc; on
+                                // connection tear-down the receiver is
+                                // dropped, the send errors, and we bail.
+                                if conn.writer_tx.send(resp.serialize()).await.is_err() {
+                                    debug!(%remote, "RTSP writer closed mid-response");
+                                    return Ok(());
+                                }
                                 read_buf.drain(..consumed);
                             }
                             Err(proto::ParseError::Incomplete) => break,
                             Err(e) => {
                                 warn!(%remote, error = %e, "RTSP parse error");
                                 let resp = Response::bad_request().with_cseq(0);
-                                socket.write_all(&resp.serialize()).await?;
+                                let _ = conn.writer_tx.send(resp.serialize()).await;
                                 read_buf.clear();
                                 break;
                             }
@@ -221,6 +256,12 @@ async fn handle_connection(
             }
         }
     }
+
+    // Cancel drain tasks spawned for any PLAY sessions on this
+    // connection. Their writer_tx clones also fail once conn is
+    // dropped below, but cancelling proactively stops any drain
+    // parked in `next_fragment().await` from lingering.
+    conn_cancel.cancel();
 
     // Emit BroadcastStopped for any active sessions.
     for session in conn.sessions.values() {
@@ -730,8 +771,35 @@ fn handle_play(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) -> R
         warn!(error = %e, "RTSP PLAY rejected");
         return Response::method_not_allowed().with_cseq(cseq);
     }
-    info!(session = %session_id, broadcast = %session.broadcast, "RTSP PLAY started");
-    Response::ok().with_cseq(cseq).with_header("Session", session_id)
+    let session_id_owned = session_id.to_string();
+    let broadcast = session.broadcast.clone();
+    // Resolve the RTP interleaved channel the client negotiated at
+    // SETUP. Every track transport stores (rtp_channel, rtcp_channel);
+    // take the first track's RTP side. Clients that SETUP without an
+    // explicit `interleaved=...` fall through to channel 0 via the
+    // default the SETUP handler installs.
+    let rtp_channel = session
+        .tracks
+        .first()
+        .and_then(|t| session.transports.get(&t.control))
+        .and_then(|t| t.interleaved)
+        .or_else(|| session.transports.values().find_map(|t| t.interleaved))
+        .map(|(rtp, _)| rtp)
+        .unwrap_or(0);
+
+    let registry = conn.registry.clone();
+    let writer_tx = conn.writer_tx.clone();
+    let cancel = conn.conn_cancel.clone();
+    tokio::spawn(crate::play::play_drain_h264(
+        broadcast.clone(),
+        rtp_channel,
+        registry,
+        writer_tx,
+        cancel,
+    ));
+
+    info!(session = %session_id_owned, %broadcast, rtp_channel, "RTSP PLAY started, drain spawned");
+    Response::ok().with_cseq(cseq).with_header("Session", &session_id_owned)
 }
 
 fn handle_record(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) -> Response {
@@ -839,6 +907,8 @@ mod tests {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry: FragmentBroadcasterRegistry::new(),
+            writer_tx: tokio::sync::mpsc::channel(1).0,
+            conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),
@@ -900,6 +970,8 @@ mod tests {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry,
+            writer_tx: tokio::sync::mpsc::channel(1).0,
+            conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),
@@ -933,12 +1005,14 @@ mod tests {
         assert!(body.contains("a=control:track1"));
     }
 
-    #[test]
-    fn full_playback_handshake() {
+    #[tokio::test]
+    async fn full_playback_handshake() {
         let mut conn = ConnectionState {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry: FragmentBroadcasterRegistry::new(),
+            writer_tx: tokio::sync::mpsc::channel(1).0,
+            conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),
@@ -1007,6 +1081,8 @@ mod tests {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry: FragmentBroadcasterRegistry::new(),
+            writer_tx: tokio::sync::mpsc::channel(1).0,
+            conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),
@@ -1095,6 +1171,8 @@ mod tests {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry: FragmentBroadcasterRegistry::new(),
+            writer_tx: tokio::sync::mpsc::channel(1).0,
+            conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),
