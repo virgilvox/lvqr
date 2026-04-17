@@ -1,8 +1,149 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 sessions A-E + F1 landed; endpoints KV + HLS redirect live; 677 tests, 24 crates
+## Project Status: v0.4.0 -- Tier 3 sessions A-E + F1 + F2a landed; end-to-end HLS redirect working; 678 tests, 24 crates
 
-**Last Updated**: 2026-04-17 (session 76 close -- Tier 3 session F1).
+**Last Updated**: 2026-04-17 (session 77 close -- Tier 3 session F2a).
+
+## Session 77 close (2026-04-17)
+
+### What shipped (1 commit, +356 / -5 lines)
+
+1. **Tier 3 session F2a: wire Cluster through lvqr-cli + HLS e2e**
+   (`1951d37`). Executes the first half of the session F split
+   that `tracking/TIER_3_PLAN.md` session F row called for.
+   F2b (DASH + RTSP redirect, ingest claim hookup, multi-process
+   ffmpeg-to-curl e2e) is session 78.
+
+   `lvqr-cli` changes:
+   * New default-on `cluster` feature. `--no-default-features`
+     gives a lean build without chitchat pulled in.
+   * New `lvqr-cluster` optional workspace dep.
+   * `ServeConfig` gains five fields: `cluster_listen`,
+     `cluster_seeds`, `cluster_node_id`, `cluster_id`,
+     `cluster_advertise_hls`. Fields are always present so the
+     struct ABI stays stable across feature flips.
+   * `main.rs` gains five CLI flags mirroring the fields.
+   * `start()` bootstraps a `Cluster` when
+     `cluster_listen` is `Some`; calls `set_endpoints` with the
+     advertised HLS URL; wires an `OwnerResolver` closure onto
+     `MultiHlsServer::with_owner_resolver` so unknown-broadcast
+     requests redirect with 302 instead of 404; wires the
+     `Arc<Cluster>` into `AdminState::with_cluster` so
+     `/api/v1/cluster/*` answers against the live cluster.
+   * `ServerHandle` gains a `cluster()` accessor (feature-gated)
+     so tests and custom wrappers can drive claim_broadcast /
+     set_endpoints directly.
+   * The `Drop` + `shutdown()` paths unchanged from session 74
+     still tear the cluster down gracefully via chitchat's own
+     shutdown sequence.
+
+   `lvqr-hls` re-exports `OwnerResolver` and `RedirectFuture`
+   from `lvqr_hls::*` (previously only reachable via
+   `lvqr_hls::server::*`).
+
+   `lvqr-test-utils::TestServer` fills the five new
+   `ServeConfig` fields with None / empty defaults so existing
+   test fixtures compile unchanged.
+
+   New end-to-end integration test at
+   `crates/lvqr-cli/tests/cluster_redirect.rs`:
+   * `hls_redirect_to_cluster_peer_end_to_end` spins two
+     in-process `lvqr_cli::start` servers over real UDP
+     loopback chitchat on ports 20801 / 20802. A claims
+     `"live/test"` and advertises its ephemeral HLS URL via
+     `set_endpoints`. B polls for convergence (10 s budget,
+     100 ms interval) on `find_owner_endpoints`. Then a raw
+     HTTP/1.1 `GET /hls/live/test/master.m3u8` on B's HLS
+     ephemeral port returns `302 Found` with
+     `Location: <a_hls_url>/hls/live/test/master.m3u8`. A
+     request for `"live/unclaimed"` still 404s.
+
+### Ground truth (session 77 close)
+
+* **Head**: `1951d37` on `main`. v0.4.0. **37 commits queued
+  but NOT pushed to origin/main** (sessions 62-77 all
+  unpushed).
+* **Tests**: 678 passed, 0 failed, 1 ignored. Delta from
+  session 76: +1 (the new end-to-end redirect test).
+* **Code**: +356 / -5 net. New file:
+  `crates/lvqr-cli/tests/cluster_redirect.rs` (~170 lines).
+* **Workspace**: 24 crates, unchanged.
+* **CI gates locally clean**: fmt, clippy
+  (`--all-targets --benches -D warnings`), test --workspace
+  all green.
+
+### Tier 3 progress
+
+| Session | Deliverable | Status |
+|---|---|---|
+| A (71) | lvqr-cluster scaffold + single-node bootstrap | DONE |
+| B (72) | Two-node integration test | DONE |
+| C (73) | Broadcast-ownership KV | DONE |
+| D (74) | Capacity advertisement | DONE |
+| E (75) | Cluster-wide config + `/api/v1/cluster/*` | DONE |
+| F1 (76) | Endpoints KV + HLS redirect mechanism | DONE |
+| F2a (77) | lvqr-cli wiring + HLS redirect e2e | DONE |
+| F2b (78) | DASH + RTSP redirect, ingest claim, ffmpeg e2e | pending |
+| G (79) | lvqr-observability scaffold + OTLP gating | pending |
+| H (80) | OTLP span exporter | pending |
+| I (81) | OTLP metric exporter | pending |
+| J (82) | JSON log + trace_id correlation | pending |
+
+Tier 3 now has 12 total session slots (original 10, session F
+split into F1/F2, then F2 further split into F2a/F2b as the
+surface area became clear). Remaining after session 77: 5
+sessions (F2b + G-J).
+
+**7 of 12 Tier 3 sessions complete.**
+
+### Known flakes / risks
+
+* Carried forward: `config_lww_prefers_later_write`
+  (session 75) and the observed-once
+  `rtsp_play_emits_rtcp_sender_report_after_interval` flake
+  (session 73).
+* `hls_redirect_to_cluster_peer_end_to_end` uses fixed UDP
+  gossip ports 20801 + 20802. Collides if another test on
+  the same host uses the same ports simultaneously. Ports
+  20801-20806 are reserved for the cluster integration test
+  suite (other tests use 20000-20206); no collision expected
+  in-tree.
+* The e2e waits up to 10 s for two chitchat rounds +
+  endpoint + claim propagation. Happy path is <1 s on a
+  reasonable laptop; the 10x margin absorbs slow CI.
+
+### Session 78 entry point
+
+**Tier 3 session F2b: DASH + RTSP redirect + ingest claim + ffmpeg e2e.**
+
+Deliverable:
+1. Mirror the HLS owner-resolver pattern on
+   `lvqr_dash::MultiDashServer`. Add `DashOwnerResolver` type
+   alias and `MultiDashServer::with_owner_resolver`. Update
+   `lvqr-cli::start` to install a resolver on the DASH server
+   when clustering is enabled, and add
+   `cluster_advertise_dash` to `ServeConfig` + CLI.
+2. RTSP redirect: on `DESCRIBE` / `PLAY` for an unknown
+   broadcast, emit RTSP/1.0 `302 Moved Temporarily` with
+   `Location: rtsp://<owner>/<broadcast>`. Add
+   `cluster_advertise_rtsp` to `ServeConfig` + CLI.
+3. Ingest claim hookup: hold a `Cluster::Claim` for the
+   lifetime of each RTMP (and WHIP / RTSP / SRT as scoped)
+   publisher session so the broadcast-ownership KV reflects
+   reality even without operator intervention. The cleanest
+   hook point is the fragment-broadcaster registry's
+   `on_entry_created` callback (the same callback HLS / DASH
+   use), which already fires exactly once per
+   `(broadcast, track)` pair.
+4. Multi-process e2e: spin two `lvqr` subprocesses via
+   `tokio::process::Command`, ffmpeg RTMP-push to A, curl
+   against B's HLS URL, assert 302 + successful follow, and
+   optionally a corresponding DASH + RTSP test.
+
+Expected scope: ~500-800 lines across `lvqr-dash`,
+`lvqr-rtsp`, `lvqr-ingest`, `lvqr-cli`. If budget is tight,
+cut the ingest-claim hookup to a follow-up session and ship
+DASH + RTSP redirect + the subprocess e2e as F2b.
 
 ## Session 76 close (2026-04-17)
 
