@@ -1,0 +1,27 @@
+[package]
+name = "lvqr-soak"
+description = "Long-duration soak harness for LVQR's RTSP PLAY egress path"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "lvqr-soak"
+path = "src/main.rs"
+
+[dependencies]
+lvqr-core = { workspace = true }
+lvqr-cmaf = { workspace = true }
+lvqr-fragment = { workspace = true }
+lvqr-rtsp = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "process"] }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
