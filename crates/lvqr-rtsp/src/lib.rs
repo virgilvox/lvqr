@@ -7,4 +7,4 @@ pub mod sdp;
 pub mod server;
 pub mod session;
 
-pub use server::RtspServer;
+pub use server::{OwnerResolver, RedirectFuture, RtspServer};

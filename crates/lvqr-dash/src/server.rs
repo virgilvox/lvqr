@@ -415,15 +415,46 @@ fn parse_seq(uri: &str, prefix: &str) -> Option<u64> {
 /// issues for that broadcast. Consumer lookups via
 /// [`MultiDashServer::get`] return `None` for broadcasts that have
 /// never published, which the router turns into a 404.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MultiDashServer {
     inner: Arc<MultiDashState>,
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for MultiDashServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiDashServer")
+            .field("broadcast_count", &self.broadcast_count())
+            .field(
+                "owner_resolver",
+                &self.inner.owner_resolver.as_ref().map(|_| "<resolver>"),
+            )
+            .finish()
+    }
+}
+
+/// Future returned by an [`OwnerResolver`]. Producing an owned
+/// `String` keeps the callback object-safe without needing HRTBs
+/// on the return type.
+pub type RedirectFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
+
+/// Callback that resolves an unknown broadcast name to the base URL
+/// of the owning node's DASH endpoint (e.g.
+/// `"http://a.local:8888"`). Returning `Some(url)` triggers a 302
+/// to `"<url>/dash/<broadcast>/<tail>"`; returning `None` falls
+/// through to the existing 404.
+///
+/// Semantic mirror of `lvqr_hls::OwnerResolver`. Both are typically
+/// backed by `lvqr_cluster::Cluster::find_owner_endpoints`, each
+/// extracting the protocol's slot from the resolved
+/// `NodeEndpoints` value.
+pub type OwnerResolver = Arc<dyn Fn(String) -> RedirectFuture + Send + Sync>;
+
 struct MultiDashState {
     config: DashConfig,
     broadcasts: Mutex<HashMap<String, DashServer>>,
+    /// Optional callback consulted when an incoming request names a
+    /// broadcast this node does not host. See [`OwnerResolver`].
+    owner_resolver: Option<OwnerResolver>,
 }
 
 impl MultiDashServer {
@@ -435,8 +466,34 @@ impl MultiDashServer {
             inner: Arc::new(MultiDashState {
                 config,
                 broadcasts: Mutex::new(HashMap::new()),
+                owner_resolver: None,
             }),
         }
+    }
+
+    /// Build a new multi-broadcast server with an
+    /// [`OwnerResolver`] already installed. Used by `lvqr-cli`
+    /// when clustering is enabled; the resolver wraps a
+    /// `Cluster::find_owner_endpoints` lookup so requests for a
+    /// broadcast hosted on a peer redirect with `302` instead of
+    /// `404`.
+    pub fn with_owner_resolver(config: DashConfig, resolver: OwnerResolver) -> Self {
+        Self {
+            inner: Arc::new(MultiDashState {
+                config,
+                broadcasts: Mutex::new(HashMap::new()),
+                owner_resolver: Some(resolver),
+            }),
+        }
+    }
+
+    /// Resolve a redirect target for `broadcast`. Returns `None`
+    /// when no resolver is installed or when the resolver yields
+    /// `None`. Pulled out of the handler so it is unit-testable
+    /// without spinning an axum request.
+    async fn resolve_redirect_base(&self, broadcast: &str) -> Option<String> {
+        let resolver = self.inner.owner_resolver.as_ref()?;
+        resolver(broadcast.to_string()).await
     }
 
     /// Producer-side entry point. Returns a cheap clone of the
@@ -512,6 +569,13 @@ async fn handle_multi_get(State(multi): State<MultiDashServer>, Path(path): Path
         return (StatusCode::NOT_FOUND, "malformed dash path").into_response();
     };
     let Some(server) = multi.get(broadcast) else {
+        // The broadcast is unknown on this node. Consult the
+        // cluster owner resolver (if configured); if it yields a
+        // peer URL, redirect the subscriber there. Otherwise fall
+        // through to the existing 404.
+        if let Some(base) = multi.resolve_redirect_base(broadcast).await {
+            return redirect_to_owner(&base, &path);
+        }
         return (StatusCode::NOT_FOUND, format!("unknown broadcast {broadcast}")).into_response();
     };
     match tail {
@@ -520,6 +584,22 @@ async fn handle_multi_get(State(multi): State<MultiDashServer>, Path(path): Path
         "init-audio.m4s" => handle_init_audio(State(server)).await,
         other => serve_segment(&server, other),
     }
+}
+
+/// Build a `302 Found` response pointing at `<base>/dash/<path>`.
+/// `base` is expected to already carry the scheme + authority (e.g.
+/// `"http://a.local:8888"`) with no trailing slash; a stray trailing
+/// slash is tolerated and silently trimmed. `path` is the tail the
+/// handler received, already `{broadcast}/{filename}` shaped.
+fn redirect_to_owner(base: &str, path: &str) -> Response {
+    let base = base.trim_end_matches('/');
+    let location = format!("{base}/dash/{path}");
+    (
+        StatusCode::FOUND,
+        [(header::LOCATION, location)],
+        "broadcast lives on another cluster node",
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -641,5 +721,137 @@ mod tests {
         server.finalize();
         let second = server.render_manifest().unwrap();
         assert_eq!(first, second, "second finalize must not change the MPD");
+    }
+
+    #[tokio::test]
+    async fn redirect_to_owner_includes_full_path_and_302() {
+        let resp = redirect_to_owner("http://a.local:8888", "live/test/manifest.mpd");
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .expect("location")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(loc, "http://a.local:8888/dash/live/test/manifest.mpd");
+    }
+
+    #[tokio::test]
+    async fn redirect_to_owner_tolerates_trailing_slash_on_base() {
+        let resp = redirect_to_owner("http://a.local:8888/", "x/init-video.m4s");
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(loc, "http://a.local:8888/dash/x/init-video.m4s");
+    }
+
+    #[tokio::test]
+    async fn resolve_redirect_base_returns_none_without_resolver() {
+        let multi = MultiDashServer::new(DashConfig::default());
+        assert!(multi.resolve_redirect_base("live/test").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_redirect_base_invokes_installed_resolver() {
+        let resolver: OwnerResolver = Arc::new(|broadcast| {
+            Box::pin(async move {
+                if broadcast == "live/test" {
+                    Some("http://a.local:8888".to_string())
+                } else {
+                    None
+                }
+            })
+        });
+        let multi = MultiDashServer::with_owner_resolver(DashConfig::default(), resolver);
+        assert_eq!(
+            multi.resolve_redirect_base("live/test").await,
+            Some("http://a.local:8888".to_string())
+        );
+        assert_eq!(multi.resolve_redirect_base("live/other").await, None);
+    }
+
+    #[tokio::test]
+    async fn unknown_broadcast_redirects_to_owner_via_router() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let resolver: OwnerResolver = Arc::new(|broadcast| {
+            Box::pin(async move {
+                if broadcast == "live/test" {
+                    Some("http://a.local:8888".to_string())
+                } else {
+                    None
+                }
+            })
+        });
+        let multi = MultiDashServer::with_owner_resolver(DashConfig::default(), resolver);
+        let app = multi.router();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dash/live/test/manifest.mpd")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let loc = resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+        assert_eq!(loc, "http://a.local:8888/dash/live/test/manifest.mpd");
+    }
+
+    #[tokio::test]
+    async fn unknown_broadcast_without_resolver_match_returns_404() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let resolver: OwnerResolver = Arc::new(|_b| Box::pin(async move { None }));
+        let multi = MultiDashServer::with_owner_resolver(DashConfig::default(), resolver);
+        let app = multi.router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dash/unknown/manifest.mpd")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn known_broadcast_skips_resolver_and_serves_locally() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // Resolver would redirect if consulted, but the broadcast
+        // is hosted locally so the redirect path MUST NOT trigger.
+        let resolver: OwnerResolver =
+            Arc::new(|_b| Box::pin(async move { Some("http://elsewhere.invalid".to_string()) }));
+        let multi = MultiDashServer::with_owner_resolver(DashConfig::default(), resolver);
+        let server = multi.ensure("live/local");
+        server.push_video_init(Bytes::from_static(b"\x00init-bytes"));
+        let app = multi.router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dash/live/local/manifest.mpd")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

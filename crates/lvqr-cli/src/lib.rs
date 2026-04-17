@@ -23,7 +23,7 @@ use axum::routing::get;
 use bytes::Bytes;
 use lvqr_auth::{AuthContext, AuthDecision, NoopAuthProvider, SharedAuth};
 use lvqr_core::{EventBus, RelayEvent};
-use lvqr_dash::{BroadcasterDashBridge, DashConfig, MultiDashServer};
+use lvqr_dash::{BroadcasterDashBridge, DashConfig};
 use lvqr_fragment::FragmentBroadcasterRegistry;
 use lvqr_hls::{MultiHlsServer, PlaylistBuilderConfig};
 use lvqr_moq::Track;
@@ -157,6 +157,17 @@ pub struct ServeConfig {
     /// `None` skips the publish; peers will then 404 rather than
     /// redirect for this node's broadcasts.
     pub cluster_advertise_hls: Option<String>,
+    /// Externally-reachable DASH base URL this node advertises
+    /// (e.g. `"http://a.local:8888"`). Shape matches
+    /// [`cluster_advertise_hls`](Self::cluster_advertise_hls);
+    /// peers use this when composing a 302 `Location` for
+    /// `/dash/...` requests.
+    pub cluster_advertise_dash: Option<String>,
+    /// Externally-reachable RTSP base URL this node advertises
+    /// (e.g. `"rtsp://a.local:8554"`). Used by the RTSP 302
+    /// redirect-to-owner path on DESCRIBE / PLAY for peer-owned
+    /// broadcasts.
+    pub cluster_advertise_rtsp: Option<String>,
 }
 
 impl ServeConfig {
@@ -190,6 +201,8 @@ impl ServeConfig {
             cluster_node_id: None,
             cluster_id: None,
             cluster_advertise_hls: None,
+            cluster_advertise_dash: None,
+            cluster_advertise_rtsp: None,
         }
     }
 }
@@ -415,11 +428,14 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             .await
             .map_err(|e| anyhow::anyhow!("cluster bootstrap failed: {e}"))?;
         let c = std::sync::Arc::new(c);
-        if let Some(ref hls_url) = config.cluster_advertise_hls {
+        if config.cluster_advertise_hls.is_some()
+            || config.cluster_advertise_dash.is_some()
+            || config.cluster_advertise_rtsp.is_some()
+        {
             let endpoints = lvqr_cluster::NodeEndpoints {
-                hls: Some(hls_url.clone()),
-                dash: None,
-                rtsp: None,
+                hls: config.cluster_advertise_hls.clone(),
+                dash: config.cluster_advertise_dash.clone(),
+                rtsp: config.cluster_advertise_rtsp.clone(),
             };
             c.set_endpoints(&endpoints)
                 .await
@@ -429,6 +445,8 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             node = %c.self_id(),
             %listen,
             advertise_hls = ?config.cluster_advertise_hls,
+            advertise_dash = ?config.cluster_advertise_dash,
+            advertise_rtsp = ?config.cluster_advertise_rtsp,
             "cluster enabled"
         );
         Some(c)
@@ -449,6 +467,34 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     });
     #[cfg(not(feature = "cluster"))]
     let hls_owner_resolver: Option<lvqr_hls::OwnerResolver> = None;
+    #[cfg(feature = "cluster")]
+    let dash_owner_resolver: Option<lvqr_dash::OwnerResolver> = cluster.as_ref().map(|c| {
+        let c = c.clone();
+        let resolver: lvqr_dash::OwnerResolver = std::sync::Arc::new(move |broadcast: String| {
+            let c = c.clone();
+            Box::pin(async move {
+                let (_, endpoints) = c.find_owner_endpoints(&broadcast).await?;
+                endpoints.dash
+            })
+        });
+        resolver
+    });
+    #[cfg(not(feature = "cluster"))]
+    let dash_owner_resolver: Option<lvqr_dash::OwnerResolver> = None;
+    #[cfg(feature = "cluster")]
+    let rtsp_owner_resolver: Option<lvqr_rtsp::OwnerResolver> = cluster.as_ref().map(|c| {
+        let c = c.clone();
+        let resolver: lvqr_rtsp::OwnerResolver = std::sync::Arc::new(move |broadcast: String| {
+            let c = c.clone();
+            Box::pin(async move {
+                let (_, endpoints) = c.find_owner_endpoints(&broadcast).await?;
+                endpoints.rtsp
+            })
+        });
+        resolver
+    });
+    #[cfg(not(feature = "cluster"))]
+    let rtsp_owner_resolver: Option<lvqr_rtsp::OwnerResolver> = None;
 
     // Optional multi-broadcast LL-HLS server. The broadcaster-native
     // HLS bridge (installed below) subscribes on the shared registry
@@ -486,7 +532,10 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // per-broadcast axum router mounted under `/dash/{broadcast}/...`.
     // Every ingest protocol (RTMP, WHIP, SRT, RTSP) feeds DASH via
     // the same `BroadcasterDashBridge` install below.
-    let dash_server = config.dash_addr.map(|_| MultiDashServer::new(DashConfig::default()));
+    let dash_server = config.dash_addr.map(|_| match dash_owner_resolver.clone() {
+        Some(r) => lvqr_dash::MultiDashServer::with_owner_resolver(DashConfig::default(), r),
+        None => lvqr_dash::MultiDashServer::new(DashConfig::default()),
+    });
 
     // Shared FragmentBroadcasterRegistry used by every ingest crate
     // and every consumer. Session 60 completed the Tier 2.1 migration:
@@ -606,9 +655,14 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let srt_shutdown_token = shutdown.clone();
 
     // Optional RTSP ingest server. Publishes to the shared registry
-    // alongside every other ingest protocol.
+    // alongside every other ingest protocol. When clustering is
+    // enabled, the owner resolver redirects DESCRIBE / PLAY for
+    // peer-owned broadcasts with RTSP 302.
     let (rtsp_server, rtsp_bound) = if let Some(addr) = config.rtsp_addr {
         let mut server = lvqr_rtsp::RtspServer::with_registry(addr, shared_registry.clone());
+        if let Some(r) = rtsp_owner_resolver.clone() {
+            server = server.with_owner_resolver(r);
+        }
         let bound = server.bind().await?;
         tracing::info!(addr = %bound, "RTSP ingest bound");
         (Some(server), Some(bound))

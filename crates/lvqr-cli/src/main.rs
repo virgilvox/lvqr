@@ -191,6 +191,19 @@ struct ServeArgs {
     /// with a 302 pointing at that owner's advertised URL.
     #[arg(long, env = "LVQR_CLUSTER_ADVERTISE_HLS")]
     cluster_advertise_hls: Option<String>,
+
+    /// Externally-reachable DASH base URL this node advertises.
+    /// Same shape as `--cluster-advertise-hls`; used by the DASH
+    /// redirect-to-owner path on `/dash/...` requests.
+    #[arg(long, env = "LVQR_CLUSTER_ADVERTISE_DASH")]
+    cluster_advertise_dash: Option<String>,
+
+    /// Externally-reachable RTSP base URL this node advertises
+    /// (example: `rtsp://a.local:8554`). Used by the RTSP 302
+    /// redirect-to-owner path on DESCRIBE / PLAY for peer-owned
+    /// broadcasts.
+    #[arg(long, env = "LVQR_CLUSTER_ADVERTISE_RTSP")]
+    cluster_advertise_rtsp: Option<String>,
 }
 
 #[tokio::main]
@@ -304,6 +317,8 @@ async fn serve_from_args(args: ServeArgs) -> Result<()> {
         cluster_node_id: args.cluster_node_id,
         cluster_id: args.cluster_id,
         cluster_advertise_hls: args.cluster_advertise_hls,
+        cluster_advertise_dash: args.cluster_advertise_dash,
+        cluster_advertise_rtsp: args.cluster_advertise_rtsp,
     };
 
     let handle = start(config).await?;

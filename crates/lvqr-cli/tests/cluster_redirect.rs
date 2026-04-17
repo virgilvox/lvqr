@@ -42,6 +42,80 @@ fn cluster_aware_config(cluster_listen_port: u16, seeds: Vec<String>, node_id: &
     cfg
 }
 
+/// Cluster-aware config with the HLS + DASH egress surfaces both
+/// enabled on ephemeral loopback ports. Used by the F2b redirect
+/// tests that exercise the DASH redirect path alongside HLS.
+fn cluster_aware_config_with_dash(cluster_listen_port: u16, seeds: Vec<String>, node_id: &str) -> ServeConfig {
+    let mut cfg = cluster_aware_config(cluster_listen_port, seeds, node_id);
+    let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
+    cfg.dash_addr = Some((loopback, 0).into());
+    cfg
+}
+
+/// Cluster-aware config with the RTSP ingest surface bound on an
+/// ephemeral loopback TCP port. The F2b RTSP redirect test drives
+/// a raw DESCRIBE against this port and expects a 302.
+fn cluster_aware_config_with_rtsp(cluster_listen_port: u16, seeds: Vec<String>, node_id: &str) -> ServeConfig {
+    let mut cfg = cluster_aware_config(cluster_listen_port, seeds, node_id);
+    let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
+    cfg.rtsp_addr = Some((loopback, 0).into());
+    cfg
+}
+
+/// Send a raw RTSP/1.0 DESCRIBE to `addr` for `broadcast` and
+/// return `(status, location_header)`. Unlike HTTP, RTSP servers
+/// keep the TCP connection open across requests, so this helper
+/// reads only until the header-terminator `\r\n\r\n` and then
+/// drops the stream rather than blocking on EOF. A bounded
+/// tokio timeout catches a stuck server so the test fails
+/// loudly instead of hanging.
+async fn rtsp_describe_raw(addr: SocketAddr, broadcast: &str) -> (u16, Option<String>) {
+    let mut stream = TcpStream::connect(addr).await.expect("tcp connect");
+    let req = format!("DESCRIBE rtsp://{addr}/{broadcast} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n",);
+    stream.write_all(req.as_bytes()).await.expect("write");
+
+    // Read until we see `\r\n\r\n` (end of headers), with a
+    // bounded timeout so a non-responsive server fails the test
+    // rather than hanging.
+    let deadline = Duration::from_secs(5);
+    let read_fut = async {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 256];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut chunk).await.expect("read");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        buf
+    };
+    let buf = tokio::time::timeout(deadline, read_fut)
+        .await
+        .expect("RTSP response within 5s");
+
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines = text.split("\r\n");
+    let status_line = lines.next().unwrap_or_default();
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut location: Option<String> = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(": ") {
+            if k.eq_ignore_ascii_case("location") {
+                location = Some(v.to_string());
+            }
+        }
+    }
+    (status, location)
+}
+
 /// Poll `probe` until it returns true or `timeout` elapses.
 async fn wait_until<F, Fut>(mut probe: F, timeout: Duration) -> bool
 where
@@ -174,6 +248,133 @@ async fn hls_redirect_to_cluster_peer_end_to_end() {
     drop(_claim);
     // Drop cluster arc refs before shutdown so Cluster::Arc drops
     // cleanly inside shutdown's own teardown.
+    drop(a_cluster);
+    drop(b_cluster);
+    a_handle.shutdown().await.expect("A shutdown");
+    b_handle.shutdown().await.expect("B shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dash_redirect_to_cluster_peer_end_to_end() {
+    // Parallel to the HLS e2e above; exercises the DASH-side
+    // owner-resolver path plumbed through lvqr-cli::start in F2b.
+    let a_handle = start(cluster_aware_config_with_dash(20803, vec![], "node-a-dash"))
+        .await
+        .expect("start A");
+    let a_dash_addr = a_handle.dash_addr().expect("A DASH bound");
+    let a_cluster = a_handle.cluster().cloned().expect("A cluster handle");
+    let a_dash_url = format!("http://{a_dash_addr}");
+
+    a_cluster
+        .set_endpoints(&NodeEndpoints {
+            hls: None,
+            dash: Some(a_dash_url.clone()),
+            rtsp: None,
+        })
+        .await
+        .expect("A set_endpoints");
+
+    let _claim = a_cluster
+        .claim_broadcast("live/test", Duration::from_secs(10))
+        .await
+        .expect("A claim");
+
+    let b_handle = start(cluster_aware_config_with_dash(
+        20804,
+        vec!["127.0.0.1:20803".to_string()],
+        "node-b-dash",
+    ))
+    .await
+    .expect("start B");
+    let b_dash_addr = b_handle.dash_addr().expect("B DASH bound");
+    let b_cluster = b_handle.cluster().cloned().expect("B cluster handle");
+
+    let converged = wait_until(
+        || {
+            let b_cluster = b_cluster.clone();
+            let expected = a_dash_url.clone();
+            async move {
+                match b_cluster.find_owner_endpoints("live/test").await {
+                    Some((_, endpoints)) => endpoints.dash.as_deref() == Some(&expected),
+                    None => false,
+                }
+            }
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(converged, "B never resolved A's DASH endpoint");
+
+    let (status, location) = http_get_raw(b_dash_addr, "/dash/live/test/manifest.mpd").await;
+    assert_eq!(status, 302, "expected 302, got {status}");
+    let loc = location.expect("Location header present on 302");
+    assert_eq!(loc, format!("{a_dash_url}/dash/live/test/manifest.mpd"));
+
+    drop(_claim);
+    drop(a_cluster);
+    drop(b_cluster);
+    a_handle.shutdown().await.expect("A shutdown");
+    b_handle.shutdown().await.expect("B shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rtsp_redirect_to_cluster_peer_end_to_end() {
+    // Exercises the RTSP 302 path plumbed through lvqr-cli::start
+    // in F2b. A claims "live/test" and advertises an RTSP URL; B
+    // receives a raw DESCRIBE and must reply 302 + Location.
+    let a_handle = start(cluster_aware_config_with_rtsp(20805, vec![], "node-a-rtsp"))
+        .await
+        .expect("start A");
+    let a_rtsp_addr = a_handle.rtsp_addr().expect("A RTSP bound");
+    let a_cluster = a_handle.cluster().cloned().expect("A cluster handle");
+    let a_rtsp_url = format!("rtsp://{a_rtsp_addr}");
+
+    a_cluster
+        .set_endpoints(&NodeEndpoints {
+            hls: None,
+            dash: None,
+            rtsp: Some(a_rtsp_url.clone()),
+        })
+        .await
+        .expect("A set_endpoints");
+
+    let _claim = a_cluster
+        .claim_broadcast("live/test", Duration::from_secs(10))
+        .await
+        .expect("A claim");
+
+    let b_handle = start(cluster_aware_config_with_rtsp(
+        20806,
+        vec!["127.0.0.1:20805".to_string()],
+        "node-b-rtsp",
+    ))
+    .await
+    .expect("start B");
+    let b_rtsp_addr = b_handle.rtsp_addr().expect("B RTSP bound");
+    let b_cluster = b_handle.cluster().cloned().expect("B cluster handle");
+
+    let converged = wait_until(
+        || {
+            let b_cluster = b_cluster.clone();
+            let expected = a_rtsp_url.clone();
+            async move {
+                match b_cluster.find_owner_endpoints("live/test").await {
+                    Some((_, endpoints)) => endpoints.rtsp.as_deref() == Some(&expected),
+                    None => false,
+                }
+            }
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(converged, "B never resolved A's RTSP endpoint");
+
+    let (status, location) = rtsp_describe_raw(b_rtsp_addr, "live/test").await;
+    assert_eq!(status, 302, "expected 302, got {status}");
+    let loc = location.expect("Location header present on RTSP 302");
+    assert_eq!(loc, format!("{a_rtsp_url}/live/test"));
+
+    drop(_claim);
     drop(a_cluster);
     drop(b_cluster);
     a_handle.shutdown().await.expect("A shutdown");

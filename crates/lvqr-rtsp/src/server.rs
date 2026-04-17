@@ -25,10 +25,30 @@ use crate::session::{
 
 const SUPPORTED_METHODS: &str = "OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, RECORD, TEARDOWN, GET_PARAMETER";
 
+/// Future returned by an [`OwnerResolver`]. Producing an owned
+/// `String` keeps the callback object-safe without HRTBs.
+pub type RedirectFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
+
+/// Callback that resolves an unknown broadcast name to the base URL
+/// of the owning node's RTSP endpoint (e.g.
+/// `"rtsp://a.local:8554"`). Returning `Some(url)` on a DESCRIBE
+/// or PLAY triggers an RTSP `302 Moved Temporarily` with
+/// `Location: <url>/<broadcast>`; returning `None` lets the handler
+/// fall through to its existing synthetic-empty-SDP or
+/// not-found path.
+///
+/// Semantic mirror of `lvqr_hls::OwnerResolver` and
+/// `lvqr_dash::OwnerResolver`. Typically backed by
+/// `lvqr_cluster::Cluster::find_owner_endpoints` with each
+/// protocol-specific wrapper extracting the matching slot from
+/// the resolved `NodeEndpoints`.
+pub type OwnerResolver = std::sync::Arc<dyn Fn(String) -> RedirectFuture + Send + Sync>;
+
 pub struct RtspServer {
     addr: SocketAddr,
     pre_bound: Option<TcpListener>,
     registry: FragmentBroadcasterRegistry,
+    owner_resolver: Option<OwnerResolver>,
 }
 
 impl RtspServer {
@@ -37,6 +57,7 @@ impl RtspServer {
             addr,
             pre_bound: None,
             registry: FragmentBroadcasterRegistry::new(),
+            owner_resolver: None,
         }
     }
 
@@ -48,7 +69,17 @@ impl RtspServer {
             addr,
             pre_bound: None,
             registry,
+            owner_resolver: None,
         }
+    }
+
+    /// Install an [`OwnerResolver`] so DESCRIBE / PLAY for a
+    /// broadcast this node does not host emit an RTSP 302 to the
+    /// owning cluster peer instead of the synthetic empty SDP.
+    /// Returns self for chained construction.
+    pub fn with_owner_resolver(mut self, resolver: OwnerResolver) -> Self {
+        self.owner_resolver = Some(resolver);
+        self
     }
 
     /// Handle to the broadcaster registry. Consumers call
@@ -75,6 +106,7 @@ impl RtspServer {
             addr,
             pre_bound,
             registry,
+            owner_resolver,
         } = self;
         let listener = match pre_bound {
             Some(l) => l,
@@ -100,9 +132,18 @@ impl RtspServer {
                     let conn_shutdown = shutdown.clone();
                     let server_addr = local_addr;
                     let conn_registry = registry.clone();
+                    let conn_resolver = owner_resolver.clone();
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_connection(socket, remote, server_addr, &ev, &conn_registry, conn_shutdown).await
+                        if let Err(e) = handle_connection(
+                            socket,
+                            remote,
+                            server_addr,
+                            &ev,
+                            &conn_registry,
+                            conn_resolver,
+                            conn_shutdown,
+                        )
+                        .await
                         {
                             debug!(%remote, error = %e, "RTSP connection ended with error");
                         }
@@ -122,6 +163,12 @@ struct ConnectionState {
     /// bytes off broadcaster meta to synthesize an SDP response; the
     /// PLAY drain task subscribes through it to produce RTP.
     registry: FragmentBroadcasterRegistry,
+    /// Optional cluster redirect resolver. Checked on DESCRIBE /
+    /// PLAY when no local broadcaster hosts the requested name;
+    /// on `Some(url)` the handler emits an RTSP 302 to that peer
+    /// instead of the synthetic empty SDP. `None` disables the
+    /// redirect path entirely (single-node deployments).
+    owner_resolver: Option<OwnerResolver>,
     /// Sink for bytes the main loop should write to the TCP socket.
     /// RTSP responses and interleaved RTP frames from PLAY drain
     /// tasks both flow through this channel so the socket is
@@ -154,6 +201,7 @@ async fn handle_connection(
     server_addr: SocketAddr,
     events: &EventBus,
     registry: &FragmentBroadcasterRegistry,
+    owner_resolver: Option<OwnerResolver>,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = vec![0u8; 8192];
@@ -171,6 +219,7 @@ async fn handle_connection(
         sessions: HashMap::new(),
         server_addr,
         registry: registry.clone(),
+        owner_resolver,
         writer_tx: writer_tx.clone(),
         conn_cancel: conn_cancel.clone(),
         h264_depack: H264Depacketizer::new(),
@@ -232,7 +281,7 @@ async fn handle_connection(
                         match proto::parse_request(&read_buf) {
                             Ok((req, consumed)) => {
                                 debug!(%remote, method = %req.method, uri = %req.uri, "RTSP request");
-                                let resp = handle_request(&mut conn, &req);
+                                let resp = handle_request(&mut conn, &req).await;
                                 // `send().await` over a bounded mpsc; on
                                 // connection tear-down the receiver is
                                 // dropped, the send errors, and we bail.
@@ -657,8 +706,28 @@ fn nals_to_length_prefixed(nalus: &[Vec<u8>], filter: NalFilter) -> Vec<u8> {
     out
 }
 
-fn handle_request(conn: &mut ConnectionState, req: &proto::Request) -> Response {
+async fn handle_request(conn: &mut ConnectionState, req: &proto::Request) -> Response {
     let cseq = req.cseq().unwrap_or(0);
+
+    // Cluster redirect check for DESCRIBE / PLAY when the broadcast
+    // has no local publisher. We consult the resolver before
+    // dispatching to `handle_describe` / `handle_play` because the
+    // sync handlers otherwise fall back to a synthetic empty SDP
+    // rather than an error, and we want peer redirects to take
+    // precedence over that fallback.
+    if matches!(req.method, Method::Describe | Method::Play)
+        && let Some(resolver) = conn.owner_resolver.as_ref()
+    {
+        let broadcast = extract_broadcast(&req.uri);
+        let local_known =
+            conn.registry.get(&broadcast, "0.mp4").is_some() || conn.registry.get(&broadcast, "1.mp4").is_some();
+        if !local_known && let Some(base) = resolver(broadcast.clone()).await {
+            let base = base.trim_end_matches('/');
+            let location = format!("{base}/{broadcast}");
+            return Response::found(&location).with_cseq(cseq);
+        }
+    }
+
     match req.method {
         Method::Options => handle_options(cseq),
         Method::Describe => handle_describe(conn, req, cseq),
@@ -1011,6 +1080,7 @@ mod tests {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry: FragmentBroadcasterRegistry::new(),
+            owner_resolver: None,
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
@@ -1074,6 +1144,7 @@ mod tests {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry,
+            owner_resolver: None,
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
@@ -1115,6 +1186,7 @@ mod tests {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry: FragmentBroadcasterRegistry::new(),
+            owner_resolver: None,
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
@@ -1185,6 +1257,7 @@ mod tests {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry: FragmentBroadcasterRegistry::new(),
+            owner_resolver: None,
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
@@ -1275,6 +1348,7 @@ mod tests {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry: FragmentBroadcasterRegistry::new(),
+            owner_resolver: None,
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
@@ -1357,5 +1431,109 @@ mod tests {
             channel,
             payload: rtp_pkt,
         }
+    }
+
+    // --- Cluster redirect (session F2b) ------------------------------
+
+    fn empty_conn_with_resolver(resolver: Option<OwnerResolver>) -> ConnectionState {
+        ConnectionState {
+            sessions: HashMap::new(),
+            server_addr: "127.0.0.1:8554".parse().unwrap(),
+            registry: FragmentBroadcasterRegistry::new(),
+            owner_resolver: resolver,
+            writer_tx: tokio::sync::mpsc::channel(1).0,
+            conn_cancel: CancellationToken::new(),
+            h264_depack: H264Depacketizer::new(),
+            hevc_depack: HevcDepacketizer::new(),
+            aac_depack: AacDepacketizer::new(),
+            rtp_packet_count: 0,
+            sps: None,
+            pps: None,
+            vps: None,
+            video_init_emitted: false,
+            video_seq: 0,
+            prev_video_dts: None,
+            audio_init_emitted: false,
+            audio_seq: 0,
+            audio_timescale: 44100,
+            prev_audio_dts: None,
+        }
+    }
+
+    fn describe_req(uri: &str, cseq: u32) -> proto::Request {
+        let mut headers = proto::Headers::new();
+        headers.insert("CSeq".to_string(), cseq.to_string());
+        proto::Request {
+            method: Method::Describe,
+            uri: uri.to_string(),
+            version: proto::RtspVersion::V1_0,
+            headers,
+            body: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn describe_unknown_broadcast_redirects_when_resolver_hits() {
+        let resolver: OwnerResolver = std::sync::Arc::new(|broadcast| {
+            Box::pin(async move {
+                if broadcast == "live/test" {
+                    Some("rtsp://a.local:8554".to_string())
+                } else {
+                    None
+                }
+            })
+        });
+        let mut conn = empty_conn_with_resolver(Some(resolver));
+        let req = describe_req("rtsp://localhost:8554/live/test", 7);
+        let resp = handle_request(&mut conn, &req).await;
+        assert_eq!(resp.status, 302);
+        assert_eq!(resp.headers.get("Location"), Some("rtsp://a.local:8554/live/test"));
+        assert_eq!(resp.headers.get("CSeq"), Some("7"));
+    }
+
+    #[tokio::test]
+    async fn describe_unknown_broadcast_falls_through_when_resolver_misses() {
+        let resolver: OwnerResolver = std::sync::Arc::new(|_b| Box::pin(async move { None }));
+        let mut conn = empty_conn_with_resolver(Some(resolver));
+        let req = describe_req("rtsp://localhost:8554/live/test", 3);
+        let resp = handle_request(&mut conn, &req).await;
+        // Falls through to the empty-SDP path, which returns 200.
+        assert_eq!(resp.status, 200);
+    }
+
+    #[tokio::test]
+    async fn describe_known_local_broadcast_skips_resolver() {
+        use bytes::BytesMut;
+        use lvqr_fragment::FragmentMeta;
+
+        // Install a broadcaster so the redirect guard sees the
+        // broadcast is locally hosted and must NOT consult the
+        // resolver.
+        let resolver: OwnerResolver =
+            std::sync::Arc::new(|_b| Box::pin(async move { Some("rtsp://elsewhere.invalid".to_string()) }));
+        let mut conn = empty_conn_with_resolver(Some(resolver));
+        let bc = conn
+            .registry
+            .get_or_create("live/local", "0.mp4", FragmentMeta::new("avc1", 90_000));
+        let init = BytesMut::from(&b"\x00\x00\x00\x18ftypiso5"[..]);
+        bc.set_init_segment(init.freeze());
+
+        let req = describe_req("rtsp://localhost:8554/live/local", 9);
+        let resp = handle_request(&mut conn, &req).await;
+        // 200 means the resolver was skipped in favor of the
+        // local empty/synthetic SDP path.
+        assert_eq!(resp.status, 200);
+        assert!(resp.headers.get("Location").is_none());
+    }
+
+    #[tokio::test]
+    async fn redirect_response_trims_trailing_slash_on_base_url() {
+        let resolver: OwnerResolver =
+            std::sync::Arc::new(|_b| Box::pin(async move { Some("rtsp://a.local:8554/".to_string()) }));
+        let mut conn = empty_conn_with_resolver(Some(resolver));
+        let req = describe_req("rtsp://localhost:8554/live/test", 1);
+        let resp = handle_request(&mut conn, &req).await;
+        assert_eq!(resp.status, 302);
+        assert_eq!(resp.headers.get("Location"), Some("rtsp://a.local:8554/live/test"));
     }
 }

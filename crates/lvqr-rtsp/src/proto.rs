@@ -157,6 +157,15 @@ impl Response {
         Self::new(500, "Internal Server Error")
     }
 
+    /// RTSP/1.0 `302 Moved Temporarily` with a `Location:` header.
+    /// Used by the cluster redirect-to-owner path when a DESCRIBE
+    /// or PLAY for a broadcast this node does not host resolves to
+    /// a peer via the cluster. RFC 2326 §11.2 lists 302 as valid
+    /// for DESCRIBE; ffplay / VLC follow it transparently.
+    pub fn found(location: &str) -> Self {
+        Self::new(302, "Moved Temporarily").with_header("Location", location)
+    }
+
     pub fn with_header(mut self, key: &str, value: &str) -> Self {
         self.headers.insert(key.to_string(), value.to_string());
         self

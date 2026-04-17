@@ -71,4 +71,4 @@ pub mod server;
 
 pub use bridge::BroadcasterDashBridge;
 pub use mpd::{AdaptationSet, DashError, Mpd, MpdType, Period, Representation, SegmentTemplate, render_mpd};
-pub use server::{DashConfig, DashServer, MultiDashServer};
+pub use server::{DashConfig, DashServer, MultiDashServer, OwnerResolver, RedirectFuture};

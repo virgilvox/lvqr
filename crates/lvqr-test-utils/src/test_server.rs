@@ -162,6 +162,8 @@ impl TestServer {
             cluster_node_id: None,
             cluster_id: None,
             cluster_advertise_hls: None,
+            cluster_advertise_dash: None,
+            cluster_advertise_rtsp: None,
         };
         let handle = start(serve_config).await?;
         Ok(Self { handle })
