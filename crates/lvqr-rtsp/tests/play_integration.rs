@@ -512,6 +512,141 @@ async fn rtsp_play_aac_audio_track_delivers_access_unit() {
     shutdown.cancel();
 }
 
+// ---------- RTCP Sender Report end-to-end ----------
+
+/// Every PLAY drain spawns a Sender Report timer on top of the RTP
+/// stream. Drive the H.264 handshake end-to-end, emit one IDR so the
+/// drain accumulates packet+octet counters, advance the tokio clock
+/// past the default 5 s SR interval, and assert an SR arrives on the
+/// odd RTCP interleaved channel with plausible counts.
+///
+/// Uses `start_paused = true` so the 5 s wait collapses to a single
+/// `advance()` call. Real I/O still progresses because socket events
+/// do not depend on virtual time.
+#[tokio::test(start_paused = true)]
+async fn rtsp_play_emits_rtcp_sender_report_after_interval() {
+    // Inline server setup: the shared `start_rtsp_server` helper uses
+    // `tokio::time::sleep(50ms)` which would hang forever under paused
+    // time. Pre-bind is enough on its own since the OS queues
+    // incoming connections until accept() runs.
+    let registry = FragmentBroadcasterRegistry::new();
+    let (expected_sps, expected_pps) = make_avc_broadcaster(&registry, "live/srtest");
+    let shutdown = CancellationToken::new();
+    let events = EventBus::with_capacity(16);
+    let mut server = RtspServer::with_registry("127.0.0.1:0".parse().unwrap(), registry.clone());
+    let addr = server.bind().await.expect("bind");
+    let cancel = shutdown.clone();
+    tokio::spawn(async move {
+        server.run(events, cancel).await.ok();
+    });
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let base_uri = format!("rtsp://{addr}/live/srtest");
+    let mut pending = Vec::<u8>::new();
+
+    // DESCRIBE / SETUP / PLAY handshake identical to the other
+    // integration tests. Assertions here focus on the SR so we
+    // compress the SDP / SETUP checks.
+    let describe = format!("DESCRIBE {base_uri} RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+    let describe_resp = rtsp_request_headers(&mut stream, &describe, &mut pending).await;
+    let content_length = parse_content_length(&describe_resp).expect("Content-Length");
+    let _sdp = drain_body(&mut stream, &mut pending, content_length).await;
+
+    let setup = format!(
+        "SETUP {base_uri}/track1 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n"
+    );
+    let setup_resp = rtsp_request_headers(&mut stream, &setup, &mut pending).await;
+    let session_id = extract_session_header(&setup_resp).expect("Session");
+    let play_req = format!("PLAY {base_uri} RTSP/1.0\r\nCSeq: 3\r\nSession: {session_id}\r\n\r\n");
+    let play_resp = rtsp_request_headers(&mut stream, &play_req, &mut pending).await;
+    assert!(play_resp.contains("RTSP/1.0 200"));
+
+    // Drain the SPS + PPS re-injection packets so they are not
+    // mistaken for the SR when we advance below.
+    let (_, sps_rtp) = read_interleaved_frame(&mut stream, &mut pending).await;
+    assert_eq!(
+        parse_rtp_header(&sps_rtp).expect("sps header").payload_type,
+        96,
+        "SPS is RTP video PT"
+    );
+    let _ = expected_sps; // silence unused hints
+    let (_, pps_rtp) = read_interleaved_frame(&mut stream, &mut pending).await;
+    assert_eq!(
+        parse_rtp_header(&pps_rtp).expect("pps header").payload_type,
+        96,
+        "PPS is RTP video PT"
+    );
+    let _ = expected_pps;
+
+    // One IDR fragment -> one more RTP packet on channel 0.
+    let idr_nal = vec![0x65, 0xAA, 0xBB, 0xCC];
+    let sample = RawSample {
+        track_id: 1,
+        dts: 9000,
+        cts_offset: 0,
+        duration: 3000,
+        payload: Bytes::from({
+            let mut v = (idr_nal.len() as u32).to_be_bytes().to_vec();
+            v.extend_from_slice(&idr_nal);
+            v
+        }),
+        keyframe: true,
+    };
+    let fragment_payload = build_moof_mdat(1, 1, 9000, std::slice::from_ref(&sample));
+    registry
+        .get("live/srtest", "0.mp4")
+        .expect("broadcaster")
+        .emit(Fragment::new(
+            "0.mp4",
+            1,
+            0,
+            0,
+            9000,
+            9000,
+            3000,
+            FragmentFlags::KEYFRAME,
+            fragment_payload,
+        ));
+
+    let (_, idr_rtp) = read_interleaved_frame(&mut stream, &mut pending).await;
+    let idr_hdr = parse_rtp_header(&idr_rtp).expect("idr hdr");
+    assert_eq!(idr_hdr.timestamp, 9000, "last RTP timestamp carried in SR");
+
+    // Collapse the 5 s wait. `start_paused = true` pins the clock at
+    // t=0 for the runtime; `advance(>5s)` triggers the SR ticker.
+    tokio::time::advance(Duration::from_secs(6)).await;
+
+    // Next interleaved frame on the socket is the SR on channel 1.
+    let (ch, sr) = read_interleaved_frame(&mut stream, &mut pending).await;
+    assert_eq!(ch, 1, "SR on the odd RTCP channel");
+    assert_eq!(sr.len(), 28, "bare SR packet: 8-byte header + 20-byte sender info");
+    // Version=2, Padding=0, RC=0.
+    assert_eq!(sr[0], 0x80);
+    // PT=SR=200.
+    assert_eq!(sr[1], 200);
+    // Length = (28 / 4) - 1 = 6 32-bit words.
+    assert_eq!(u16::from_be_bytes([sr[2], sr[3]]), 6);
+    // SSRC matches the video drain's DEFAULT_SSRC.
+    assert_eq!(&sr[4..8], &0xDEAD_BEEFu32.to_be_bytes());
+    // RTP timestamp = most recent emitted (the IDR's 9000).
+    assert_eq!(
+        u32::from_be_bytes([sr[16], sr[17], sr[18], sr[19]]),
+        9000,
+        "SR carries latest RTP timestamp",
+    );
+    // Packet count >= 3 (SPS + PPS + IDR).
+    let packet_count = u32::from_be_bytes([sr[20], sr[21], sr[22], sr[23]]);
+    assert!(
+        packet_count >= 3,
+        "packet count covers SPS + PPS + IDR (got {packet_count})"
+    );
+    // Octet count > 0 (payload bytes of the three packets).
+    let octet_count = u32::from_be_bytes([sr[24], sr[25], sr[26], sr[27]]);
+    assert!(octet_count > 0, "octet count positive after real emits");
+
+    shutdown.cancel();
+}
+
 // ---------- Opus PLAY end-to-end ----------
 
 fn make_opus_broadcaster(registry: &FragmentBroadcasterRegistry, broadcast: &str) {

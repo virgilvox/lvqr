@@ -827,7 +827,7 @@ fn handle_play(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) -> R
     // is skipped. SETUP currently stamps the transport under the
     // track control URI -- matching DESCRIBE's emitted "track1" /
     // "track2" URIs is how we route each drain.
-    let video_channel = session
+    let video_channels = session
         .transports
         .get("track1")
         .and_then(|t| t.interleaved)
@@ -839,13 +839,8 @@ fn handle_play(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) -> R
             } else {
                 None
             }
-        })
-        .map(|(rtp, _)| rtp);
-    let audio_channel = session
-        .transports
-        .get("track2")
-        .and_then(|t| t.interleaved)
-        .map(|(rtp, _)| rtp);
+        });
+    let audio_channels = session.transports.get("track2").and_then(|t| t.interleaved);
 
     // Pick the video drain variant that matches the broadcaster's
     // codec. Try HEVC first (its extractor returns None on an AVC
@@ -875,59 +870,35 @@ fn handle_play(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) -> R
     let registry = conn.registry.clone();
     let cancel = conn.conn_cancel.clone();
 
-    if let Some(rtp_channel) = video_channel {
+    if let Some((rtp_channel, rtcp_channel)) = video_channels {
         let writer_tx = conn.writer_tx.clone();
         let registry = registry.clone();
         let cancel = cancel.clone();
-        let broadcast = broadcast.clone();
+        let ctx = crate::play::PlayDrainCtx::new(broadcast.clone(), rtp_channel, rtcp_channel);
         if is_hevc {
-            tokio::spawn(crate::play::play_drain_hevc(
-                broadcast,
-                rtp_channel,
-                registry,
-                writer_tx,
-                cancel,
-            ));
+            tokio::spawn(crate::play::play_drain_hevc(ctx, registry, writer_tx, cancel));
         } else {
-            tokio::spawn(crate::play::play_drain_h264(
-                broadcast,
-                rtp_channel,
-                registry,
-                writer_tx,
-                cancel,
-            ));
+            tokio::spawn(crate::play::play_drain_h264(ctx, registry, writer_tx, cancel));
         }
     }
 
-    if let Some(rtp_channel) = audio_channel {
+    if let Some((rtp_channel, rtcp_channel)) = audio_channels {
         let writer_tx = conn.writer_tx.clone();
         let registry = registry.clone();
         let cancel = cancel.clone();
-        let broadcast = broadcast.clone();
+        let ctx = crate::play::PlayDrainCtx::new(broadcast.clone(), rtp_channel, rtcp_channel);
         if is_opus {
-            tokio::spawn(crate::play::play_drain_opus(
-                broadcast,
-                rtp_channel,
-                registry,
-                writer_tx,
-                cancel,
-            ));
+            tokio::spawn(crate::play::play_drain_opus(ctx, registry, writer_tx, cancel));
         } else {
-            tokio::spawn(crate::play::play_drain_aac(
-                broadcast,
-                rtp_channel,
-                registry,
-                writer_tx,
-                cancel,
-            ));
+            tokio::spawn(crate::play::play_drain_aac(ctx, registry, writer_tx, cancel));
         }
     }
 
     info!(
         session = %session_id_owned,
         %broadcast,
-        ?video_channel,
-        ?audio_channel,
+        ?video_channels,
+        ?audio_channels,
         video_codec = if is_hevc { "H265" } else { "H264" },
         audio_codec = if is_opus { "Opus" } else { "AAC" },
         "RTSP PLAY started, drains spawned"

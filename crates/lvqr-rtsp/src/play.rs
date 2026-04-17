@@ -2,18 +2,24 @@
 //! RTP, and write interleaved frames back to the client socket.
 //!
 //! Composition of session-61 (RTP packetizers) + session-62 (fmp4
-//! mdat extractor + parameter-set extractor + SDP builder). The
-//! drain task owns only a [`BroadcasterStream`] receiver and an
-//! mpsc sender to the connection's writer loop; it never holds a
-//! strong `Arc<FragmentBroadcaster>`. That pins the invariant the
-//! archive / HLS / DASH drains already document: a keepalive Arc
-//! would keep the `broadcast::Sender` alive and `recv()` would
-//! never see `Closed` after every ingest clone dropped.
+//! mdat extractor + parameter-set extractor + SDP builder) + session-
+//! 64 (RTCP Sender Reports). The drain task owns only a
+//! [`BroadcasterStream`] receiver and an mpsc sender to the
+//! connection's writer loop; it never holds a strong
+//! `Arc<FragmentBroadcaster>`. That pins the invariant the archive /
+//! HLS / DASH drains already document: a keepalive Arc would keep
+//! the `broadcast::Sender` alive and `recv()` would never see
+//! `Closed` after every ingest clone dropped.
 //!
-//! Scope of the first pass: H.264 video only. HEVC + audio land
-//! once the LL-HLS + DASH conformance story gives the extra codec
-//! surfaces a testable home. A non-H.264 broadcaster here just
-//! produces no RTP (the drain exits without emitting).
+//! Each drain also co-owns an [`RtpStats`] record and spawns an SR
+//! timer via [`crate::rtcp::spawn_sr_task`] that ticks every
+//! [`PlayDrainCtx::sr_interval`]. The SR task shares the same mpsc
+//! writer and the same cancellation token, so the interleaved RTCP
+//! stream is naturally rate-limited by TCP back-pressure and exits
+//! in lock step with the drain.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use lvqr_fragment::{FragmentBroadcasterRegistry, FragmentStream};
 use tokio::sync::mpsc;
@@ -21,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::fmp4;
+use crate::rtcp::{RtpStats, spawn_sr_task};
 use crate::rtp::{AacPacketizer, H264Packetizer, HevcPacketizer, OpusPacketizer};
 
 /// Default dynamic RTP payload type for the video track. Both the
@@ -55,6 +62,50 @@ const INITIAL_RTP_SEQUENCE: u16 = 1000;
 /// ever trips.
 const DEFAULT_SSRC: u32 = 0xDEAD_BEEF;
 
+/// Per-codec SSRC salt so video / AAC / Opus drains on the same
+/// session emit distinct SSRCs. The RTCP SR task reads the same
+/// per-drain SSRC so Wireshark traces pair each SR with its RTP
+/// stream cleanly.
+const AAC_SSRC: u32 = DEFAULT_SSRC ^ 0x0001_0000;
+const OPUS_SSRC: u32 = DEFAULT_SSRC ^ 0x0002_0000;
+
+/// Default RTCP Sender Report cadence in production. RFC 3550 allows
+/// bandwidth-derived cadences; 5 s is a safe default for the LL-HLS-
+/// adjacent broadcast sizes LVQR targets and keeps Wireshark logs
+/// compact during interop testing.
+pub const DEFAULT_SR_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Per-drain wiring shared across every codec.
+///
+/// Grouping these into a struct keeps the drain signatures short as
+/// new transport knobs (RTCP cadence, DSCP, retransmit hints) come
+/// and go. Callers that only care about the common path use
+/// [`PlayDrainCtx::new`] and leave `sr_interval` at its default.
+#[derive(Debug, Clone)]
+pub struct PlayDrainCtx {
+    /// Broadcast name on the registry (e.g. `"live/cam1"`).
+    pub broadcast: String,
+    /// Even interleaved channel the RTP stream writes on.
+    pub rtp_channel: u8,
+    /// Odd interleaved channel the SR stream writes on. Typically
+    /// `rtp_channel + 1` under the RFC 2326 pairing convention.
+    pub rtcp_channel: u8,
+    /// Interval between Sender Reports.
+    pub sr_interval: Duration,
+}
+
+impl PlayDrainCtx {
+    /// Construct a context with the default SR interval.
+    pub fn new(broadcast: impl Into<String>, rtp_channel: u8, rtcp_channel: u8) -> Self {
+        Self {
+            broadcast: broadcast.into(),
+            rtp_channel,
+            rtcp_channel,
+            sr_interval: DEFAULT_SR_INTERVAL,
+        }
+    }
+}
+
 /// Wrap a fully formed RTP packet in an RTSP interleaved TCP frame
 /// (`$ channel length rtp_packet`) and push it onto the connection
 /// writer. Asserts the packet fits in the 16-bit length field; a
@@ -69,6 +120,24 @@ async fn send_interleaved(writer_tx: &mpsc::Sender<Vec<u8>>, channel: u8, rtp: &
     frame.extend_from_slice(&(len as u16).to_be_bytes());
     frame.extend_from_slice(rtp);
     writer_tx.send(frame).await.map_err(|_| ())
+}
+
+/// Send one RTP packet and tick the stats record. LVQR packetizers
+/// always emit a 12-byte fixed header (V=2, CC=0, no extension), so
+/// the RTP payload octet count is the packet length minus 12. That
+/// matches the "payload octets" field RFC 3550 section 6.4.1
+/// prescribes for the SR `octet_count`.
+async fn send_rtp(
+    writer_tx: &mpsc::Sender<Vec<u8>>,
+    channel: u8,
+    rtp: &[u8],
+    rtp_ts: u32,
+    stats: &RtpStats,
+) -> Result<(), ()> {
+    send_interleaved(writer_tx, channel, rtp).await?;
+    let payload_octets = u32::try_from(rtp.len().saturating_sub(12)).unwrap_or(u32::MAX);
+    stats.record_packet(payload_octets, rtp_ts);
+    Ok(())
 }
 
 /// Drive one PLAY session over the registry's H.264 broadcaster.
@@ -97,14 +166,13 @@ async fn send_interleaved(writer_tx: &mpsc::Sender<Vec<u8>>, channel: u8, rtp: &
 /// * `writer_tx` is closed (the connection writer task exited; the
 ///   socket is gone so further RTP writes would panic on TCP).
 pub async fn play_drain_h264(
-    broadcast: String,
-    rtp_channel: u8,
+    ctx: PlayDrainCtx,
     registry: FragmentBroadcasterRegistry,
     writer_tx: mpsc::Sender<Vec<u8>>,
     cancel: CancellationToken,
 ) {
-    let Some(bc) = registry.get(&broadcast, "0.mp4") else {
-        debug!(%broadcast, "play_drain: no video broadcaster; exiting before first emit");
+    let Some(bc) = registry.get(&ctx.broadcast, "0.mp4") else {
+        debug!(broadcast = %ctx.broadcast, "play_drain: no video broadcaster; exiting before first emit");
         return;
     };
     let mut sub = bc.subscribe();
@@ -120,6 +188,15 @@ pub async fn play_drain_h264(
         .and_then(|init| lvqr_cmaf::extract_avc_parameter_sets(init));
 
     let mut packetizer = H264Packetizer::new(DEFAULT_SSRC, H264_PAYLOAD_TYPE, INITIAL_RTP_SEQUENCE);
+    let stats = Arc::new(RtpStats::new());
+    let sr_task = spawn_sr_task(
+        DEFAULT_SSRC,
+        stats.clone(),
+        ctx.rtcp_channel,
+        writer_tx.clone(),
+        cancel.clone(),
+        ctx.sr_interval,
+    );
 
     if let Some(ref params) = params {
         // Each parameter set is a single NAL emitted as its own
@@ -127,21 +204,25 @@ pub async fn play_drain_h264(
         // access unit's last NAL (a few packets later) sets it.
         for sps in &params.sps_list {
             for pkt in packetizer.packetize(sps, 0, false) {
-                if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
+                if send_rtp(&writer_tx, ctx.rtp_channel, &pkt, 0, &stats).await.is_err() {
+                    cancel.cancel();
+                    let _ = sr_task.await;
                     return;
                 }
             }
         }
         for pps in &params.pps_list {
             for pkt in packetizer.packetize(pps, 0, false) {
-                if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
+                if send_rtp(&writer_tx, ctx.rtp_channel, &pkt, 0, &stats).await.is_err() {
+                    cancel.cancel();
+                    let _ = sr_task.await;
                     return;
                 }
             }
         }
     }
 
-    info!(%broadcast, "play_drain: video egress started");
+    info!(broadcast = %ctx.broadcast, "play_drain: video egress started");
 
     loop {
         let fragment = tokio::select! {
@@ -161,13 +242,20 @@ pub async fn play_drain_h264(
         for (i, nal) in nalus.iter().enumerate() {
             let end_of_au = i == last;
             for pkt in packetizer.packetize(nal, rtp_ts, end_of_au) {
-                if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
+                if send_rtp(&writer_tx, ctx.rtp_channel, &pkt, rtp_ts, &stats)
+                    .await
+                    .is_err()
+                {
+                    cancel.cancel();
+                    let _ = sr_task.await;
                     return;
                 }
             }
         }
     }
-    info!(%broadcast, "play_drain: video egress terminated");
+    info!(broadcast = %ctx.broadcast, "play_drain: video egress terminated");
+    cancel.cancel();
+    let _ = sr_task.await;
 }
 
 /// Drive one PLAY session over the registry's HEVC broadcaster.
@@ -184,14 +272,13 @@ pub async fn play_drain_h264(
 /// video codec is on the broadcaster should try
 /// [`play_drain_h264`] first and fall back to this function.
 pub async fn play_drain_hevc(
-    broadcast: String,
-    rtp_channel: u8,
+    ctx: PlayDrainCtx,
     registry: FragmentBroadcasterRegistry,
     writer_tx: mpsc::Sender<Vec<u8>>,
     cancel: CancellationToken,
 ) {
-    let Some(bc) = registry.get(&broadcast, "0.mp4") else {
-        debug!(%broadcast, "play_drain (hevc): no video broadcaster; exiting before first emit");
+    let Some(bc) = registry.get(&ctx.broadcast, "0.mp4") else {
+        debug!(broadcast = %ctx.broadcast, "play_drain (hevc): no video broadcaster; exiting before first emit");
         return;
     };
     let mut sub = bc.subscribe();
@@ -202,38 +289,53 @@ pub async fn play_drain_hevc(
         .as_ref()
         .and_then(|init| lvqr_cmaf::extract_hevc_parameter_sets(init));
 
-    let mut packetizer = HevcPacketizer::new(DEFAULT_SSRC, HEVC_PAYLOAD_TYPE, INITIAL_RTP_SEQUENCE);
-
-    if let Some(ref params) = params {
-        // VPS first, then SPS, then PPS. Each one is a single NAL
-        // emitted as its own single-NAL RTP packet.
-        for vps in &params.vps_list {
-            for pkt in packetizer.packetize(vps, 0, false) {
-                if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
-                    return;
-                }
-            }
-        }
-        for sps in &params.sps_list {
-            for pkt in packetizer.packetize(sps, 0, false) {
-                if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
-                    return;
-                }
-            }
-        }
-        for pps in &params.pps_list {
-            for pkt in packetizer.packetize(pps, 0, false) {
-                if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
-                    return;
-                }
-            }
-        }
-    } else {
-        debug!(%broadcast, "play_drain (hevc): init segment did not decode as HEVC; exiting");
+    let Some(params) = params else {
+        debug!(broadcast = %ctx.broadcast, "play_drain (hevc): init segment did not decode as HEVC; exiting");
         return;
+    };
+
+    let mut packetizer = HevcPacketizer::new(DEFAULT_SSRC, HEVC_PAYLOAD_TYPE, INITIAL_RTP_SEQUENCE);
+    let stats = Arc::new(RtpStats::new());
+    let sr_task = spawn_sr_task(
+        DEFAULT_SSRC,
+        stats.clone(),
+        ctx.rtcp_channel,
+        writer_tx.clone(),
+        cancel.clone(),
+        ctx.sr_interval,
+    );
+
+    // VPS first, then SPS, then PPS. Each one is a single NAL
+    // emitted as its own single-NAL RTP packet.
+    for vps in &params.vps_list {
+        for pkt in packetizer.packetize(vps, 0, false) {
+            if send_rtp(&writer_tx, ctx.rtp_channel, &pkt, 0, &stats).await.is_err() {
+                cancel.cancel();
+                let _ = sr_task.await;
+                return;
+            }
+        }
+    }
+    for sps in &params.sps_list {
+        for pkt in packetizer.packetize(sps, 0, false) {
+            if send_rtp(&writer_tx, ctx.rtp_channel, &pkt, 0, &stats).await.is_err() {
+                cancel.cancel();
+                let _ = sr_task.await;
+                return;
+            }
+        }
+    }
+    for pps in &params.pps_list {
+        for pkt in packetizer.packetize(pps, 0, false) {
+            if send_rtp(&writer_tx, ctx.rtp_channel, &pkt, 0, &stats).await.is_err() {
+                cancel.cancel();
+                let _ = sr_task.await;
+                return;
+            }
+        }
     }
 
-    info!(%broadcast, "play_drain: HEVC egress started");
+    info!(broadcast = %ctx.broadcast, "play_drain: HEVC egress started");
 
     loop {
         let fragment = tokio::select! {
@@ -253,13 +355,20 @@ pub async fn play_drain_hevc(
         for (i, nal) in nalus.iter().enumerate() {
             let end_of_au = i == last;
             for pkt in packetizer.packetize(nal, rtp_ts, end_of_au) {
-                if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
+                if send_rtp(&writer_tx, ctx.rtp_channel, &pkt, rtp_ts, &stats)
+                    .await
+                    .is_err()
+                {
+                    cancel.cancel();
+                    let _ = sr_task.await;
                     return;
                 }
             }
         }
     }
-    info!(%broadcast, "play_drain: HEVC egress terminated");
+    info!(broadcast = %ctx.broadcast, "play_drain: HEVC egress terminated");
+    cancel.cancel();
+    let _ = sr_task.await;
 }
 
 /// Drive one PLAY session over the registry's AAC audio broadcaster.
@@ -278,20 +387,28 @@ pub async fn play_drain_hevc(
 /// Terminates on cancel / broadcaster close / writer-channel close
 /// same as the video drain.
 pub async fn play_drain_aac(
-    broadcast: String,
-    rtp_channel: u8,
+    ctx: PlayDrainCtx,
     registry: FragmentBroadcasterRegistry,
     writer_tx: mpsc::Sender<Vec<u8>>,
     cancel: CancellationToken,
 ) {
-    let Some(bc) = registry.get(&broadcast, "1.mp4") else {
-        debug!(%broadcast, "play_drain (aac): no audio broadcaster; exiting");
+    let Some(bc) = registry.get(&ctx.broadcast, "1.mp4") else {
+        debug!(broadcast = %ctx.broadcast, "play_drain (aac): no audio broadcaster; exiting");
         return;
     };
     let mut sub = bc.subscribe();
-    let mut packetizer = AacPacketizer::new(DEFAULT_SSRC ^ 0x0001_0000, AAC_PAYLOAD_TYPE, INITIAL_RTP_SEQUENCE);
+    let mut packetizer = AacPacketizer::new(AAC_SSRC, AAC_PAYLOAD_TYPE, INITIAL_RTP_SEQUENCE);
+    let stats = Arc::new(RtpStats::new());
+    let sr_task = spawn_sr_task(
+        AAC_SSRC,
+        stats.clone(),
+        ctx.rtcp_channel,
+        writer_tx.clone(),
+        cancel.clone(),
+        ctx.sr_interval,
+    );
 
-    info!(%broadcast, "play_drain: AAC egress started");
+    info!(broadcast = %ctx.broadcast, "play_drain: AAC egress started");
 
     loop {
         let fragment = tokio::select! {
@@ -310,11 +427,18 @@ pub async fn play_drain_aac(
         }
         let rtp_ts = fragment.pts as u32;
         let pkt = packetizer.packetize(body, rtp_ts);
-        if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
+        if send_rtp(&writer_tx, ctx.rtp_channel, &pkt, rtp_ts, &stats)
+            .await
+            .is_err()
+        {
+            cancel.cancel();
+            let _ = sr_task.await;
             return;
         }
     }
-    info!(%broadcast, "play_drain: AAC egress terminated");
+    info!(broadcast = %ctx.broadcast, "play_drain: AAC egress terminated");
+    cancel.cancel();
+    let _ = sr_task.await;
 }
 
 /// Drive one PLAY session over the registry's Opus audio broadcaster.
@@ -338,25 +462,30 @@ pub async fn play_drain_aac(
 /// Terminates on cancel / broadcaster close / writer-channel close
 /// same as the video and AAC drains.
 pub async fn play_drain_opus(
-    broadcast: String,
-    rtp_channel: u8,
+    ctx: PlayDrainCtx,
     registry: FragmentBroadcasterRegistry,
     writer_tx: mpsc::Sender<Vec<u8>>,
     cancel: CancellationToken,
 ) {
-    let Some(bc) = registry.get(&broadcast, "1.mp4") else {
-        debug!(%broadcast, "play_drain (opus): no audio broadcaster; exiting");
+    let Some(bc) = registry.get(&ctx.broadcast, "1.mp4") else {
+        debug!(broadcast = %ctx.broadcast, "play_drain (opus): no audio broadcaster; exiting");
         return;
     };
     let mut sub = bc.subscribe();
-    // SSRC is XOR'd with a codec-specific nibble to keep Opus
-    // distinct from AAC and H.264 streams on the same session. The
-    // exact value is not observable to clients that key on channel
-    // only, but Wireshark traces during interop testing read better
-    // when each track has a distinct SSRC.
-    let mut packetizer = OpusPacketizer::new(DEFAULT_SSRC ^ 0x0002_0000, OPUS_PAYLOAD_TYPE, INITIAL_RTP_SEQUENCE);
+    // SSRC keeps Opus distinct from AAC / H.264 on the same session so
+    // Wireshark traces pair each SR with its RTP stream unambiguously.
+    let mut packetizer = OpusPacketizer::new(OPUS_SSRC, OPUS_PAYLOAD_TYPE, INITIAL_RTP_SEQUENCE);
+    let stats = Arc::new(RtpStats::new());
+    let sr_task = spawn_sr_task(
+        OPUS_SSRC,
+        stats.clone(),
+        ctx.rtcp_channel,
+        writer_tx.clone(),
+        cancel.clone(),
+        ctx.sr_interval,
+    );
 
-    info!(%broadcast, "play_drain: Opus egress started");
+    info!(broadcast = %ctx.broadcast, "play_drain: Opus egress started");
 
     loop {
         let fragment = tokio::select! {
@@ -375,11 +504,18 @@ pub async fn play_drain_opus(
         }
         let rtp_ts = fragment.pts as u32;
         let pkt = packetizer.packetize(body, rtp_ts);
-        if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
+        if send_rtp(&writer_tx, ctx.rtp_channel, &pkt, rtp_ts, &stats)
+            .await
+            .is_err()
+        {
+            cancel.cancel();
+            let _ = sr_task.await;
             return;
         }
     }
-    info!(%broadcast, "play_drain: Opus egress terminated");
+    info!(broadcast = %ctx.broadcast, "play_drain: Opus egress terminated");
+    cancel.cancel();
+    let _ = sr_task.await;
 }
 
 #[cfg(test)]
@@ -432,15 +568,12 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // Spawn the drain. The fixed SSRC and starting sequence make
-        // the output deterministic.
+        // the output deterministic. Tests use a long SR interval so
+        // the SR task never ticks during the assertion window.
         let drain_cancel = cancel.clone();
-        let handle = tokio::spawn(play_drain_h264(
-            "live/test".to_string(),
-            0, // RTP channel
-            registry.clone(),
-            writer_tx,
-            drain_cancel,
-        ));
+        let mut ctx = PlayDrainCtx::new("live/test".to_string(), 0, 1);
+        ctx.sr_interval = std::time::Duration::from_secs(3600);
+        let handle = tokio::spawn(play_drain_h264(ctx, registry.clone(), writer_tx, drain_cancel));
 
         // Give the drain a tick to subscribe + emit parameter sets.
         // The first two interleaved frames must be SPS and PPS.
@@ -510,7 +643,12 @@ mod tests {
         let cancel = CancellationToken::new();
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            play_drain_h264("no/such/broadcast".into(), 0, registry, writer_tx, cancel),
+            play_drain_h264(
+                PlayDrainCtx::new("no/such/broadcast", 0, 1),
+                registry,
+                writer_tx,
+                cancel,
+            ),
         )
         .await
         .expect("drain exits promptly when broadcaster is missing");
@@ -573,13 +711,9 @@ mod tests {
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(64);
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn(play_drain_hevc(
-            "live/hevc".to_string(),
-            0,
-            registry.clone(),
-            writer_tx,
-            cancel.clone(),
-        ));
+        let mut ctx = PlayDrainCtx::new("live/hevc", 0, 1);
+        ctx.sr_interval = std::time::Duration::from_secs(3600);
+        let handle = tokio::spawn(play_drain_hevc(ctx, registry.clone(), writer_tx, cancel.clone()));
 
         // Read three param-set packets (VPS, SPS, PPS) and confirm
         // their contents match the input NALs.
@@ -674,13 +808,9 @@ mod tests {
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(16);
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn(play_drain_aac(
-            "live/aac".to_string(),
-            2,
-            registry.clone(),
-            writer_tx,
-            cancel.clone(),
-        ));
+        let mut ctx = PlayDrainCtx::new("live/aac", 2, 3);
+        ctx.sr_interval = std::time::Duration::from_secs(3600);
+        let handle = tokio::spawn(play_drain_aac(ctx, registry.clone(), writer_tx, cancel.clone()));
 
         // Wait for the drain to subscribe. Unlike the video drains,
         // the AAC path emits no pre-roll (no parameter-set packets),
@@ -750,7 +880,7 @@ mod tests {
         let cancel = CancellationToken::new();
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            play_drain_aac("no/aac".into(), 2, registry, writer_tx, cancel),
+            play_drain_aac(PlayDrainCtx::new("no/aac", 2, 3), registry, writer_tx, cancel),
         )
         .await
         .expect("aac drain exits promptly when no 1.mp4 broadcaster");
@@ -790,13 +920,9 @@ mod tests {
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(16);
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn(play_drain_opus(
-            "live/opus".to_string(),
-            2,
-            registry.clone(),
-            writer_tx,
-            cancel.clone(),
-        ));
+        let mut ctx = PlayDrainCtx::new("live/opus", 2, 3);
+        ctx.sr_interval = std::time::Duration::from_secs(3600);
+        let handle = tokio::spawn(play_drain_opus(ctx, registry.clone(), writer_tx, cancel.clone()));
 
         // Opus has no pre-roll (no parameter-set re-injection). Wait
         // for the drain to subscribe so the emit below is not a race.
@@ -863,7 +989,7 @@ mod tests {
         let cancel = CancellationToken::new();
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            play_drain_opus("no/opus".into(), 2, registry, writer_tx, cancel),
+            play_drain_opus(PlayDrainCtx::new("no/opus", 2, 3), registry, writer_tx, cancel),
         )
         .await
         .expect("opus drain exits promptly when no 1.mp4 broadcaster");
@@ -896,7 +1022,7 @@ mod tests {
         let cancel = CancellationToken::new();
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            play_drain_hevc("live/avc".into(), 0, registry, writer_tx, cancel),
+            play_drain_hevc(PlayDrainCtx::new("live/avc", 0, 1), registry, writer_tx, cancel),
         )
         .await
         .expect("hevc drain exits promptly on AVC init");
