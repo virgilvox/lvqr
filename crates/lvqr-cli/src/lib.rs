@@ -12,6 +12,8 @@
 //! integration tests.
 
 mod archive;
+#[cfg(feature = "cluster")]
+pub mod cluster_claim;
 mod hls;
 
 use anyhow::Result;
@@ -543,6 +545,17 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // consumer (archive, LL-HLS, DASH) installs an on_entry_created
     // callback against it.
     let shared_registry = FragmentBroadcasterRegistry::new();
+
+    // Auto-claim every new broadcast against the cluster so peers
+    // redirect correctly without the operator having to call
+    // `Cluster::claim_broadcast` by hand. The bridge holds the
+    // `Claim` alive until every ingest publisher for that
+    // broadcast disconnects. Feature-gated; no-op when
+    // single-node.
+    #[cfg(feature = "cluster")]
+    if let Some(ref c) = cluster {
+        cluster_claim::install_cluster_claim_bridge(c.clone(), cluster_claim::DEFAULT_CLAIM_LEASE, &shared_registry);
+    }
 
     // RTMP ingest bridged to MoQ. Pre-bind the TCP listener so we can
     // report the real bound port (for ephemeral-port test setups).

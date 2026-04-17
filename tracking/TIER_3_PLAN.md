@@ -155,16 +155,38 @@ Integration surfaces:
 
 Each session is scoped so the workspace stays green at the end.
 
-| # | Session | Deliverable | Verification |
-|---|---|---|---|
-| A | 71 | `crates/lvqr-cluster/` scaffold; chitchat dep pinning; `Cluster::bootstrap` on a single node. | `cargo test -p lvqr-cluster --lib` |
-| B | 72 | Two-node integration test: both see each other in `members()`. | Integration test with two `Cluster` instances on ephemeral ports. |
-| C | 73 | Broadcast ownership KV. `claim_broadcast` + `find_broadcast_owner`; lease expiry. | Integration test: node A claims, node B sees it, A drops claim, B no longer sees it after expiry. |
-| D | 74 | Capacity advertisement. CPU / RSS / bandwidth counters published to chitchat every 5 s. | Integration test reads `members()` and asserts capacity fields populate. |
-| E | 75 | Cluster-wide config channel. Read-only HTTP endpoints under `/admin/cluster`. | Integration test + admin GET. |
-| F | 76 | Wire `Cluster` through `lvqr-cli::serve` + RTSP / HLS / DASH handlers (redirect-to-owner). | End-to-end two-node test: publisher on A, subscriber on B, subscriber receives owner-redirect and follows it. |
+| # | Session | Deliverable | Verification | Status |
+|---|---|---|---|---|
+| A | 71 | `crates/lvqr-cluster/` scaffold; chitchat dep pinning; `Cluster::bootstrap` on a single node. | `cargo test -p lvqr-cluster --lib` | DONE |
+| B | 72 | Two-node integration test: both see each other in `members()`. | Integration test with two `Cluster` instances on ephemeral ports. | DONE |
+| C | 73 | Broadcast ownership KV. `claim_broadcast` + `find_broadcast_owner`; lease expiry. | Integration test: node A claims, node B sees it, A drops claim, B no longer sees it after expiry. | DONE |
+| D | 74 | Capacity advertisement. CPU / RSS / bandwidth counters published to chitchat every 5 s. | Integration test reads `members()` and asserts capacity fields populate. | DONE |
+| E | 75 | Cluster-wide config channel. Read-only HTTP endpoints under `/admin/cluster`. | Integration test + admin GET. | DONE |
+| F1 | 76 | Endpoints KV + `OwnerResolver` mechanism on `lvqr-hls`. Library plumbing. | Unit tests prove resolver→302 via axum router. | DONE |
+| F2a | 77 | Wire `Cluster` through `lvqr-cli::serve` + HLS redirect-to-owner. | Two in-process `start()` servers over real UDP loopback; HLS 302. | DONE |
+| F2b | 78 | DASH + RTSP redirect-to-owner; DASH + RTSP e2e. | In-process two-node 302 for DASH + RTSP. | DONE |
+| F2c | 79 | Ingest auto-claim on first broadcast. Publishers no longer need manual `claim_broadcast`. | Two-cluster test: registry `get_or_create` fires auto-claim; peer converges. Dedup across tracks. Release on broadcaster close. | DONE |
 
-Six sessions total for the cluster plane.
+Nine sessions total for the cluster plane (the original session F row expanded
+into F1+F2a+F2b+F2c as the surface area emerged across sessions 76-79).
+
+### Cluster plane is complete
+
+As of session 79 (F2c) the cluster plane carries every deliverable in the
+[Scope](#scope-what-lands) list:
+
+* Node membership ✓ (A + B)
+* Broadcast ownership ✓ (C) + auto-claim on publish ✓ (F2c)
+* Capacity advertisement ✓ (D)
+* Cluster-wide config ✓ (E)
+* Admin HTTP surface ✓ (E)
+* `lvqr-cli` integration + HLS/DASH/RTSP redirect-to-owner ✓ (F2a + F2b)
+
+The ffmpeg-subprocess full-stack e2e is deferred. The in-process two-node
+redirect tests for each egress protocol + the auto-claim integration test
+cover the same wire path end-to-end without the CI-flakiness of an
+external binary dependence. A future session can add a subprocess test
+if marketing demands a shareable demo script.
 
 ### Risks + mitigations
 
