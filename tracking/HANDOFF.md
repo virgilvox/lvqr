@@ -1,8 +1,116 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- RTSP PLAY + RTCP SR + full soak + criterion benches in lvqr-rtsp + lvqr-cmaf; 620 tests, 24 crates
+## Project Status: v0.4.0 -- RTSP PLAY + RTCP SR + full soak + 15 benches + Tier 3 plan; 620 tests, 24 crates
 
-**Last Updated**: 2026-04-17 (session 69 close).
+**Last Updated**: 2026-04-17 (session 70 close).
+
+## Session 70 close (2026-04-17)
+
+### What shipped (1 commit, +358 lines)
+
+1. **Tier 3 planning document** (`5a8ba72`). Lands
+   `tracking/TIER_3_PLAN.md` so sessions 71+ can execute without
+   further design work. Prior session closes (62 onward) kept
+   flagging "Tier 3 requires a planning document first"; this
+   clears that prerequisite.
+
+   Two orthogonal planes planned:
+
+   * **Cluster plane** (`lvqr-cluster`, chitchat-backed): node
+     membership, broadcast ownership via lease-backed KV,
+     capacity advertisement, cluster-wide config, read-only
+     `/admin/cluster/*` HTTP surface. Session decomposition
+     A-F (six sessions, 71-76).
+   * **Observability plane** (`lvqr-observability`, OTLP): span
+     + metric export behind `LVQR_OTLP_ENDPOINT`, log-trace
+     correlation, Prometheus scrape regression guard. Session
+     decomposition G-J (four sessions, 77-80).
+
+   The plan enforces the three load-bearing decisions from the
+   roadmap (LBD #3 control-vs-hot-path, LBD #4 EventBus split,
+   LBD #5 chitchat scope discipline) and makes explicit
+   rejections: no consensus protocols, no per-frame counters on
+   gossip, no Byzantine tolerance, no auto-scaling this tier, no
+   admin write APIs.
+
+   ETA 12 sessions total (6 cluster + 4 observability + 2
+   buffer). Exit criteria: 3-node cluster shares broadcasts via
+   owner redirects; Jaeger shows end-to-end spans; full workspace
+   tests remain green.
+
+   Four open questions flagged for session 71 to resolve before
+   writing code: gossip port default, broadcast-ownership lease
+   default, OTLP exporter protocol (gRPC vs HTTP),
+   `lvqr-mesh` vs `lvqr-cluster` orthogonality doc.
+
+### Why a planning doc got priority this session
+
+User instruction: "lets keep going i want to get to tier 4
+sooner, but go along the proper path to that." The proper path
+to Tier 4 runs through Tier 3; Tier 3 requires a scoped plan
+first. Previous sessions 65-69 built out Tier 1 test + bench
+infrastructure; session 70 pivots to the Tier 3 design gate.
+No code moved this session.
+
+### Ground truth (session 70 close)
+
+* **Head**: `5a8ba72` on `main`. v0.4.0. **24 commits queued
+  but NOT pushed to origin/main** (sessions 62-70 all unpushed).
+* **Tests**: 620 passed, 0 failed, 1 ignored. Unchanged
+  (docs-only commit).
+* **Code**: +358 lines of planning documentation in
+  `tracking/TIER_3_PLAN.md`.
+* **CI gates**: fmt clean, no code changed so clippy / test
+  unchanged from session 69.
+
+### Load-bearing invariants (all still pinned)
+
+Unchanged. The Tier 3 plan explicitly preserves LBD #3 / #4 / #5
+and the four RTSP drain invariants pinned in sessions 60 / 64.
+
+### Protocols supported
+
+Unchanged. 11 protocols. Feature-complete for every codec.
+
+### Known gaps
+
+1. **Open questions in the Tier 3 plan**: gossip port default,
+   ownership lease default, OTLP protocol choice,
+   lvqr-mesh-vs-lvqr-cluster doc. Session 71 resolves these
+   before code starts.
+2. **mediastreamvalidator binary on CI runner**: unchanged.
+   User-bound.
+3. **MediaMTX comparison harness**: deferred pending the
+   Tier 3 work.
+4. **Actual 24 h nightly soak run**: harness complete; no CI
+   job yet.
+
+### Session 71 entry point
+
+Tier 3 session A. Deliverable:
+
+1. Resolve the four Tier 3 open questions inline at the top of
+   `TIER_3_PLAN.md`.
+2. Create `crates/lvqr-cluster/` scaffold (Cargo.toml with
+   chitchat dep pinned to a SHA, src/lib.rs with a stubbed
+   `Cluster::bootstrap` that exercises the happy path on a
+   single node).
+3. Unit test: bootstrap returns, `members()` contains the local
+   node, Drop cleans up.
+4. Workspace Cargo.toml adds `lvqr-cluster` to members.
+
+Estimated scope: ~300-400 lines. One commit for scaffold + one
+for test + one for handoff.
+
+### Critical path to M4
+
+Per the Tier 3 plan, M4 now has a concrete 12-session ETA on
+top of the current session count. At ~10-15 sessions/calendar
+week observed velocity that is ~1 calendar week of focused
+Tier 3 work. M4 itself then depends only on Tier 4
+differentiators (WASM filters, in-process AI, Kubernetes
+operator), each of which has its one-page MVP deferred to its
+own planning session.
 
 ## Session 69 close (2026-04-17)
 
