@@ -1,8 +1,133 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- RTSP PLAY + RTCP SR + `lvqr-soak` covering every codec; 619 tests, 24 crates
+## Project Status: v0.4.0 -- RTSP PLAY + RTCP SR + `lvqr-soak` with per-sample CPU tracking; 620 tests, 24 crates
 
-**Last Updated**: 2026-04-17 (session 66 close).
+**Last Updated**: 2026-04-17 (session 67 close).
+
+## Session 67 close (2026-04-17)
+
+### What shipped (1 commit, +77 lines)
+
+1. **CPU-tick sampling in soak metrics** (`1116508`). Closes the
+   session-65 deferred item. Every metrics tick now records the
+   process's cumulative `utime + stime` from `/proc/self/stat`
+   so the soak report surfaces CPU seconds burned over the run
+   window. Linux-only; macOS returns `None` and the renderer
+   suppresses the line when data is unavailable, matching the
+   existing RSS + FD conventions.
+
+   Surface changes:
+   * `MetricsSample.cpu_ticks: Option<u64>` alongside the
+     existing `rss_bytes` / `fd_count`.
+   * New public constant `lvqr_soak::CLK_TCK_PER_SEC = 100`
+     so the crate stays `libc`-free. Kernels with
+     `CONFIG_HZ_250` still expose 100 at the sysconf layer
+     (userspace ticks are decoupled from jiffies).
+   * `SoakReport::render_summary` renders
+     `cpu over window : <cpu_s> cpu / <wall_s> wall (<busy %>%)`
+     when both the first and last sample populated
+     `cpu_ticks`.
+
+   Implementation:
+   * `read_cpu_ticks()` locates the last `)` in
+     `/proc/self/stat` to skip past the `comm` field (which may
+     itself contain spaces / parens), then pulls fields 14 and
+     15 per `proc(5)`.
+   * Initial sample, interval ticks, and the final post-soak
+     sample all record the new field.
+
+   New test `soak_cpu_sampling_matches_platform_expectation`
+   asserts `Some` on Linux and `None` elsewhere for every sample
+   in the report; pins the platform-split wiring against a
+   future regression that accidentally disables CPU sampling.
+
+### Ground truth (session 67 close)
+
+* **Head**: `1116508` on `main`. v0.4.0. **19 commits queued
+  but NOT pushed to origin/main** (sessions 62-67 all unpushed).
+* **Tests**: 620 passed, 0 failed, 1 ignored. Delta from
+  session 66: +1 (CPU-sampling smoke).
+* **Code**: +77 lines within `crates/lvqr-soak/`.
+* **CI gates locally clean**: fmt, clippy (`-D warnings`),
+  test --workspace all green.
+
+### Soak harness coverage (updated)
+
+| Piece                                             | Status |
+|---------------------------------------------------|--------|
+| H.264 / HEVC / AAC / Opus PLAY soak               | DONE (session 66) |
+| RTP + RTCP counts per subscriber                  | DONE (session 65) |
+| RSS + FD samples (Linux)                          | DONE (session 65) |
+| CPU-tick samples (Linux)                          | DONE   |
+| Per-codec 2 s smoke tests in workspace CI         | DONE (session 66) |
+| Actual 24 h nightly run                           | infra, deferred |
+| Multi-host jitter / latency harness               | deferred |
+
+### Load-bearing invariants (all still pinned)
+
+Unchanged from session 60. Session-67 change is contained to
+`lvqr-soak` and only reads one more procfs file; no
+invariant-adjacent internals moved.
+
+### Protocols supported
+
+Unchanged. 11 protocols. Feature-complete for every codec.
+
+### Known gaps
+
+1. **mediastreamvalidator binary on CI runner**: still the
+   biggest audit gap (unchanged from session 64). Requires a
+   self-hosted macOS runner or a pre-baked custom image with
+   Apple HTTP Live Streaming Tools. User-bound.
+2. **Actual 24 h nightly soak run**: harness is feature-complete
+   for every codec + resource gauge, but no CI job runs it
+   nightly yet.
+3. **MediaMTX comparison harness**: not started.
+4. **Tier 3**: cluster (chitchat) + observability (OTLP) not
+   started.
+5. **Carry-over tech debt**: `lvqr-wasm` scaffold deletion,
+   `TrackId` newtype, CORS restrictive default, first criterion
+   benches.
+
+### Session 68 entry point
+
+Priority order:
+
+1. **mediastreamvalidator self-hosted runner** (unchanged).
+   Infra; user-bound.
+
+2. **MediaMTX comparison harness**. Sibling to `lvqr-soak`: a
+   new `crates/lvqr-compare/` that spawns MediaMTX (via its
+   published docker image or the `mediamtx` binary on PATH),
+   publishes an identical synthetic stream to both servers,
+   and diffs subscriber-side fragment counts / RTP sequence
+   wraps / latency histograms. Gives the roadmap claims a real
+   head-to-head number. Soft-skip the MediaMTX side when the
+   binary is absent so developer laptops can still run the
+   LVQR-only half.
+
+3. **First criterion benchmark**. Workspace has zero benches
+   today. Bench `H264Packetizer::packetize` through an
+   FU-A path as the first target; establishes the
+   `cargo bench` contract and a baseline number.
+
+4. **Tier 3 planning**. Cluster (chitchat) + observability
+   (OTLP). Still "do not start mid-session" without a planning
+   document first.
+
+5. **Carry-over tech debt**: `lvqr-wasm` scaffold deletion
+   (cheapest), CORS restrictive default.
+
+### Velocity note
+
+Session 67 landed a single small commit (77 lines). Soak
+harness is now feature-complete for every codec + every
+resource gauge LVQR can sample without pulling a platform-
+abstraction crate. Observed pace holds at ~10-15 sessions per
+calendar week. Realistic M4 ETA remains 3-5 calendar weeks of
+sustained sessions, bounded by user-controlled items
+(mediastreamvalidator runner, 24 h nightly CI slot, multi-node
+cluster debugging).
 
 ## Session 66 close (2026-04-17)
 
