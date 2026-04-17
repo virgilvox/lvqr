@@ -23,5 +23,10 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 lvqr-test-utils = { workspace = true }
 proptest = "1"
+
+[[bench]]
+name = "rtp_packetizer"
+harness = false
