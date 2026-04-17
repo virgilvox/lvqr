@@ -1,8 +1,153 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 cluster plane COMPLETE (A through F2c); auto-claim + all three redirect protocols wired; 694 tests, 24 crates
+## Project Status: v0.4.0 -- Cluster plane COMPLETE; observability G scaffolded; 706 tests, 25 crates
 
-**Last Updated**: 2026-04-17 (session 79 close -- Tier 3 session F2c).
+**Last Updated**: 2026-04-17 (session 80 close -- cross-session audit 73-79 + Tier 3 session G).
+
+## Session 80 close (2026-04-17)
+
+### What shipped (2 commits, +430 / -18 lines)
+
+1. **Cross-session audit 73-79 + flake fix** (`71216d1`).
+   Before starting observability work, audited the 14 commits
+   since session 72's last audit. Findings:
+
+   * Commit hygiene: every commit authored as
+     `Moheeb Zara <hackbuildvideo@gmail.com>` alone. ✓
+   * Workspace integrity: `ls crates/` 24 crates, workspace
+     `members` 24 matches, `cargo metadata` confirms 24.
+   * fmt + clippy `--all-targets --benches -D warnings` both
+     clean.
+   * **Regression**:
+     `rtsp_play_emits_rtcp_sender_report_after_interval`
+     failing ~80 % of runs. Root cause was
+     `#[tokio::test(start_paused = true)]` + tokio
+     auto-advance firing `tokio::time::timeout`s inside the
+     shared `rtsp_request_headers` read helper while the
+     server task was blocked on real I/O. Fix: drop
+     `start_paused`, use a real-time 6 s sleep past the
+     default SR interval. Test now deterministic at 6.0 s
+     runtime (verified 5/5 green in the audit).
+   * Housekeeping: added `crates/lvqr-rtsp/fuzz` to the
+     workspace `exclude` list so it matches the other seven
+     fuzz crates. `cargo metadata` unchanged; this is
+     consistency only.
+   * `memory/project_audit_findings.md` refreshed from
+     session-72 state to session-79 state (cluster plane
+     closed; observability G-J + ROADMAP Tier 3 extensions
+     listed as remaining strategic scope).
+
+2. **Tier 3 session G: lvqr-observability scaffold**
+   (`73d57e9`). Kicks off the observability plane.
+
+   New crate `crates/lvqr-observability/` (workspace member
+   #25). Surface:
+
+   * `ObservabilityConfig` with five env-parsed fields:
+     `otlp_endpoint`, `service_name`, `resource_attributes`,
+     `json_logs`, `trace_sample_ratio`. All driven by one
+     env var each (`LVQR_OTLP_ENDPOINT`, `LVQR_SERVICE_NAME`,
+     `LVQR_OTLP_RESOURCE`, `LVQR_LOG_JSON`,
+     `LVQR_TRACE_SAMPLE_RATIO`).
+   * `ObservabilityConfig::from_env` reads the process
+     environment. `ObservabilityConfig::from_env_reader<F>`
+     takes an arbitrary lookup closure so unit tests
+     exercise every parse branch without mutating the
+     process env.
+   * `ObservabilityHandle` empty guard struct today, marked
+     `#[must_use]`. Sessions H / I park the
+     `TracerProvider` / `SdkMeterProvider` guards here so
+     their background flushers do not leak past `main`.
+   * `init(config) -> Result<ObservabilityHandle>` installs
+     a global stdout `fmt` subscriber with an `EnvFilter`
+     sourced from `RUST_LOG` (or `"lvqr=info"` default),
+     emits a `tracing::warn!` stub if
+     `LVQR_OTLP_ENDPOINT` is set but not yet consumed, and
+     returns the handle.
+
+   What session G deliberately does not do:
+   * Depend on `opentelemetry*` crates yet. Hold-back keeps
+     bring-up dependency-light; session H pulls them in.
+   * Touch `lvqr-test-utils::init_test_tracing`. Per plan,
+     tests keep the existing stdout subscriber.
+
+   `lvqr-cli` changes:
+   * Dep on `lvqr-observability` (always on, no feature
+     gate).
+   * `main.rs` replaces the inline
+     `tracing_subscriber::fmt().init()` call with
+     `lvqr_observability::init(ObservabilityConfig::from_env())`
+     and holds the `ObservabilityHandle` for the function
+     scope. Behavior identical today; session-H ready.
+
+   12 new unit tests in `lvqr-observability/src/lib.rs`
+   cover defaults, full env parse, empty-value guards,
+   truthy / falsy `LVQR_LOG_JSON` variants, trace-ratio
+   clamping, unparseable fall-through, and resource-attr
+   whitespace / empty-token tolerance.
+
+### Ground truth (session 80 close)
+
+* **Head**: `73d57e9` on `main`. v0.4.0. **43 commits queued
+  but NOT pushed to origin/main** (sessions 62-80 all
+  unpushed).
+* **Tests**: 706 passed, 0 failed, 1 ignored. Delta from
+  session 79: +12 (all 12 new observability unit tests).
+* **Code**: +408 / -5 feat commit, +22 / -13 audit commit.
+* **Workspace**: 25 crates (+1: `lvqr-observability`).
+* **CI gates locally clean**: fmt, clippy
+  (`--all-targets --benches -D warnings`), test --workspace
+  all green on a fresh run. The
+  `rtsp_play_emits_rtcp_sender_report_after_interval` flake
+  fixed in the audit commit is deterministically green 5/5.
+
+### Tier 3 progress
+
+| Session | Deliverable | Status |
+|---|---|---|
+| A-B-C-D-E (71-75) | Scaffold, 2-node, ownership, capacity, config + admin | DONE |
+| F1 (76) | Endpoints KV + HLS redirect mechanism | DONE |
+| F2a (77) | lvqr-cli wiring + HLS e2e | DONE |
+| F2b (78) | DASH + RTSP redirect + e2e | DONE |
+| F2c (79) | Ingest auto-claim on first broadcast | DONE |
+| **G (80)** | **lvqr-observability scaffold + OTLP env-var gating** | **DONE** |
+| H (81) | OTLP span exporter + in-memory collector test | pending |
+| I (82) | OTLP metric exporter | pending |
+| J (83) | JSON log + trace_id correlation | pending |
+
+**10 of 13 Tier 3 sessions complete.** Remaining 3 (H-I-J)
+are OTLP wire implementation + JSON log correlation.
+
+### Known flakes / risks
+
+* Carried forward: `config_lww_prefers_later_write` (5 ms
+  sleep; session 75).
+* FIXED in session 80:
+  `rtsp_play_emits_rtcp_sender_report_after_interval` is now
+  deterministic (see audit commit above).
+
+### Session 81 entry point
+
+**Tier 3 session H: OTLP span exporter + in-memory collector test.**
+
+Deliverable per `tracking/TIER_3_PLAN.md` observability-plane:
+1. Add `opentelemetry`, `opentelemetry_sdk`,
+   `opentelemetry-otlp`, and `tracing-opentelemetry` to
+   `lvqr-observability`'s deps (pinned per
+   `tracking/TIER_3_PLAN.md` session-70 dependency table:
+   opentelemetry 0.27 / tracing-opentelemetry 0.28).
+2. When `config.otlp_endpoint` is `Some`, install a
+   `tracing-opentelemetry` layer alongside the stdout fmt
+   layer. The layer exports spans to the configured OTLP
+   gRPC endpoint with a `BatchSpanProcessor`.
+3. Populate the `TracerProvider` drop guard slot on
+   `ObservabilityHandle`.
+4. Integration test using `opentelemetry-stdout` exporter
+   (or a manual mpsc-receiver shim) to capture a synthetic
+   span without requiring a network round-trip.
+
+Expected scope: ~300-500 lines. Most of it is plumbing
+around the OTel SDK's setup API; test harness is ~100 lines.
 
 ## Session 79 close (2026-04-17)
 
