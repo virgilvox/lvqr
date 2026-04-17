@@ -1,8 +1,169 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- RTSP PLAY egress end-to-end for H.264 + HEVC video + AAC audio; 590 tests, all green
+## Project Status: v0.4.0 -- RTSP PLAY egress for H.264 + HEVC + AAC + Opus with per-drain RTCP SR; 614 tests, all green
 
-**Last Updated**: 2026-04-16 (session 63 close).
+**Last Updated**: 2026-04-16 (session 64 close).
+
+## Session 64 close (2026-04-16)
+
+### What shipped (2 commits, +1490 / -182 lines, net +1308)
+
+1. **Opus RTSP PLAY egress** (`543e002`). Extended the AAC PLAY
+   scaffold to Opus:
+   * `lvqr_cmaf::OpusConfig` + `extract_opus_config` parse the
+     dOps box from an Opus sample entry. Returns channels,
+     pre_skip, input_sample_rate, output_gain, and the serialized
+     11-byte dOps body (so out-of-band signaling can echo the
+     raw bytes).
+   * `sdp::OpusTrackDescription` + new `AudioTrackDescription`
+     enum render RFC 7587 audio (`opus/48000/<ch>`, `sprop-
+     stereo`, `useinbandfec=1`) at PT 98 distinct from AAC's
+     PT 97. `PlaySdp.audio` switched from `Option<AacTrackDescription>`
+     to the enum so only one audio codec is describable per
+     broadcast.
+   * `rtp::OpusPacketizer` + `OpusDepacketizer`: one Opus frame
+     per RTP packet with marker=1 per RFC 7587. Depacketizer is
+     byte-transparent.
+   * `play::play_drain_opus` mirrors `play_drain_aac`. No
+     parameter-set re-injection (Opus decoder state comes from
+     the dOps on SDP).
+   * `handle_describe` tries Opus first then falls through to
+     AAC. `handle_play` dispatches the audio drain variant the
+     same way.
+   * Integration test `rtsp_play_opus_audio_track_delivers_frame`
+     round-trips a synthetic Opus frame over real TCP through
+     DESCRIBE / SETUP / PLAY and `OpusDepacketizer`.
+   * +13 tests.
+
+2. **RTCP Sender Reports on every PLAY drain** (`0bfe7d7`).
+   Per-SSRC SR generation so long sessions stay NTP-wallclock
+   aligned:
+   * New `crate::rtcp` module with `RtpStats` (lock-free
+     packet/octet/last-RTP-ts counters), `write_sender_report`
+     (RFC 3550 section 6.4.1, 28-byte SR, no reception reports),
+     `system_time_to_ntp` (RFC 5905 seconds-since-1900), and
+     `spawn_sr_task` (per-drain ticker that snapshots stats and
+     pushes interleaved RTCP on the odd channel).
+   * `play::PlayDrainCtx` groups `broadcast + rtp_channel +
+     rtcp_channel + sr_interval` so the four drain signatures
+     stay short. `DEFAULT_SR_INTERVAL = 5 s`.
+   * Each drain (H.264 / HEVC / AAC / Opus) now owns an
+     `Arc<RtpStats>` shared with a spawned SR task, routes every
+     RTP send through `send_rtp()` so counters tick in lock step
+     with the wire output, and awaits the SR task on termination
+     so the task never outlives its session. Per-codec SSRCs
+     (AAC_SSRC, OPUS_SSRC) keep Wireshark traces readable.
+   * `handle_play` preserves both interleaved channels off the
+     session transport and feeds them into each drain's
+     `PlayDrainCtx`.
+   * Integration test `rtsp_play_emits_rtcp_sender_report_after_interval`
+     uses `start_paused = true` + `tokio::time::advance(6s)` to
+     collapse the 5 s wait, drives the H.264 handshake end-to-
+     end, emits one IDR, and asserts an SR arrives on channel 1
+     carrying the latest RTP timestamp (9000) with packet_count
+     >= 3 (SPS + PPS + IDR) and octet_count > 0.
+   * +11 tests.
+
+### Ground truth (session 64 close)
+
+* **Head**: `0bfe7d7` on `main`. v0.4.0. **14 commits queued but
+  NOT pushed to origin/main** (sessions 62-64 all unpushed).
+* **Tests**: 614 passed, 0 failed, 1 ignored. Delta from session
+  63: +24 (13 Opus + 11 RTCP).
+* **Code**: +1490 / -182 net lines across the 2 commits.
+* **CI gates locally clean**: fmt, clippy (`-D warnings`),
+  test --workspace all green.
+
+### RTSP PLAY status (session 64 end)
+
+| Piece                                             | Status |
+|---------------------------------------------------|--------|
+| H.264 PLAY drain + SDP + re-injection             | DONE (session 62) |
+| HEVC PLAY drain + RFC 7798 SDP + VPS/SPS/PPS      | DONE (session 63) |
+| AAC PLAY drain + RFC 3640 SDP + config=hex        | DONE (session 63) |
+| Opus PLAY drain + RFC 7587 SDP + dOps             | DONE   |
+| RTCP SR generation (H.264 / HEVC / AAC / Opus)    | DONE   |
+| fMP4 mdat extractor + AVCC NAL splitter           | DONE   |
+| Init-segment extraction (AVC/HEVC/AAC/Opus)       | DONE   |
+| DESCRIBE SDP from broadcaster meta                | DONE   |
+| End-to-end integration (5 codecs + SR)            | DONE   |
+| mediastreamvalidator in CI                        | pending |
+
+RTSP PLAY egress is feature-complete for every codec LVQR carries
+at ingest time (H.264, HEVC, AAC, Opus) and every long-session
+stream now emits paired SRs on the standard 0/1 and 2/3 interleaved
+channels. No audio codec is missing; no video codec is missing;
+long sessions stay NTP-aligned for DVR scrub.
+
+### Load-bearing invariants (all four still pinned)
+
+Unchanged from session 60. Each PLAY drain owns only a
+`BroadcasterStream` receiver (no strong `Arc<FragmentBroadcaster>`),
+and the new SR task co-owned by each drain also avoids any
+broadcaster reference -- it only sees `Arc<RtpStats>`, a writer
+mpsc sender, and the shared cancellation token. Four drains,
+four SR tasks, one shared invariant.
+
+### Protocols supported
+
+11 protocols. Feature-complete for every codec: RTMP / WHIP /
+SRT / RTSP ingest; LL-HLS + DASH + WHEP + MoQ + WebSocket + **RTSP
+PLAY (H.264 / HEVC / AAC / Opus, RTCP SR on all four)** egress.
+
+### Known gaps
+
+1. **mediastreamvalidator binary on CI runner**: the biggest
+   remaining audit gap. `hls-conformance.yml` runs
+   `continue-on-error: false` on every PR, but `macos-latest`
+   ships without Apple HTTP Live Streaming Tools, so the
+   validator step soft-skips and the effective gate is the
+   ffmpeg-client-pull fallback. Promotion requires a
+   self-hosted macOS runner or a pre-baked custom image.
+2. **Tier 1 infra**: no playwright, no 24h soak, no MediaMTX
+   comparison harness.
+3. **Tier 3**: cluster (chitchat) + observability (OTLP) not
+   started.
+4. **Tiers 4-5**: not started.
+
+### Session 65 entry point
+
+Priority order:
+
+1. **mediastreamvalidator self-hosted runner** (infra;
+   user-bound). Apple HTTP Live Streaming Tools on a
+   self-hosted macOS runner (or pre-baked custom image) so
+   `hls-conformance.yml`'s validator step runs authoritatively
+   instead of soft-skipping. Removes the last asterisk on the
+   "spec-compliant LL-HLS" claim. Schedule when the user has
+   capacity for the infra work.
+
+2. **Tier 3 planning**. Cluster (chitchat) + observability (OTLP).
+   Bigger scope; do not start mid-session.
+
+3. **24 h soak harness**. Tier 1 gap that informs the M4
+   "LiveKit alternative for new projects" readiness date. Run a
+   synthetic publisher + 10 concurrent PLAY subscribers over
+   24 h and track fragment loss, drain CPU, SR drift. No code
+   changes; purely harness + CI wiring.
+
+4. **MediaMTX comparison harness**. Head-to-head latency +
+   memory footprint benchmark so the roadmap ETAs have real
+   numbers behind them.
+
+5. **Tier 2.4 WASM client** (research). Defer until M4 is within
+   reach.
+
+### Velocity note
+
+Session 64 landed Opus PLAY + RTCP SR in two commits (one per
+feature); +24 tests; 614 total across 23 crates. Observed pace
+stays at ~10-15 sessions per calendar week at ~2-4 commits and
+~300-1500 lines each. RTSP PLAY egress work is now closed out;
+the remaining Tier 2 surface is infra (#1) + observability (#2)
+rather than protocol code. Realistic M4 ("LiveKit alternative
+for new projects") ETA remains 3-5 calendar weeks of sustained
+sessions, bounded by 24 h soak, multi-node cluster debugging,
+and WASM / AI research components.
 
 ## Session 63 close (2026-04-16)
 
