@@ -1,8 +1,164 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 sessions A+B+C landed; broadcast-ownership KV live; 640 tests, 24 crates
+## Project Status: v0.4.0 -- Tier 3 sessions A+B+C+D landed; broadcast-ownership KV + capacity advertisement live; 649 tests, 24 crates
 
-**Last Updated**: 2026-04-17 (session 73 close -- Tier 3 session C).
+**Last Updated**: 2026-04-17 (session 74 close -- Tier 3 session D).
+
+## Session 74 close (2026-04-17)
+
+### What shipped (1 commit, +579 / -35 lines)
+
+1. **Tier 3 session D: capacity advertisement** (`92793d6`).
+   Executes the fourth slot of the `tracking/TIER_3_PLAN.md`
+   decomposition. Introduces `Cluster::capacity_gauge()` plus a
+   background advertiser task that publishes the gauge's snapshot
+   to the self node's chitchat KV every
+   `capacity_advertise_interval` (default 5 s), and extends
+   `ClusterNode` with an optional `capacity` field so
+   `Cluster::members()` returns every peer's latest advertised
+   numbers.
+
+   New module `crates/lvqr-cluster/src/capacity.rs`:
+   * `NodeCapacity { cpu_pct: f32, rss_bytes: u64, bytes_out_per_sec: u64 }`
+     with serde round-trip and forward-compat decode (unknown
+     fields are tolerated so a future schema bump does not break
+     older readers).
+   * `CapacityGauge` -- `Arc<{AtomicU32, AtomicU64, AtomicU64}>`
+     (f32 bits stored as u32). Cheap to clone, lock-free reads,
+     lock-free writes. Three individual setters plus one full
+     `set(NodeCapacity)` convenience. Reads and writes can race
+     at sub-interval granularity; the 5 s advertisement cadence
+     makes any torn read indistinguishable from a one-tick-late
+     publish.
+   * `spawn_advertiser(chitchat, gauge, interval, cancel)` --
+     uses the `MissedTickBehavior::Delay` + `tokio::select` on
+     `CancellationToken` pattern from session 73's claim renewer
+     and session 64's RTCP SR timer. First tick fires at
+     `now + interval` so the caller has a deterministic window
+     to stage gauge values before the first publish.
+
+   Library changes in `crates/lvqr-cluster/src/lib.rs`:
+   * `mod capacity;` + `pub use capacity::{CapacityGauge, NodeCapacity, CAPACITY_KEY};`
+   * `ClusterConfig::capacity_advertise_interval: Duration`
+     (default 5 s; `for_test()` sets 200 ms).
+   * `Cluster` now owns `capacity_gauge`, a
+     `CancellationToken` for background-task shutdown, and an
+     `Option<JoinHandle<()>>` for the advertiser task.
+   * `ClusterNode` gains `capacity: Option<NodeCapacity>` and
+     drops derived `Eq` + `Hash` (f32 breaks reflexivity on
+     NaN). `PartialEq` retained. Callers that need map keys
+     should key on `NodeId` directly.
+   * `Cluster::members()` reads each node's `capacity` KV entry
+     and populates the field. Manual self_node push removed --
+     chitchat's `live_nodes()` already prepends self.
+   * `Cluster::shutdown()` now cancels the background token and
+     awaits the advertiser task before shutting chitchat down.
+   * `Cluster` now implements `Drop`: cancels the token and
+     aborts the advertiser so the spawned task does not leak
+     past the gossip server if the user drops `Cluster`
+     without calling `shutdown()`.
+   * `Cluster.handle: Option<ChitchatHandle>` -- the new `Drop`
+     forbids moving named fields out in the consuming
+     `shutdown()`, so the handle goes through `Option::take`.
+     Private `handle()` accessor returns `&ChitchatHandle` for
+     the non-consuming code paths.
+
+   New integration tests at
+   `crates/lvqr-cluster/tests/capacity.rs`:
+   * `capacity_reaches_peer_via_gossip` -- A sets cpu_pct=42.5,
+     rss_bytes=1_234_567, bytes_out_per_sec=890_000 between
+     bootstrap and the first 150 ms-delayed tick; B observes
+     the values via `members()` within a 3 s budget. cpu_pct
+     compared with a 1e-5 epsilon.
+   * `capacity_updates_reflect_in_subsequent_snapshots` -- after
+     the first propagation at rss_bytes=100, a later update to
+     rss_bytes=500 is picked up on the next advertise tick and
+     gossipped out. Pins the rolling-snapshot semantic.
+
+### Ground truth (session 74 close)
+
+* **Head**: `92793d6` on `main`. v0.4.0. **33 commits queued but
+  NOT pushed to origin/main** (sessions 62-74 all unpushed).
+* **Tests**: 649 passed, 0 failed, 1 ignored. Delta from session
+  73: +9 (7 capacity unit tests, 2 capacity integration tests).
+* **Code**: +579 / -35 net. New files: `capacity.rs` (290 lines),
+  `tests/capacity.rs` (146 lines).
+* **Workspace**: 24 crates, unchanged.
+* **CI gates locally clean**: fmt, clippy
+  (`--all-targets --benches -D warnings`), test --workspace all
+  green on a fresh run.
+
+### Tier 3 progress
+
+| Session | Deliverable | Status |
+|---|---|---|
+| A (71) | lvqr-cluster scaffold + single-node bootstrap | DONE |
+| B (72) | Two-node integration test: both see each other | DONE |
+| C (73) | Broadcast-ownership KV (claim_broadcast, find_broadcast_owner) | DONE |
+| D (74) | Capacity advertisement | DONE |
+| E (75) | Cluster-wide config channel + admin endpoints | pending |
+| F (76) | Wire Cluster through lvqr-cli serve + RTSP/HLS/DASH redirect | pending |
+| G (77) | lvqr-observability scaffold + OTLP env-var gating | pending |
+| H (78) | OTLP span exporter + in-memory collector test | pending |
+| I (79) | OTLP metric exporter | pending |
+| J (80) | JSON log + trace_id correlation | pending |
+
+**4 of 10 Tier 3 sessions complete.** Remaining 6 sessions at
+the observed pace = ~2 calendar days of focused work before Tier
+4 becomes the critical-path tier.
+
+### Known flakes / risks
+
+* `rtsp_play_emits_rtcp_sender_report_after_interval` in
+  `lvqr-rtsp` flaked once in session 73 and passed on the
+  immediate retry; did not surface in session 74's gate runs.
+  Pre-existing timing-sensitive test.
+* `capacity_reaches_peer_via_gossip` depends on chitchat
+  gossip + the 150 ms test advertise interval. 3 s timeout is
+  ~20x the happy-path budget; if CI flakes, bump the timeout
+  before touching the interval.
+
+### Session 75 entry point
+
+**Tier 3 session E: cluster-wide config channel + admin
+endpoints.**
+
+Deliverable per `tracking/TIER_3_PLAN.md` session E row:
+1. Narrow cluster-wide config surface gossipped via chitchat KV
+   under a `config.<key>` prefix, analogous to the session-73
+   `broadcast.<name>` prefix. Proposed initial keys per the
+   plan: `hls.low-latency.enabled`, `rtsp.tcp.interleaved.enabled`.
+   Reader side: `Cluster::config_get(key) -> Option<String>`.
+   Writer side: a cluster-wide setter that replaces the KV entry
+   on *every live node* via a broadcast write (chitchat KV is
+   per-node, so "cluster-wide config" means converged writes;
+   last-write-wins per key).
+2. Watch API: `Cluster::config_watch(key) -> Stream<Item=Option<String>>`
+   so consumers react to live changes without polling.
+3. Read-only HTTP endpoints under `/admin/cluster/*`:
+   `/admin/cluster/nodes` (from `members()`),
+   `/admin/cluster/broadcasts` (iter_prefix("broadcast.") across
+   all node states), `/admin/cluster/config` (iter_prefix
+   ("config.") across all node states). Wire into `lvqr-admin`;
+   gate behind a new `cluster` feature flag so admin can be
+   built without the cluster crate.
+4. Integration test: two nodes, A sets a config key, B's
+   `config_get` eventually observes it; admin GET returns the
+   expected JSON shape.
+
+Expected scope: ~300-400 lines. One feat commit in
+`lvqr-cluster` + one feat commit wiring the routes into
+`lvqr-admin` (or a single commit if the surface stays tight).
+Session-close doc in a second commit.
+
+Note on "cluster-wide" semantics: chitchat does not have a
+single cluster-wide KV. "Setting" a config key means the
+originating node writes the key to its own state; peers read
+the most recent (by chitchat version) entry they have observed.
+For true last-write-wins across nodes we piggy-back on
+chitchat's monotonic version counter -- the reader resolves
+conflicts by picking the highest-version entry across all
+node states. Document this in the module header.
 
 ## Session 73 close (2026-04-17)
 
