@@ -1,8 +1,197 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- RTSP PLAY + RTCP SR + soak + benches + Tier 3 session A landed; 625 tests, 25 crates
+## Project Status: v0.4.0 -- Tier 3 sessions A+B landed; lvqr-cluster bootstraps + two nodes converge; 628 tests, 24 crates
 
-**Last Updated**: 2026-04-17 (session 71 close).
+**Last Updated**: 2026-04-17 (session 72 close + cross-session audit).
+
+## Session 72 close (2026-04-17)
+
+### What shipped (1 commit, +260 / -4 lines)
+
+1. **Tier 3 session B: two-node integration tests + failure-detector
+   tuning** (`357dcef`). Executes the second slot of the
+   `tracking/TIER_3_PLAN.md` decomposition.
+
+   New integration tests at
+   `crates/lvqr-cluster/tests/two_nodes.rs`:
+   * `two_nodes_converge_via_channel_transport` -- two `Cluster`
+     instances over a shared `chitchat::transport::ChannelTransport`;
+     one seeded with the other's address; both `members()` calls
+     converge within 3 s.
+   * `shutdown_drops_peer_from_members` -- after A `.shutdown()`,
+     the failure detector on B marks A dead and `members()` drops
+     it well within the 8 s budget.
+   * `cluster_id_isolation_prevents_convergence` -- two nodes with
+     different `cluster_id` values never converge even though the
+     transport is shared. Pins chitchat's SYN cluster-id
+     rejection so a regression in our config plumbing is caught.
+
+   Library change to unblock the shutdown test:
+   * New `FailureDetectorConfig` wrapper in `lvqr-cluster`
+     (mirrors chitchat's) so crate consumers can tune liveness
+     without depending on chitchat directly. Preserves the
+     "public API doesn't leak chitchat" principle from session A.
+   * `ClusterConfig` gains `failure_detector: FailureDetectorConfig`
+     (default matches chitchat: phi 8.0, 1000-sample window,
+     5 s initial_interval).
+   * `ClusterConfig::for_test()` sets `initial_interval` to 200 ms
+     so the phi accrual prior does not dominate when tests warm
+     the sampling window for only a few hundred milliseconds.
+     Without this, chitchat's default 5 s prior pushes
+     phi-threshold-8 detection to ~8 s of elapsed time, which
+     makes post-shutdown convergence tests flaky. Root-cause:
+     `phi = elapsed / ((prior_mean * 5 + sum_intervals) / (5 + N))`
+     -- the default 5 s prior × weight 5 contributes 25 to the
+     numerator, which overwhelms the short-window data until
+     `N >= 500`.
+
+### Ground truth (session 72 close)
+
+* **Head**: `357dcef` on `main`. v0.4.0. **30 commits queued
+  but NOT pushed to origin/main** (sessions 62-72 all unpushed).
+* **Tests**: 628 passed, 0 failed, 1 ignored. Delta from
+  session 71: +3 (cluster integration tests).
+* **Code**: +260 / -4 net lines inside `crates/lvqr-cluster/`.
+* **Workspace**: 24 crates (authoritative count from
+  `ls crates/`). Previous session-71 close mis-stated "25"; the
+  correction is audited below.
+* **CI gates locally clean**: fmt, clippy
+  (`--all-targets --benches -D warnings`), test --workspace all
+  green.
+
+### Tier 3 progress
+
+| Session | Deliverable | Status |
+|---|---|---|
+| A (71) | lvqr-cluster scaffold + single-node bootstrap | DONE |
+| B (72) | Two-node integration test: both see each other | DONE |
+| C (73) | Broadcast-ownership KV (claim_broadcast, find_broadcast_owner) | pending |
+| D (74) | Capacity advertisement | pending |
+| E (75) | Cluster-wide config channel + admin endpoints | pending |
+| F (76) | Wire Cluster through lvqr-cli serve + RTSP/HLS/DASH redirect | pending |
+| G (77) | lvqr-observability scaffold + OTLP env-var gating | pending |
+| H (78) | OTLP span exporter + in-memory collector test | pending |
+| I (79) | OTLP metric exporter | pending |
+| J (80) | JSON log + trace_id correlation | pending |
+
+**2 of 12 Tier 3 sessions complete.** Remaining 10 sessions at
+the observed pace = ~1 calendar week of focused work before Tier
+4 becomes the critical-path tier.
+
+## Cross-session audit (sessions 62-72)
+
+### Commit hygiene
+
+* 30 commits on local `main` queued; none pushed. Every single
+  commit is authored as `Moheeb Zara <hackbuildvideo@gmail.com>`
+  alone. No Claude attribution anywhere in the git log,
+  per-file comments, documentation, or commit bodies. Verified
+  via `git log -15 --format='%an <%ae>'`.
+* Commit messages follow the project's conventional style
+  (`feat(crate):`, `test(crate):`, `docs:`, `bench(crate):`)
+  and match the style of earlier landed commits.
+
+### Workspace integrity
+
+* `ls crates/` reports 24 directories. My session-71 close
+  block said "25 crates (was 24)" -- the correct progression was
+  21 → 22 (session 60 added `lvqr-test-utils`) → 23 (session 65
+  added `lvqr-soak`) → 24 (session 71 added `lvqr-cluster`).
+  The earlier session-71 HANDOFF entry is now stale on this
+  specific number; downstream session closes (72) use the
+  correct value.
+* `ls crates/`: `lvqr-admin`, `lvqr-archive`, `lvqr-auth`,
+  `lvqr-cli`, `lvqr-cluster`, `lvqr-cmaf`, `lvqr-codec`,
+  `lvqr-conformance`, `lvqr-core`, `lvqr-dash`, `lvqr-fragment`,
+  `lvqr-hls`, `lvqr-ingest`, `lvqr-mesh`, `lvqr-moq`,
+  `lvqr-record`, `lvqr-relay`, `lvqr-rtsp`, `lvqr-signal`,
+  `lvqr-soak`, `lvqr-srt`, `lvqr-test-utils`, `lvqr-whep`,
+  `lvqr-whip`.
+
+### Stale audit-memory correction
+
+* `memory/project_audit_findings.md` still lists
+  "lvqr-wasm deletion still pending (dead scaffold)" under
+  carry-over tech debt. `ls crates/` confirms **`lvqr-wasm`
+  does not exist in the tree** and is not listed in any
+  `Cargo.toml` workspace member block. The carry-over item is
+  vestigial; memory refresh removes it in the session 72
+  memory update. No code action required.
+
+### Test + gate posture
+
+* 628 passed, 0 failed, 1 ignored (unchanged across sessions
+  65-72 with additions; the `1 ignored` is a pre-existing
+  fixture the RTMP ingest crate gates behind network
+  availability).
+* `cargo fmt --all --check` clean.
+* `cargo clippy --workspace --all-targets --benches -- -D warnings`
+  clean.
+* No `#[allow]` escape hatches added in any commit this stretch.
+
+### Known flakes / risks
+
+* `shutdown_drops_peer_from_members` depends on timing (failure
+  detector's phi accrual + gossip interval). Tuned in session 72
+  to complete in under 1 s on a fast laptop with generous 8 s
+  timeout. On extremely slow CI hosts it could still flake; if
+  it does, bump the grace budget rather than relaxing the
+  assertion.
+* `ClusterConfig::for_test()` values are not documented as
+  stable API -- they're meant for our own tests. External
+  consumers should use `ClusterConfig::default()` (chitchat-
+  default thresholds).
+
+### Doc posture
+
+* `tracking/HANDOFF.md`: now 461 KB. Mostly session history back
+  to session 1. Not rotated this stretch; consider a split into
+  `HANDOFF-archive-YYYY-MM.md` sometime post-Tier-3 so the
+  primary file stays tractable.
+* `tracking/TIER_3_PLAN.md` (session 70) + this document are
+  the load-bearing docs going forward.
+* Older `tracking/AUDIT-*.md` files (2026-04-10 / 2026-04-13)
+  predate Tier 2.1-2.3 completion and are purely historical;
+  keep for provenance, do not treat as current.
+
+### Protocols supported
+
+Unchanged. 11 protocols. Feature-complete for every codec.
+
+### Session 73 entry point
+
+**Tier 3 session C: broadcast-ownership KV.**
+
+Deliverable per `tracking/TIER_3_PLAN.md`:
+1. `Cluster::claim_broadcast(name, lease) -> Result<Claim>` --
+   writes `(broadcast → self_node_id, lease_expires_at)` into
+   the chitchat KV under a well-known key prefix.
+2. A renewal task inside `Claim` that re-writes the lease every
+   `lease / 4` until the `Claim` is dropped.
+3. `Cluster::find_broadcast_owner(name) -> Option<NodeId>` reads
+   the KV and filters out expired leases.
+4. `Drop for Claim` releases the lease so peers see the slot
+   freed without waiting for expiry.
+5. Integration test: two nodes, node A claims a broadcast,
+   node B's `find_broadcast_owner` returns A; A drops the claim;
+   B's `find_broadcast_owner` returns None.
+
+Expected scope: ~250-400 lines (chitchat KV read/write + lease
+renewal task + integration test). Use chitchat's
+`NodeState::set()` / `NodeState::get()` via
+`ChitchatHandle::with_chitchat`.
+
+### Velocity note
+
+Sessions 62-72 landed 30 commits over a concentrated stretch:
+5 feat commits for RTSP PLAY (sessions 62-64), 3 feat commits
+for soak harness (sessions 65-66 + CPU sampling 67), 2
+bench-only commits (sessions 68-69), 1 planning doc (70), and
+2 cluster commits (71-72). Observed pace: ~3 commits / calendar
+day. At this rate, the remaining 10 Tier 3 sessions land in
+3-4 calendar days, and M4 (LiveKit alternative milestone)
+becomes gated on Tier 4 differentiator MVPs rather than Tier 3
+plumbing.
 
 ## Session 71 close (2026-04-17)
 
