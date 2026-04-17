@@ -1,8 +1,138 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- RTSP PLAY egress end-to-end (H.264 video); 575 tests, all green
+## Project Status: v0.4.0 -- RTSP PLAY egress end-to-end for H.264 + HEVC video + AAC audio; 590 tests, all green
 
-**Last Updated**: 2026-04-16 (session 62 close).
+**Last Updated**: 2026-04-16 (session 63 close).
+
+## Session 63 close (2026-04-16)
+
+### What shipped (3 commits, +1321 / -43 lines, net +1278)
+
+1. **HEVC PLAY egress** (`6937b03`). Extended the H.264 PLAY
+   scaffold to HEVC:
+   * `lvqr_cmaf::HevcParameterSets` gains profile/tier/level
+     fields pulled off the hvcC box for RFC 7798 SDP.
+   * `sdp::PlaySdp.video` becomes `VideoTrackDescription::{H264,
+     Hevc}`; HEVC renders `m=video` + `rtpmap H265/90000` + RFC
+     7798 fmtp with profile-space/id, tier-flag, level-id,
+     profile-compatibility-indicator, interop-constraints, and
+     separate base64 `sprop-vps` / `sprop-sps` / `sprop-pps`.
+   * `play::play_drain_hevc` composes `HevcPacketizer` with
+     `extract_hevc_parameter_sets` and the existing `fmp4`
+     demux. Re-injects VPS + SPS + PPS before the first IDR
+     (three packets vs H.264's two).
+   * `handle_describe` prefers HEVC, falls back to AVC.
+     `handle_play` picks the drain variant by testing
+     `extract_hevc_parameter_sets` on the init bytes.
+   * 5 new tests.
+
+2. **AAC PLAY egress** (`618a709`). Parallel audio path:
+   * `lvqr_cmaf::AacConfig` + `extract_aac_config`: decode
+     ftyp+moov, find the first mp4a entry, reconstruct the
+     2-byte AudioSpecificConfig from the mp4-atom
+     `DecoderSpecific` (profile / freq_index / chan_conf).
+     Sample rate resolved from the standard freq_index table.
+   * `sdp::AacTrackDescription` renders RFC 3640 AAC-hbr:
+     `m=audio` + `mpeg4-generic/<rate>/<channels>` +
+     `streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;
+     indexlength=3;indexdeltalength=3;config=<hex>`.
+   * `play::play_drain_aac`: AacPacketizer + the existing
+     `fmp4::extract_mdat_body`. No parameter-set re-injection
+     (AAC decoder config lives only in SDP). One RTP packet
+     per access unit, marker=1 per RFC 3640, PT=97 distinct
+     from video's PT=96.
+   * `handle_play` now spawns video + audio drains in parallel
+     from `session.transports["track1"]` and
+     `session.transports["track2"]` so a client SETUPping
+     both tracks gets both drains.
+   * 8 new tests (4 cmaf, 2 sdp, 2 play).
+
+3. **HEVC + AAC PLAY end-to-end integration** (`b9c7563`).
+   Two new tests in `tests/play_integration.rs` beside the
+   session-62 H.264 test. Real TCP client runs DESCRIBE ->
+   SETUP -> PLAY against a bare RtspServer, emits a fragment
+   through the broadcaster, and verifies round-trip through
+   the depacketizer.
+
+### Ground truth (session 63 close)
+
+* **Head**: `b9c7563` on `main`. v0.4.0.
+* **Tests**: 590 passed, 0 failed, 1 ignored. Delta from
+  session 62: +15 (5 HEVC + 8 AAC + 2 integration).
+* **Code**: +1321 / -43 net lines.
+* **CI gates locally clean**: fmt, clippy (`-D warnings`),
+  test --workspace all green.
+
+### RTSP PLAY status (session 63 end)
+
+| Piece                                             | Status |
+|---------------------------------------------------|--------|
+| H.264 PLAY drain + SDP + re-injection             | DONE (session 62) |
+| HEVC PLAY drain + RFC 7798 SDP + VPS/SPS/PPS      | DONE   |
+| AAC PLAY drain + RFC 3640 SDP + config=hex        | DONE   |
+| fMP4 mdat extractor + AVCC NAL splitter           | DONE   |
+| Init-segment param-set extraction (AVC/HEVC/AAC)  | DONE   |
+| DESCRIBE SDP from broadcaster meta                | DONE   |
+| End-to-end integration tests (H.264 + HEVC + AAC) | DONE   |
+| RTCP SR generation                                | pending |
+| Opus audio PLAY drain                             | pending |
+| mediastreamvalidator in CI                        | pending |
+
+All three codecs LVQR ships at ingest time now have a working
+PLAY egress. RTCP and Opus remain but are incremental.
+
+### Load-bearing invariants (all four still pinned)
+
+Unchanged from session 60. Each PLAY drain holds only a
+`BroadcasterStream` receiver, never a strong
+`Arc<FragmentBroadcaster>`. The three drain functions have
+parallel structure so future refactors can extract a common
+skeleton without regressing the invariant.
+
+### Protocols supported
+
+11 protocols, now with fuller PLAY coverage: RTMP + WHIP + SRT +
+RTSP ingest; LL-HLS + DASH + WHEP + MoQ + WebSocket + **RTSP PLAY
+(H.264 / HEVC / AAC)** egress.
+
+### Known gaps
+
+1. **RTCP SR on PLAY**: no sender reports today. Most clients
+   tolerate absence for short sessions; a long-running VLC / ffplay
+   will eventually query the NTP-wallclock alignment and silence.
+2. **Opus PLAY drain**: WebRTC-sourced Opus would currently
+   produce an audio broadcaster that `extract_aac_config` rejects.
+   The SDP builder needs a parallel `OpusTrackDescription` and
+   `play_drain_opus`. Opus RTP packetization is RFC 7587
+   (single-frame packets, easy) and would fit the existing
+   scaffold cleanly.
+3. **Apple mediastreamvalidator in CI**: biggest audit gap.
+4. **Tier 1 infra**: no playwright, no 24h soak, no MediaMTX
+   comparison harness.
+5. **Tiers 3-5**: not started.
+
+### Session 64 entry point
+
+Priority order:
+
+1. **Apple mediastreamvalidator in CI**. GitHub Actions macOS
+   runner that runs Apple's validator against
+   `lvqr-hls`-generated playlists and blocks merges on
+   validator-red. Biggest audit-findings gap after the PLAY
+   egress work.
+
+2. **Opus PLAY drain + SDP**. Layer on top of the audio drain
+   skeleton. RFC 7587 packetization is straightforward; SDP
+   uses `opus/48000/2` + `a=fmtp:<pt> sprop-stereo=1`.
+
+3. **RTCP SR generation**. Per-SSRC Sender Reports on a short
+   timer. Needed for long-running sessions and for Wireshark
+   sanity during external interop testing.
+
+4. **lvqr-cmaf with mp4-atom**. Only becomes urgent when AV1
+   or timed text land in the data path.
+
+5. **Tier 3 planning**. Cluster (chitchat) + observability (OTLP).
 
 ## Session 62 close (2026-04-16)
 
