@@ -2,40 +2,54 @@
 //!
 //! This is the crate `lvqr-cli::main` calls at the top of the
 //! process to wire tracing + metrics subscribers in one place.
-//! Today (session 80, Tier 3 session G) it installs a single
-//! stdout `fmt` layer gated by `RUST_LOG` / env filter -- the
-//! same behavior the previous inline `tracing_subscriber::fmt()
-//! .init()` call produced -- behind a
-//! [`ObservabilityConfig::from_env`] facade so future sessions
-//! can layer in OTLP span (H), OTLP metric (I), and JSON-log +
-//! `trace_id` correlation (J) without touching the call site.
+//! As of session 81 (Tier 3 session H) it can optionally
+//! install an OTLP gRPC span exporter alongside the stdout
+//! `fmt` layer, gated on `LVQR_OTLP_ENDPOINT`; when that env
+//! var is unset, the original stdout-only path runs unchanged.
+//! Sessions I and J will layer in OTLP metric export and JSON
+//! log + `trace_id` correlation respectively.
 //!
-//! ## Scope of session G
+//! ## Scope of session H (this session)
 //!
-//! * [`ObservabilityConfig`] with five fields: `otlp_endpoint`,
-//!   `service_name`, `resource_attributes`, `json_logs`,
-//!   `trace_sample_ratio`. All parsed from environment variables
-//!   by [`ObservabilityConfig::from_env`] so operators can
-//!   change behavior without a binary change.
-//! * [`ObservabilityHandle`] -- an empty guard struct today.
-//!   Sessions H / I will park the tracer-provider and
-//!   meter-provider drop guards here so the OTLP background
-//!   flushers do not leak past `main`.
-//! * [`init`] installs the stdout fmt subscriber (honouring the
-//!   `EnvFilter` rules the previous call used) and returns the
-//!   handle. If `otlp_endpoint` is set, a warning is emitted
-//!   that OTLP support is not yet wired; the stdout path still
-//!   runs.
+//! * Depend on the OTel workspace crates at the versions pinned
+//!   in `tracking/TIER_3_PLAN.md`'s "Dependencies to pin" table:
+//!   `opentelemetry` 0.27 / `opentelemetry_sdk` 0.27 (rt-tokio)
+//!   / `opentelemetry-otlp` 0.27 (grpc-tonic) /
+//!   `tracing-opentelemetry` 0.28.
+//! * When `config.otlp_endpoint.is_some()`, build a
+//!   [`opentelemetry_sdk::trace::TracerProvider`] backed by a
+//!   `BatchSpanProcessor` over an OTLP gRPC exporter pointing at
+//!   the configured endpoint. Compose a `tracing_opentelemetry`
+//!   layer with the fmt layer through
+//!   [`tracing_subscriber::registry`] so tracing spans flow out
+//!   via OTLP AND still render on stdout for operators.
+//! * Honour `config.service_name` and
+//!   `config.resource_attributes` through the `Resource` applied
+//!   to the `TracerProvider`.
+//! * Honour `config.trace_sample_ratio` via
+//!   `opentelemetry_sdk::trace::Sampler::TraceIdRatioBased`.
+//! * Park the `TracerProvider` on
+//!   [`ObservabilityHandle::tracer_provider`] and force-flush +
+//!   shut it down on drop so pending spans are not lost when
+//!   the process exits.
 //!
-//! ## What is deliberately NOT in this crate yet
+//! ## Scope of session G (already landed, unchanged here)
 //!
-//! * OTLP span export via `opentelemetry-otlp`. Lands session H.
-//! * OTLP metric export. Lands session I.
+//! * [`ObservabilityConfig`] + [`ObservabilityConfig::from_env`]
+//!   parse five env vars (`LVQR_OTLP_ENDPOINT`,
+//!   `LVQR_SERVICE_NAME`, `LVQR_OTLP_RESOURCE`, `LVQR_LOG_JSON`,
+//!   `LVQR_TRACE_SAMPLE_RATIO`). See the env-var surface table
+//!   below.
+//! * [`ObservabilityHandle`] is `#[must_use]`; dropping it
+//!   flushes and shuts down the OTLP exporter (session H
+//!   addition).
+//!
+//! ## What is still deliberately NOT in this crate yet
+//!
+//! * OTLP metric export via `opentelemetry_sdk::metrics`. Lands
+//!   session I.
 //! * JSON log formatting + `trace_id` correlation on every log
 //!   line. Lands session J.
-//! * Dependency on `opentelemetry*` crates -- deliberately held
-//!   back so session-80 bring-up stays dependency-light and
-//!   does not cascade version churn across the workspace.
 //!
 //! ## Env var surface
 //!
@@ -43,13 +57,13 @@
 //! with a well-known prefix. Unset values fall through to the
 //! compiled-in defaults from [`ObservabilityConfig::default`].
 //!
-//! | env | field | default | future use |
-//! |-----|-------|---------|------------|
-//! | `LVQR_OTLP_ENDPOINT` | `otlp_endpoint` | `None` | session H: gRPC OTLP target |
+//! | env | field | default | consumer |
+//! |-----|-------|---------|----------|
+//! | `LVQR_OTLP_ENDPOINT` | `otlp_endpoint` | `None` | OTLP gRPC target (session H span; session I metric) |
 //! | `LVQR_SERVICE_NAME` | `service_name` | `"lvqr"` | span / metric `service.name` resource |
 //! | `LVQR_OTLP_RESOURCE` | `resource_attributes` | `[]` | comma-separated `k=v` pairs added to every span / metric |
-//! | `LVQR_LOG_JSON` | `json_logs` | `false` | session J: flip the fmt layer from pretty → JSON |
-//! | `LVQR_TRACE_SAMPLE_RATIO` | `trace_sample_ratio` | `1.0` | session H: head-based sampling ratio |
+//! | `LVQR_LOG_JSON` | `json_logs` | `false` | session J: flip the fmt layer from pretty to JSON |
+//! | `LVQR_TRACE_SAMPLE_RATIO` | `trace_sample_ratio` | `1.0` | head-based sampling ratio, clamped to `[0.0, 1.0]` |
 //!
 //! Test infrastructure (`lvqr-test-utils::init_test_tracing`) is
 //! intentionally left untouched -- tests keep the existing stdout
@@ -59,7 +73,16 @@
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
-use tracing_subscriber::EnvFilter;
+use opentelemetry::KeyValue;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::export::trace::SpanExporter;
+use opentelemetry_sdk::runtime;
+use opentelemetry_sdk::trace::{Sampler, TracerProvider};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, fmt};
 
 /// Environment variable that, when set, supplies the OTLP
 /// collector endpoint. Example: `http://localhost:4317`.
@@ -81,8 +104,8 @@ pub const ENV_TRACE_SAMPLE_RATIO: &str = "LVQR_TRACE_SAMPLE_RATIO";
 #[derive(Debug, Clone)]
 pub struct ObservabilityConfig {
     /// OTLP collector endpoint. `None` disables OTLP export
-    /// entirely; stdout logs still run. Sessions H (spans) and
-    /// I (metrics) consume this.
+    /// entirely; stdout logs still run. Session H (spans) and
+    /// session I (metrics) consume this.
     pub otlp_endpoint: Option<String>,
     /// `service.name` resource attribute applied to every span
     /// / metric. Operators set this to distinguish multiple
@@ -147,10 +170,10 @@ impl ObservabilityConfig {
         if let Some(v) = get(ENV_JSON_LOGS).filter(|s| !s.is_empty()) {
             cfg.json_logs = parse_truthy(&v);
         }
-        if let Some(v) = get(ENV_TRACE_SAMPLE_RATIO).filter(|s| !s.is_empty()) {
-            if let Ok(parsed) = f64::from_str(&v) {
-                cfg.trace_sample_ratio = parsed.clamp(0.0, 1.0);
-            }
+        if let Some(v) = get(ENV_TRACE_SAMPLE_RATIO).filter(|s| !s.is_empty())
+            && let Ok(parsed) = f64::from_str(&v)
+        {
+            cfg.trace_sample_ratio = parsed.clamp(0.0, 1.0);
         }
         cfg
     }
@@ -181,63 +204,139 @@ fn parse_truthy(raw: &str) -> bool {
     matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
-/// Lifetime guard for the observability subsystem. Drop semantics
-/// are a no-op today; sessions H / I park the OTLP tracer and
-/// meter provider guards here so the background flushers do
-/// not leak past the end of `main`.
+/// Lifetime guard for the observability subsystem. Hold this
+/// for the process lifetime; dropping it force-flushes and
+/// shuts down the OTLP tracer provider (session H) so the
+/// background batch span processor does not lose pending
+/// spans. Single-node deployments without
+/// `LVQR_OTLP_ENDPOINT` set carry `None` here and drop is
+/// a no-op.
 #[derive(Debug, Default)]
 #[must_use = "dropping ObservabilityHandle shuts down OTLP exporters; hold it for the process lifetime"]
 pub struct ObservabilityHandle {
-    /// Reserved for session H: `opentelemetry_sdk::trace::TracerProvider`.
-    /// Concrete type omitted until the dep is added.
-    _tracer_provider: (),
-    /// Reserved for session I: `opentelemetry_sdk::metrics::SdkMeterProvider`.
-    _meter_provider: (),
+    /// The OTLP tracer provider, when
+    /// `config.otlp_endpoint.is_some()`. `None` for the default
+    /// stdout-only path.
+    tracer_provider: Option<TracerProvider>,
+}
+
+impl Drop for ObservabilityHandle {
+    fn drop(&mut self) {
+        if let Some(provider) = self.tracer_provider.take() {
+            for result in provider.force_flush() {
+                if let Err(err) = result {
+                    eprintln!("lvqr-observability: force_flush reported error: {err}");
+                }
+            }
+            if let Err(err) = provider.shutdown() {
+                eprintln!("lvqr-observability: tracer provider shutdown error: {err}");
+            }
+        }
+    }
+}
+
+/// Build a resource from the service name + user-supplied
+/// attribute list. Split out so the integration test can build
+/// an equivalent `TracerProvider` without duplicating the
+/// attribute-merge logic.
+fn build_resource(config: &ObservabilityConfig) -> Resource {
+    let mut kvs: Vec<KeyValue> = Vec::with_capacity(1 + config.resource_attributes.len());
+    kvs.push(KeyValue::new("service.name", config.service_name.clone()));
+    for (k, v) in &config.resource_attributes {
+        kvs.push(KeyValue::new(k.clone(), v.clone()));
+    }
+    Resource::new(kvs)
+}
+
+/// Build a [`TracerProvider`] configured per `config` with a
+/// caller-supplied [`SpanExporter`]. Production path calls this
+/// with an OTLP gRPC exporter built by [`init`]; integration
+/// tests call it with an in-memory exporter so a synthetic span
+/// can be asserted end-to-end without a real network
+/// round-trip.
+///
+/// The exporter is wrapped in a `BatchSpanProcessor` backed by
+/// [`runtime::Tokio`], so the caller MUST be inside a Tokio
+/// runtime when this function is invoked. `lvqr-cli::main` is
+/// already `#[tokio::main]`; tests mark themselves
+/// `#[tokio::test]`.
+pub fn build_tracer_provider<E>(config: &ObservabilityConfig, exporter: E) -> TracerProvider
+where
+    E: SpanExporter + 'static,
+{
+    TracerProvider::builder()
+        .with_batch_exporter(exporter, runtime::Tokio)
+        .with_resource(build_resource(config))
+        .with_sampler(Sampler::TraceIdRatioBased(config.trace_sample_ratio))
+        .build()
 }
 
 /// Install the global tracing subscriber. Returns an
-/// [`ObservabilityHandle`] that the caller should hold for the
-/// process lifetime; dropping it before the process exits
-/// shortens the background flusher windows of future sessions'
-/// OTLP exporters.
+/// [`ObservabilityHandle`] that the caller MUST hold for the
+/// process lifetime; dropping it force-flushes and shuts down
+/// the OTLP exporter so pending spans are not lost.
 ///
-/// Current behavior (session 80 / Tier 3 session G):
-/// * Installs a single stdout `fmt` layer with an
-///   [`EnvFilter`] sourced from `RUST_LOG` (or the
-///   `"lvqr=info"` default when that env var is unset).
-/// * Emits a `tracing::warn!` if
-///   `config.otlp_endpoint.is_some()` telling the operator
-///   OTLP support lands in session 81.
-/// * Returns an empty handle.
+/// Behavior as of session 81 (Tier 3 session H):
+/// * Installs a stdout `fmt` layer with an [`EnvFilter`]
+///   sourced from `RUST_LOG` (or the `"lvqr=info"` default when
+///   that env var is unset). Matches the previous inline
+///   `tracing_subscriber::fmt().init()` behavior.
+/// * If `config.otlp_endpoint.is_some()`, ALSO installs a
+///   `tracing_opentelemetry` layer backed by an OTLP gRPC
+///   exporter. Spans emitted through `tracing::instrument`,
+///   `tracing::info_span!`, etc. flow both to stdout AND out
+///   the OTLP exporter.
+/// * If the OTLP exporter fails to build (invalid endpoint,
+///   DNS miss at process start, tonic initialization failure),
+///   the init call returns `Err`; the caller can decide
+///   whether to fail fast or continue without tracing.
 ///
-/// Calling `init` more than once per process is an error
+/// Calling `init` more than once per process returns an error
 /// (`tracing::dispatcher::set_global_default` can only win
 /// once). In tests, prefer `lvqr_test_utils::init_test_tracing`
 /// which is idempotent on re-run.
 pub fn init(config: ObservabilityConfig) -> Result<ObservabilityHandle> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("lvqr=info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let fmt_layer = fmt::layer();
+
+    let tracer_provider = if let Some(endpoint) = config.otlp_endpoint.as_deref() {
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()
+            .context("build OTLP gRPC span exporter")?;
+        Some(build_tracer_provider(&config, exporter))
+    } else {
+        None
+    };
+
+    let otel_layer = tracer_provider.as_ref().map(|provider| {
+        let tracer = provider.tracer(config.service_name.clone());
+        tracing_opentelemetry::layer().with_tracer(tracer)
+    });
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(otel_layer)
         .try_init()
         .map_err(|e| anyhow::anyhow!("install global tracing subscriber: {e}"))
         .context("lvqr-observability init")?;
 
-    if let Some(ref endpoint) = config.otlp_endpoint {
-        tracing::warn!(
-            endpoint = %endpoint,
-            "LVQR_OTLP_ENDPOINT configured but OTLP export is not wired yet; \
-             span export lands in Tier 3 session H (lvqr session 81)",
-        );
+    if let Some(ref provider) = tracer_provider {
+        opentelemetry::global::set_tracer_provider(provider.clone());
     }
 
     tracing::info!(
         service_name = %config.service_name,
+        otlp_enabled = tracer_provider.is_some(),
+        otlp_endpoint = config.otlp_endpoint.as_deref().unwrap_or(""),
         json_logs = config.json_logs,
         trace_sample_ratio = config.trace_sample_ratio,
-        "observability initialized (stdout fmt only; OTLP stub)",
+        "observability initialized",
     );
 
-    Ok(ObservabilityHandle::default())
+    Ok(ObservabilityHandle { tracer_provider })
 }
 
 #[cfg(test)]
@@ -297,7 +396,6 @@ mod tests {
     #[test]
     fn empty_env_var_value_is_treated_as_unset() {
         let cfg = ObservabilityConfig::from_env_reader(mk_env(&[(ENV_OTLP_ENDPOINT, ""), (ENV_SERVICE_NAME, "")]));
-        // Empty strings don't override defaults.
         assert!(cfg.otlp_endpoint.is_none());
         assert_eq!(cfg.service_name, "lvqr");
     }
@@ -361,10 +459,33 @@ mod tests {
 
     #[test]
     fn observability_handle_is_send_and_sync() {
-        // If this ever breaks, the handle cannot be held on an
-        // Arc across threads alongside the server state.
         fn require<T: Send + Sync>(_: &T) {}
         let h = ObservabilityHandle::default();
         require(&h);
+    }
+
+    #[test]
+    fn build_resource_merges_service_name_and_attrs() {
+        let cfg = ObservabilityConfig {
+            service_name: "lvqr-a".to_string(),
+            resource_attributes: vec![
+                ("deploy.env".to_string(), "prod".to_string()),
+                ("region".to_string(), "us-east-1".to_string()),
+            ],
+            ..ObservabilityConfig::default()
+        };
+        let resource = build_resource(&cfg);
+        let service_name = resource
+            .get(opentelemetry::Key::from_static_str("service.name"))
+            .map(|v| v.to_string());
+        assert_eq!(service_name.as_deref(), Some("lvqr-a"));
+        let env = resource
+            .get(opentelemetry::Key::from_static_str("deploy.env"))
+            .map(|v| v.to_string());
+        assert_eq!(env.as_deref(), Some("prod"));
+        let region = resource
+            .get(opentelemetry::Key::from_static_str("region"))
+            .map(|v| v.to_string());
+        assert_eq!(region.as_deref(), Some("us-east-1"));
     }
 }

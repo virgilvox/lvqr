@@ -122,6 +122,15 @@ jsonwebtoken = "9"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
+# OpenTelemetry (Tier 3 observability plane, sessions H-J). Pin the exact
+# versions from tracking/TIER_3_PLAN.md's "Dependencies to pin" table; any
+# upgrade gets its own session. `tracing-opentelemetry` 0.28 targets the
+# `opentelemetry*` 0.27 line per upstream release cadence.
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.28"
+
 # Internal crates
 lvqr-core = { version = "0.4.0", path = "crates/lvqr-core" }
 lvqr-moq = { version = "0.4.0", path = "crates/lvqr-moq" }
