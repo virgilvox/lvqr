@@ -105,6 +105,9 @@ h264-reader = "0.7"
 # Random
 rand = "0.8"
 
+# Base64 (SDP sprop-parameter-sets encoding)
+base64 = "0.22"
+
 # Authentication
 jsonwebtoken = "9"
 

@@ -118,6 +118,11 @@ impl RtspServer {
 struct ConnectionState {
     sessions: HashMap<SessionId, Session>,
     server_addr: SocketAddr,
+    /// Shared broadcaster registry. The DESCRIBE handler reads init
+    /// bytes off broadcaster meta to synthesize an SDP response; the
+    /// (future) PLAY path subscribes through it to drain fragments
+    /// into RTP.
+    registry: FragmentBroadcasterRegistry,
     h264_depack: H264Depacketizer,
     hevc_depack: HevcDepacketizer,
     aac_depack: AacDepacketizer,
@@ -149,6 +154,7 @@ async fn handle_connection(
     let mut conn = ConnectionState {
         sessions: HashMap::new(),
         server_addr,
+        registry: registry.clone(),
         h264_depack: H264Depacketizer::new(),
         hevc_depack: HevcDepacketizer::new(),
         aac_depack: AacDepacketizer::new(),
@@ -631,20 +637,32 @@ fn handle_options(cseq: u32) -> Response {
 
 fn handle_describe(conn: &ConnectionState, req: &proto::Request, cseq: u32) -> Response {
     let broadcast = extract_broadcast(&req.uri);
-    // Build a minimal SDP describing available tracks.
-    // In a full implementation this would query the fragment observer
-    // for active broadcasts and their codec parameters.
-    let sdp = format!(
-        "v=0\r\n\
-         o=- 0 0 IN IP4 {}\r\n\
-         s={broadcast}\r\n\
-         t=0 0\r\n\
-         a=control:*\r\n\
-         m=video 0 RTP/AVP 96\r\n\
-         a=rtpmap:96 H264/90000\r\n\
-         a=control:track1\r\n",
-        conn.server_addr.ip()
-    );
+
+    // Session-level SDP. The video block is populated only when the
+    // shared registry carries a video broadcaster for this broadcast
+    // AND its meta has an init segment we can pull SPS / PPS out of.
+    // An absent video block still yields a syntactically valid SDP so
+    // clients that DESCRIBE before anyone publishes get a well-formed
+    // empty stream description rather than a 404.
+    let video = conn
+        .registry
+        .get(&broadcast, "0.mp4")
+        .and_then(|bc| bc.meta().init_segment.clone())
+        .and_then(|init| lvqr_cmaf::extract_avc_parameter_sets(&init))
+        .map(|params| crate::sdp::H264TrackDescription {
+            payload_type: 96,
+            clock_rate: 90_000,
+            control: "track1".to_string(),
+            params,
+        });
+
+    let sdp = crate::sdp::PlaySdp {
+        session_name: broadcast,
+        host_ip: conn.server_addr.ip(),
+        video,
+    }
+    .render();
+
     Response::ok()
         .with_cseq(cseq)
         .with_header("Content-Base", &req.uri)
@@ -812,10 +830,15 @@ mod tests {
     }
 
     #[test]
-    fn describe_returns_sdp() {
+    fn describe_without_broadcaster_returns_empty_sdp() {
+        // Before anyone publishes, DESCRIBE returns a valid session
+        // header but no media m= line. A video m= line only appears
+        // after the registry carries an H.264 broadcaster with a
+        // decodable init segment.
         let conn = ConnectionState {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
+            registry: FragmentBroadcasterRegistry::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),
@@ -842,7 +865,72 @@ mod tests {
         assert_eq!(resp.status, 200);
         let body = std::str::from_utf8(&resp.body).unwrap();
         assert!(body.contains("v=0"));
-        assert!(body.contains("H264/90000"));
+        assert!(body.contains("s=live/test"));
+        assert!(!body.contains("m=video"), "no video m= when no broadcaster");
+    }
+
+    #[test]
+    fn describe_with_broadcaster_emits_h264_media_block() {
+        use bytes::BytesMut;
+        use lvqr_cmaf::{VideoInitParams, write_avc_init_segment};
+        use lvqr_fragment::FragmentMeta;
+
+        let registry = FragmentBroadcasterRegistry::new();
+
+        // Pre-populate the broadcaster with a real AVC init segment so
+        // DESCRIBE can extract SPS/PPS.
+        let sps = [0x67u8, 0x42, 0x00, 0x1F, 0xD9, 0x40, 0x50, 0x04, 0xFB, 0x01, 0x10, 0x00];
+        let pps = [0x68u8, 0xEB, 0xE3, 0xCB, 0x22, 0xC0];
+        let mut init = BytesMut::new();
+        write_avc_init_segment(
+            &mut init,
+            &VideoInitParams {
+                sps: sps.to_vec(),
+                pps: pps.to_vec(),
+                width: 1280,
+                height: 720,
+                timescale: 90_000,
+            },
+        )
+        .expect("write init");
+        let bc = registry.get_or_create("live/test", "0.mp4", FragmentMeta::new("avc1", 90_000));
+        bc.set_init_segment(init.freeze());
+
+        let conn = ConnectionState {
+            sessions: HashMap::new(),
+            server_addr: "127.0.0.1:8554".parse().unwrap(),
+            registry,
+            h264_depack: H264Depacketizer::new(),
+            hevc_depack: HevcDepacketizer::new(),
+            aac_depack: AacDepacketizer::new(),
+            rtp_packet_count: 0,
+            sps: None,
+            pps: None,
+            vps: None,
+            video_init_emitted: false,
+            video_seq: 0,
+            prev_video_dts: None,
+            audio_init_emitted: false,
+            audio_seq: 0,
+            audio_timescale: 44100,
+            prev_audio_dts: None,
+        };
+        let req = proto::Request {
+            method: Method::Describe,
+            uri: "rtsp://localhost:8554/live/test".into(),
+            version: proto::RtspVersion::V1_0,
+            headers: proto::Headers::new(),
+            body: Vec::new(),
+        };
+        let resp = handle_describe(&conn, &req, 2);
+        assert_eq!(resp.status, 200);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        assert!(body.contains("m=video 0 RTP/AVP 96"));
+        assert!(body.contains("a=rtpmap:96 H264/90000"));
+        assert!(body.contains("packetization-mode=1"));
+        assert!(body.contains("sprop-parameter-sets="));
+        assert!(body.contains("profile-level-id=42001F"), "profile pulled from SPS");
+        assert!(body.contains("a=control:track1"));
     }
 
     #[test]
@@ -850,6 +938,7 @@ mod tests {
         let mut conn = ConnectionState {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
+            registry: FragmentBroadcasterRegistry::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),
@@ -917,6 +1006,7 @@ mod tests {
         let mut conn = ConnectionState {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
+            registry: FragmentBroadcasterRegistry::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),
@@ -1004,6 +1094,7 @@ mod tests {
         let mut conn = ConnectionState {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
+            registry: FragmentBroadcasterRegistry::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),

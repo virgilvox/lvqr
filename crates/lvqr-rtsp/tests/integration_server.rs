@@ -75,9 +75,14 @@ async fn describe_returns_sdp() {
         "DESCRIBE rtsp://localhost/live/cam1 RTSP/1.0\r\nCSeq: 1\r\n\r\n",
     )
     .await;
+    // No broadcaster exists yet, so the SDP carries only the session
+    // header with no m= media blocks. The DESCRIBE still returns 200
+    // + application/sdp per RFC 2326 so clients can observe the empty
+    // stream rather than racing a 404.
     assert!(resp.contains("RTSP/1.0 200"));
     assert!(resp.contains("application/sdp"));
-    assert!(resp.contains("H264/90000"));
+    assert!(resp.contains("v=0"));
+    assert!(!resp.contains("m=video"), "no video m= before any publisher");
 
     shutdown.cancel();
 }
