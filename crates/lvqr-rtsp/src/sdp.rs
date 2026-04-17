@@ -7,8 +7,11 @@
 //! will accept as a PLAY description.
 //!
 //! The builder is intentionally small: it renders one session-level
-//! block plus one media block per populated track. Audio + HEVC
-//! lands in a follow-up change; today the PLAY path is H.264-only.
+//! block plus one media block per populated track. H.264 follows RFC
+//! 6184 (`profile-level-id`, `packetization-mode`,
+//! `sprop-parameter-sets`); HEVC follows RFC 7798 (`profile-space`,
+//! `profile-id`, `tier-flag`, `level-id`, separate `sprop-vps` /
+//! `sprop-sps` / `sprop-pps`). Audio support lands in a follow-up.
 //!
 //! Session-level and media-level control URIs are relative and
 //! resolved against the `Content-Base` header the DESCRIBE response
@@ -17,7 +20,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use lvqr_cmaf::AvcParameterSets;
+use lvqr_cmaf::{AvcParameterSets, HevcParameterSets};
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
@@ -36,6 +39,29 @@ pub struct H264TrackDescription {
     pub params: AvcParameterSets,
 }
 
+/// SDP for an HEVC video track on the PLAY response. Mirrors
+/// [`H264TrackDescription`] but follows RFC 7798 for the fmtp line:
+/// profile-space / profile-id / tier-flag / level-id instead of the
+/// H.264 `profile-level-id`, and three separate `sprop-vps` /
+/// `sprop-sps` / `sprop-pps` attributes instead of the joined
+/// `sprop-parameter-sets`.
+#[derive(Debug, Clone)]
+pub struct HevcTrackDescription {
+    pub payload_type: u8,
+    pub clock_rate: u32,
+    pub control: String,
+    pub params: HevcParameterSets,
+}
+
+/// Either an H.264 or an HEVC video track for the PLAY SDP. A single
+/// broadcast is one codec at a time; the enum enforces that only one
+/// variant is rendered.
+#[derive(Debug, Clone)]
+pub enum VideoTrackDescription {
+    H264(H264TrackDescription),
+    Hevc(HevcTrackDescription),
+}
+
 /// Top-level SDP description rendered in response to DESCRIBE.
 #[derive(Debug, Clone)]
 pub struct PlaySdp {
@@ -46,7 +72,7 @@ pub struct PlaySdp {
     pub host_ip: IpAddr,
     /// Video description, present when a video broadcaster exists
     /// for the requested broadcast.
-    pub video: Option<H264TrackDescription>,
+    pub video: Option<VideoTrackDescription>,
 }
 
 impl PlaySdp {
@@ -69,27 +95,74 @@ impl PlaySdp {
         let _ = writeln!(out, "t=0 0\r");
         let _ = writeln!(out, "a=control:*\r");
 
-        if let Some(ref v) = self.video {
-            let _ = writeln!(out, "m=video 0 RTP/AVP {}\r", v.payload_type);
-            let _ = writeln!(out, "c=IN {addr_family} 0.0.0.0\r");
-            let _ = writeln!(out, "a=rtpmap:{} H264/{}\r", v.payload_type, v.clock_rate);
-
-            let profile_level_id = profile_level_id_from_avc(&v.params);
-            let sprop = sprop_parameter_sets(&v.params);
-            let fmtp_parts = [
-                format!("profile-level-id={profile_level_id}"),
-                // packetization-mode=1 is the normative LL-HLS / live
-                // default: allows single-NAL, STAP-A, and FU-A packets.
-                // The LVQR packetizer emits single-NAL + FU-A; FU-B and
-                // MTAP are not used.
-                "packetization-mode=1".to_string(),
-                format!("sprop-parameter-sets={sprop}"),
-            ];
-            let _ = writeln!(out, "a=fmtp:{} {}\r", v.payload_type, fmtp_parts.join(";"));
-            let _ = writeln!(out, "a=control:{}\r", v.control);
+        match self.video.as_ref() {
+            Some(VideoTrackDescription::H264(v)) => render_h264_block(&mut out, addr_family, v),
+            Some(VideoTrackDescription::Hevc(v)) => render_hevc_block(&mut out, addr_family, v),
+            None => {}
         }
         out
     }
+}
+
+fn render_h264_block(out: &mut String, addr_family: &str, v: &H264TrackDescription) {
+    let _ = writeln!(out, "m=video 0 RTP/AVP {}\r", v.payload_type);
+    let _ = writeln!(out, "c=IN {addr_family} 0.0.0.0\r");
+    let _ = writeln!(out, "a=rtpmap:{} H264/{}\r", v.payload_type, v.clock_rate);
+
+    let profile_level_id = profile_level_id_from_avc(&v.params);
+    let sprop = sprop_parameter_sets(&v.params);
+    let fmtp_parts = [
+        format!("profile-level-id={profile_level_id}"),
+        // packetization-mode=1 is the normative LL-HLS / live
+        // default: allows single-NAL, STAP-A, and FU-A packets.
+        // The LVQR packetizer emits single-NAL + FU-A; FU-B and
+        // MTAP are not used.
+        "packetization-mode=1".to_string(),
+        format!("sprop-parameter-sets={sprop}"),
+    ];
+    let _ = writeln!(out, "a=fmtp:{} {}\r", v.payload_type, fmtp_parts.join(";"));
+    let _ = writeln!(out, "a=control:{}\r", v.control);
+}
+
+fn render_hevc_block(out: &mut String, addr_family: &str, v: &HevcTrackDescription) {
+    let _ = writeln!(out, "m=video 0 RTP/AVP {}\r", v.payload_type);
+    let _ = writeln!(out, "c=IN {addr_family} 0.0.0.0\r");
+    let _ = writeln!(out, "a=rtpmap:{} H265/{}\r", v.payload_type, v.clock_rate);
+
+    let tier_flag: u8 = if v.params.general_tier_flag { 1 } else { 0 };
+    // Per RFC 7798 section 7.1 the 4-byte profile_compatibility_flags
+    // + 6-byte general_constraint_indicator_flags arrays are rendered
+    // as unsigned hex integers in the fmtp line. Leading zeros are
+    // allowed to be trimmed; keep them to match typical ffmpeg
+    // output for easier interoperability comparisons.
+    let profile_compat = u32::from_be_bytes(v.params.general_profile_compatibility_flags);
+    let interop_constraints = {
+        let b = v.params.general_constraint_indicator_flags;
+        format!(
+            "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+            b[0], b[1], b[2], b[3], b[4], b[5]
+        )
+    };
+    let fmtp_parts = [
+        format!("profile-space={}", v.params.general_profile_space),
+        format!("profile-id={}", v.params.general_profile_idc),
+        format!("tier-flag={tier_flag}"),
+        format!("level-id={}", v.params.general_level_idc),
+        format!("profile-compatibility-indicator={profile_compat:08X}"),
+        format!("interop-constraints={interop_constraints}"),
+        format!("sprop-vps={}", join_base64(&v.params.vps_list)),
+        format!("sprop-sps={}", join_base64(&v.params.sps_list)),
+        format!("sprop-pps={}", join_base64(&v.params.pps_list)),
+    ];
+    let _ = writeln!(out, "a=fmtp:{} {}\r", v.payload_type, fmtp_parts.join(";"));
+    let _ = writeln!(out, "a=control:{}\r", v.control);
+}
+
+/// Encode a list of NAL units into the comma-separated base64 form
+/// RFC 7798 requires for `sprop-vps` / `sprop-sps` / `sprop-pps`.
+/// Empty list renders as the empty string, which is legal.
+fn join_base64(nalus: &[Vec<u8>]) -> String {
+    nalus.iter().map(|n| BASE64.encode(n)).collect::<Vec<_>>().join(",")
 }
 
 /// Hex-encode the 3-byte profile_level_id (AVCProfileIndication,
@@ -144,12 +217,12 @@ mod tests {
         let sdp = PlaySdp {
             session_name: "live/cam1".into(),
             host_ip: "127.0.0.1".parse().unwrap(),
-            video: Some(H264TrackDescription {
+            video: Some(VideoTrackDescription::H264(H264TrackDescription {
                 payload_type: 96,
                 clock_rate: 90_000,
                 control: "track1".into(),
                 params: sample_avc_params(),
-            }),
+            })),
         };
         let rendered = sdp.render();
         eprintln!("--- SDP ---\n{rendered}--- end ---");
@@ -227,12 +300,12 @@ mod tests {
         let sdp = PlaySdp {
             session_name: "live/cam1".into(),
             host_ip: "10.0.0.5".parse().unwrap(),
-            video: Some(H264TrackDescription {
+            video: Some(VideoTrackDescription::H264(H264TrackDescription {
                 payload_type: 96,
                 clock_rate: 90_000,
                 control: "track1".into(),
                 params: sample_avc_params(),
-            }),
+            })),
         };
         let rendered = sdp.render();
         let tracks = crate::session::parse_sdp_tracks(&rendered);
@@ -243,5 +316,93 @@ mod tests {
         let fmtp = tracks[0].fmtp.as_deref().expect("fmtp captured");
         assert!(fmtp.contains("packetization-mode=1"));
         assert!(fmtp.contains("sprop-parameter-sets="));
+    }
+
+    fn sample_hevc_params() -> HevcParameterSets {
+        HevcParameterSets {
+            vps_list: vec![vec![0x40, 0x01, 0x0C, 0x01]],
+            sps_list: vec![vec![0x42, 0x01, 0x01, 0x01]],
+            pps_list: vec![vec![0x44, 0x01, 0xC0]],
+            general_profile_space: 0,
+            general_tier_flag: false,
+            general_profile_idc: 1,
+            general_profile_compatibility_flags: 0x60000000u32.to_be_bytes(),
+            general_constraint_indicator_flags: [0, 0, 0, 0, 0, 0],
+            general_level_idc: 60,
+        }
+    }
+
+    #[test]
+    fn render_hevc_video_sdp_per_rfc_7798() {
+        let sdp = PlaySdp {
+            session_name: "live/hevc".into(),
+            host_ip: "127.0.0.1".parse().unwrap(),
+            video: Some(VideoTrackDescription::Hevc(HevcTrackDescription {
+                payload_type: 96,
+                clock_rate: 90_000,
+                control: "track1".into(),
+                params: sample_hevc_params(),
+            })),
+        };
+        let rendered = sdp.render();
+
+        assert!(rendered.contains("m=video 0 RTP/AVP 96\r\n"));
+        assert!(rendered.contains("a=rtpmap:96 H265/90000\r\n"));
+        assert!(rendered.contains("profile-space=0"));
+        assert!(rendered.contains("profile-id=1"));
+        assert!(rendered.contains("tier-flag=0"));
+        assert!(rendered.contains("level-id=60"));
+        assert!(rendered.contains("profile-compatibility-indicator=60000000"));
+        assert!(rendered.contains("interop-constraints=000000000000"));
+        // Base64 of the sample NAL bytes above.
+        assert!(rendered.contains("sprop-vps=QAEMAQ=="));
+        assert!(rendered.contains("sprop-sps=QgEBAQ=="));
+        assert!(rendered.contains("sprop-pps=RAHA"));
+        assert!(rendered.contains("a=control:track1"));
+        // Must NOT emit H264-only attributes.
+        assert!(!rendered.contains("profile-level-id="));
+        assert!(!rendered.contains("sprop-parameter-sets="));
+    }
+
+    #[test]
+    fn hevc_round_trips_through_parse_sdp_tracks() {
+        let sdp = PlaySdp {
+            session_name: "live/hevc".into(),
+            host_ip: "10.0.0.5".parse().unwrap(),
+            video: Some(VideoTrackDescription::Hevc(HevcTrackDescription {
+                payload_type: 96,
+                clock_rate: 90_000,
+                control: "track1".into(),
+                params: sample_hevc_params(),
+            })),
+        };
+        let rendered = sdp.render();
+        let tracks = crate::session::parse_sdp_tracks(&rendered);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].codec, crate::session::TrackCodec::H265);
+        assert_eq!(tracks[0].clock_rate, 90_000);
+        assert_eq!(tracks[0].control, "track1");
+        let fmtp = tracks[0].fmtp.as_deref().expect("fmtp captured");
+        assert!(fmtp.contains("sprop-vps="));
+        assert!(fmtp.contains("sprop-sps="));
+        assert!(fmtp.contains("sprop-pps="));
+    }
+
+    #[test]
+    fn hevc_tier_flag_is_rendered_when_high_tier() {
+        let mut params = sample_hevc_params();
+        params.general_tier_flag = true;
+        let sdp = PlaySdp {
+            session_name: "live/hevc".into(),
+            host_ip: "127.0.0.1".parse().unwrap(),
+            video: Some(VideoTrackDescription::Hevc(HevcTrackDescription {
+                payload_type: 96,
+                clock_rate: 90_000,
+                control: "track1".into(),
+                params,
+            })),
+        };
+        let rendered = sdp.render();
+        assert!(rendered.contains("tier-flag=1"));
     }
 }

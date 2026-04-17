@@ -21,12 +21,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::fmp4;
-use crate::rtp::H264Packetizer;
+use crate::rtp::{H264Packetizer, HevcPacketizer};
 
-/// Default dynamic H.264 RTP payload type. Matches the DESCRIBE SDP
-/// this crate emits so a compliant client binds the right track to
-/// the right interleaved channel on SETUP.
-const H264_PAYLOAD_TYPE: u8 = 96;
+/// Default dynamic RTP payload type for the video track. Both the
+/// H.264 and HEVC SDP blocks emit PT 96 because only one of the two
+/// is advertised per broadcast; a compliant client binds that track
+/// to the negotiated interleaved channel on SETUP.
+const VIDEO_PAYLOAD_TYPE: u8 = 96;
+const H264_PAYLOAD_TYPE: u8 = VIDEO_PAYLOAD_TYPE;
+const HEVC_PAYLOAD_TYPE: u8 = VIDEO_PAYLOAD_TYPE;
 
 /// Sequence-number seed for the video RTP stream. RFC 3550 suggests
 /// a random initial value; a constant is fine for tests and the
@@ -155,6 +158,98 @@ pub async fn play_drain_h264(
         }
     }
     info!(%broadcast, "play_drain: video egress terminated");
+}
+
+/// Drive one PLAY session over the registry's HEVC broadcaster.
+///
+/// Same shape as [`play_drain_h264`]: subscribes, re-injects the
+/// parameter sets before the first IDR, loops on fragments. HEVC
+/// carries three parameter sets (VPS + SPS + PPS) instead of two;
+/// the packetizer emits single-NAL packets for fragments that fit
+/// the MTU and FU (type 49) otherwise. NAL type extraction is
+/// handled by [`HevcPacketizer`] itself.
+///
+/// If the broadcaster's init segment does not decode as HEVC, the
+/// drain exits without emitting. A caller that cannot tell which
+/// video codec is on the broadcaster should try
+/// [`play_drain_h264`] first and fall back to this function.
+pub async fn play_drain_hevc(
+    broadcast: String,
+    rtp_channel: u8,
+    registry: FragmentBroadcasterRegistry,
+    writer_tx: mpsc::Sender<Vec<u8>>,
+    cancel: CancellationToken,
+) {
+    let Some(bc) = registry.get(&broadcast, "0.mp4") else {
+        debug!(%broadcast, "play_drain (hevc): no video broadcaster; exiting before first emit");
+        return;
+    };
+    let mut sub = bc.subscribe();
+    sub.refresh_meta();
+    let params = sub
+        .meta()
+        .init_segment
+        .as_ref()
+        .and_then(|init| lvqr_cmaf::extract_hevc_parameter_sets(init));
+
+    let mut packetizer = HevcPacketizer::new(DEFAULT_SSRC, HEVC_PAYLOAD_TYPE, INITIAL_RTP_SEQUENCE);
+
+    if let Some(ref params) = params {
+        // VPS first, then SPS, then PPS. Each one is a single NAL
+        // emitted as its own single-NAL RTP packet.
+        for vps in &params.vps_list {
+            for pkt in packetizer.packetize(vps, 0, false) {
+                if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
+                    return;
+                }
+            }
+        }
+        for sps in &params.sps_list {
+            for pkt in packetizer.packetize(sps, 0, false) {
+                if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
+                    return;
+                }
+            }
+        }
+        for pps in &params.pps_list {
+            for pkt in packetizer.packetize(pps, 0, false) {
+                if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
+                    return;
+                }
+            }
+        }
+    } else {
+        debug!(%broadcast, "play_drain (hevc): init segment did not decode as HEVC; exiting");
+        return;
+    }
+
+    info!(%broadcast, "play_drain: HEVC egress started");
+
+    loop {
+        let fragment = tokio::select! {
+            _ = cancel.cancelled() => break,
+            f = sub.next_fragment() => f,
+        };
+        let Some(fragment) = fragment else {
+            break;
+        };
+
+        let Some(body) = fmp4::extract_mdat_body(&fragment.payload) else {
+            continue;
+        };
+        let nalus = fmp4::split_avcc_nalus(body);
+        let rtp_ts = fragment.pts as u32;
+        let last = nalus.len().saturating_sub(1);
+        for (i, nal) in nalus.iter().enumerate() {
+            let end_of_au = i == last;
+            for pkt in packetizer.packetize(nal, rtp_ts, end_of_au) {
+                if send_interleaved(&writer_tx, rtp_channel, &pkt).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+    info!(%broadcast, "play_drain: HEVC egress terminated");
 }
 
 #[cfg(test)]
@@ -289,5 +384,166 @@ mod tests {
         )
         .await
         .expect("drain exits promptly when broadcaster is missing");
+    }
+
+    // --- HEVC drain tests ---
+
+    /// Real x265 HEVC Main 3.0 NAL units. Same capture used by
+    /// lvqr-cmaf's init.rs tests so the whole init-extract-reinjection
+    /// round-trip is exercised against real bytes.
+    const HEVC_VPS: &[u8] = &[
+        0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00,
+        0x03, 0x00, 0x3c, 0x95, 0x94, 0x09,
+    ];
+    const HEVC_SPS: &[u8] = &[
+        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c,
+        0xa0, 0x0a, 0x08, 0x0f, 0x16, 0x59, 0x59, 0x52, 0x93, 0x0b, 0xc0, 0x5a, 0x02, 0x00, 0x00, 0x03, 0x00, 0x02,
+        0x00, 0x00, 0x03, 0x00, 0x3c, 0x10,
+    ];
+    const HEVC_PPS: &[u8] = &[0x44, 0x01, 0xc0, 0x73, 0xc1, 0x89];
+
+    fn hevc_sps_info() -> lvqr_codec::hevc::HevcSps {
+        lvqr_codec::hevc::HevcSps {
+            general_profile_space: 0,
+            general_tier_flag: false,
+            general_profile_idc: 1,
+            general_profile_compatibility_flags: 0x60000000,
+            general_level_idc: 60,
+            chroma_format_idc: 1,
+            pic_width_in_luma_samples: 320,
+            pic_height_in_luma_samples: 240,
+        }
+    }
+
+    /// Drive one HEVC IDR fragment through play_drain_hevc; verify
+    /// the VPS + SPS + PPS preamble is emitted (three packets) and
+    /// the IDR follows on the same channel with the right PT and
+    /// marker bit.
+    #[tokio::test]
+    async fn play_drain_hevc_re_injects_vps_sps_pps_and_packetizes_idr() {
+        use bytes::BytesMut;
+        use lvqr_cmaf::{HevcInitParams, write_hevc_init_segment};
+
+        let registry = FragmentBroadcasterRegistry::new();
+        let bc = registry.get_or_create("live/hevc", "0.mp4", FragmentMeta::new("hev1", 90_000));
+
+        let mut init = BytesMut::new();
+        write_hevc_init_segment(
+            &mut init,
+            &HevcInitParams {
+                vps: HEVC_VPS.to_vec(),
+                sps: HEVC_SPS.to_vec(),
+                pps: HEVC_PPS.to_vec(),
+                sps_info: hevc_sps_info(),
+                timescale: 90_000,
+            },
+        )
+        .expect("write hevc init");
+        bc.set_init_segment(init.freeze());
+
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(64);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(play_drain_hevc(
+            "live/hevc".to_string(),
+            0,
+            registry.clone(),
+            writer_tx,
+            cancel.clone(),
+        ));
+
+        // Read three param-set packets (VPS, SPS, PPS) and confirm
+        // their contents match the input NALs.
+        let vps_frame = tokio::time::timeout(std::time::Duration::from_secs(1), writer_rx.recv())
+            .await
+            .expect("vps timeout")
+            .expect("vps channel open");
+        let sps_frame = writer_rx.recv().await.expect("sps frame");
+        let pps_frame = writer_rx.recv().await.expect("pps frame");
+
+        for (expected, frame) in [(HEVC_VPS, vps_frame), (HEVC_SPS, sps_frame), (HEVC_PPS, pps_frame)] {
+            assert_eq!(frame[0], 0x24);
+            assert_eq!(frame[1], 0);
+            let rtp = &frame[4..];
+            let hdr = crate::rtp::parse_rtp_header(rtp).expect("rtp header");
+            assert_eq!(hdr.payload_type, HEVC_PAYLOAD_TYPE);
+            assert_eq!(hdr.ssrc, DEFAULT_SSRC);
+            assert_eq!(hdr.timestamp, 0);
+            assert!(!hdr.marker, "param-set packets clear marker bit");
+            let payload = &rtp[hdr.header_len..];
+            // Each parameter set fits within MTU so the packet is a
+            // single-NAL packet whose payload is the NAL verbatim.
+            assert_eq!(payload, expected);
+        }
+
+        // Emit an IDR HEVC NAL and verify depacketization round-trips.
+        let mut idr_nal = vec![0x26, 0x01]; // IDR_W_RADL (type 19)
+        idr_nal.extend_from_slice(&[0xA1, 0xB2, 0xC3, 0xD4]);
+        let sample = RawSample {
+            track_id: 1,
+            dts: 3000,
+            cts_offset: 0,
+            duration: 3000,
+            payload: Bytes::from(avcc_nal(&idr_nal)),
+            keyframe: true,
+        };
+        let fragment_payload = build_moof_mdat(1, 1, 3000, std::slice::from_ref(&sample));
+        bc.emit(Fragment::new(
+            "0.mp4",
+            1,
+            0,
+            0,
+            3000,
+            3000,
+            3000,
+            FragmentFlags::KEYFRAME,
+            fragment_payload,
+        ));
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), writer_rx.recv())
+            .await
+            .expect("idr timeout")
+            .expect("idr channel open");
+        let rtp = &frame[4..];
+        let hdr = crate::rtp::parse_rtp_header(rtp).expect("rtp header");
+        assert_eq!(hdr.timestamp, 3000);
+        assert!(hdr.marker, "IDR is a single NAL -> marker set");
+        let payload = &rtp[hdr.header_len..];
+        assert_eq!(payload, &idr_nal[..]);
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn play_drain_hevc_exits_on_avc_init() {
+        // The HEVC drain on an AVC-only broadcaster must exit cleanly
+        // rather than emit malformed RTP or panic. Mirrors the same
+        // invariant play_drain_h264 pins for HEVC inits.
+        use bytes::BytesMut;
+
+        let registry = FragmentBroadcasterRegistry::new();
+        let bc = registry.get_or_create("live/avc", "0.mp4", FragmentMeta::new("avc1", 90_000));
+        let mut init = BytesMut::new();
+        write_avc_init_segment(
+            &mut init,
+            &VideoInitParams {
+                sps: SPS.to_vec(),
+                pps: PPS.to_vec(),
+                width: 1280,
+                height: 720,
+                timescale: 90_000,
+            },
+        )
+        .expect("write init");
+        bc.set_init_segment(init.freeze());
+
+        let (writer_tx, _writer_rx) = mpsc::channel::<Vec<u8>>(4);
+        let cancel = CancellationToken::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            play_drain_hevc("live/avc".into(), 0, registry, writer_tx, cancel),
+        )
+        .await
+        .expect("hevc drain exits promptly on AVC init");
     }
 }

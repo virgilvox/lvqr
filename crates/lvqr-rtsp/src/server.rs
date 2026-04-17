@@ -681,21 +681,38 @@ fn handle_describe(conn: &ConnectionState, req: &proto::Request, cseq: u32) -> R
 
     // Session-level SDP. The video block is populated only when the
     // shared registry carries a video broadcaster for this broadcast
-    // AND its meta has an init segment we can pull SPS / PPS out of.
-    // An absent video block still yields a syntactically valid SDP so
-    // clients that DESCRIBE before anyone publishes get a well-formed
-    // empty stream description rather than a 404.
-    let video = conn
+    // AND its meta has a parseable init segment. Try HEVC first
+    // (its extractor returns None on an AVC init) so an HEVC
+    // publisher is described correctly, then fall back to AVC. An
+    // absent video block still yields a syntactically valid SDP so
+    // clients that DESCRIBE before anyone publishes get a
+    // well-formed empty stream description rather than a 404.
+    let video_init = conn
         .registry
         .get(&broadcast, "0.mp4")
-        .and_then(|bc| bc.meta().init_segment.clone())
-        .and_then(|init| lvqr_cmaf::extract_avc_parameter_sets(&init))
-        .map(|params| crate::sdp::H264TrackDescription {
-            payload_type: 96,
-            clock_rate: 90_000,
-            control: "track1".to_string(),
-            params,
-        });
+        .and_then(|bc| bc.meta().init_segment.clone());
+
+    let video = video_init.as_ref().and_then(|init| {
+        if let Some(params) = lvqr_cmaf::extract_hevc_parameter_sets(init) {
+            Some(crate::sdp::VideoTrackDescription::Hevc(
+                crate::sdp::HevcTrackDescription {
+                    payload_type: 96,
+                    clock_rate: 90_000,
+                    control: "track1".to_string(),
+                    params,
+                },
+            ))
+        } else {
+            lvqr_cmaf::extract_avc_parameter_sets(init).map(|params| {
+                crate::sdp::VideoTrackDescription::H264(crate::sdp::H264TrackDescription {
+                    payload_type: 96,
+                    clock_rate: 90_000,
+                    control: "track1".to_string(),
+                    params,
+                })
+            })
+        }
+    });
 
     let sdp = crate::sdp::PlaySdp {
         session_name: broadcast,
@@ -787,18 +804,48 @@ fn handle_play(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) -> R
         .map(|(rtp, _)| rtp)
         .unwrap_or(0);
 
+    // Pick the drain that matches the broadcaster's codec. Try HEVC
+    // first (its extractor returns None on an AVC init) so an HEVC
+    // publisher gets the HEVC drain; fall back to H.264 otherwise.
+    // If neither matches (no broadcaster / empty init), default to
+    // H.264: the drain will itself notice the absent broadcaster
+    // and exit immediately.
+    let init = conn
+        .registry
+        .get(&broadcast, "0.mp4")
+        .and_then(|bc| bc.meta().init_segment.clone());
+    let is_hevc = init
+        .as_ref()
+        .is_some_and(|bytes| lvqr_cmaf::extract_hevc_parameter_sets(bytes).is_some());
+
     let registry = conn.registry.clone();
     let writer_tx = conn.writer_tx.clone();
     let cancel = conn.conn_cancel.clone();
-    tokio::spawn(crate::play::play_drain_h264(
-        broadcast.clone(),
-        rtp_channel,
-        registry,
-        writer_tx,
-        cancel,
-    ));
+    if is_hevc {
+        tokio::spawn(crate::play::play_drain_hevc(
+            broadcast.clone(),
+            rtp_channel,
+            registry,
+            writer_tx,
+            cancel,
+        ));
+    } else {
+        tokio::spawn(crate::play::play_drain_h264(
+            broadcast.clone(),
+            rtp_channel,
+            registry,
+            writer_tx,
+            cancel,
+        ));
+    }
 
-    info!(session = %session_id_owned, %broadcast, rtp_channel, "RTSP PLAY started, drain spawned");
+    info!(
+        session = %session_id_owned,
+        %broadcast,
+        rtp_channel,
+        codec = if is_hevc { "H265" } else { "H264" },
+        "RTSP PLAY started, drain spawned"
+    );
     Response::ok().with_cseq(cseq).with_header("Session", &session_id_owned)
 }
 

@@ -907,11 +907,26 @@ pub struct AvcParameterSets {
 /// configuration. Mirrors [`AvcParameterSets`] with the VPS that HEVC
 /// additionally carries. NAL types 32 (VPS), 33 (SPS), 34 (PPS) per
 /// ISO/IEC 14496-15 section 8.
+///
+/// The profile-tier-level fields (`general_profile_space`,
+/// `general_tier_flag`, `general_profile_idc`,
+/// `general_profile_compatibility_flags`,
+/// `general_constraint_indicator_flags`, `general_level_idc`) are
+/// copied off the `hvcC` box so RFC 7798 SDP fmtp rendering has
+/// everything it needs without re-parsing the SPS. Bit layout
+/// matches the `mp4_atom::Hvcc` decode (profile-compatibility as a
+/// 4-byte big-endian array, constraint flags as a 6-byte array).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HevcParameterSets {
     pub vps_list: Vec<Vec<u8>>,
     pub sps_list: Vec<Vec<u8>>,
     pub pps_list: Vec<Vec<u8>>,
+    pub general_profile_space: u8,
+    pub general_tier_flag: bool,
+    pub general_profile_idc: u8,
+    pub general_profile_compatibility_flags: [u8; 4],
+    pub general_constraint_indicator_flags: [u8; 6],
+    pub general_level_idc: u8,
 }
 
 /// Decode an fMP4 init segment (ftyp + moov) and return the AVC
@@ -962,8 +977,17 @@ pub fn extract_hevc_parameter_sets(init: &[u8]) -> Option<HevcParameterSets> {
     for trak in &moov.trak {
         for codec in &trak.mdia.minf.stbl.stsd.codecs {
             if let Codec::Hev1(hev1) = codec {
-                let mut out = HevcParameterSets::default();
-                for array in &hev1.hvcc.arrays {
+                let hvcc = &hev1.hvcc;
+                let mut out = HevcParameterSets {
+                    general_profile_space: hvcc.general_profile_space,
+                    general_tier_flag: hvcc.general_tier_flag,
+                    general_profile_idc: hvcc.general_profile_idc,
+                    general_profile_compatibility_flags: hvcc.general_profile_compatibility_flags,
+                    general_constraint_indicator_flags: hvcc.general_constraint_indicator_flags,
+                    general_level_idc: hvcc.general_level_idc,
+                    ..Default::default()
+                };
+                for array in &hvcc.arrays {
                     match array.nal_unit_type {
                         32 => out.vps_list.extend(array.nalus.iter().cloned()),
                         33 => out.sps_list.extend(array.nalus.iter().cloned()),
@@ -1396,6 +1420,18 @@ mod tests {
         assert_eq!(extracted.vps_list, vec![HEVC_VPS_X265.to_vec()]);
         assert_eq!(extracted.sps_list, vec![HEVC_SPS_X265_NAL.to_vec()]);
         assert_eq!(extracted.pps_list, vec![HEVC_PPS_X265.to_vec()]);
+        // Profile-tier-level fields pulled off the hvcC matching the
+        // values the init writer computes from `HevcSps`.
+        assert_eq!(extracted.general_profile_space, 0);
+        assert!(!extracted.general_tier_flag);
+        assert_eq!(extracted.general_profile_idc, 1, "Main profile");
+        assert_eq!(extracted.general_level_idc, 60, "Level 6.0");
+        assert_eq!(
+            extracted.general_profile_compatibility_flags,
+            0x60000000u32.to_be_bytes(),
+            "Main + Main10 compat bits",
+        );
+        assert_eq!(extracted.general_constraint_indicator_flags, [0u8; 6]);
     }
 
     #[test]
