@@ -15,15 +15,17 @@
 //! The two crates have no API overlap; neither depends on the
 //! other; a deployed LVQR node may enable neither, either, or both.
 //!
-//! ## Scope as of session 73
+//! ## Scope as of session 74
 //!
 //! * [`Cluster::bootstrap`] spins up a local chitchat gossip node
 //!   on a UDP port.
 //! * [`Cluster::self_node`] returns this node's identity.
-//! * [`Cluster::members`] returns the self node plus every live
-//!   peer chitchat reports.
+//! * [`Cluster::members`] returns every live peer chitchat reports
+//!   (self included) with each peer's most recent advertised
+//!   [`NodeCapacity`] attached.
 //! * [`Cluster::shutdown`] is an explicit graceful shutdown that
-//!   waits for the background gossip task to exit.
+//!   waits for both the capacity advertiser and the gossip task to
+//!   exit.
 //! * [`Cluster::claim_broadcast`] publishes a `(broadcast → self)`
 //!   lease into chitchat KV and keeps it fresh via a background
 //!   renewer. Dropping the returned [`Claim`] tombstones the key
@@ -31,9 +33,13 @@
 //!   round.
 //! * [`Cluster::find_broadcast_owner`] scans every known node's KV
 //!   state for a non-expired lease on the given broadcast.
+//! * [`Cluster::capacity_gauge`] exposes a shared handle to this
+//!   node's advertised capacity. Samplers update the gauge; the
+//!   advertiser task publishes snapshots every
+//!   `capacity_advertise_interval`.
 //!
-//! Capacity advertisement, cluster-wide config gossip, and the
-//! `/admin/cluster/*` HTTP surface land in sessions 74-76.
+//! Cluster-wide config gossip and the `/admin/cluster/*` HTTP
+//! surface land in sessions 75-76.
 //!
 //! ## Load-bearing invariants preserved
 //!
@@ -46,6 +52,7 @@
 //!   fragment hot path.
 
 mod broadcast;
+mod capacity;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -57,9 +64,12 @@ use chitchat::{
 };
 use rand::Rng;
 use rand::distributions::Alphanumeric;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 pub use broadcast::{BROADCAST_KEY_PREFIX, Claim, MIN_LEASE};
+pub use capacity::{CAPACITY_KEY, CapacityGauge, NodeCapacity};
 
 /// Default UDP port for the chitchat gossip transport. Matches the
 /// upstream chitchat example's convention. No LVQR listener today
@@ -86,6 +96,12 @@ pub const DEFAULT_GOSSIP_INTERVAL: Duration = Duration::from_secs(1);
 /// dropping state; chitchat itself defaults to two hours, which is
 /// too long for LVQR's typical node lifetime.
 pub const DEFAULT_MARKED_FOR_DELETION_GRACE_PERIOD: Duration = Duration::from_secs(60);
+
+/// Default interval between capacity advertisements. Five seconds
+/// matches the figure in `tracking/TIER_3_PLAN.md`: fine enough for
+/// load-aware routing decisions that play out over many seconds,
+/// coarse enough that the gossip payload stays small.
+pub const DEFAULT_CAPACITY_ADVERTISE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Unique-within-cluster identifier for one LVQR node.
 ///
@@ -215,6 +231,11 @@ pub struct ClusterConfig {
     /// over a 1000-sample window, 5 s initial interval prior).
     /// Override in tests for snappier detection.
     pub failure_detector: FailureDetectorConfig,
+    /// Interval between capacity KV publishes. Defaults to 5 s per
+    /// `tracking/TIER_3_PLAN.md`; tests shorten it to low
+    /// hundreds of ms so assertions on propagation complete inside
+    /// a few seconds.
+    pub capacity_advertise_interval: Duration,
 }
 
 impl Default for ClusterConfig {
@@ -228,6 +249,7 @@ impl Default for ClusterConfig {
             gossip_interval: DEFAULT_GOSSIP_INTERVAL,
             marked_for_deletion_grace_period: DEFAULT_MARKED_FOR_DELETION_GRACE_PERIOD,
             failure_detector: FailureDetectorConfig::default(),
+            capacity_advertise_interval: DEFAULT_CAPACITY_ADVERTISE_INTERVAL,
         }
     }
 }
@@ -261,6 +283,11 @@ impl ClusterConfig {
                 initial_interval: Duration::from_millis(200),
                 dead_node_grace_period: Duration::from_secs(2),
             },
+            // 200 ms is the sweet spot: long enough for tests to
+            // stage gauge values after bootstrap before the first
+            // publish fires, short enough that the two-node
+            // propagation assertion completes well under a second.
+            capacity_advertise_interval: Duration::from_millis(200),
         }
     }
 }
@@ -269,7 +296,12 @@ impl ClusterConfig {
 ///
 /// Mirrors chitchat's [`ChitchatId`] but presented behind our public
 /// type so crate consumers do not have to depend on chitchat directly.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// `Eq` / `Hash` are intentionally not derived: the `capacity` field
+/// carries an `f32` which breaks reflexivity on NaN. Callers that
+/// need to key a map on a cluster node should key on [`NodeId`]
+/// directly.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClusterNode {
     pub id: NodeId,
     /// Monotonically-increasing generation. Incremented each time
@@ -278,16 +310,11 @@ pub struct ClusterNode {
     pub generation: u64,
     /// Address peers should use to gossip with this node.
     pub gossip_addr: SocketAddr,
-}
-
-impl ClusterNode {
-    fn from_chitchat_id(cid: &ChitchatId) -> Self {
-        Self {
-            id: NodeId(cid.node_id.clone()),
-            generation: cid.generation_id,
-            gossip_addr: cid.gossip_advertise_addr,
-        }
-    }
+    /// Most recent advertised capacity for this node. `None` if the
+    /// node has not yet published a capacity entry (e.g. freshly
+    /// booted, first tick has not fired) or if the entry failed to
+    /// decode.
+    pub capacity: Option<NodeCapacity>,
 }
 
 /// Handle to a running cluster node.
@@ -296,7 +323,20 @@ impl ClusterNode {
 /// or call [`Cluster::shutdown`] to terminate cleanly.
 pub struct Cluster {
     self_node: ClusterNode,
-    handle: ChitchatHandle,
+    /// Wrapped in `Option` so `shutdown()` can move the handle out
+    /// even though `Cluster` implements `Drop` (moving a named field
+    /// out of a `Drop` type is forbidden; `Option::take` is the
+    /// standard workaround).
+    handle: Option<ChitchatHandle>,
+    capacity_gauge: CapacityGauge,
+    /// Cancels background tasks owned by this cluster (currently
+    /// just the capacity advertiser). Fires on both explicit
+    /// `shutdown()` and on `Drop`.
+    background_cancel: CancellationToken,
+    /// JoinHandle for the capacity advertiser task. Taken out on
+    /// `shutdown()` so we can `.await` clean exit; otherwise the
+    /// `Drop` below aborts it.
+    capacity_advertiser: Option<JoinHandle<()>>,
 }
 
 impl Cluster {
@@ -350,7 +390,17 @@ impl Cluster {
             id: node_id.clone(),
             generation,
             gossip_addr: advertise,
+            capacity: None,
         };
+
+        let capacity_gauge = CapacityGauge::new();
+        let background_cancel = CancellationToken::new();
+        let capacity_advertiser = capacity::spawn_advertiser(
+            handle.chitchat(),
+            capacity_gauge.clone(),
+            config.capacity_advertise_interval,
+            background_cancel.clone(),
+        );
 
         info!(
             node = %node_id,
@@ -360,7 +410,19 @@ impl Cluster {
             "cluster bootstrapped"
         );
 
-        Ok(Self { self_node, handle })
+        Ok(Self {
+            self_node,
+            handle: Some(handle),
+            capacity_gauge,
+            background_cancel,
+            capacity_advertiser: Some(capacity_advertiser),
+        })
+    }
+
+    fn handle(&self) -> &ChitchatHandle {
+        self.handle
+            .as_ref()
+            .expect("ChitchatHandle is always Some between bootstrap and shutdown/drop")
     }
 
     /// This node's identity. Available immediately after bootstrap
@@ -374,29 +436,61 @@ impl Cluster {
         &self.self_node.id
     }
 
-    /// Snapshot of the current cluster membership: the self node
-    /// plus every peer chitchat's failure detector currently
-    /// considers live.
+    /// Snapshot of the current cluster membership: every node
+    /// chitchat's failure detector currently considers live,
+    /// populated with the latest advertised capacity from each
+    /// node's KV state.
     ///
-    /// Chitchat's `live_nodes()` returns peers only (the self node
-    /// is implicit); we merge them here so callers do not have to
-    /// reason about the distinction.
+    /// Chitchat's `live_nodes()` prepends the self node, so no
+    /// manual merge is needed.
     pub async fn members(&self) -> Vec<ClusterNode> {
-        let chitchat = self.handle.chitchat();
+        let chitchat = self.handle().chitchat();
         let guard = chitchat.lock().await;
-        let mut out: Vec<ClusterNode> = guard.live_nodes().map(ClusterNode::from_chitchat_id).collect();
-        out.push(self.self_node.clone());
+        let mut out: Vec<ClusterNode> = guard
+            .live_nodes()
+            .map(|cid| {
+                let capacity = guard
+                    .node_state(cid)
+                    .and_then(|state| state.get(CAPACITY_KEY))
+                    .and_then(NodeCapacity::decode);
+                ClusterNode {
+                    id: NodeId(cid.node_id.clone()),
+                    generation: cid.generation_id,
+                    gossip_addr: cid.gossip_advertise_addr,
+                    capacity,
+                }
+            })
+            .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out.dedup_by(|a, b| a.id == b.id);
         out
     }
 
-    /// Graceful shutdown: stops the gossip task and waits for it to
-    /// exit. Equivalent to dropping the handle but propagates any
-    /// shutdown error to the caller.
-    pub async fn shutdown(self) -> Result<()> {
+    /// Shared gauge for this node's advertised capacity. Callers
+    /// (samplers living in lvqr-cli, lvqr-relay, etc.) write into
+    /// it whenever they have a fresh reading; the advertiser task
+    /// picks up the values on its next tick.
+    pub fn capacity_gauge(&self) -> &CapacityGauge {
+        &self.capacity_gauge
+    }
+
+    /// Graceful shutdown: stops the capacity advertiser and the
+    /// gossip task, waiting for both to exit. Propagates any
+    /// chitchat shutdown error.
+    pub async fn shutdown(mut self) -> Result<()> {
         debug!(node = %self.self_node.id, "cluster shutdown requested");
-        self.handle.shutdown().await.context("chitchat shutdown")
+        self.background_cancel.cancel();
+        if let Some(task) = self.capacity_advertiser.take() {
+            // The advertiser exits cleanly as soon as it sees the
+            // cancel signal; ignoring JoinError drops panic info we
+            // cannot recover from anyway.
+            let _ = task.await;
+        }
+        let handle = self
+            .handle
+            .take()
+            .expect("ChitchatHandle is always Some between bootstrap and shutdown/drop");
+        handle.shutdown().await.context("chitchat shutdown")
     }
 
     /// Claim ownership of `name` for the duration of `lease`. The
@@ -410,7 +504,7 @@ impl Cluster {
     /// entry. Callers that need stronger semantics should layer a
     /// reconciliation pass on top of this API (a Tier 4 item).
     pub async fn claim_broadcast(&self, name: &str, lease: Duration) -> Result<Claim> {
-        broadcast::claim(&self.handle, &self.self_node.id, name, lease).await
+        broadcast::claim(self.handle(), &self.self_node.id, name, lease).await
     }
 
     /// Look up the current non-expired owner of `name` by scanning
@@ -422,7 +516,21 @@ impl Cluster {
     /// positive once the deadline passes, even before chitchat
     /// garbage-collects the node state.
     pub async fn find_broadcast_owner(&self, name: &str) -> Option<NodeId> {
-        broadcast::find_owner(&self.handle, name).await
+        broadcast::find_owner(self.handle(), name).await
+    }
+}
+
+impl Drop for Cluster {
+    /// If the caller never invoked [`Cluster::shutdown`] (e.g. a
+    /// panic on the owning task) this fires the cancellation token
+    /// and aborts the advertiser so the spawned task does not leak
+    /// past the gossip server. Dropping [`ChitchatHandle`] itself
+    /// then tears the gossip server down.
+    fn drop(&mut self) {
+        self.background_cancel.cancel();
+        if let Some(task) = self.capacity_advertiser.take() {
+            task.abort();
+        }
     }
 }
 
