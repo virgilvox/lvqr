@@ -97,16 +97,26 @@ RTSP ingest; LL-HLS + DASH + WHEP + MoQ + WebSocket + **RTSP PLAY
 
 ### Known gaps
 
-1. **RTCP SR on PLAY**: no sender reports today. Most clients
-   tolerate absence for short sessions; a long-running VLC / ffplay
-   will eventually query the NTP-wallclock alignment and silence.
-2. **Opus PLAY drain**: WebRTC-sourced Opus would currently
-   produce an audio broadcaster that `extract_aac_config` rejects.
-   The SDP builder needs a parallel `OpusTrackDescription` and
-   `play_drain_opus`. Opus RTP packetization is RFC 7587
-   (single-frame packets, easy) and would fit the existing
-   scaffold cleanly.
-3. **Apple mediastreamvalidator in CI**: biggest audit gap.
+1. **Opus PLAY drain**: WebRTC-sourced Opus currently produces an
+   audio broadcaster that `extract_aac_config` rejects. The SDP
+   builder needs a parallel `OpusTrackDescription` and
+   `play_drain_opus`. RFC 7587 packetization is
+   single-frame-per-packet and fits cleanly alongside the AAC
+   scaffold.
+2. **RTCP SR on PLAY**: no sender reports today. Most clients
+   tolerate absence for short sessions; a long-running VLC /
+   ffplay will eventually query NTP-wallclock alignment and
+   silence.
+3. **mediastreamvalidator binary on CI runner**: the
+   `hls-conformance.yml` workflow already exists and runs on
+   every PR with `continue-on-error: false`, promoted in
+   session 33. But `macos-latest` ships without Apple's HTTP
+   Live Streaming Tools, so the job currently soft-skips the
+   validator step and the real effective gate is the
+   ffmpeg-client-pull fallback (4xx detection on the pulled
+   playlist + 5 s of real decode). Promotion to a
+   validator-backed gate requires a self-hosted macOS runner or
+   pre-baked Apple tools in a custom image.
 4. **Tier 1 infra**: no playwright, no 24h soak, no MediaMTX
    comparison harness.
 5. **Tiers 3-5**: not started.
@@ -115,19 +125,34 @@ RTSP ingest; LL-HLS + DASH + WHEP + MoQ + WebSocket + **RTSP PLAY
 
 Priority order:
 
-1. **Apple mediastreamvalidator in CI**. GitHub Actions macOS
-   runner that runs Apple's validator against
-   `lvqr-hls`-generated playlists and blocks merges on
-   validator-red. Biggest audit-findings gap after the PLAY
-   egress work.
+1. **Opus PLAY drain + SDP**. Extend the AAC scaffold:
+   `OpusTrackDescription` next to `AacTrackDescription`, SDP
+   block `m=audio 0 RTP/AVP <pt>` + `a=rtpmap:<pt>
+   opus/48000/2` + `a=fmtp:<pt> sprop-stereo=1;useinbandfec=1`.
+   `play_drain_opus` uses a new `OpusPacketizer` (RFC 7587:
+   one Opus frame per RTP packet, no framing). `handle_describe`
+   detects Opus by trying `extract_opus_config` first (to be
+   added in `lvqr-cmaf`, parses the `dOps` box) and falls
+   through to AAC. `handle_play` picks the drain variant by
+   inspecting the audio broadcaster's init segment. Integration
+   test against a synthetic Opus init + fragment.
 
-2. **Opus PLAY drain + SDP**. Layer on top of the audio drain
-   skeleton. RFC 7587 packetization is straightforward; SDP
-   uses `opus/48000/2` + `a=fmtp:<pt> sprop-stereo=1`.
+2. **RTCP SR generation**. Per-SSRC Sender Reports on a short
+   timer (say every 5 s). Needed for long-running sessions and
+   for Wireshark sanity during external interop testing. Write
+   from the same mpsc writer channel the PLAY drains use, on
+   the odd interleaved channel paired with each RTP channel
+   (channel 1 for video, 3 for audio under the standard
+   0-1 / 2-3 pairing).
 
-3. **RTCP SR generation**. Per-SSRC Sender Reports on a short
-   timer. Needed for long-running sessions and for Wireshark
-   sanity during external interop testing.
+3. **mediastreamvalidator self-hosted runner**. Stand up a
+   self-hosted macOS runner (or bake a custom image) carrying
+   Apple HTTP Live Streaming Tools so `hls-conformance.yml`'s
+   validator step runs authoritatively instead of soft-skipping.
+   Removes the last asterisk on the "spec-compliant LL-HLS"
+   claim. Schedule when the user has capacity for the infra
+   work; incremental code changes (priorities 1 + 2) are more
+   tractable inside a single Claude Code session.
 
 4. **lvqr-cmaf with mp4-atom**. Only becomes urgent when AV1
    or timed text land in the data path.
