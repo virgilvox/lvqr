@@ -1,8 +1,160 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- RTSP PLAY egress for H.264 + HEVC + AAC + Opus with per-drain RTCP SR; 614 tests, all green
+## Project Status: v0.4.0 -- RTSP PLAY egress complete for 4 codecs + RTCP SR + `lvqr-soak` harness; 616 tests, 24 crates
 
-**Last Updated**: 2026-04-16 (session 64 close).
+**Last Updated**: 2026-04-17 (session 65 close).
+
+## Session 65 close (2026-04-17)
+
+### What shipped (1 commit, +875 lines / -0 lines)
+
+1. **`lvqr-soak` long-duration harness** (`f9b3d9a`). New
+   dev-only crate (`crates/lvqr-soak`, `publish = false`) that
+   drives a synthetic H.264 publisher plus `N` concurrent RTSP
+   PLAY subscribers against a real `lvqr-rtsp` server on
+   loopback. Addresses the Tier 1 soak gap identified in the
+   session-64 handoff.
+
+   Library surface:
+   * `SoakConfig` bundles duration, subscribers, fragment_hz,
+     optional RTP + RTCP floors, metrics_interval, broadcast
+     name, and init-segment video dimensions. Defaults target
+     60 s / 10 subscribers / 30 Hz.
+   * `SubscriberStats` records per-subscriber RTP + RTCP packet
+     counts, bytes, first-RTP latency, optional error.
+   * `MetricsSample` captures RSS (from `/proc/self/statm`) and
+     open-FD count (from `/proc/self/fd`) on Linux, `None` on
+     other platforms.
+   * `SoakReport` aggregates the above with a pass/fail verdict
+     and a terminal-friendly `render_summary()`.
+   * `run_soak(config)` is the one-call entry point: stands up
+     the registry, emits a deterministic AVC init, binds an
+     `RtspServer`, spawns publisher + metrics tasks + `N`
+     subscriber tasks, runs for `duration`, joins everything,
+     and returns the report.
+
+   Binary (`lvqr-soak`):
+   * `clap`-parsed CLI: `--duration-secs`, `--subscribers`,
+     `--fragment-hz`, `--metrics-interval-secs`,
+     `--min-rtp-per-subscriber`, `--min-rtcp-per-subscriber`,
+     `--broadcast`. Exits 0 on pass, 1 on any threshold miss.
+   * Default tracing subscriber via `LVQR_LOG=info`.
+
+   Smoke tests (+2):
+   * `soak_runs_for_short_duration_and_reports_traffic` runs a
+     2 s / 2 subscribers smoke and asserts every subscriber got
+     RTP packets and populated `first_rtp_after`. Thresholds
+     loosened so slow CI hosts do not flake.
+   * `soak_report_flags_failure_when_threshold_unmet` pins the
+     pass/fail wiring: an absurdly high RTP floor must produce
+     `passed = false` with a populated `failure_reason`.
+
+   Hand-verified the binary with `cargo run -p lvqr-soak
+   --release -- --duration-secs 3 --subscribers 3
+   --min-rtp-per-subscriber 1 --min-rtcp-per-subscriber 0`:
+   publisher emitted 91 fragments, every subscriber saw 92 RTP
+   packets (SPS + PPS re-injection + 90 IDRs), `passed = yes`.
+
+### Ground truth (session 65 close)
+
+* **Head**: `f9b3d9a` on `main`. v0.4.0. **15 commits queued
+  but NOT pushed to origin/main** (sessions 62-65 all unpushed).
+* **Tests**: 616 passed, 0 failed, 1 ignored. Delta from
+  session 64: +2 (soak smoke tests).
+* **Code**: +875 lines across 6 files, one new crate
+  (`lvqr-soak`). Workspace is now 24 crates (was 23).
+* **CI gates locally clean**: fmt, clippy (`-D warnings`),
+  test --workspace all green.
+
+### Soak harness coverage
+
+| Piece                                             | Status |
+|---------------------------------------------------|--------|
+| H.264 PLAY soak (publisher + N subscribers)       | DONE   |
+| RTP + RTCP counts per subscriber                  | DONE   |
+| Resource samples (RSS + FD, Linux)                | DONE   |
+| Pass/fail thresholds (CLI-tunable)                | DONE   |
+| 2 s smoke test in workspace CI                    | DONE   |
+| HEVC / AAC / Opus soak coverage                   | deferred |
+| Actual 24 h nightly run                           | infra, deferred |
+| CPU sampling                                      | deferred |
+| Multi-host jitter / latency harness               | deferred |
+
+Loopback harness runs are meaningful for leak detection and
+throughput regression; real latency / jitter numbers need a
+multi-host rig that does not belong in this crate.
+
+### Load-bearing invariants (all still pinned)
+
+Unchanged from session 60. The new soak harness only consumes
+the existing public surface (`RtspServer::with_registry`,
+`FragmentBroadcasterRegistry`, `Fragment::new`,
+`build_moof_mdat`); no invariant-adjacent internals moved this
+session.
+
+### Protocols supported
+
+Unchanged from session 64. 11 protocols. Feature-complete for
+every codec (H.264 / HEVC / AAC / Opus).
+
+### Known gaps
+
+1. **mediastreamvalidator binary on CI runner**: still the
+   biggest audit gap (unchanged from session 64). Requires a
+   self-hosted macOS runner or a pre-baked custom image with
+   Apple HTTP Live Streaming Tools. User-bound.
+2. **Actual 24 h nightly soak run**: harness exists, but no CI
+   job runs it nightly yet. GitHub Actions' 6 h job limit means
+   the nightly would need a self-hosted runner; an on-demand
+   local run (`cargo run -p lvqr-soak --release --
+   --duration-secs 86400`) is viable today for one-off
+   verification.
+3. **MediaMTX comparison harness**: not started. Would be a
+   sibling to `lvqr-soak` that publishes to both LVQR and a
+   spawned MediaMTX, diffs the subscriber outputs.
+4. **Tier 3**: cluster (chitchat) + observability (OTLP) not
+   started.
+5. **Tiers 4-5**: not started.
+
+### Session 66 entry point
+
+Priority order:
+
+1. **mediastreamvalidator self-hosted runner** (unchanged).
+   Infra; user-bound.
+
+2. **MediaMTX comparison harness**. Sibling to `lvqr-soak`: a
+   new `crates/lvqr-compare/` that spawns MediaMTX (via its
+   published docker image or the `mediamtx` binary on PATH),
+   publishes an identical synthetic stream to both servers,
+   and diffs subscriber-side fragment counts / RTP sequence
+   wraps / latency histograms. Gives the roadmap claims a
+   real head-to-head number.
+
+3. **Extend `lvqr-soak` to HEVC / AAC / Opus**. Add a
+   `--codec <h264|hevc|aac|opus>` flag; swap the publisher's
+   init writer + NAL shape per codec. Under ~150 lines per
+   codec variant given the existing scaffold.
+
+4. **Tier 3 planning**. Cluster (chitchat) + observability
+   (OTLP). Bigger scope; still "do not start mid-session"
+   without a planning document first.
+
+5. **CPU sampling in soak harness**. Add a tokio worker CPU
+   % sample to `MetricsSample`; probably via `sysinfo` (new
+   dep) since `/proc/self/stat` deltas over short intervals
+   are noisy with the multi-thread runtime.
+
+### Velocity note
+
+Session 65 landed one self-contained infra commit (~875
+lines). Observed pace stays ~10-15 sessions per calendar week
+at ~1-3 commits. Tier 2 protocol surface is now closed out;
+Tier 1 infra is progressing. Realistic M4 ("LiveKit
+alternative for new projects") ETA remains 3-5 calendar weeks
+of sustained sessions, now bounded chiefly by the
+user-controlled items (mediastreamvalidator runner, multi-node
+cluster debugging).
 
 ## Session 64 close (2026-04-16)
 
