@@ -71,4 +71,4 @@ pub use manifest::{
     HlsError, Manifest, Part, PlaylistBuilder, PlaylistBuilderConfig, Segment, ServerControl, render_manifest,
 };
 pub use master::{MasterPlaylist, MediaRendition, MediaRenditionType, VariantStream};
-pub use server::{HlsServer, MultiHlsServer};
+pub use server::{HlsServer, MultiHlsServer, OwnerResolver, RedirectFuture};

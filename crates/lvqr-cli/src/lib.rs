@@ -127,6 +127,36 @@ pub struct ServeConfig {
     pub tls_cert: Option<PathBuf>,
     /// Path to TLS private key (PEM). Reserved; not consumed yet.
     pub tls_key: Option<PathBuf>,
+    /// Optional cluster gossip bind address. When `Some`, `start()`
+    /// bootstraps an `lvqr_cluster::Cluster` on this address, wires
+    /// it into the admin router so `/api/v1/cluster/*` answers, and
+    /// installs an `OwnerResolver` on the HLS server so subscribers
+    /// hitting this node for a peer-owned broadcast receive a 302
+    /// pointing at the owner. `None` (default) disables clustering
+    /// and the node behaves as a standalone single-process server.
+    ///
+    /// Feature-gated on `cluster`; the field is present regardless
+    /// so `ServeConfig` stays ABI-stable across feature flips.
+    pub cluster_listen: Option<SocketAddr>,
+    /// Cluster peer seed addresses. Each entry is an `ip:port`
+    /// string the new node gossips to on boot. Ignored when
+    /// [`cluster_listen`](Self::cluster_listen) is `None`.
+    pub cluster_seeds: Vec<String>,
+    /// Cluster-node identifier. `None` auto-generates a random
+    /// `lvqr-<16 alphanumeric>` id at bootstrap.
+    pub cluster_node_id: Option<String>,
+    /// Cluster tag gossipped in every SYN. Chitchat rejects
+    /// cross-cluster gossip so two LVQR deployments on the same
+    /// subnet stay isolated. Empty string falls back to the
+    /// crate-default (`"lvqr"`).
+    pub cluster_id: Option<String>,
+    /// Externally-reachable HLS base URL this node advertises
+    /// (e.g. `"http://a.local:8888"`). When clustering is enabled,
+    /// `start()` writes this URL into the per-node `endpoints` KV
+    /// so peers redirecting subscribers know where to send them.
+    /// `None` skips the publish; peers will then 404 rather than
+    /// redirect for this node's broadcasts.
+    pub cluster_advertise_hls: Option<String>,
 }
 
 impl ServeConfig {
@@ -155,6 +185,11 @@ impl ServeConfig {
             install_prometheus: false,
             tls_cert: None,
             tls_key: None,
+            cluster_listen: None,
+            cluster_seeds: Vec::new(),
+            cluster_node_id: None,
+            cluster_id: None,
+            cluster_advertise_hls: None,
         }
     }
 }
@@ -177,6 +212,12 @@ pub struct ServerHandle {
     srt_addr: Option<SocketAddr>,
     shutdown: CancellationToken,
     join: Option<tokio::task::JoinHandle<()>>,
+    /// Cluster handle kept alive for the server's lifetime when
+    /// clustering is configured. Feature-gated; `None` when the
+    /// `cluster` feature is on but `ServeConfig::cluster_listen` is
+    /// `None`, and absent entirely when the feature is off.
+    #[cfg(feature = "cluster")]
+    cluster: Option<std::sync::Arc<lvqr_cluster::Cluster>>,
 }
 
 impl ServerHandle {
@@ -223,6 +264,17 @@ impl ServerHandle {
     /// Bound SRT ingest UDP address, when SRT ingest is enabled.
     pub fn srt_addr(&self) -> Option<SocketAddr> {
         self.srt_addr
+    }
+
+    /// Cluster handle backing this server, when
+    /// [`ServeConfig::cluster_listen`] was `Some` at `start()`
+    /// time. Returns `None` for single-node servers. Callers
+    /// typically drive the handle to claim broadcasts or inspect
+    /// membership; the `shutdown()` method on this crate's
+    /// `ServerHandle` already tears the cluster down gracefully.
+    #[cfg(feature = "cluster")]
+    pub fn cluster(&self) -> Option<&std::sync::Arc<lvqr_cluster::Cluster>> {
+        self.cluster.as_ref()
     }
 
     /// HTTP URL pointing at a path on the DASH surface, e.g.
@@ -344,12 +396,70 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let (mut moq_server, relay_bound) = relay.init_server()?;
     tracing::info!(addr = %relay_bound, "MoQ relay bound");
 
+    // Optional cluster bootstrap. Resolver for `MultiHlsServer` is
+    // built up-front so the HLS constructor below can install it in
+    // one shot instead of patching the server after the fact.
+    #[cfg(feature = "cluster")]
+    let cluster = if let Some(listen) = config.cluster_listen {
+        let ccfg = lvqr_cluster::ClusterConfig {
+            listen,
+            seeds: config.cluster_seeds.clone(),
+            node_id: config.cluster_node_id.clone().map(lvqr_cluster::NodeId::new),
+            cluster_id: config
+                .cluster_id
+                .clone()
+                .unwrap_or_else(|| lvqr_cluster::ClusterConfig::default().cluster_id),
+            ..lvqr_cluster::ClusterConfig::default()
+        };
+        let c = lvqr_cluster::Cluster::bootstrap(ccfg)
+            .await
+            .map_err(|e| anyhow::anyhow!("cluster bootstrap failed: {e}"))?;
+        let c = std::sync::Arc::new(c);
+        if let Some(ref hls_url) = config.cluster_advertise_hls {
+            let endpoints = lvqr_cluster::NodeEndpoints {
+                hls: Some(hls_url.clone()),
+                dash: None,
+                rtsp: None,
+            };
+            c.set_endpoints(&endpoints)
+                .await
+                .map_err(|e| anyhow::anyhow!("cluster set_endpoints failed: {e}"))?;
+        }
+        tracing::info!(
+            node = %c.self_id(),
+            %listen,
+            advertise_hls = ?config.cluster_advertise_hls,
+            "cluster enabled"
+        );
+        Some(c)
+    } else {
+        None
+    };
+    #[cfg(feature = "cluster")]
+    let hls_owner_resolver: Option<lvqr_hls::OwnerResolver> = cluster.as_ref().map(|c| {
+        let c = c.clone();
+        let resolver: lvqr_hls::OwnerResolver = std::sync::Arc::new(move |broadcast: String| {
+            let c = c.clone();
+            Box::pin(async move {
+                let (_, endpoints) = c.find_owner_endpoints(&broadcast).await?;
+                endpoints.hls
+            })
+        });
+        resolver
+    });
+    #[cfg(not(feature = "cluster"))]
+    let hls_owner_resolver: Option<lvqr_hls::OwnerResolver> = None;
+
     // Optional multi-broadcast LL-HLS server. The broadcaster-native
     // HLS bridge (installed below) subscribes on the shared registry
     // and pumps fragments into the shared `MultiHlsServer` state.
     // Each broadcast gets its own per-broadcast `HlsServer` on first
     // publish; the axum router demultiplexes requests under
     // `/hls/{broadcast}/...`.
+    //
+    // When clustering is enabled, an `OwnerResolver` redirects
+    // subscribers of peer-owned broadcasts to the owning node's HLS
+    // URL instead of returning 404.
     let target_dur = config.hls_target_duration_secs;
     let part_target_secs = config.hls_part_target_ms as f32 / 1000.0;
     let max_segments = if config.hls_dvr_window_secs == 0 || target_dur == 0 {
@@ -358,12 +468,16 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         Some((config.hls_dvr_window_secs / target_dur) as usize)
     };
     let hls_server = config.hls_addr.map(|_| {
-        MultiHlsServer::new(PlaylistBuilderConfig {
+        let playlist_cfg = PlaylistBuilderConfig {
             target_duration_secs: target_dur,
             part_target_secs,
             max_segments,
             ..PlaylistBuilderConfig::default()
-        })
+        };
+        match hls_owner_resolver.clone() {
+            Some(r) => MultiHlsServer::with_owner_resolver(playlist_cfg, r),
+            None => MultiHlsServer::new(playlist_cfg),
+        }
     });
 
     // Optional multi-broadcast MPEG-DASH server. Sibling of the
@@ -669,6 +783,14 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     } else {
         admin_state
     };
+    // Wire the cluster into `/api/v1/cluster/*`. Without this the
+    // feature-gated routes in `lvqr-admin` reply 500 with a
+    // "cluster not wired" message.
+    #[cfg(feature = "cluster")]
+    let admin_state = match cluster.as_ref() {
+        Some(c) => admin_state.with_cluster(c.clone()),
+        None => admin_state,
+    };
 
     // WebSocket fMP4 relay + WebSocket ingest state.
     let ws_state = WsRelayState {
@@ -942,6 +1064,8 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         srt_addr: srt_bound,
         shutdown,
         join: Some(join),
+        #[cfg(feature = "cluster")]
+        cluster,
     })
 }
 

@@ -19,10 +19,13 @@ name = "lvqr"
 path = "src/main.rs"
 
 [features]
-default = ["rtmp", "quinn-transport"]
-full = ["rtmp", "quinn-transport"]
+default = ["rtmp", "quinn-transport", "cluster"]
+full = ["rtmp", "quinn-transport", "cluster"]
 rtmp = ["lvqr-ingest/rtmp"]
 quinn-transport = ["lvqr-relay/quinn-transport"]
+# Enables cluster-mode CLI flags + bootstrap in `start()`. Disabled
+# deployments fall back to the single-node path.
+cluster = ["dep:lvqr-cluster"]
 
 [dependencies]
 lvqr-core = { workspace = true }
@@ -44,6 +47,7 @@ lvqr-whip = { workspace = true }
 lvqr-archive = { workspace = true }
 lvqr-rtsp = { workspace = true }
 lvqr-srt = { workspace = true }
+lvqr-cluster = { workspace = true, optional = true }
 
 axum = { workspace = true }
 bytes = { workspace = true }

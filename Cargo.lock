@@ -1769,6 +1769,7 @@ dependencies = [
  "lvqr-admin",
  "lvqr-archive",
  "lvqr-auth",
+ "lvqr-cluster",
  "lvqr-cmaf",
  "lvqr-core",
  "lvqr-dash",

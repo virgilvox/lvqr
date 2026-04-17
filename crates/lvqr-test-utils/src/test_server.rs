@@ -157,6 +157,11 @@ impl TestServer {
             install_prometheus: false,
             tls_cert: None,
             tls_key: None,
+            cluster_listen: None,
+            cluster_seeds: Vec::new(),
+            cluster_node_id: None,
+            cluster_id: None,
+            cluster_advertise_hls: None,
         };
         let handle = start(serve_config).await?;
         Ok(Self { handle })

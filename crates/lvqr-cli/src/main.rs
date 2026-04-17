@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use lvqr_auth::{JwtAuthConfig, JwtAuthProvider, NoopAuthProvider, SharedAuth, StaticAuthConfig, StaticAuthProvider};
 use lvqr_cli::{ServeConfig, start};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -160,6 +161,36 @@ struct ServeArgs {
     /// checked. Only meaningful with `--jwt-secret`.
     #[arg(long, env = "LVQR_JWT_AUDIENCE")]
     jwt_audience: Option<String>,
+
+    /// Cluster gossip bind address (`ip:port`). When set, this node
+    /// joins an LVQR cluster over chitchat gossip; when unset, it
+    /// runs standalone. Requires the `cluster` feature (default-on).
+    #[arg(long, env = "LVQR_CLUSTER_LISTEN")]
+    cluster_listen: Option<SocketAddr>,
+
+    /// Comma-separated seed peers for the chitchat gossip. Each
+    /// entry is `ip:port`. Used only when `--cluster-listen` is set.
+    #[arg(long, env = "LVQR_CLUSTER_SEEDS", value_delimiter = ',')]
+    cluster_seeds: Vec<String>,
+
+    /// Optional explicit cluster-node identifier. Defaults to a
+    /// random `lvqr-<16 alphanumeric>` id generated at bootstrap.
+    #[arg(long, env = "LVQR_CLUSTER_NODE_ID")]
+    cluster_node_id: Option<String>,
+
+    /// Cluster tag gossipped in every SYN. Two deployments sharing
+    /// a subnet stay isolated by using different values here.
+    /// Defaults to the crate-level `"lvqr"` constant.
+    #[arg(long, env = "LVQR_CLUSTER_ID")]
+    cluster_id: Option<String>,
+
+    /// Externally-reachable HLS base URL this node advertises to
+    /// peers (example: `http://a.local:8888`). Used by the
+    /// redirect-to-owner path: when a subscriber hits this node for
+    /// a broadcast owned by another node, the HLS handler replies
+    /// with a 302 pointing at that owner's advertised URL.
+    #[arg(long, env = "LVQR_CLUSTER_ADVERTISE_HLS")]
+    cluster_advertise_hls: Option<String>,
 }
 
 #[tokio::main]
@@ -268,6 +299,11 @@ async fn serve_from_args(args: ServeArgs) -> Result<()> {
         install_prometheus: true,
         tls_cert: args.tls_cert,
         tls_key: args.tls_key,
+        cluster_listen: args.cluster_listen,
+        cluster_seeds: args.cluster_seeds,
+        cluster_node_id: args.cluster_node_id,
+        cluster_id: args.cluster_id,
+        cluster_advertise_hls: args.cluster_advertise_hls,
     };
 
     let handle = start(config).await?;
