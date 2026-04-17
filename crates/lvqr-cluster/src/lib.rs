@@ -45,7 +45,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chitchat::transport::{Transport, UdpTransport};
-use chitchat::{ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig, spawn_chitchat};
+use chitchat::{
+    ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig as ChitchatFailureDetectorConfig, spawn_chitchat,
+};
 use rand::Rng;
 use rand::distributions::Alphanumeric;
 use tracing::{debug, info};
@@ -121,6 +123,60 @@ impl From<&str> for NodeId {
     }
 }
 
+/// Failure-detector tuning knobs re-exported from chitchat behind a
+/// thin wrapper so crate consumers can tune liveness detection
+/// without depending on chitchat directly.
+///
+/// Phi accrual parameters:
+///
+/// * `phi_threshold` -- a node is flagged dead when its phi value
+///   exceeds this threshold. Chitchat ships 8.0 which is the
+///   classic Cassandra default.
+/// * `sampling_window_size` -- how many heartbeat intervals the
+///   detector averages over. Larger windows smooth jitter but slow
+///   adaptation.
+/// * `max_interval` -- heartbeat arrivals longer than this are
+///   ignored (they're treated as data corruption rather than real
+///   samples).
+/// * `initial_interval` -- prior mean used to seed the sampling
+///   window before any real samples have been observed. Shorter
+///   values make the detector more aggressive on freshly-joined
+///   peers.
+/// * `dead_node_grace_period` -- once a node is marked dead, its
+///   state is kept for this long before garbage collection.
+#[derive(Debug, Clone)]
+pub struct FailureDetectorConfig {
+    pub phi_threshold: f64,
+    pub sampling_window_size: usize,
+    pub max_interval: Duration,
+    pub initial_interval: Duration,
+    pub dead_node_grace_period: Duration,
+}
+
+impl Default for FailureDetectorConfig {
+    fn default() -> Self {
+        Self {
+            phi_threshold: 8.0,
+            sampling_window_size: 1_000,
+            max_interval: Duration::from_secs(10),
+            initial_interval: Duration::from_secs(5),
+            dead_node_grace_period: Duration::from_secs(24 * 60 * 60),
+        }
+    }
+}
+
+impl From<FailureDetectorConfig> for ChitchatFailureDetectorConfig {
+    fn from(cfg: FailureDetectorConfig) -> Self {
+        Self {
+            phi_threshold: cfg.phi_threshold,
+            sampling_window_size: cfg.sampling_window_size,
+            max_interval: cfg.max_interval,
+            initial_interval: cfg.initial_interval,
+            dead_node_grace_period: cfg.dead_node_grace_period,
+        }
+    }
+}
+
 /// Inputs to [`Cluster::bootstrap`]. Every field has a sensible
 /// default so simple callers can `ClusterConfig::default()`.
 #[derive(Debug, Clone)]
@@ -146,6 +202,10 @@ pub struct ClusterConfig {
     /// Delay between a peer being scheduled for deletion and its
     /// state being garbage-collected.
     pub marked_for_deletion_grace_period: Duration,
+    /// Failure-detector tuning. Defaults match chitchat's (phi 8.0
+    /// over a 1000-sample window, 5 s initial interval prior).
+    /// Override in tests for snappier detection.
+    pub failure_detector: FailureDetectorConfig,
 }
 
 impl Default for ClusterConfig {
@@ -158,14 +218,17 @@ impl Default for ClusterConfig {
             cluster_id: DEFAULT_CLUSTER_ID.to_string(),
             gossip_interval: DEFAULT_GOSSIP_INTERVAL,
             marked_for_deletion_grace_period: DEFAULT_MARKED_FOR_DELETION_GRACE_PERIOD,
+            failure_detector: FailureDetectorConfig::default(),
         }
     }
 }
 
 impl ClusterConfig {
     /// Preset suitable for unit tests: ephemeral UDP port on
-    /// loopback, no seeds, short gossip interval + grace period so
-    /// expiry-sensitive assertions complete in under a second.
+    /// loopback, no seeds, short gossip interval + grace period,
+    /// aggressive failure-detector tuning so expiry-sensitive
+    /// assertions complete in under a second instead of hitting
+    /// chitchat's 5 s prior-mean floor.
     pub fn for_test() -> Self {
         Self {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -175,6 +238,20 @@ impl ClusterConfig {
             cluster_id: "lvqr-test".to_string(),
             gossip_interval: Duration::from_millis(100),
             marked_for_deletion_grace_period: Duration::from_secs(2),
+            failure_detector: FailureDetectorConfig {
+                // Match chitchat's default phi threshold; with the
+                // shortened initial interval below, phi crosses 8
+                // within ~500 ms of missed heartbeats at a 50 ms
+                // gossip interval.
+                phi_threshold: 8.0,
+                sampling_window_size: 1_000,
+                max_interval: Duration::from_secs(10),
+                // Shrink the prior so tests do not have to warm the
+                // sampling window for 25 s before the detector
+                // becomes responsive.
+                initial_interval: Duration::from_millis(200),
+                dead_node_grace_period: Duration::from_secs(2),
+            },
         }
     }
 }
@@ -246,7 +323,7 @@ impl Cluster {
             gossip_interval: config.gossip_interval,
             listen_addr: config.listen,
             seed_nodes: config.seeds.clone(),
-            failure_detector_config: FailureDetectorConfig::default(),
+            failure_detector_config: config.failure_detector.clone().into(),
             marked_for_deletion_grace_period: config.marked_for_deletion_grace_period,
             catchup_callback: None,
             extra_liveness_predicate: None,
