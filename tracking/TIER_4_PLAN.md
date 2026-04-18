@@ -181,11 +181,11 @@ impl WasmFilter {
 
 ### Session decomposition
 
-| # | Session | Deliverable | Verification |
-|---|---|---|---|
-| 85 | A | Scaffold `lvqr-wasm`; pin `wasmtime = "25"` at workspace; implement `WasmFilter::load` + `apply` with the simplest component-model binding; one proptest over fragment round-trip through a no-op filter. | `cargo test -p lvqr-wasm --lib` |
-| 86 | B | `frame-counter` example + integration test that publishes real RTMP through `lvqr-cli::start` with `--wasm-filter=examples/frame-counter.wasm` and asserts stderr contains the counter log. | Integration test under `crates/lvqr-cli/tests/wasm_frame_counter.rs` |
-| 87 | C | Hot-reload via `notify-rs`; `redact` example; E2E test that swaps between `frame-counter` and `redact` at runtime and asserts behaviour changes without a server restart. | `cargo test -p lvqr-cli --test wasm_hot_reload` |
+| # | Session | Deliverable | Verification | Status |
+|---|---|---|---|---|
+| 85 | A | Scaffold `lvqr-wasm`; pin `wasmtime = "25"` at workspace; `FragmentFilter` trait + `WasmFilter` core-WASM impl (on_fragment(ptr,len)->i32; negative=drop, non-negative N=keep first N bytes); fail-open runtime; SharedFilter wrapper with replace() for session-C hot reload; 9 unit tests + 1 proptest (256 cases). Core WASM chosen over component model for scope narrowing; trait surface is stable either way. | `cargo test -p lvqr-wasm` | **DONE (session 85)** |
+| 86 | B | `WasmFragmentObserver` installed on `FragmentBroadcasterRegistry`; `--wasm-filter <path>` (env `LVQR_WASM_FILTER`) on lvqr-cli; `frame-counter` example; integration test publishes real RTMP through `TestServer` with `--wasm-filter` and asserts the counter log + downstream HLS playlist. | `cargo test -p lvqr-cli --test wasm_frame_counter` | pending |
+| 87 | C | Hot-reload via `notify`; `redact` example; E2E test that swaps between `frame-counter` and `redact` at runtime and asserts behaviour changes without a server restart. | `cargo test -p lvqr-cli --test wasm_hot_reload` | pending |
 
 ### Risks + mitigations
 

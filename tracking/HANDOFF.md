@@ -1,8 +1,189 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 PLANNED (TIER_4_PLAN.md); 714 tests, 25 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.2 session A DONE (lvqr-wasm scaffold); 724 tests, 26 crates
 
-**Last Updated**: 2026-04-17 (session 84 close -- planning-only session. Tier 4 plan committed to `tracking/TIER_4_PLAN.md` covering all 8 differentiator items with 1-page MVP specs each, per ROADMAP load-bearing decision #10. Next session opens the first Tier 4 code work: the `lvqr-wasm` crate scaffold for per-fragment filters.
+**Last Updated**: 2026-04-17 (session 85 close -- first Tier 4 code session landed: `crates/lvqr-wasm/` scaffold with `FragmentFilter` trait + `WasmFilter` concrete impl hosting core WASM modules on a `wasmtime::Engine`. 9 unit tests + 1 proptest (256 cases) green. Workspace is now 26 crates. Next session is 4.2 B: wire `WasmFragmentObserver` + `--wasm-filter` CLI flag + RTMP E2E.
+
+## Session 85 close (2026-04-17)
+
+### What shipped (1 feat commit, +1414 / -14 lines)
+
+1. **Tier 4 item 4.2 session A: lvqr-wasm scaffold** (`727151f`).
+   First Tier 4 code landing per
+   `tracking/TIER_4_PLAN.md` section 4.2.
+
+   New workspace crate `crates/lvqr-wasm/` (workspace member
+   #26, NOT the browser-facing `lvqr-wasm` deleted in
+   0.4-session-44; this is a fresh server-side host).
+
+   Surface:
+
+   * `FragmentFilter` trait. One synchronous method:
+     `apply(Fragment) -> Option<Fragment>`. `Some` keeps
+     (possibly with a replaced payload), `None` drops.
+   * `WasmFilter` concrete impl. Compiles a WASM module via
+     `WasmFilter::load(path)` or `WasmFilter::from_bytes(&[u8])`.
+     Creates a fresh `wasmtime::Store` per `apply` call so
+     filters cannot accumulate state across fragments (LBD
+     #10 anti-scope from the plan).
+   * `SharedFilter` wrapper (`Arc<Mutex<Box<dyn
+     FragmentFilter>>>`) for thread-safe observer installs;
+     includes `replace()` so session C's hot-reload path can
+     swap modules atomically.
+
+   Host-to-guest ABI (intentionally minimal -- core WASM, not
+   the component model):
+
+   * Guest exports `memory` (1-page initial) and
+     `on_fragment(ptr: i32, len: i32) -> i32`.
+   * Host writes payload to offset 0 of memory, calls
+     `on_fragment(0, payload_len)`.
+   * Return value: negative -> drop; non-negative N -> keep
+     the fragment, use the first N bytes of memory as the
+     replacement payload. N = 0 is a legal keep-with-empty-
+     payload, semantically distinct from drop.
+   * One substantive design cycle: original draft used `0`
+     for drop, which collided with the legitimate empty-
+     payload case (the `empty_payload_roundtrips_unchanged`
+     unit test caught it on first run). Switched to
+     negative-means-drop before commit.
+
+   Fail-open semantics: a module that fails to instantiate
+   or traps at runtime logs a `tracing::warn` and passes the
+   fragment through unchanged. A single misbehaving filter
+   cannot take down the server.
+
+   Metadata pass-through: `track_id`, `group_id`,
+   `object_id`, `priority`, `dts`, `pts`, `duration`, `flags`
+   pass through unchanged regardless of filter output.
+   Session B / C broaden the host-function surface to cover
+   metadata mutation; session A ships the simplest useful
+   shape so the runtime, trait, test harness, and CLI wiring
+   path can land without scope entanglement.
+
+   Workspace deps pinned (new):
+
+   * `wasmtime = "25", default-features = false,
+     features = ["runtime", "cranelift"]` -- per
+     TIER_4_PLAN's dependency-pin table. Component model +
+     WASI 0.2 stable as of 25.0 but we use core WASM for
+     now; the dep still covers session B+ needs.
+   * `notify = "6"` -- pulled in now so session 87's
+     hot-reload path has the import available without a
+     second Cargo edit. The watcher is stubbed in session A.
+
+   Tests:
+
+   * 9 unit tests in `crates/lvqr-wasm/src/lib.rs` cover
+     no-op passthrough, drop, truncate, missing-memory
+     fallback, empty-payload roundtrip, `SharedFilter`
+     clone + `replace`, invalid-bytes rejection, and the
+     `path()` accessor.
+   * 1 proptest at `tests/proptest_roundtrip.rs` (256 cases)
+     asserts arbitrary `Fragment` (any metadata, 0-16 KiB
+     payload) roundtrips through a no-op WASM module
+     byte-for-byte. 16 KiB cap is deliberate for session A
+     (full bound lands with session B's `FragmentObserver`
+     wiring once linear-memory growth is exercised under
+     production payload sizes).
+   * Test fixtures are WAT snippets assembled via the `wat`
+     dev-dep at test time; no pre-compiled `.wasm` fixtures
+     in the repo, no external toolchain dependency.
+
+### Why core WASM and not the component model
+
+Scope narrowing, not a design pivot. The
+single-export `on_fragment(ptr, len) -> i32` surface binds
+with `wasmtime::TypedFunc` directly and lets session A ship
+the trait + harness without dragging in `cargo-component` or
+a wit-bindgen build step for test fixtures. Session B is the
+right place to decide whether the component-model binding is
+worth its boilerplate for a broader host surface (e.g. if we
+want full metadata mutation, or a richer error channel).
+`FragmentFilter` is the stable surface the rest of the
+workspace depends on; the transport between `WasmFilter` and
+the guest module is an implementation detail that can change
+without churning `FragmentBroadcasterRegistry` call sites.
+
+### Ground truth (session 85 close, pre-session-close-doc commit)
+
+* **Head**: `727151f` on `main`. v0.4.0. Local main is **1
+  commit ahead of origin/main**; after this session-close
+  doc lands it will be 2 ahead. 3 other commits from
+  sessions 82-84 that were already queued had been pushed
+  at session 82's close (see `6d99bef`); only sessions 83-84
+  commits were held. Post-session-83 the 2 unpushed
+  (session-83 feat + session-83 doc) + session-84 doc were
+  all still local; this session adds session-85 feat. After
+  the session-close doc commit lands: **5 commits queued**
+  (9666cd1, 755d320, 7fb8dfe, 727151f, and this close doc).
+  Do NOT push without direct user instruction.
+* **Tests**: 724 passed, 0 failed, 1 ignored. Delta from
+  session 84 (which was planning-only): +10 (9 lib unit +
+  1 proptest harness with 256 cases). Delta from session 83:
+  +10.
+* **Code**: +1414 / -14 net. Workspace `Cargo.toml` + `Cargo.lock`
+  (wasmtime 25.0.3 + notify 6.1.1 + their transitives),
+  `crates/lvqr-wasm/Cargo.toml`, `crates/lvqr-wasm/src/lib.rs`
+  (441 lines), `crates/lvqr-wasm/tests/proptest_roundtrip.rs`
+  (90 lines).
+* **Workspace**: **26 crates** (+1: `lvqr-wasm`).
+* **CI gates locally clean**: `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets --benches -- -D
+  warnings`, `cargo test --workspace` all green.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **A DONE**, B/C pending | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | PLANNED | 88-89 |
+| 4.3 | C2PA signed media | PLANNED | 90-91 |
+| 4.8 | One-token-all-protocols | PLANNED | 92-93 |
+| 4.5 | In-process AI agents | PLANNED | 94-97 |
+| 4.4 | Cross-cluster federation | PLANNED | 98-100 |
+| 4.6 | Server-side transcoding | PLANNED | 101-103 |
+| 4.7 | Latency SLO scheduling | PLANNED | 104-105 |
+
+### Session 86 entry point
+
+**Tier 4 item 4.2 session B: WasmFragmentObserver + CLI
+wiring + RTMP E2E.**
+
+Deliverable per `tracking/TIER_4_PLAN.md` section 4.2 session B:
+
+1. New `WasmFragmentObserver` in `lvqr-wasm` that
+   implements `lvqr_fragment::broadcaster::FragmentObserver`
+   (or the equivalent observer trait used by
+   `FragmentBroadcasterRegistry`). On each fragment it calls
+   the `SharedFilter::apply` path and forwards the result;
+   drops are sinks, not errors.
+2. `lvqr-cli` gains `--wasm-filter <path>` (env
+   `LVQR_WASM_FILTER`). When set, `start()` loads the
+   module via `WasmFilter::load`, wraps in `SharedFilter`,
+   and installs the observer on the shared
+   `FragmentBroadcasterRegistry` before any ingest listener
+   starts accepting traffic.
+3. First example filter at
+   `crates/lvqr-wasm/examples/frame-counter/`. A hand-rolled
+   WAT (or a minimal Rust WASM crate if simpler) that counts
+   invocations and writes to WASI stderr every 100th call.
+   Committed as source + pre-compiled `.wasm` under
+   `examples/frame-counter.wasm`.
+4. Integration test at
+   `crates/lvqr-cli/tests/wasm_frame_counter.rs`. Publishes
+   real RTMP through `TestServer` with `--wasm-filter=<path>`,
+   asserts stderr (or a capture hook) contains the counter
+   log, asserts the fragment pipeline still reaches
+   downstream egress (i.e. HLS playlist shows up with the
+   expected segments).
+
+Expected scope: ~400-600 lines. Biggest risk is WASI stderr
+capture in the test harness; if that proves flaky, the
+example filter writes to a host-call side channel and the
+test observes the count directly.
+
+### Prior session blocks (reverse chronological)
 
 ## Session 84 close (2026-04-17)
 
