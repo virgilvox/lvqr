@@ -310,8 +310,8 @@ impl WasmFilter {
 
 | # | Session | Deliverable | Verification |
 |---|---|---|---|
-| 90 | A | `C2paConfig` + finalize-time signing hook in `lvqr-archive`. | `cargo test -p lvqr-archive --test c2pa_sign` |
-| 91 | B | `/playback/verify/{broadcast}` admin route + E2E verification test. | `cargo test -p lvqr-cli --test c2pa_verify_e2e` |
+| 91 | A | `C2paConfig` + finalize-time signing hook in `lvqr-archive`. | `cargo test -p lvqr-archive --test c2pa_sign` |
+| 92 | B | `/playback/verify/{broadcast}` admin route + E2E verification test. | `cargo test -p lvqr-cli --test c2pa_verify_e2e` |
 
 ### Risks + mitigations
 

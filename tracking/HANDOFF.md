@@ -1,8 +1,207 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.2 COMPLETE; 4.1 sessions A1 + A2 DONE (io-uring feature gate landed behind `lvqr-archive --features io-uring` on Linux); 739 tests, 26 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 COMPLETE; 739 tests, 26 crates
 
-**Last Updated**: 2026-04-18 (session 89 close -- Tier 4 item 4.1 session A2 landed: feature-gated `tokio-uring` write path in `lvqr_archive::writer::write_segment`. Workspace pin `tokio-uring = "0.5"` under a `cfg(target_os = "linux")` target block in `lvqr-archive/Cargo.toml`; default-off `io-uring` feature flips the body to a per-call `tokio_uring::start` + `fs::File::write_all_at` + `sync_all` + `close` sequence inside the caller's existing `spawn_blocking` closure. Process-global `OnceLock<bool>` latch catches `tokio_uring::start` setup failures via `std::panic::catch_unwind` (the upstream API unwraps `Runtime::new` internally), logs a single `tracing::warn!`, and pins `std::fs::write` for the rest of the process. New CI job `archive-io-uring` runs `cargo clippy + cargo test -p lvqr-archive --features io-uring` on ubuntu-latest; existing macOS + ubuntu matrix cells stay on the default feature path. Workspace tests 739 passing, 0 failed, 1 ignored on macOS (the new `write_segment_io_uring_matches_std_bytes` test is `cfg(all(linux, io-uring))` gated out). Session 90 entry point is Tier 4 item 4.1 session B (criterion bench + `docs/deployment.md` "when to enable io-uring" section).
+**Last Updated**: 2026-04-18 (session 90 close -- Tier 4 item 4.1 session B landed: criterion bench `crates/lvqr-archive/benches/io_uring_vs_std.rs` parameterised across `[4 KiB, 64 KiB, 256 KiB, 1 MiB]` segment sizes + new `docs/deployment.md` section "Archive: `io_uring` write backend (Linux-only)" covering when to enable, how to measure via criterion saved baselines, the `OnceLock` cold-start warn operator runbook, and caveats. Item 4.1 is COMPLETE (sessions 88-90). Workspace tests unchanged on macOS: 739 passing, 0 failed, 1 ignored (benches do not add test count; the io-uring test is still cfg-gated out locally). Session 91 entry point is Tier 4 item 4.3 session A (C2PA finalize-time signing hook in `lvqr-archive`).
+
+## Session 90 close (2026-04-18)
+
+### What shipped
+
+1. **Tier 4 item 4.1 session B: criterion bench +
+   deployment operator doc** (`bbe2757`). Last piece of
+   item 4.1 after A1 extracted the writer (session 88)
+   and A2 added the feature-gated tokio-uring path
+   (session 89). The caller-facing API
+   (`write_segment(archive_dir, broadcast, track, seq,
+   payload) -> Result<PathBuf, ArchiveError>`) is
+   unchanged; B is purely measurement + documentation.
+
+   `crates/lvqr-archive/benches/io_uring_vs_std.rs` (~95
+   LOC). criterion 0.5, parameterised on segment size
+   across `[4 KiB, 64 KiB, 256 KiB, 1 MiB]` -- span
+   chosen to cover the production fragment distribution
+   (AAC AU through high-bitrate keyframe). Uses
+   `BenchmarkId::from_parameter` + `Throughput::Bytes`
+   so criterion reports per-variant throughput + latency.
+   `measurement_time = 2s`, `sample_size = 30` caps a
+   full run at ~8 s wall + ~1 GB of tempdir writes on
+   the top variant; operators raise the cap from the CLI
+   when they want tighter CIs.
+
+   The harness does not cfg-gate itself. `write_segment`
+   handles path selection internally, so the same bench
+   file exercises std::fs on macOS + Windows (smoke test
+   for harness health) and the tokio-uring path on
+   Linux with `--features io-uring`. The std-vs-io-uring
+   comparison is criterion's saved-baseline workflow
+   (`--save-baseline std` + `--baseline std`), which is
+   called out in the docs section verbatim.
+
+   One TempDir per variant; seq counter rolls forward
+   per iter so writes land on distinct files (matches
+   the production monotonic-seq contract). `TMPDIR=
+   /dev/shm` is explicitly marked anti-pattern in the
+   bench doc-comment: tmpfs bypasses the block-device
+   IO scheduler and hides the very effect the bench is
+   measuring.
+
+   `docs/deployment.md` gains a new 153-line "Archive:
+   `io_uring` write backend (Linux-only)" section
+   between "Upgrade strategy" and "Firewall hardening
+   checklist". Covers when to enable (Linux + kernel
+   5.6 + non-seccomp-restricted runtime; not for
+   bursty-small workloads), how to enable (rebuild with
+   `--features lvqr-archive/io-uring`; compile-time
+   only, no runtime flag), how to measure (the criterion
+   saved-baseline workflow with TMPDIR guidance), how
+   to interpret (throughput delta + p99 on 256 KiB + 1
+   MiB is the enable signal; 4 KiB regression means
+   leave it off until session-B-scope follow-up
+   promotes the writer to option (b)), the exact
+   `OnceLock` cold-start `tracing::warn!` operator
+   runbook (seccomp profile check, LimitMEMLOCK,
+   gVisor/Kata carve-outs), and caveats (
+   `create_dir_all` stays on std::fs, reader path stays
+   on `tokio::fs`, ordering contract unchanged).
+
+   **No Linux io_uring numbers committed.** The plan
+   said "cite the numbers" but numbers captured on one
+   machine are not portable to another (different CPUs,
+   kernels, block devices yield materially different
+   results). Committing numbers from this macOS dev box
+   would misrepresent Linux production performance;
+   committing numbers from a specific cloud instance
+   would misrepresent self-hosted + bare-metal
+   performance. The docs section drives the
+   capture-your-own workflow instead. macOS smoke-run
+   numbers (4 KiB: ~79 us; 1 MiB: ~940 us / ~1 GiB/s
+   throughput) are noted in the feat commit message as
+   evidence the harness is healthy end-to-end; they are
+   not quoted in operator-facing docs.
+
+   Plan refresh: section 4.1 header flipped to
+   `**COMPLETE (sessions 88-90)**`; session B row
+   flipped to `**DONE (session 90)**`. Opportunistic
+   hygiene: the inline session-decomposition table for
+   4.3 was still numbered 90/91 from before session 88
+   split 4.1 into three sub-sessions; corrected to
+   91/92 so the next item starts from a consistent
+   baseline.
+
+2. **Session 90 close doc** (this commit).
+
+### Tests shipped
+
+| # | Test | Passes? |
+|---|---|---|
+| 0 | Benches do not add test count. The bench harness was smoke-run on macOS with `--measurement-time 1 --sample-size 10 --warm-up-time 1`; all four segment-size variants produced plausible numbers. |
+
+Total workspace tests on macOS: **739**, unchanged
+from session 89. `cargo bench -p lvqr-archive --no-run`
+compiles clean; `cargo clippy --workspace --all-targets
+--benches -- -D warnings` includes the new bench in
+scope and is clean.
+
+### Ground truth (session 90 close)
+
+* **Head**: `bbe2757` (feat) on `main` before this
+  close-doc commit lands; after it lands local main is
+  4 commits ahead of `origin/main` (session 89 feat +
+  session 89 close + session 90 feat + session 90
+  close). Verify via `git log --oneline
+  origin/main..main` before any push. Do NOT push
+  without direct user instruction.
+* **Tests**: **739** passed, 0 failed, 1 ignored on
+  macOS.
+* **CI gates locally clean**: `cargo fmt --all --
+  --check`, `cargo clippy --workspace --all-targets
+  --benches -- -D warnings`, `cargo test --workspace`
+  all green. `cargo bench -p lvqr-archive --no-run`
+  compiles clean.
+* **Workspace**: 26 crates, unchanged.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 (A1) / 89 (A2) / 90 (B) |
+| 4.3 | C2PA signed media | PLANNED | 91 (A) / 92 (B) |
+| 4.8 | One-token-all-protocols | PLANNED | 93-94 |
+| 4.5 | In-process AI agents | PLANNED | 95-98 |
+| 4.4 | Cross-cluster federation | PLANNED | 99-101 |
+| 4.6 | Server-side transcoding | PLANNED | 102-104 |
+| 4.7 | Latency SLO scheduling | PLANNED | 105-106 |
+
+Three Tier 4 items are now known-state (4.1 DONE, 4.2
+DONE, 4.3 PLANNED with a known entry point). Tier 4
+budget is unchanged at 27 sessions (85-111); the 4.1
+extension from 2 to 3 sessions absorbed cleanly into
+the tier-wide buffer at session 88's replan.
+
+### Session 91 entry point
+
+**Tier 4 item 4.3 session A: C2PA finalize-time
+signing hook in `lvqr-archive`.**
+
+Deliverable per `tracking/TIER_4_PLAN.md` section 4.3:
+
+1. Add `c2pa-rs` to workspace deps (pin a specific 0.x
+   version; `c2pa-rs` is pre-1.0 so any minor upgrade
+   gets its own session). `tracking/TIER_4_PLAN.md`'s
+   "Dependencies to pin" table at the bottom of the
+   file has the target-version placeholder.
+2. `lvqr-archive` gains a `C2paConfig` struct:
+   `signing_cert_path`, `private_key_path`,
+   `assertion_creator`. The config is optional at the
+   crate boundary; when `None`, archive finalize
+   behaves exactly as it does today (no signing, no
+   manifest emission).
+3. On `finalize()` (broadcaster disconnect), the
+   archive emits a C2PA manifest asserting authorship
+   + the SHA-256 of the finalized MP4 bytes. The
+   manifest lives adjacent to the finalized file --
+   layout decision up to session A, but
+   `<archive_dir>/<broadcast>/<track>/manifest.c2pa`
+   is the obvious starting point.
+4. Integration test: `cargo test -p lvqr-archive
+   --test c2pa_sign` hits a fixture cert + key pair
+   (bundle in `crates/lvqr-archive/tests/fixtures/`),
+   exercises the sign path, reads the manifest back
+   via `c2pa-rs`'s reader, and asserts the author +
+   content hash.
+5. Anti-scope for A: no admin verify route (that is
+   session B), no operator-supplied PKI (MVP uses
+   `c2pa-rs` bundled Adobe test CA), no live
+   signed-as-you-go manifests (file-at-rest only,
+   covers the legal-discovery / broadcast-archive /
+   journalism use cases the plan names).
+
+Expected scope: ~250-400 LOC (C2paConfig struct +
+finalize hook + fixture cert/key + integration test +
+`docs/security.md` or similar pointer section; plus a
+workspace dep pin). Biggest risk: the `c2pa-rs` API is
+still pre-1.0 and may require an adapter if the shape
+does not match the plan's mental model; if so,
+session A surfaces that + the adapter is worth
+carrying into session B as shared infrastructure.
+
+Pre-session checklist:
+
+- Read `tracking/TIER_4_PLAN.md` section 4.3 top-to-
+  bottom. It is short (the whole section is ~40
+  lines); no staleness risk comparable to 4.1's
+  session-88 replan but worth confirming.
+- Check `c2pa-rs` on crates.io for the current 0.x
+  version. If it is a large jump from whatever the
+  plan targeted, pin to the tested-compatible version
+  and note the upgrade as follow-up work.
+- Decide on the manifest-on-disk layout before coding
+  (flat `manifest.c2pa` next to the final MP4, vs.
+  embedded in a sidecar JSON, vs. manifested into the
+  MP4 bytes themselves). The plan does not prescribe;
+  pick + document in the feat commit.
 
 ## Session 89 close (2026-04-18)
 
