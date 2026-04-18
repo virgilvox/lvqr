@@ -64,7 +64,23 @@ AI agents, cross-cluster federation) as Tier 4 on the roadmap.
   renewal, per-node capacity advertisement, LWW config, HLS/DASH/
   RTSP redirect-to-owner, `/api/v1/cluster/{nodes,broadcasts,config}`
 
-**Stability signal:** 724 workspace tests, 0 failures, 1 ignored.
+**Programmable data plane (Tier 4 shipped so far):**
+- WASM per-fragment filter runtime via `wasmtime 25`
+  (`--wasm-filter <path>` / `LVQR_WASM_FILTER`): guest modules
+  observe every ingested fragment through
+  `on_fragment(ptr, len) -> i32`; negative returns drop,
+  non-negative keep. Fail-open: a module that fails to compile or
+  traps passes the fragment through unchanged. Hot-reload via
+  `notify`-watched parent directory: rewriting the `.wasm` file
+  atomically swaps the running filter in place; in-flight calls
+  finish on the old module, subsequent calls see the new one.
+  Ships with two example filters (`frame-counter`, `redact-keyframes`)
+  under `crates/lvqr-wasm/examples/`. v1 is a read-only tap: the
+  filter drives per-broadcast keep/drop counters and the
+  `lvqr_wasm_fragments_total{outcome=keep|drop}` metric; downstream
+  egress sees the original fragment unchanged.
+
+**Stability signal:** 739 workspace tests, 0 failures, 1 ignored.
 `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
 --benches -- -D warnings`, and `cargo test --workspace` all green
 on every session close. The 5-artifact test contract
@@ -77,12 +93,14 @@ easily miss):** webhook-based auth providers, OAuth2 / JWKS
 dynamic key discovery, HMAC signed URLs, hot config reload, a
 dedicated DVR scrub web UI, WebVTT caption segmenter +
 SCTE-35 passthrough, stream-key CRUD admin API, WHEP audio
-(AAC → Opus transcoder required; unblocks with the Tier 4
+(AAC to Opus transcoder required; unblocks with the Tier 4
 gstreamer bridge), server-side transcoding / ABR ladders,
-WASM per-fragment filters (landing now in Tier 4), C2PA
-signed media, cross-cluster federation, in-process AI
-agents, io_uring archive writes, latency SLO scheduling.
-Every one of these is either explicitly on
+C2PA signed media, cross-cluster federation, in-process AI
+agents, io_uring archive writes (landing as Tier 4 item 4.1;
+A1 writer extraction is in, A2 adds the feature-gated
+`tokio-uring` path), latency SLO scheduling, stream-
+modifying WASM filter pipelines (the v1 WASM runtime is a
+read-only tap). Every one of these is either explicitly on
 [`tracking/ROADMAP.md`](tracking/ROADMAP.md) Tier 3 / Tier 4
 or documented as out-of-scope for v1. None is a silent gap.
 
@@ -226,6 +244,12 @@ lvqr serve [OPTIONS]
   --record-dir <PATH>       fMP4 recording directory
   --archive-dir <PATH>      DVR archive dir, enables /playback/*
 
+  WASM filter (read-only tap in v1):
+  --wasm-filter <PATH>      Path to a .wasm module exporting
+                            on_fragment(ptr, len) -> i32. Hot-
+                            reloaded on file change. Env:
+                            LVQR_WASM_FILTER.
+
   Cluster:
   --cluster-listen <ADDR>   Gossip bind (enables cluster plane)
   --cluster-seeds <LIST>    Comma-separated peer ip:port seeds
@@ -285,7 +309,7 @@ cargo build --release
 
 ## Crate map
 
-The workspace is 25 crates organised along the Tier-2 unified
+The workspace is 26 crates organised along the Tier-2 unified
 data plane: one segmenter, every protocol is a projection.
 
 ```
@@ -321,6 +345,9 @@ Auth, storage, admin
 Cluster + observability
   lvqr-cluster       -- chitchat plane (ownership, capacity, config)
   lvqr-observability -- OTLP span + metric export, metrics-crate bridge
+
+Programmable data plane
+  lvqr-wasm          -- wasmtime fragment-filter runtime + notify hot-reload
 
 Infrastructure
   lvqr-cli           -- single-binary composition root
