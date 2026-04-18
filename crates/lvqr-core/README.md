@@ -39,4 +39,7 @@ assert_eq!(track.as_str(), "live/test");
 
 ## License
 
-MIT OR Apache-2.0
+AGPL-3.0-or-later for open-source use; commercial license
+available for proprietary / SaaS deployments. See the top-
+level [`COMMERCIAL-LICENSE.md`](../../COMMERCIAL-LICENSE.md)
+for the process.

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/virgilvox/lvqr/actions/workflows/ci.yml/badge.svg)](https://github.com/virgilvox/lvqr/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/lvqr-core.svg)](https://crates.io/crates/lvqr-core)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-AGPL--3.0%20or%20commercial-blue.svg)](LICENSE)
 
 A Rust live video server. One binary ingests RTMP, WHIP, SRT, and
 RTSP; serves LL-HLS, DASH, WHEP, MoQ/QUIC, and WebSocket fMP4; and
@@ -385,6 +385,24 @@ Feature flags and Docker recipes are in
 
 ## License
 
-Dual-licensed under [Apache License, Version 2.0](LICENSE-APACHE)
-or [MIT license](LICENSE-MIT) at your option. See
-[`CONTRIBUTING.md`](CONTRIBUTING.md) for the contribution workflow.
+LVQR is **dual-licensed**: AGPL-3.0-or-later for open-source
+use, commercial terms for everyone else.
+
+* **AGPL-3.0-or-later** (see [`LICENSE`](LICENSE)) for
+  personal projects, research, education, non-profits, and
+  any commercial use willing to release derivative source
+  code under AGPL. AGPL-3's network copyleft means hosting
+  LVQR as a SaaS product counts as distribution for license
+  purposes; you must publish your full SaaS source under AGPL
+  too.
+* **Commercial license** for proprietary products, managed /
+  hosted services that do not want to open-source their code,
+  and deployments that need indemnification, warranty, or
+  priority security response. See
+  [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md) for the
+  process. Contact: `hackbuildvideo@gmail.com`.
+
+Contributions are accepted under AGPL; see
+[`CONTRIBUTING.md`](CONTRIBUTING.md) and the "Contributing"
+section of the commercial-license document for the CLA-style
+relicensing grant that keeps the dual-license model honest.

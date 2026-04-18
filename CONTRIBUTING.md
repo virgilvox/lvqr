@@ -101,4 +101,18 @@ Add GOP cache eviction policy
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the MIT OR Apache-2.0 license.
+LVQR is dual-licensed: AGPL-3.0-or-later for open-source use
+and commercial terms for proprietary / SaaS deployments. See
+[`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md) at the repo
+root for the commercial-license process.
+
+By submitting a pull request you agree that your contribution
+is licensed under AGPL-3.0-or-later AND you grant the project
+maintainer (Moheeb Zara, hackbuildvideo@gmail.com) a
+perpetual, irrevocable, worldwide license to relicense your
+contribution under the commercial terms above. This is the
+CLA-style mechanism that keeps the dual-license model honest;
+every line in the repo is either owned by the maintainer or
+explicitly relicenseable. If you cannot agree to those terms
+for a specific contribution, please mention it in your pull
+request and we will discuss alternatives.

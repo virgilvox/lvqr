@@ -13,7 +13,9 @@ Never add Claude as an author, co-author, or contributor in git commits, files, 
 ## Project Metadata
 - Author: Moheeb Zara <hackbuildvideo@gmail.com>
 - GitHub: virgilvox
-- License: MIT OR Apache-2.0
+- License: AGPL-3.0-or-later for open-source use; commercial license for
+  proprietary / SaaS (see COMMERCIAL-LICENSE.md at repo root). Contributions
+  are AGPL + commercial-relicense grant to the maintainer.
 - npm scope: @lvqr
 
 ## Workspace Conventions

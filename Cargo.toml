@@ -45,7 +45,11 @@ members = [
 [workspace.package]
 version = "0.4.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+# LVQR is dual-licensed: AGPL-3.0-or-later for open-source use and commercial
+# terms for proprietary / SaaS deployments. See COMMERCIAL-LICENSE.md at the
+# repo root for the commercial-license process; LICENSE contains the AGPL
+# text.
+license = "AGPL-3.0-or-later"
 repository = "https://github.com/virgilvox/lvqr"
 homepage = "https://github.com/virgilvox/lvqr"
 rust-version = "1.85"
