@@ -26,4 +26,14 @@ pub enum ArchiveError {
     /// callers do not need a redb dependency to log it.
     #[error("redb storage error: {0}")]
     Storage(String),
+
+    /// A filesystem operation in [`crate::writer`] failed. The inner
+    /// string carries the affected path plus the underlying
+    /// `io::Error` `Display`, so callers log it without taking a
+    /// transitive dependency on `std::io::Error` at the API
+    /// boundary. Session 88 session A (io_uring archive writes)
+    /// uses this variant for both the `std::fs` fallback path and
+    /// the future `tokio-uring` path.
+    #[error("archive I/O error: {0}")]
+    Io(String),
 }

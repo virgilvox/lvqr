@@ -204,17 +204,24 @@ impl WasmFilter {
 
 1. `lvqr-archive` gains a compile-time feature flag
    `io-uring` (default off; Linux-only). When on, the
-   `IndexingFragmentObserver` uses `tokio-uring::fs` for
-   `write_all` on archive segments instead of `tokio::fs`.
-2. Bench under `crates/lvqr-archive/benches/io_uring_vs_tokio.rs`
+   `lvqr_archive::writer::write_segment` helper uses
+   `tokio-uring::fs` for the `create_dir_all` +
+   `write_all` sequence on archive segments instead of
+   `std::fs`. The caller
+   (`lvqr_cli::archive::BroadcasterArchiveIndexer::drain`)
+   still wraps the call in `tokio::task::spawn_blocking`,
+   so enabling io-uring does not change the call-site
+   contract.
+2. Bench under `crates/lvqr-archive/benches/io_uring_vs_std.rs`
    comparing throughput (MB/s) and p99 latency on a
    1-hour synthetic broadcast. Published in
    `docs/deployment.md` as the
    "when to enable the io_uring backend" section.
 3. Graceful fallback: if `tokio_uring::start` fails (kernel
    < 5.6, container sandbox without io_uring syscalls), the
-   crate logs a warn and falls back to `tokio::fs` at
-   runtime.
+   crate logs a warn and falls back to `std::fs` at
+   runtime so a misconfigured deployment never silently
+   loses segments.
 
 ### Anti-scope
 
@@ -223,17 +230,19 @@ impl WasmFilter {
   different architecture (thread-per-core) that would
   conflict with tokio's scheduler. Revisit as part of a
   potential monoio experiment in a future tier.
-* **Single-threaded runtime.** tokio-uring requires a
-  current-thread runtime; the archive writer already runs
-  on its own per-broadcast task so this is compatible. No
-  change needed in `lvqr-cli::start`'s runtime flavor.
+* **Archive reader path.** `lvqr-cli::archive::file_handler`
+  still serves playback bytes via `tokio::fs::read`;
+  io-uring gains accrue almost entirely on the write side
+  and adding a reader variant doubles the validation
+  surface. Revisit if a latency SLO forces it.
 
 ### Session decomposition
 
-| # | Session | Deliverable | Verification |
-|---|---|---|---|
-| 88 | A | Feature-gated `tokio-uring` path for init + media segment writes; runtime fallback. | `cargo test -p lvqr-archive --features io-uring` on Linux + `cargo test -p lvqr-archive` on macOS both green. |
-| 89 | B | Criterion bench + documentation update. | `cargo bench -p lvqr-archive --features io-uring` produces a report; `docs/deployment.md` cites the numbers. |
+| # | Session | Deliverable | Verification | Status |
+|---|---|---|---|---|
+| 88 | A1 | Lift the archive writer out of `lvqr_cli::archive::BroadcasterArchiveIndexer::drain` into a new `lvqr_archive::writer` module. Public `write_segment(archive_dir, broadcast, track, seq, payload) -> Result<PathBuf, ArchiveError>` wraps `std::fs::create_dir_all` + `std::fs::write` with no behavior change; `segment_path` helper documents the canonical `<dir>/<broadcast>/<track>/<seq:08>.m4s` layout. `ArchiveError::Io` variant added. Session 87-era `BroadcasterArchiveIndexer::segment_path` deleted in favor of the crate-owned helper. Unit tests cover round-trip, mkdir-on-demand, idempotent overwrite, and parent-is-a-file error propagation. Plan text refreshed to reflect the session 59-60 architecture (writer in `lvqr-cli`, not retired `IndexingFragmentObserver`). | `cargo test -p lvqr-archive` green on macOS; `cargo test -p lvqr-cli --test rtmp_archive_e2e` still green (no behavior change). | **DONE (session 88)** |
+| 89 | A2 | Feature-gated `tokio-uring` path inside `lvqr_archive::writer::write_segment`. Off by default; Linux-only via `target_os = "linux"` guards alongside the `io-uring` feature. Runtime fallback to `std::fs` on `tokio_uring::start` failure. Note the runtime-integration question: the caller is on a multi-thread tokio runtime, so the io-uring variant spins a short-lived `tokio_uring::start` block per segment (simplest), or a persistent current-thread runtime pinned to a dedicated writer thread (lower per-write overhead; needs the session to decide). Start with per-segment; measure in session B; promote to persistent runtime only if the overhead shows up. | `cargo test -p lvqr-archive --features io-uring` on Linux + `cargo test -p lvqr-archive` on macOS both green. | pending |
+| 90 | B | Criterion bench + documentation update. | `cargo bench -p lvqr-archive --features io-uring` produces a report; `docs/deployment.md` cites the numbers. | pending |
 
 ### Risks + mitigations
 
@@ -243,6 +252,22 @@ impl WasmFilter {
   `ubuntu-latest` job. Added to `.github/workflows/ci.yml`
   as a separate job rather than a matrix cell so macOS CI
   stays fast.
+* **tokio-uring runtime integration.** `tokio-uring`
+  requires a current-thread runtime. The LVQR server uses
+  multi-thread tokio, so the io-uring variant cannot call
+  `tokio_uring::fs::File::create(...)` directly from a
+  multi-thread task; it has to either (a) spin
+  `tokio_uring::start` per segment inside a
+  `spawn_blocking` closure, or (b) pin a long-lived
+  current-thread runtime to a dedicated writer thread and
+  dispatch segment writes to it. Option (a) is simpler and
+  matches the current `spawn_blocking`-per-fragment
+  cadence; option (b) is faster per write but needs a
+  channel + ordering discussion. Session A2 ships (a) and
+  session B's bench decides whether (b) is worth the
+  complexity. This nuance was missing from the pre-session-
+  88 plan because the plan predated the tokio-uring API
+  shape decision.
 
 ## 4.3 -- C2PA signed media (1 week, 2 sessions)
 

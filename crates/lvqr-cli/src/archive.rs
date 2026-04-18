@@ -14,7 +14,7 @@
 //! unit. Range scans return rows ordered by `start_dts`, which is
 //! exactly the DVR scrub primitive the archive is for.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
@@ -23,6 +23,7 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
+use lvqr_archive::writer::write_segment;
 use lvqr_archive::{RedbSegmentIndex, SegmentIndex, SegmentRef};
 use lvqr_auth::{AuthContext, AuthDecision, SharedAuth};
 use lvqr_fragment::{FragmentBroadcasterRegistry, FragmentStream};
@@ -117,29 +118,38 @@ impl BroadcasterArchiveIndexer {
             let start_dts = fragment.dts;
             let end_dts = fragment.dts.saturating_add(fragment.duration);
             let keyframe_start = fragment.flags.keyframe;
-            let path = Self::segment_path(&dir, &broadcast, &track, segment_seq);
             let payload = fragment.payload.clone();
             let length = payload.len() as u64;
+            let dir_for_task = dir.clone();
             let broadcast = broadcast.clone();
             let track = track.clone();
             let index = Arc::clone(&index);
-            let path_for_task = path.clone();
+            // Session 88 A1: the segment layout + synchronous
+            // write live in `lvqr_archive::writer::write_segment`.
+            // `spawn_blocking` is still this caller's job because
+            // the multi-thread tokio runtime can absorb the
+            // blocking syscall on a worker thread; session 88 A2
+            // will swap the body of `write_segment` behind an
+            // `io-uring` feature without touching this call site.
             tokio::task::spawn_blocking(move || {
-                if let Some(parent) = path_for_task.parent()
-                    && let Err(e) = std::fs::create_dir_all(parent)
-                {
-                    tracing::warn!(error = ?e, dir = %parent.display(), "broadcaster archive: mkdir failed");
-                    return;
-                }
-                if let Err(e) = std::fs::write(&path_for_task, payload.as_ref()) {
-                    tracing::warn!(error = ?e, path = %path_for_task.display(), "broadcaster archive: fs::write failed");
-                    return;
-                }
-                let path_str = match path_for_task.to_str() {
+                let path = match write_segment(&dir_for_task, &broadcast, &track, segment_seq, payload.as_ref()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            broadcast = %broadcast,
+                            track = %track,
+                            seq = segment_seq,
+                            "broadcaster archive: write_segment failed",
+                        );
+                        return;
+                    }
+                };
+                let path_str = match path.to_str() {
                     Some(s) => s.to_string(),
                     None => {
                         tracing::warn!(
-                            path = %path_for_task.display(),
+                            path = %path.display(),
                             "broadcaster archive: path is not valid utf-8"
                         );
                         return;
@@ -167,10 +177,6 @@ impl BroadcasterArchiveIndexer {
             track = %track,
             "BroadcasterArchiveIndexer: drain terminated (producers closed)",
         );
-    }
-
-    fn segment_path(root: &Path, broadcast: &str, track: &str, seq: u64) -> PathBuf {
-        root.join(broadcast).join(track).join(format!("{seq:08}.m4s"))
     }
 }
 

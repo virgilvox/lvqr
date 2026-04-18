@@ -60,10 +60,23 @@
 //!    not long-running. Callers that want to run an index query
 //!    off the tokio runtime can wrap with `spawn_blocking`.
 //!
+//! ## What this crate OWNS
+//!
+//! * The segment index (redb B-tree keyed by `(broadcast,
+//!   track, start_dts)`) via [`RedbSegmentIndex`].
+//! * The canonical on-disk layout `<archive_dir>/<broadcast>/
+//!   <track>/<seq:08>.m4s` + the synchronous
+//!   `write_segment` helper via [`writer`]. Session 88 session
+//!   A1 lifted this writer out of `lvqr-cli` so the layout and
+//!   the index live in the same crate; session 88 B will add a
+//!   feature-gated `io-uring` variant behind the same
+//!   signature.
+//!
 //! ## What this crate is NOT
 //!
-//! * Not a segment writer. That is in `lvqr-record`.
-//! * Not an HTTP playback endpoint. That is a follow-up.
+//! * Not an HTTP playback endpoint -- that lives in
+//!   `lvqr-cli/src/archive.rs` alongside the subscribe-token
+//!   check, because the endpoint needs `lvqr-auth`.
 //! * Not a transcoder or ABR ladder generator.
 //! * Not responsible for disk quota, rotation, or cleanup. A
 //!   `delete(broadcast, track, before_dts)` API will land when a
@@ -72,6 +85,7 @@
 mod error;
 mod index;
 mod segment;
+pub mod writer;
 
 pub use error::ArchiveError;
 pub use index::{RedbSegmentIndex, SegmentIndex};
