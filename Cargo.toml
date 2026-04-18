@@ -147,6 +147,13 @@ tracing-opentelemetry = "0.28"
 wasmtime = { version = "25", default-features = false, features = ["runtime", "cranelift"] }
 notify = "6"
 
+# io_uring runtime for the lvqr-archive `io-uring` feature (Tier 4 item 4.1,
+# session 89 A2). Pinned to 0.5 per TIER_4_PLAN.md's "Dependencies to pin"
+# table. Listed at the workspace level so the version is a single-file change,
+# but pulled in only under `[target.'cfg(target_os = "linux")'.dependencies]`
+# in `lvqr-archive` so macOS + Windows builds never see it in their dep graph.
+tokio-uring = "0.5"
+
 # Internal crates
 lvqr-core = { version = "0.4.0", path = "crates/lvqr-core" }
 lvqr-moq = { version = "0.4.0", path = "crates/lvqr-moq" }

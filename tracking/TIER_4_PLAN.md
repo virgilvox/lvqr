@@ -241,7 +241,7 @@ impl WasmFilter {
 | # | Session | Deliverable | Verification | Status |
 |---|---|---|---|---|
 | 88 | A1 | Lift the archive writer out of `lvqr_cli::archive::BroadcasterArchiveIndexer::drain` into a new `lvqr_archive::writer` module. Public `write_segment(archive_dir, broadcast, track, seq, payload) -> Result<PathBuf, ArchiveError>` wraps `std::fs::create_dir_all` + `std::fs::write` with no behavior change; `segment_path` helper documents the canonical `<dir>/<broadcast>/<track>/<seq:08>.m4s` layout. `ArchiveError::Io` variant added. Session 87-era `BroadcasterArchiveIndexer::segment_path` deleted in favor of the crate-owned helper. Unit tests cover round-trip, mkdir-on-demand, idempotent overwrite, and parent-is-a-file error propagation. Plan text refreshed to reflect the session 59-60 architecture (writer in `lvqr-cli`, not retired `IndexingFragmentObserver`). | `cargo test -p lvqr-archive` green on macOS; `cargo test -p lvqr-cli --test rtmp_archive_e2e` still green (no behavior change). | **DONE (session 88)** |
-| 89 | A2 | Feature-gated `tokio-uring` path inside `lvqr_archive::writer::write_segment`. Off by default; Linux-only via `target_os = "linux"` guards alongside the `io-uring` feature. Runtime fallback to `std::fs` on `tokio_uring::start` failure. Note the runtime-integration question: the caller is on a multi-thread tokio runtime, so the io-uring variant spins a short-lived `tokio_uring::start` block per segment (simplest), or a persistent current-thread runtime pinned to a dedicated writer thread (lower per-write overhead; needs the session to decide). Start with per-segment; measure in session B; promote to persistent runtime only if the overhead shows up. | `cargo test -p lvqr-archive --features io-uring` on Linux + `cargo test -p lvqr-archive` on macOS both green. | pending |
+| 89 | A2 | Feature-gated `tokio-uring` path inside `lvqr_archive::writer::write_segment`. Off by default; Linux-only via `target_os = "linux"` guards alongside the `io-uring` feature. `write_segment`'s outer signature is unchanged; when the feature + target match, the body routes file-create + `write_all_at` + `sync_all` + `close` through a per-call `tokio_uring::start` wrapped in `std::panic::catch_unwind` (tokio-uring 0.5 unwraps `Runtime::new` internally, so `catch_unwind` is the only way to observe a kernel-side setup failure without aborting). `create_dir_all` stays on `std::fs` because tokio-uring 0.5 has no mkdir primitive; the archive tree is amortised across thousands of segments so the extra syscall is noise. Runtime fallback: a process-global `OnceLock<bool>` catches the first `tokio_uring::start` failure, logs a single `tracing::warn!`, and pins `std::fs::write` for the rest of the process. On-path `io::Error`s (create / write / sync / close) do NOT trip the latch -- they surface as `ArchiveError::Io` and the caller retries on the next segment. Option (a) shipped (per-call `tokio_uring::start` inside the existing `spawn_blocking`); option (b) (persistent current-thread runtime on a dedicated writer thread) deferred to session B if the criterion bench shows option (a)'s setup overhead dominates. CI got a new `archive-io-uring` job on `ubuntu-latest` running `cargo clippy -p lvqr-archive --features io-uring` + `cargo test -p lvqr-archive --features io-uring`; kept as a separate job rather than a matrix cell on the existing `test` job so macOS CI time does not grow. | `cargo test -p lvqr-archive` green on macOS; `cargo test -p lvqr-cli --test rtmp_archive_e2e` still green; `cargo test -p lvqr-archive --features io-uring` runs on Linux CI (macOS cannot exercise tokio-uring itself -- the feature is a no-op on non-Linux targets because the dep is target-gated). | **DONE (session 89)** |
 | 90 | B | Criterion bench + documentation update. | `cargo bench -p lvqr-archive --features io-uring` produces a report; `docs/deployment.md` cites the numbers. | pending |
 
 ### Risks + mitigations
@@ -263,11 +263,20 @@ impl WasmFilter {
   dispatch segment writes to it. Option (a) is simpler and
   matches the current `spawn_blocking`-per-fragment
   cadence; option (b) is faster per write but needs a
-  channel + ordering discussion. Session A2 ships (a) and
-  session B's bench decides whether (b) is worth the
-  complexity. This nuance was missing from the pre-session-
-  88 plan because the plan predated the tokio-uring API
-  shape decision.
+  channel + ordering discussion. **Session A2 shipped
+  option (a)**; session B's bench decides whether (b) is
+  worth the complexity. This nuance was missing from the
+  pre-session-88 plan because the plan predated the
+  tokio-uring API shape decision.
+* **`tokio_uring::start` panics on setup failure.**
+  tokio-uring 0.5 calls `.unwrap()` on `Runtime::new`
+  internally, with no fallible variant exposed on the
+  `Builder`. Session A2 uses `std::panic::catch_unwind` to
+  observe the setup failure without aborting the process.
+  This is documented in `crates/lvqr-archive/src/writer.rs`;
+  if tokio-uring ever ships a fallible `Builder::build` the
+  catch_unwind block should be swapped for the explicit
+  error. Session B's bench is a good place to revisit.
 
 ## 4.3 -- C2PA signed media (1 week, 2 sessions)
 

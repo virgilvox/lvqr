@@ -15,5 +15,19 @@ redb = "2"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+# Linux-only io_uring runtime for the `io-uring` feature (Tier 4 item 4.1
+# session A2). Gated on `target_os = "linux"` so macOS + Windows builds never
+# resolve the crate. `optional = true` lets the `io-uring` feature pull it in
+# via `dep:tokio-uring`.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = { workspace = true, optional = true }
+
+[features]
+# Route `writer::write_segment` through `tokio_uring::fs` on Linux. Default
+# off; the feature is accepted on non-Linux targets as a no-op because the
+# `tokio-uring` dep is target-gated above. See `src/writer.rs` for the split
+# write path + OnceLock fallback to `std::fs` on setup failure.
+io-uring = ["dep:tokio-uring"]
+
 [dev-dependencies]
 tempfile = "3"
