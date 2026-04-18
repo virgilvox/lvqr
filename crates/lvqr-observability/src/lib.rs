@@ -86,7 +86,9 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod log_format;
 pub mod metric_bridge;
+pub use log_format::CorrelatedFormat;
 pub use metric_bridge::OtelMetricsRecorder;
 
 /// Environment variable that, when set, supplies the OTLP
@@ -379,7 +381,7 @@ where
 /// which is idempotent on re-run.
 pub fn init(config: ObservabilityConfig) -> Result<ObservabilityHandle> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("lvqr=info"));
-    let fmt_layer = fmt::layer();
+    let fmt_layer = fmt::layer().event_format(log_format::CorrelatedFormat::new(config.json_logs));
 
     let (tracer_provider, meter_provider, metrics_recorder) = if let Some(endpoint) = config.otlp_endpoint.as_deref() {
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
