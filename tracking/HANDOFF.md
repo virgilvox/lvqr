@@ -1,8 +1,153 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE (cluster plane + observability plane closed); 714 tests, 25 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 PLANNED (TIER_4_PLAN.md); 714 tests, 25 crates
 
-**Last Updated**: 2026-04-17 (session 83 close -- Tier 3 session J landed: `LVQR_LOG_JSON=true` flips stdout fmt to JSON one-object-per-line; every log event inside a tracing-opentelemetry-bound span carries `trace_id` + `span_id` fields matching the parent span's OTel SpanContext. **Tier 3 is now complete.** Next session opens Tier 4 (WASM per-fragment filters, C2PA, federation, in-process AI agents, io_uring archive writes).
+**Last Updated**: 2026-04-17 (session 84 close -- planning-only session. Tier 4 plan committed to `tracking/TIER_4_PLAN.md` covering all 8 differentiator items with 1-page MVP specs each, per ROADMAP load-bearing decision #10. Next session opens the first Tier 4 code work: the `lvqr-wasm` crate scaffold for per-fragment filters.
+
+## Session 84 close (2026-04-17)
+
+### What shipped (1 docs commit, +620 / -1 lines across HANDOFF + TIER_4_PLAN)
+
+Planning session only; no code changes. Wrote
+`tracking/TIER_4_PLAN.md` to bound Tier 4 scope before the
+first implementation session, per ROADMAP load-bearing
+decision #10 (\"every Tier 4 item gets a one-page MVP spec
+before work starts\").
+
+The plan covers all 8 Tier 4 items from ROADMAP, each with a
+1-page section that includes:
+
+1. Scope (what lands)
+2. Anti-scope (explicit rejections)
+3. API sketch (where relevant)
+4. Session decomposition (2-3 sessions per item, numbered 85
+   through 105)
+5. Risks + mitigations
+
+Execution order prioritises moat value per week of work,
+dependency ordering, and "public demo" items first so the M4
+marketing milestone lands on schedule:
+
+1. 4.2 WASM per-fragment filters (3 weeks, sessions 85-87)
+2. 4.1 io_uring archive writes (2 weeks, sessions 88-89)
+3. 4.3 C2PA signed media (1 week, sessions 90-91)
+4. 4.8 One-token-all-protocols (1 week, sessions 92-93)
+5. 4.5 In-process AI agents / whisper.cpp (3 weeks, 94-97)
+6. 4.4 Cross-cluster federation (2 weeks, 98-100)
+7. 4.6 Server-side transcoding (2 weeks, 101-103)
+8. 4.7 Latency SLO scheduling (1 week, 104-105)
+
+Total: ~27 working sessions including 3-session buffer.
+Budget: sessions 85 through 111. At 10-15 sessions / calendar
+week, **~10-12 focused calendar weeks** for all of Tier 4.
+
+Plan includes explicit non-goals: no browser WASM target, no
+multi-filter pipelines, no SIP, no room-composite egress, no
+live-signed C2PA streams, no GPU WASM, no admission control on
+SLO breach, no OAuth2 / JWKS.
+
+Three open questions deferred to the session that lands the
+affected item:
+* C2PA default `assertion_creator` string (proposal:
+  `urn:lvqr:node/<node_id>`)
+* Federation link auth layer (proposal: JWT bearer via item
+  4.8's normaliser, which lands BEFORE federation)
+* WASM filter audio handling (proposal: audio passthrough
+  untouched in v1)
+
+Five resolved questions (answered in the plan itself):
+* WASM runtime = wasmtime (not wasmer, not wasmi)
+* AI agent trait runs synchronously on the fragment hot path
+  via `&mut self + &Fragment -> ()`; expensive work buffers
+  internally
+* Federation auth = JWT via item 4.8 (do not invent a new
+  layer)
+* Transcoding output = new broadcast, not new track on
+  source broadcast
+* SLO metric is server-side only in v1; true glass-to-glass
+  lands in Tier 5 SDKs
+
+### Ground truth (session 84 close, pre-session-close-doc commit)
+
+* **Head**: `755d320` on `main`. v0.4.0. Local main and
+  origin/main are **EVEN** at the session-83 close
+  (`755d320`) as of this session's start; after this doc
+  commit lands, local will be 1 commit ahead. Do NOT push
+  without direct user instruction.
+* **Tests**: 714 passed, 0 failed, 1 ignored.
+  Unchanged from session 83 close (no code landed this
+  session).
+* **Code**: planning-only. `tracking/TIER_4_PLAN.md` (~620
+  lines) and this close block on `tracking/HANDOFF.md`.
+* **Workspace**: 25 crates, unchanged.
+* **CI gates locally clean**: no rebuild needed; session 83
+  close state stands.
+
+### Tier 3 final state (unchanged from session 83 close)
+
+All 13 sessions DONE. Cluster plane (71-79) + observability
+plane (80-83) closed. LVQR is a multi-node live video server
+with turnkey OTLP telemetry.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | PLANNED, next up | 85-87 |
+| 4.1 | io_uring archive writes | PLANNED | 88-89 |
+| 4.3 | C2PA signed media | PLANNED | 90-91 |
+| 4.8 | One-token-all-protocols | PLANNED | 92-93 |
+| 4.5 | In-process AI agents | PLANNED | 94-97 |
+| 4.4 | Cross-cluster federation | PLANNED | 98-100 |
+| 4.6 | Server-side transcoding | PLANNED | 101-103 |
+| 4.7 | Latency SLO scheduling | PLANNED | 104-105 |
+
+### Session 85 entry point
+
+**Tier 4 item 4.2 -- WASM per-fragment filters (session A of
+3).**
+
+Deliverable per `tracking/TIER_4_PLAN.md` section 4.2 session A:
+
+1. New crate `crates/lvqr-wasm/`. NOT the deleted
+   browser-facing `lvqr-wasm` referenced in the post-0.4.0
+   removal block; this is a fresh server-side crate for
+   `wasmtime`-hosted fragment filters.
+2. Pin `wasmtime = "25"` as a workspace dep. Component
+   model + WASI 0.2 are stable in 25.0. Pin `notify = "6"`
+   for the session-87 hot-reload path (added now so
+   session A has the import available but the code path is
+   stubbed).
+3. Define a `FragmentFilter` trait plus one concrete impl
+   `WasmFilter` that loads a WASM component from disk and
+   exposes one host call: `on-fragment(fragment) -> option<fragment>`.
+   Matches the `lvqr:filter@0.1.0` WIT interface documented
+   in the plan.
+4. One proptest under `crates/lvqr-wasm/tests/proptest_roundtrip.rs`
+   that pushes arbitrary `lvqr_fragment::Fragment` values
+   through a no-op filter (a WASM component that returns
+   input unchanged) and asserts bytewise equality on the
+   payload.
+5. Skeletons for fuzz + integration + E2E + conformance
+   slots per the 5-artifact contract. These can be
+   educational-warning level in session A; session B closes
+   them.
+
+Expected scope: ~300-500 lines split between
+`crates/lvqr-wasm/src/lib.rs` (~200 LOC),
+`crates/lvqr-wasm/Cargo.toml`, a minimal WASM component
+fixture under `crates/lvqr-wasm/tests/fixtures/` (can be
+compiled-in-advance WASM bytes committed to the repo), and
+the proptest harness. No CLI wiring in session A; that comes
+in session B.
+
+Risk to flag on entry: wasmtime 25's component-model host
+binding generator has a fair amount of boilerplate. If the
+generated code exceeds ~300 LOC per host call, we use the
+lower-level `Linker::func_wrap` API instead of the WIT
+bindgen macro; session A picks whichever ships green first.
+
+### Prior session blocks (reverse chronological)
 
 ## Session 83 close (2026-04-17)
 
