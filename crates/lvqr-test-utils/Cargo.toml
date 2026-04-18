@@ -13,6 +13,7 @@ publish = false
 lvqr-core = { workspace = true }
 lvqr-cli = { workspace = true }
 lvqr-auth = { workspace = true }
+lvqr-wasm = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "net"] }
 tokio-util = { workspace = true }
 bytes = { workspace = true }

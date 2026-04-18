@@ -74,6 +74,9 @@ use lvqr_fragment::Fragment;
 use parking_lot::Mutex;
 use wasmtime::{Engine, Instance, Module, Store, TypedFunc};
 
+mod observer;
+pub use observer::{FilterStats, WasmFilterBridgeHandle, install_wasm_filter_bridge};
+
 /// Name of the WASM export the host calls once per fragment.
 /// Guest modules MUST export a function with this name matching
 /// the `(i32, i32) -> i32` signature described in the

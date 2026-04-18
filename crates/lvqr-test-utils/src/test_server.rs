@@ -45,6 +45,7 @@ pub struct TestServerConfig {
     auth: Option<SharedAuth>,
     record_dir: Option<PathBuf>,
     archive_dir: Option<PathBuf>,
+    wasm_filter: Option<PathBuf>,
     hls_disabled: bool,
     dash_enabled: bool,
     srt_enabled: bool,
@@ -110,6 +111,15 @@ impl TestServerConfig {
         self.rtsp_enabled = true;
         self
     }
+
+    /// Install a WASM fragment filter from a file path before
+    /// any ingest listener starts. The server holds the
+    /// `WasmFilterBridgeHandle` on `ServerHandle`; tests read
+    /// per-broadcast counters off it.
+    pub fn with_wasm_filter(mut self, path: impl Into<PathBuf>) -> Self {
+        self.wasm_filter = Some(path.into());
+        self
+    }
 }
 
 /// A running LVQR server bound to ephemeral loopback ports.
@@ -150,6 +160,7 @@ impl TestServer {
             auth: config.auth,
             record_dir: config.record_dir,
             archive_dir: config.archive_dir,
+            wasm_filter: config.wasm_filter,
             // Prometheus install is process-wide and panics on second
             // call, so tests always disable it. Metrics macros still
             // fire; they're just dropped on the floor instead of being
@@ -214,6 +225,12 @@ impl TestServer {
         self.handle
             .rtsp_addr()
             .expect("RTSP ingest not enabled on this TestServer; call with_rtsp() to enable")
+    }
+
+    /// WASM filter tap handle (read-only). Returns `None` when
+    /// `with_wasm_filter` was not used on this TestServer.
+    pub fn wasm_filter(&self) -> Option<&lvqr_wasm::WasmFilterBridgeHandle> {
+        self.handle.wasm_filter()
     }
 
     /// Bound SRT ingest UDP address. Panics if SRT was not enabled.

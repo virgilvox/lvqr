@@ -13,8 +13,11 @@ categories = ["multimedia", "wasm"]
 [dependencies]
 anyhow = { workspace = true }
 bytes = { workspace = true }
+dashmap = { workspace = true }
 lvqr-fragment = { workspace = true }
+metrics = { workspace = true }
 parking_lot = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 wasmtime = { workspace = true }
 # notify is pulled in at session A so session-87's hot-reload path has the

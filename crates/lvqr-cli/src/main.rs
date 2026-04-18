@@ -146,6 +146,17 @@ struct ServeArgs {
     #[arg(long, env = "LVQR_ARCHIVE_DIR")]
     archive_dir: Option<PathBuf>,
 
+    /// Path to a WASM fragment filter module. When set, `serve`
+    /// loads + compiles the module via `lvqr_wasm::WasmFilter::load`
+    /// and installs a filter tap on the shared
+    /// `FragmentBroadcasterRegistry` before any ingest listener
+    /// starts accepting traffic. The tap observes every fragment
+    /// and drives `lvqr_wasm_fragments_total{outcome=keep|drop}`
+    /// counters. Tier 4 item 4.2 session B (observation only);
+    /// stream-modifying filters ship in a later v1.1 pass.
+    #[arg(long, env = "LVQR_WASM_FILTER")]
+    wasm_filter: Option<PathBuf>,
+
     /// HS256 shared secret enabling JWT authentication. When set, the JWT
     /// provider replaces the static-token provider and all auth surfaces
     /// validate bearer tokens as signed JWTs.
@@ -324,6 +335,7 @@ async fn serve_from_args(
         auth: Some(auth),
         record_dir: args.record_dir,
         archive_dir: args.archive_dir,
+        wasm_filter: args.wasm_filter,
         install_prometheus: true,
         otel_metrics_recorder,
         tls_cert: args.tls_cert,

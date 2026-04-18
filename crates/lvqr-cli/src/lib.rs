@@ -120,6 +120,17 @@ pub struct ServeConfig {
     /// `SegmentRef` against the index. The index + segment files
     /// back the DVR scrub / time-range playback surface (Tier 2.4).
     pub archive_dir: Option<PathBuf>,
+    /// Optional path to a WASM fragment filter module. When set,
+    /// `start()` loads + compiles the module via
+    /// `lvqr_wasm::WasmFilter::load` and installs a filter tap
+    /// on the shared `FragmentBroadcasterRegistry` before any
+    /// ingest listener starts accepting traffic. The tap
+    /// observes every fragment flowing through every
+    /// broadcaster and drives
+    /// `lvqr_wasm_fragments_total{outcome=keep|drop}` counters;
+    /// in v1 it does NOT modify what downstream subscribers
+    /// receive (session-86 scope narrowing). Omit to disable.
+    pub wasm_filter: Option<PathBuf>,
     /// Install the global Prometheus recorder. Must be `false` in tests
     /// because `metrics-exporter-prometheus` panics on the second install
     /// in a process. `main.rs` sets this to `true`.
@@ -204,6 +215,7 @@ impl ServeConfig {
             auth: None,
             record_dir: None,
             archive_dir: None,
+            wasm_filter: None,
             install_prometheus: false,
             otel_metrics_recorder: None,
             tls_cert: None,
@@ -243,6 +255,11 @@ pub struct ServerHandle {
     /// `None`, and absent entirely when the feature is off.
     #[cfg(feature = "cluster")]
     cluster: Option<std::sync::Arc<lvqr_cluster::Cluster>>,
+    /// WASM fragment-filter tap handle kept alive for the
+    /// server's lifetime when `--wasm-filter` is configured.
+    /// Tests read fragment counters off this handle to assert
+    /// the filter actually saw the ingested broadcasts.
+    wasm_filter: Option<lvqr_wasm::WasmFilterBridgeHandle>,
 }
 
 impl ServerHandle {
@@ -346,6 +363,14 @@ impl ServerHandle {
     /// Construct the RTMP publish URL for an app + stream key.
     pub fn rtmp_url(&self, app: &str, stream_key: &str) -> String {
         format!("rtmp://{}/{app}/{stream_key}", self.rtmp_addr)
+    }
+
+    /// Snapshot of per-`(broadcast, track)` WASM filter tap
+    /// counters. Returns `None` when `--wasm-filter` is not set.
+    /// Tests read this after an RTMP publish completes to assert
+    /// the filter actually observed the broadcast.
+    pub fn wasm_filter(&self) -> Option<&lvqr_wasm::WasmFilterBridgeHandle> {
+        self.wasm_filter.as_ref()
     }
 
     /// Trigger graceful shutdown and wait for every subsystem to drain.
@@ -592,6 +617,19 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     if let Some(ref c) = cluster {
         cluster_claim::install_cluster_claim_bridge(c.clone(), cluster_claim::DEFAULT_CLAIM_LEASE, &shared_registry);
     }
+
+    // Optional WASM fragment filter tap. Installed BEFORE any
+    // ingest listener accepts traffic so the very first fragment
+    // of the first broadcast flows through the filter.
+    let wasm_filter_handle = if let Some(ref path) = config.wasm_filter {
+        let filter = lvqr_wasm::WasmFilter::load(path)
+            .map_err(|e| anyhow::anyhow!("WASM filter load at {} failed: {e}", path.display()))?;
+        tracing::info!(path = %path.display(), "WASM fragment filter loaded");
+        let shared = lvqr_wasm::SharedFilter::new(filter);
+        Some(lvqr_wasm::install_wasm_filter_bridge(&shared_registry, shared))
+    } else {
+        None
+    };
 
     // RTMP ingest bridged to MoQ. Pre-bind the TCP listener so we can
     // report the real bound port (for ephemeral-port test setups).
@@ -1169,6 +1207,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         join: Some(join),
         #[cfg(feature = "cluster")]
         cluster,
+        wasm_filter: wasm_filter_handle,
     })
 }
 
