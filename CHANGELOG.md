@@ -1,6 +1,147 @@
 # Changelog
 
-All notable changes to LVQR are documented in this file.
+All notable changes to LVQR are documented in this file. The
+head of `main` is always the source of truth; this file
+summarises user-visible surface changes between tagged
+releases. For session-by-session engineering notes, see
+`tracking/HANDOFF.md`.
+
+## Unreleased (post-0.4.0, through session 82 -- 2026-04-17)
+
+Sessions 45 through 82 expanded the protocol surface well
+beyond the 0.4.0 release cut, then added a cluster plane and
+the first two observability-plane sessions. Net result: 25
+crates, 711 workspace tests, and the single-binary
+`lvqr serve` now covers every protocol in the v1 scope plus
+multi-node operation and OTLP telemetry.
+
+### Added
+
+- **RTSP/1.0 server.** `lvqr-rtsp` accepts ANNOUNCE / SETUP /
+  RECORD / TEARDOWN over TCP with interleaved RTP; depacketized
+  H.264 / HEVC flow through the unified `Fragment` stream to
+  every existing egress. Enabled via `--rtsp-port` (env
+  `LVQR_RTSP_PORT`). 44 unit tests plus a full
+  `rtsp_hls_e2e` integration test. Session-80 audit fixed the
+  `rtsp_play_emits_rtcp_sender_report_after_interval` flake
+  (root-caused to `start_paused` + tokio auto-advance firing
+  timeouts inside the shared read helper); the test is now
+  deterministic at ~6 s runtime.
+
+- **SRT ingest.** `lvqr-srt` accepts SRT-over-UDP MPEG-TS
+  streams from broadcast encoders (OBS, vMix, Larix, ffmpeg),
+  demuxes them, and feeds the unified fragment pipeline.
+  Enabled via `--srt-port` (env `LVQR_SRT_PORT`).
+
+- **Cluster plane (chitchat).** `lvqr-cluster` gives `lvqr
+  serve --cluster-listen=... --cluster-seeds=...` a two-node
+  cluster out of the box.
+    - Membership + failure detection via chitchat (session 72).
+    - Broadcast ownership KV with lease renewal and release on
+      broadcaster close (session 73).
+    - Per-node capacity advertisement -- CPU %, memory RSS,
+      outbound bandwidth utilization (session 74).
+    - Cluster-wide config with last-write-wins semantics and
+      read-only `/api/v1/cluster/{nodes,broadcasts,config}`
+      admin routes (session 75).
+    - Per-node endpoints KV + HLS redirect-to-owner (session
+      76-77). A subscriber hitting a non-owner receives a 302
+      to the owner's advertised base URL.
+    - DASH + RTSP redirect-to-owner (session 78).
+    - Ingest auto-claim on first broadcast -- publishers no
+      longer need a manual `claim_broadcast` call; the CLI
+      wires a callback on the
+      `FragmentBroadcasterRegistry::on_entry_created` hook
+      that auto-claims every new broadcast for the life of its
+      broadcaster (session 79).
+    - Configurable via `--cluster-listen`, `--cluster-seeds`,
+      `--cluster-node-id`, `--cluster-id`, and
+      `--cluster-advertise-{hls,dash,rtsp}`.
+
+- **Observability plane (OTLP + Prometheus fanout).**
+  `lvqr-observability` gates every OTLP surface behind
+  `LVQR_OTLP_ENDPOINT`.
+    - Session G (80): scaffold crate, `ObservabilityConfig::
+      from_env` parsing five env vars, stdout fmt subscriber.
+    - Session H (81): OTLP gRPC span export.
+      `tracing_opentelemetry` layer composed with the fmt
+      layer through `tracing_subscriber::registry()`;
+      `Sampler::TraceIdRatioBased` honours
+      `LVQR_TRACE_SAMPLE_RATIO`; `BatchSpanProcessor` flushes
+      and shuts down on `ObservabilityHandle::drop`.
+    - Session I (82): OTLP gRPC metric export + a
+      `metrics::Recorder` bridge (`OtelMetricsRecorder`) that
+      forwards every existing `metrics::counter!` /
+      `gauge!` / `histogram!` call site to an OTel
+      `SdkMeterProvider`. `lvqr-cli::start` composes the
+      bridge with the Prometheus scrape recorder via
+      `metrics_util::layers::FanoutBuilder` when both paths
+      are enabled.
+    - Resource attribution via `service.name` (from
+      `LVQR_SERVICE_NAME`) plus arbitrary `k=v` pairs from
+      `LVQR_OTLP_RESOURCE`.
+
+- **LL-HLS always-on in the zero-config default.**
+  `--hls-port` default is now `8888`; a fresh
+  `lvqr serve` exposes `/hls/{broadcast}/playlist.m3u8`
+  without any extra flags.
+
+- **Workspace-level deps pinned.** `opentelemetry = "0.27"`,
+  `opentelemetry_sdk = "0.27"` (`rt-tokio` + `trace` +
+  `metrics`), `opentelemetry-otlp = "0.27"` (`grpc-tonic` +
+  `trace` + `metrics`), `tracing-opentelemetry = "0.28"`,
+  `metrics-util = "0.19"`.
+
+- **5-artifact test contract enforcement.** Every crate under
+  `crates/lvqr-{ingest,whip,whep,hls,dash,srt,rtsp,codec,cmaf,
+  archive,moq,fragment,record}` now ships proptest + fuzz +
+  integration + E2E + conformance (some conformance slots are
+  still soft-skips until external validators are in CI).
+  `scripts/check_test_contract.sh` drives
+  `.github/workflows/contract.yml`.
+
+- **Criterion benches.** 15 benches across `lvqr-rtsp` (session
+  68), `lvqr-cmaf` (session 69), and `lvqr-hls`
+  (`PlaylistBuilder`).
+
+### Changed
+
+- **`lvqr-cli::start` recorder install.** The Prometheus
+  recorder install path is now a four-arm match over
+  `(install_prometheus, otel_metrics_recorder)`. Both set →
+  `FanoutBuilder`; Prom only → legacy install; OTel only →
+  `set_global_recorder(otel)`; neither → no-op. The
+  Prometheus scrape handle is always captured before the
+  recorder is handed to the fanout, so `/metrics` works in
+  every permutation.
+
+- **`lvqr-cli::main` lifetime.** The observability handle is
+  held for the full `main` scope so the OTLP background
+  flushers get a clean force_flush + shutdown on process
+  exit. `take_metrics_recorder()` runs once, immediately
+  after `init`, and threads the recorder through
+  `ServeConfig`.
+
+### Removed
+
+- **`lvqr-wasm` deleted.** Browser clients should use
+  `@lvqr/core` (MoQ client + admin client) and
+  `@lvqr/player` (`<lvqr-player>` web component) instead.
+
+### Fixed
+
+- **`rtsp_play_emits_rtcp_sender_report_after_interval` flake.**
+  Session-80 audit removed `start_paused=true` + auto-advance
+  from the test; uses a real-time `sleep(6s)` past the
+  default SR interval. Deterministic 5/5 green.
+
+- **Honest test count.** The session-30 README claimed "84 test
+  binaries, 379 tests" under the default feature set. Tier
+  1 + Tier 2 progress replaced roughly a third of the Tier-0
+  theatrical tests with real integration tests (publisher
+  RTMP, subscriber HLS, end-to-end ffprobe validation) and
+  added the 5-artifact contract harness; current count is
+  711 / 0 failed / 1 ignored across the workspace.
 
 ## [0.4.0] - 2026-04-16
 

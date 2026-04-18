@@ -12,10 +12,16 @@ cargo run -p lvqr-cli -- serve
 lvqr serve
 ```
 
-This starts:
+This starts the zero-config defaults:
 - MoQ relay on port 4443 (QUIC/WebTransport)
 - RTMP ingest on port 1935
-- Admin API on port 8080
+- LL-HLS on port 8888 (HTTP/1.1)
+- Admin API + WebSocket fMP4 on port 8080
+
+Adding `--dash-port 8889`, `--whep-port 8443`, `--whip-port 8443`,
+`--rtsp-port 8554`, and/or `--srt-port 8890` brings up the
+optional protocols. See the top-level README for the full
+port matrix.
 
 ## Stream from OBS
 
@@ -37,12 +43,7 @@ curl http://localhost:8080/api/v1/streams
 
 # Stats
 curl http://localhost:8080/api/v1/stats
+
+# Play back via LL-HLS
+open http://localhost:8888/hls/live/test/playlist.m3u8
 ```
-
-## With Config File
-
-```bash
-lvqr serve --config lvqr.toml
-```
-
-See `lvqr.toml` in this directory for available options.
