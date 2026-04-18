@@ -1,8 +1,179 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Cluster plane COMPLETE; Tier 3 observability H + I (OTLP spans + metrics) DONE; 711 tests, 25 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE (cluster plane + observability plane closed); 714 tests, 25 crates
 
-**Last Updated**: 2026-04-17 (session 82 close -- Tier 3 session I landed: LVQR_OTLP_ENDPOINT now drives BOTH an OTLP span exporter (session H) and an OTLP metric exporter (session I). The existing `metrics::counter!` / `gauge!` / `histogram!` call sites flow out OTLP via a `metrics::Recorder` bridge that lvqr-cli composes with the Prometheus scrape recorder through `metrics_util::FanoutBuilder`).
+**Last Updated**: 2026-04-17 (session 83 close -- Tier 3 session J landed: `LVQR_LOG_JSON=true` flips stdout fmt to JSON one-object-per-line; every log event inside a tracing-opentelemetry-bound span carries `trace_id` + `span_id` fields matching the parent span's OTel SpanContext. **Tier 3 is now complete.** Next session opens Tier 4 (WASM per-fragment filters, C2PA, federation, in-process AI agents, io_uring archive writes).
+
+## Session 83 close (2026-04-17)
+
+### What shipped (1 feat commit, +536 / -1 lines; session-close doc commit below)
+
+1. **Tier 3 session J: JSON logs + trace_id correlation, TIER 3 COMPLETE** (`9666cd1`).
+   Delivers the final observability-plane row in
+   `tracking/TIER_3_PLAN.md`.
+
+   New module `crates/lvqr-observability/src/log_format.rs`
+   (~250 LOC). `CorrelatedFormat` is a single
+   [`tracing_subscriber::fmt::format::FormatEvent`] impl
+   parameterised by an internal `Mode { Pretty, Json }` enum.
+   That keeps the `tracing_subscriber::registry()` composition
+   in `init()` type-homogeneous regardless of the
+   `LVQR_LOG_JSON` value -- the entry-point risk flagged at
+   the top of session 82's close block.
+
+   `trace_id` + `span_id` fields are read off the span's
+   `tracing_opentelemetry::OtelData` extension directly
+   (`otel_data.builder.trace_id` / `.span_id`) rather than
+   via `tracing::Span::current().context()`. Inside a
+   `FormatEvent` callback the tracing dispatcher installs a
+   re-entrance guard that makes `Span::current()` return a
+   disabled span; reading the SpanRef off
+   `FmtContext::event_scope()` is the only reliable
+   strategy. This was the session's one substantive debug
+   cycle.
+
+   Pretty mode renders `<RFC3339> <LEVEL> <target>
+   [trace_id=... span_id=...]: <message> <inline fields>`.
+   JSON mode renders one `serde_json::Value::Object` per
+   event with `timestamp` / `level` / `target` / (`trace_id`
+   / `span_id` when in-span) / event fields / `spans[]`
+   chain root-first. Both modes omit the correlation fields
+   when no OTel-bound span is active.
+
+   New deps on `lvqr-observability`:
+   `chrono = "0.4"` (RFC 3339 timestamp formatting) and
+   `serde_json` (JSON object construction). Both were already
+   in the workspace lockfile transitively; the crate's
+   `Cargo.toml` just promotes them to direct deps. No
+   workspace-level changes. `CorrelatedFormat` is re-exported
+   at the crate root
+   (`lvqr_observability::CorrelatedFormat`) so embedders who
+   want to compose their own `fmt::layer` (e.g. to swap the
+   writer in tests or stack additional layers behind it) can
+   still get the OTel correlation behaviour `lvqr-cli::start`
+   gets by default.
+
+   `init()` now plugs `CorrelatedFormat::new(config.json_logs)`
+   into the fmt layer via `.event_format(...)`. Everything
+   else in the initialisation path (EnvFilter, OTLP span
+   exporter, OTLP metric exporter, `OtelMetricsRecorder`
+   handoff) is unchanged.
+
+   Integration tests at
+   `crates/lvqr-observability/tests/log_correlation.rs`
+   (3 tests):
+   * `json_log_inside_span_carries_matching_trace_and_span_ids`
+     -- MakeWriter shim captures the fmt layer's bytes,
+     parses one JSON object, asserts `trace_id` + `span_id`
+     match the parent span's `SpanContext`. Also covers
+     level, target, message, and call-site field
+     propagation.
+   * `log_outside_any_span_omits_trace_id_fields` --
+     regression guard that correlation fields are omitted
+     when no span is entered.
+   * `instrumented_async_fn_propagates_ids_across_await` --
+     `tracing::Instrument`-wrapped async fn with
+     `tokio::time::sleep`; both sides of the await carry a
+     non-empty `trace_id` of the same 32-hex-char length.
+
+   Offline on every `cargo test --workspace` invocation:
+   NoopExporter stub on the OTLP side + in-memory capture
+   buffer on the fmt side. No network, no stdout
+   manipulation.
+
+### Ground truth (session 83 close, pre-session-close-doc commit)
+
+* **Head**: `9666cd1` on `main`. v0.4.0. Local main is **1 commit
+  ahead of origin/main** (this feat commit); after the session-
+  close doc commit lands it will be 2 ahead. Do NOT push without
+  direct user instruction.
+* **Tests**: 714 passed, 0 failed, 1 ignored. Delta from session
+  82: +3 (the three new log-correlation integration tests).
+  observability test counts are now 13 lib + 2 span + 2 metric
+  + 3 log = 20.
+* **Code**: +536 / -1 net. New files:
+  `crates/lvqr-observability/src/log_format.rs` (~250 LOC),
+  `crates/lvqr-observability/tests/log_correlation.rs` (~280 LOC).
+  Workspace deps unchanged; `lvqr-observability` gains chrono
+  and serde_json as direct deps (both already in lockfile
+  transitively).
+* **Workspace**: 25 crates, unchanged since session 80.
+* **CI gates locally clean**: `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets --benches -- -D
+  warnings`, `cargo test --workspace` all green.
+
+### Tier 3 FINAL progress
+
+| Session | Deliverable | Status |
+|---|---|---|
+| A-B-C-D-E (71-75) | Scaffold, 2-node, ownership, capacity, config + admin | DONE |
+| F1-F2c (76-79) | Endpoints KV + HLS/DASH/RTSP redirect + auto-claim | DONE |
+| G (80) | lvqr-observability scaffold + OTLP env-var gating | DONE |
+| H (81) | OTLP span exporter + in-memory collector test | DONE |
+| I (82) | OTLP metric exporter + metrics-crate bridge + fanout wiring | DONE |
+| **J (83)** | **JSON logs + trace_id correlation** | **DONE** |
+
+**Tier 3 is COMPLETE.** 13 of 13 sessions closed. Both planes
+of Tier 3 (cluster + observability) fully landed. LVQR is now
+a multi-node live video server with end-to-end OTLP telemetry
+out of the box.
+
+### Session 84 entry point
+
+**Tier 4 differentiators.** Per
+`tracking/ROADMAP.md` Tier 4 scope and the ten load-bearing
+architectural decisions, every Tier 4 item is capped at a
+1-page MVP spec and 3 weeks of implementation. Candidates in
+roughly the priority order the roadmap lists:
+
+1. **4.2 WASM per-fragment filters** (~3 weeks). `wasmtime`
+   host with one host function (read fragment, return
+   fragment or drop), one example filter, hot-reloadable
+   from a file. Demo: `frame-counter` + `redact` filters.
+   This is the "developer loyalty" moat; it slots directly
+   into the `FragmentObserver` tap pattern `lvqr-cli` already
+   uses.
+2. **4.1 io_uring archive writes** (~2 weeks). `tokio-uring`
+   backend for `lvqr-archive` disk writes behind an
+   `io-uring` feature flag. Linux-only. Benchmark vs `tokio::fs`
+   and ship the result in `docs/deployment.md`.
+3. **4.3 C2PA signed media** (~1 week MVP). Sign recorded
+   MP4 files at finalization with `c2pa-rs` and a
+   configurable key; verify on archive-scrub playback.
+4. **4.8 One-token-all-protocols** (~1 week). Single JWT
+   grants the same identity publish/subscribe rights across
+   RTMP, WHIP, SRT, RTSP, MoQ. Cross-protocol auth
+   normalization layer in `lvqr-auth`. Tests verify a single
+   token accepted by all five ingest protocols.
+5. **4.5 In-process AI agents framework** (~3 weeks). MVP:
+   real-time transcription via `whisper.cpp` FFI as a
+   subscriber that publishes a captions track.
+6. **4.4 Cross-cluster federation** (~2 weeks). Unidirectional
+   MoQ track forwarding between two clusters over an
+   authenticated QUIC link.
+7. **4.6 Server-side transcoding** (~2 weeks). `gstreamer-rs`
+   bridge: subscribe to a fragment stream, push through a
+   GStreamer pipeline, publish output as a new broadcast.
+8. **4.7 Latency SLO scheduling** (~1 week). End-to-end
+   latency histogram per subscriber via OTel, alert on SLO
+   violation.
+
+Recommendation for session 84: **start with 4.2 WASM
+per-fragment filters**, because it has the highest moat value
+(no other Rust media server has it), the `FragmentObserver`
+slot is already defined, and the 3-week cap is realistic
+given Tier 3's precedent. The first session should land the
+`lvqr-wasm` crate scaffold (NOT the deprecated one; this is a
+new crate), pin `wasmtime` to a workspace version, design the
+host-function surface, and prove a single filter can mutate a
+fragment end-to-end with a real RTMP publish.
+
+Before any Tier 4 code: a session-84 entry planning doc at
+`tracking/TIER_4_PLAN.md` mirroring the structure of
+`TIER_3_PLAN.md`. Each of the eight Tier 4 items gets a
+~1-page MVP section; the plan is approved before any code
+lands. This is load-bearing decision #10 from the ROADMAP
+(\"MVP cap on differentiators\").
 
 ## Session 82 close (2026-04-17)
 

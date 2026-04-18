@@ -279,9 +279,9 @@ Integration surface:
 | G | 80 | `crates/lvqr-observability/` scaffold. `ObservabilityConfig::from_env` + stdout fmt layer. Wire into `lvqr-cli`. | Regression: existing tests unchanged; start logs still render. | DONE |
 | H | 81 | OTLP span exporter. When `LVQR_OTLP_ENDPOINT` is set, spans flow out. | Integration test: in-memory `SpanExporter` captures a synthetic `tracing::info_span!` through the `tracing_opentelemetry` layer; `TraceIdRatioBased(0.0)` regression guard. | DONE |
 | I | 82 | OTLP metric exporter + `metrics` crate bridge. `metrics::counter!` / `gauge!` / `histogram!` call sites flow out OTLP, fanouted with the existing Prometheus exporter via `metrics_util::FanoutBuilder` when both are enabled. | Integration test: in-memory `PushMetricExporter` captures two counter increments that sum to the expected total; label attributes propagate; `set` on gauges converges via delta updates. | DONE |
-| J | 83 | JSON log + trace_id correlation. | `cargo test -p lvqr-observability --test log_correlation` -- a captured log line carries the expected trace_id. | pending |
+| J | 83 | JSON log + trace_id correlation. Custom `tracing_subscriber::fmt::format::FormatEvent` impl (`CorrelatedFormat`) that toggles pretty/JSON via an internal `Mode` enum and injects `trace_id` + `span_id` fields on every event inside a tracing-opentelemetry-bound span (reading `OtelData` off the span ref because the re-entrance guard nulls `Span::current()` inside `format_event`). | Integration test captures a JSON event through a `MakeWriter` shim, parses it, and asserts `trace_id` + `span_id` match the parent `SpanContext`; regression guard for no-span case; `#[tracing::Instrument]` async across-await case. | DONE |
 
-Four sessions for the observability plane (G-J landed across sessions 80-83).
+Four sessions for the observability plane (G-J landed across sessions 80-83). **Tier 3 is now COMPLETE.**
 
 ## Total Tier 3 ETA
 
