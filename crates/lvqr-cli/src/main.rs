@@ -209,23 +209,34 @@ struct ServeArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Install the observability subsystem at the top of `main`.
-    // Today this is the same stdout fmt subscriber the previous
-    // inline `tracing_subscriber::fmt()` call produced, but
-    // behind the `lvqr_observability` facade so Tier 3 sessions
-    // H (OTLP spans), I (OTLP metrics), and J (JSON + trace_id
-    // correlation) can layer on without touching this call
-    // site. The handle is held for the full `main` scope so
-    // future OTLP background flushers do not leak.
-    let _observability = lvqr_observability::init(lvqr_observability::ObservabilityConfig::from_env())?;
+    // Session 80 (G) wired in the `lvqr_observability` facade;
+    // session 81 (H) added OTLP span export; session 82 (I)
+    // adds OTLP metric export + a pre-built `metrics`-crate
+    // bridging recorder we hand off to `start()` via
+    // `ServeConfig.otel_metrics_recorder` so it can be composed
+    // with the Prometheus scrape recorder via
+    // `metrics_util::FanoutBuilder`. The handle is held for the
+    // full `main` scope so the OTLP background flushers do not
+    // leak; `mut` so we can `take_metrics_recorder` once.
+    let mut observability = lvqr_observability::init(lvqr_observability::ObservabilityConfig::from_env())?;
+    let otel_metrics_recorder = observability.take_metrics_recorder();
 
     let cli = Cli::parse();
 
-    match cli {
-        Cli::Serve(args) => serve_from_args(args).await,
-    }
+    let result = match cli {
+        Cli::Serve(args) => serve_from_args(args, otel_metrics_recorder).await,
+    };
+
+    // Keep `observability` alive here so the tracer / meter
+    // providers flush on drop after serve_from_args returns.
+    drop(observability);
+    result
 }
 
-async fn serve_from_args(args: ServeArgs) -> Result<()> {
+async fn serve_from_args(
+    args: ServeArgs,
+    otel_metrics_recorder: Option<lvqr_observability::OtelMetricsRecorder>,
+) -> Result<()> {
     // Build auth provider from CLI/env. JWT takes precedence when
     // `--jwt-secret` is set; otherwise fall back to the static-token
     // provider when any individual token is configured; otherwise open
@@ -314,6 +325,7 @@ async fn serve_from_args(args: ServeArgs) -> Result<()> {
         record_dir: args.record_dir,
         archive_dir: args.archive_dir,
         install_prometheus: true,
+        otel_metrics_recorder,
         tls_cert: args.tls_cert,
         tls_key: args.tls_key,
         cluster_listen: args.cluster_listen,

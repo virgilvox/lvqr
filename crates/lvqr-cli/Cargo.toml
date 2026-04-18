@@ -61,6 +61,7 @@ tokio-util = { workspace = true }
 futures = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+metrics-util = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }

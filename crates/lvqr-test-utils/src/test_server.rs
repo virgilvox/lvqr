@@ -155,6 +155,7 @@ impl TestServer {
             // fire; they're just dropped on the floor instead of being
             // rendered through a /metrics endpoint.
             install_prometheus: false,
+            otel_metrics_recorder: None,
             tls_cert: None,
             tls_key: None,
             cluster_listen: None,

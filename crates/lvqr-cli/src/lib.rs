@@ -124,6 +124,15 @@ pub struct ServeConfig {
     /// because `metrics-exporter-prometheus` panics on the second install
     /// in a process. `main.rs` sets this to `true`.
     pub install_prometheus: bool,
+    /// Pre-built OTLP metrics recorder handed off by
+    /// `lvqr_observability::init` when `LVQR_OTLP_ENDPOINT` is
+    /// set. When `Some`, `start()` installs it as the global
+    /// `metrics`-crate recorder -- either on its own or composed
+    /// with the Prometheus recorder via
+    /// `metrics_util::layers::FanoutBuilder` when
+    /// `install_prometheus` is also true. When `None`, only the
+    /// Prometheus path runs (legacy behavior).
+    pub otel_metrics_recorder: Option<lvqr_observability::OtelMetricsRecorder>,
     /// Path to TLS certificate (PEM). Reserved; not consumed yet. The
     /// relay auto-generates self-signed certs when unset.
     pub tls_cert: Option<PathBuf>,
@@ -196,6 +205,7 @@ impl ServeConfig {
             record_dir: None,
             archive_dir: None,
             install_prometheus: false,
+            otel_metrics_recorder: None,
             tls_cert: None,
             tls_key: None,
             cluster_listen: None,
@@ -380,15 +390,41 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         "starting LVQR server"
     );
 
-    // Optional Prometheus install. Process-wide, must be skipped in tests.
-    let prom_handle = if config.install_prometheus {
-        Some(
+    // Metrics recorder install. Process-wide, must be skipped in
+    // tests (all four permutations below call
+    // `metrics::set_global_recorder` which panics or errors on
+    // second install). The four cases are:
+    //   Prom + OTel:   install a FanoutBuilder of both.
+    //   Prom only:     install the Prometheus recorder (legacy).
+    //   OTel only:     install the OTel-forwarding recorder.
+    //   Neither:       install nothing; metrics calls are no-ops.
+    // The `PrometheusRecorder` handle is exposed on
+    // `ServerHandle` for the admin `/metrics` scrape route, so
+    // we always capture it before handing the recorder off to a
+    // Fanout layer.
+    let prom_handle = match (config.install_prometheus, config.otel_metrics_recorder.clone()) {
+        (true, Some(otel_recorder)) => {
+            let prom_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = prom_recorder.handle();
+            let fanout = metrics_util::layers::FanoutBuilder::default()
+                .add_recorder(prom_recorder)
+                .add_recorder(otel_recorder)
+                .build();
+            metrics::set_global_recorder(fanout)
+                .map_err(|e| anyhow::anyhow!("failed to install metrics fanout recorder: {e}"))?;
+            Some(handle)
+        }
+        (true, None) => Some(
             metrics_exporter_prometheus::PrometheusBuilder::new()
                 .install_recorder()
                 .map_err(|e| anyhow::anyhow!("failed to install Prometheus recorder: {e}"))?,
-        )
-    } else {
-        None
+        ),
+        (false, Some(otel_recorder)) => {
+            metrics::set_global_recorder(otel_recorder)
+                .map_err(|e| anyhow::anyhow!("failed to install OTLP metrics recorder: {e}"))?;
+            None
+        }
+        (false, None) => None,
     };
 
     let shutdown = CancellationToken::new();

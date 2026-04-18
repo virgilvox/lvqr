@@ -121,14 +121,19 @@ jsonwebtoken = "9"
 # Metrics
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
+# metrics-util powers FanoutBuilder so lvqr-cli can install both the
+# Prometheus recorder AND the OTLP-bridging recorder at once when the
+# operator enables both paths. Version matches the one already pulled
+# transitively by metrics-exporter-prometheus.
+metrics-util = "0.19"
 
 # OpenTelemetry (Tier 3 observability plane, sessions H-J). Pin the exact
 # versions from tracking/TIER_3_PLAN.md's "Dependencies to pin" table; any
 # upgrade gets its own session. `tracing-opentelemetry` 0.28 targets the
 # `opentelemetry*` 0.27 line per upstream release cadence.
 opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "trace"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace", "metrics"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "trace", "metrics"] }
 tracing-opentelemetry = "0.28"
 
 # Internal crates

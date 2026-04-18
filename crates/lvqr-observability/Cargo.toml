@@ -12,19 +12,22 @@ categories = ["development-tools::debugging"]
 
 [dependencies]
 anyhow = { workspace = true }
+dashmap = { workspace = true }
+metrics = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-# Tier 3 session H: OTLP span exporter. These are always compiled in so the
-# runtime-gated behavior (on / off based on `LVQR_OTLP_ENDPOINT`) stays
-# internal to this crate and the rest of the workspace never has to care
-# about OTel versioning.
+# Tier 3 sessions H (span) + I (metric) OTLP export. These are always
+# compiled in so the runtime-gated behavior (on / off based on
+# `LVQR_OTLP_ENDPOINT`) stays internal to this crate and the rest of the
+# workspace never has to care about OTel versioning.
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
+async-trait = "0.1"
 futures = { workspace = true }
 tokio = { workspace = true }

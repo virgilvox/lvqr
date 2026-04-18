@@ -78,11 +78,16 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::export::trace::SpanExporter;
+use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::runtime;
 use opentelemetry_sdk::trace::{Sampler, TracerProvider};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
+
+pub mod metric_bridge;
+pub use metric_bridge::OtelMetricsRecorder;
 
 /// Environment variable that, when set, supplies the OTLP
 /// collector endpoint. Example: `http://localhost:4317`.
@@ -206,11 +211,11 @@ fn parse_truthy(raw: &str) -> bool {
 
 /// Lifetime guard for the observability subsystem. Hold this
 /// for the process lifetime; dropping it force-flushes and
-/// shuts down the OTLP tracer provider (session H) so the
-/// background batch span processor does not lose pending
-/// spans. Single-node deployments without
-/// `LVQR_OTLP_ENDPOINT` set carry `None` here and drop is
-/// a no-op.
+/// shuts down the OTLP tracer provider (session H) and meter
+/// provider (session I) so the background batch span processor
+/// and periodic metric reader do not lose pending data.
+/// Single-node deployments without `LVQR_OTLP_ENDPOINT` set
+/// carry `None` in both slots and drop is a no-op.
 #[derive(Debug, Default)]
 #[must_use = "dropping ObservabilityHandle shuts down OTLP exporters; hold it for the process lifetime"]
 pub struct ObservabilityHandle {
@@ -218,6 +223,47 @@ pub struct ObservabilityHandle {
     /// `config.otlp_endpoint.is_some()`. `None` for the default
     /// stdout-only path.
     tracer_provider: Option<TracerProvider>,
+    /// The OTLP meter provider, when
+    /// `config.otlp_endpoint.is_some()`. `None` for the default
+    /// stdout-only path.
+    meter_provider: Option<SdkMeterProvider>,
+    /// Pre-built [`metrics::Recorder`] that forwards the
+    /// `metrics` crate's global call sites into `meter_provider`.
+    /// Built lazily in [`init`] alongside `meter_provider`; the
+    /// caller (typically `lvqr-cli::start`) takes ownership via
+    /// [`Self::take_metrics_recorder`] and composes it with any
+    /// other recorder (e.g. Prometheus) through
+    /// `metrics-util::FanoutBuilder` before installing the
+    /// result globally. Left in the handle the recorder is never
+    /// installed, so `metrics::counter!` call sites silently
+    /// flow into the process-default (usually NoopRecorder); the
+    /// handle Drop does NOT touch the global `metrics` recorder.
+    metrics_recorder: Option<OtelMetricsRecorder>,
+}
+
+impl ObservabilityHandle {
+    /// Take ownership of the pre-built metric recorder, leaving
+    /// `None` behind. Returns `None` if OTLP is disabled or if
+    /// the recorder was already taken by a previous call.
+    ///
+    /// The caller is responsible for installing the returned
+    /// recorder (via `metrics::set_global_recorder` or a
+    /// `metrics-util::FanoutBuilder`). If the caller drops the
+    /// recorder without installing it, `metrics::counter!` call
+    /// sites silently discard their emissions.
+    pub fn take_metrics_recorder(&mut self) -> Option<OtelMetricsRecorder> {
+        self.metrics_recorder.take()
+    }
+
+    /// Borrow the underlying `SdkMeterProvider`, if OTLP is
+    /// enabled. Exposed primarily so callers can build
+    /// additional OTel instruments (outside the `metrics` crate
+    /// bridge) against the same provider and share its
+    /// `Resource` / exporter wiring. Production call sites
+    /// rarely need this; tests use it to assert provider state.
+    pub fn meter_provider(&self) -> Option<&SdkMeterProvider> {
+        self.meter_provider.as_ref()
+    }
 }
 
 impl Drop for ObservabilityHandle {
@@ -225,11 +271,19 @@ impl Drop for ObservabilityHandle {
         if let Some(provider) = self.tracer_provider.take() {
             for result in provider.force_flush() {
                 if let Err(err) = result {
-                    eprintln!("lvqr-observability: force_flush reported error: {err}");
+                    eprintln!("lvqr-observability: tracer force_flush reported error: {err}");
                 }
             }
             if let Err(err) = provider.shutdown() {
                 eprintln!("lvqr-observability: tracer provider shutdown error: {err}");
+            }
+        }
+        if let Some(provider) = self.meter_provider.take() {
+            if let Err(err) = provider.force_flush() {
+                eprintln!("lvqr-observability: meter force_flush reported error: {err}");
+            }
+            if let Err(err) = provider.shutdown() {
+                eprintln!("lvqr-observability: meter provider shutdown error: {err}");
             }
         }
     }
@@ -271,25 +325,53 @@ where
         .build()
 }
 
+/// Build an [`SdkMeterProvider`] configured per `config` with a
+/// caller-supplied [`PushMetricExporter`]. Symmetric to
+/// [`build_tracer_provider`] -- production builds an OTLP gRPC
+/// exporter in [`init`], tests use an in-memory shim.
+///
+/// The exporter is wrapped in a [`PeriodicReader`] backed by
+/// [`runtime::Tokio`]; default collect interval is 60 s per
+/// the OTel SDK defaults. Callers needing a different interval
+/// can build a `PeriodicReader` themselves and assemble the
+/// provider directly. The caller MUST be inside a Tokio runtime.
+pub fn build_meter_provider<E>(config: &ObservabilityConfig, exporter: E) -> SdkMeterProvider
+where
+    E: PushMetricExporter + 'static,
+{
+    let reader = PeriodicReader::builder(exporter, runtime::Tokio).build();
+    SdkMeterProvider::builder()
+        .with_reader(reader)
+        .with_resource(build_resource(config))
+        .build()
+}
+
 /// Install the global tracing subscriber. Returns an
 /// [`ObservabilityHandle`] that the caller MUST hold for the
 /// process lifetime; dropping it force-flushes and shuts down
-/// the OTLP exporter so pending spans are not lost.
+/// the OTLP exporters so pending spans and metrics are not lost.
 ///
-/// Behavior as of session 81 (Tier 3 session H):
+/// Behavior as of session 82 (Tier 3 session I):
 /// * Installs a stdout `fmt` layer with an [`EnvFilter`]
 ///   sourced from `RUST_LOG` (or the `"lvqr=info"` default when
 ///   that env var is unset). Matches the previous inline
 ///   `tracing_subscriber::fmt().init()` behavior.
 /// * If `config.otlp_endpoint.is_some()`, ALSO installs a
-///   `tracing_opentelemetry` layer backed by an OTLP gRPC
-///   exporter. Spans emitted through `tracing::instrument`,
-///   `tracing::info_span!`, etc. flow both to stdout AND out
-///   the OTLP exporter.
-/// * If the OTLP exporter fails to build (invalid endpoint,
-///   DNS miss at process start, tonic initialization failure),
-///   the init call returns `Err`; the caller can decide
-///   whether to fail fast or continue without tracing.
+///   `tracing_opentelemetry` layer backed by an OTLP gRPC span
+///   exporter (session H) AND constructs an [`SdkMeterProvider`]
+///   and [`OtelMetricsRecorder`] pair backed by an OTLP gRPC
+///   metric exporter (session I). Spans emitted through
+///   `tracing::instrument`, `tracing::info_span!`, etc. flow
+///   both to stdout AND out the OTLP span endpoint. The metric
+///   recorder is stashed on the handle but is NOT installed as
+///   the `metrics`-crate global recorder, so the caller owns
+///   that decision and can compose the OTLP recorder with any
+///   other recorder (e.g. the Prometheus scrape exporter already
+///   wired in `lvqr-cli`) via `metrics-util::FanoutBuilder`.
+/// * If any exporter fails to build (invalid endpoint, DNS miss
+///   at process start, tonic initialization failure), the init
+///   call returns `Err`; the caller can decide whether to fail
+///   fast or continue without telemetry.
 ///
 /// Calling `init` more than once per process returns an error
 /// (`tracing::dispatcher::set_global_default` can only win
@@ -299,15 +381,25 @@ pub fn init(config: ObservabilityConfig) -> Result<ObservabilityHandle> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("lvqr=info"));
     let fmt_layer = fmt::layer();
 
-    let tracer_provider = if let Some(endpoint) = config.otlp_endpoint.as_deref() {
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
+    let (tracer_provider, meter_provider, metrics_recorder) = if let Some(endpoint) = config.otlp_endpoint.as_deref() {
+        let span_exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .with_endpoint(endpoint)
             .build()
             .context("build OTLP gRPC span exporter")?;
-        Some(build_tracer_provider(&config, exporter))
+        let tracer_provider = build_tracer_provider(&config, span_exporter);
+
+        let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()
+            .context("build OTLP gRPC metric exporter")?;
+        let meter_provider = build_meter_provider(&config, metric_exporter);
+        let metrics_recorder = OtelMetricsRecorder::new(&meter_provider);
+
+        (Some(tracer_provider), Some(meter_provider), Some(metrics_recorder))
     } else {
-        None
+        (None, None, None)
     };
 
     let otel_layer = tracer_provider.as_ref().map(|provider| {
@@ -326,17 +418,25 @@ pub fn init(config: ObservabilityConfig) -> Result<ObservabilityHandle> {
     if let Some(ref provider) = tracer_provider {
         opentelemetry::global::set_tracer_provider(provider.clone());
     }
+    if let Some(ref provider) = meter_provider {
+        opentelemetry::global::set_meter_provider(provider.clone());
+    }
 
     tracing::info!(
         service_name = %config.service_name,
         otlp_enabled = tracer_provider.is_some(),
         otlp_endpoint = config.otlp_endpoint.as_deref().unwrap_or(""),
+        metrics_recorder_ready = metrics_recorder.is_some(),
         json_logs = config.json_logs,
         trace_sample_ratio = config.trace_sample_ratio,
         "observability initialized",
     );
 
-    Ok(ObservabilityHandle { tracer_provider })
+    Ok(ObservabilityHandle {
+        tracer_provider,
+        meter_provider,
+        metrics_recorder,
+    })
 }
 
 #[cfg(test)]
