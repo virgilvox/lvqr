@@ -266,6 +266,159 @@ the owner's advertised URL. Full reference:
    returns 503 during shutdown so traffic drains before the
    process exits.
 
+## Archive: `io_uring` write backend (Linux-only)
+
+The DVR archive writer routes CMAF segments to disk via
+`lvqr-archive`'s `write_segment`. By default it uses
+`std::fs::create_dir_all` + `std::fs::write`; on Linux hosts the
+crate can be rebuilt with the `io-uring` feature to route the
+file-create + payload write + `fsync` phase through a
+`tokio-uring::fs::File` instead. This is a build-time decision --
+the feature is off by default and entirely absent from the macOS +
+Windows dep graph.
+
+### When to enable
+
+Turn it on if all of these are true:
+
+- Target deployment is Linux with kernel >= 5.6 (the `io_uring_*`
+  syscall family landed in 5.1 but the `IORING_OP_WRITE` /
+  `IORING_OP_CLOSE` shape relied on by tokio-uring 0.5 is stable
+  from 5.6 onward).
+- You are archiving high-bitrate streams or many concurrent
+  broadcasts. The win scales with segment size + segment rate --
+  large keyframes at frequent intervals benefit most.
+- Your container runtime does NOT drop `io_uring_*` from its
+  default seccomp profile. Docker 24+ and containerd 1.7+ allow
+  io_uring by default; older runtimes and some managed
+  Kubernetes distributions still block it (gVisor, for example,
+  blocks io_uring unconditionally).
+
+Leave it off if any of these are true:
+
+- You are targeting macOS, Windows, or a BSD variant. The feature
+  is a no-op on those targets because the `tokio-uring` dep is
+  gated on `cfg(target_os = "linux")`.
+- Your archive workload is bursty-small (AAC-only, or a handful
+  of sub-4-KiB fragments per second). The per-call
+  `tokio_uring::start` setup cost is a fixed overhead that small
+  writes do not amortise. Run the bench (below) to confirm on
+  your hardware + kernel; the crossover point varies.
+- You operate under a hardened seccomp profile that does not
+  include io_uring. The crate's runtime fallback will carry on
+  correctly, but you gain no benefit and pay one cold-start
+  `tracing::warn` per process.
+
+### Enable
+
+Rebuild `lvqr-cli` with the feature forwarded through to
+`lvqr-archive`:
+
+```bash
+cargo build --release -p lvqr-cli --features lvqr-archive/io-uring
+```
+
+Or, if you consume `lvqr-archive` directly in a downstream crate:
+
+```toml
+[dependencies]
+lvqr-archive = { version = "0.4", features = ["io-uring"] }
+```
+
+No runtime flag, no config file change. The path switch is
+compile-time only; callers do not change.
+
+### Measure on your host
+
+`lvqr-archive` ships a criterion bench that parameterises segment
+size across `[4 KiB, 64 KiB, 256 KiB, 1 MiB]`. The recommended
+workflow is criterion's saved baselines: run the std path first,
+save it as a named baseline, then run the io-uring path against
+it.
+
+```bash
+# 1. Capture the std::fs baseline.
+cargo bench -p lvqr-archive --bench io_uring_vs_std -- \
+    --save-baseline std
+
+# 2. Re-run with the feature on; criterion diffs vs. the saved baseline.
+cargo bench -p lvqr-archive --features io-uring \
+    --bench io_uring_vs_std -- --baseline std
+```
+
+Run both on the same host. Different CPUs, kernels, and block
+devices produce materially different results; numbers captured on
+one machine are not portable to another. Archive writes are
+disk-IO-bound, so do not run the bench against `tmpfs`
+(`/dev/shm`) -- tmpfs bypasses the block-device IO scheduler and
+hides the effect the feature is designed to measure. Use a real
+disk mount, and if `/tmp` is small, `TMPDIR=/var/tmp` (or a
+dedicated scratch partition) before running.
+
+Interpret the output like any criterion run: look at the
+throughput delta + the p99 latency column. A positive throughput
+delta on 256 KiB + 1 MiB variants with a no-worse result on the 4
+KiB variant is the signal to enable the feature. If the 4 KiB
+variant regresses measurably, leave it off or revisit when
+session-90-scope bench work promotes the writer to a persistent
+current-thread runtime (see
+`tracking/TIER_4_PLAN.md` section 4.1, option (b)).
+
+### Runtime fallback
+
+The feature cannot silently fail on a misconfigured host. At
+first call, `write_segment` attempts `tokio_uring::start`; if the
+kernel rejects the setup (too old, seccomp drop, missing CAP),
+the crate catches the panic, emits exactly one warning, and
+pins `std::fs::write` for the rest of the process lifetime.
+Subsequent writes skip the probe and go straight to the std
+path, so the cost of the fallback is one log line.
+
+The warning looks like this:
+
+```text
+WARN lvqr_archive::writer: tokio_uring::start failed (kernel < 5.6
+    or sandbox without io_uring syscalls); falling back to std::fs
+    for archive writes for the rest of this process
+    path=/var/lib/lvqr/archive/live/dvr/0.mp4/00000001.m4s
+```
+
+If you see this in production while running on a kernel you
+believe supports io_uring, check:
+
+1. Your container seccomp profile includes the `io_uring_setup`,
+   `io_uring_enter`, and `io_uring_register` syscalls.
+2. No `LimitMEMLOCK` or `LimitNOFILE` in your systemd unit is
+   capping ringbuf allocation below tokio-uring's defaults.
+3. You are not inside a gVisor or Kata sandbox that blocks
+   io_uring by policy (those sandboxes will never allow it --
+   run without the feature).
+
+On-path `io::Error`s (disk full, permission denied, ENOENT on a
+since-deleted archive dir) after the runtime is up surface as
+`ArchiveError::Io` and are logged by the caller, exactly as the
+std::fs path would. Those errors do NOT trip the fallback latch;
+the next segment retries the io_uring path cleanly.
+
+### Caveats
+
+- `create_dir_all` stays on `std::fs` even with the feature on.
+  tokio-uring 0.5 exposes no mkdir primitive; the archive tree
+  (`<root>/<broadcast>/<track>/`) is created once per
+  `(broadcast, track)` pair and then amortised across thousands
+  of segment writes, so the extra syscall is noise compared to
+  the payload write.
+- The feature only affects archive *writes*. Playback reads
+  still use `tokio::fs::read` in the `lvqr-cli::archive`
+  file-handler. Adding an io_uring reader path doubles the
+  validation surface and the gains on the read side are smaller
+  (reads are typically page-cache hits); deferred to a later
+  session if a latency SLO forces it.
+- Archive segment ordering is enforced by the caller's existing
+  `BroadcasterArchiveIndexer::drain` task -- one drain task per
+  `(broadcast, track)`, which serialises writes per stream. The
+  io-uring feature does not change this contract.
+
 ## Firewall hardening checklist
 
 - [ ] `--admin-port` (8080) limited to internal subnets.
