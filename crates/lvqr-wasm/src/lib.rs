@@ -49,20 +49,25 @@
 //! detail that can change without churning
 //! `FragmentBroadcasterRegistry` call sites.
 //!
-//! # What is deliberately NOT in this crate yet
+//! # What this crate ships
 //!
-//! * **Session B deliverable:** a `WasmFragmentObserver` that
-//!   plugs into `FragmentBroadcasterRegistry`'s observer
-//!   fan-out, plus a `--wasm-filter <path>` CLI flag on
-//!   `lvqr-cli`.
-//! * **Session C deliverable:** hot-reload of the WASM module
-//!   via `notify`; drop-in swap of the compiled `Module` on
-//!   file change.
-//! * **Anti-scope (per TIER_4_PLAN.md section 4.2):** no
-//!   multi-filter pipeline, no stateful filters, no GPU, no
-//!   browser target. Every `apply` call creates a fresh
-//!   `wasmtime::Store`; state does not carry between
-//!   invocations.
+//! * **Session A:** [`FragmentFilter`] trait, [`WasmFilter`]
+//!   concrete impl, [`SharedFilter`] wrapper with a
+//!   `replace` method.
+//! * **Session B:** [`install_wasm_filter_bridge`] +
+//!   [`WasmFilterBridgeHandle`] plug into
+//!   `FragmentBroadcasterRegistry` as a per-`(broadcast, track)`
+//!   tap; `--wasm-filter <path>` CLI flag on `lvqr-cli`.
+//! * **Session C:** [`WasmFilterReloader`] watches the filter's
+//!   path via `notify` and calls [`SharedFilter::replace`] on
+//!   every debounced file change so operators can swap a
+//!   deployed module without restarting the server.
+//!
+//! # Anti-scope (per `tracking/TIER_4_PLAN.md` section 4.2)
+//!
+//! No multi-filter pipeline, no stateful filters, no GPU, no
+//! browser target. Every `apply` call creates a fresh
+//! `wasmtime::Store`; state does not carry between invocations.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -75,7 +80,9 @@ use parking_lot::Mutex;
 use wasmtime::{Engine, Instance, Module, Store, TypedFunc};
 
 mod observer;
+mod reloader;
 pub use observer::{FilterStats, WasmFilterBridgeHandle, install_wasm_filter_bridge};
+pub use reloader::{DEFAULT_DEBOUNCE, WasmFilterReloader};
 
 /// Name of the WASM export the host calls once per fragment.
 /// Guest modules MUST export a function with this name matching

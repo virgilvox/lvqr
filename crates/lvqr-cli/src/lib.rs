@@ -260,6 +260,15 @@ pub struct ServerHandle {
     /// Tests read fragment counters off this handle to assert
     /// the filter actually saw the ingested broadcasts.
     wasm_filter: Option<lvqr_wasm::WasmFilterBridgeHandle>,
+    /// WASM filter hot-reload watcher kept alive for the
+    /// server's lifetime when `--wasm-filter` is configured.
+    /// On every debounced change to the module path, the
+    /// reloader recompiles the module and swaps it into the
+    /// shared filter; in-flight `apply` calls complete on the
+    /// old module, subsequent calls see the new one. Unused
+    /// directly; held for its `Drop` side effect of stopping
+    /// the watcher thread on shutdown.
+    _wasm_reloader: Option<lvqr_wasm::WasmFilterReloader>,
 }
 
 impl ServerHandle {
@@ -620,15 +629,22 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
 
     // Optional WASM fragment filter tap. Installed BEFORE any
     // ingest listener accepts traffic so the very first fragment
-    // of the first broadcast flows through the filter.
-    let wasm_filter_handle = if let Some(ref path) = config.wasm_filter {
+    // of the first broadcast flows through the filter. The
+    // reloader watches the module path for changes and calls
+    // `SharedFilter::replace` atomically when the file changes;
+    // in-flight fragments finish on the old module and the next
+    // fragment sees the new one.
+    let (wasm_filter_handle, wasm_reloader_handle) = if let Some(ref path) = config.wasm_filter {
         let filter = lvqr_wasm::WasmFilter::load(path)
             .map_err(|e| anyhow::anyhow!("WASM filter load at {} failed: {e}", path.display()))?;
         tracing::info!(path = %path.display(), "WASM fragment filter loaded");
         let shared = lvqr_wasm::SharedFilter::new(filter);
-        Some(lvqr_wasm::install_wasm_filter_bridge(&shared_registry, shared))
+        let bridge = lvqr_wasm::install_wasm_filter_bridge(&shared_registry, shared.clone());
+        let reloader = lvqr_wasm::WasmFilterReloader::spawn(path, shared)
+            .map_err(|e| anyhow::anyhow!("WASM filter hot-reload watcher at {} failed: {e}", path.display()))?;
+        (Some(bridge), Some(reloader))
     } else {
-        None
+        (None, None)
     };
 
     // RTMP ingest bridged to MoQ. Pre-bind the TCP listener so we can
@@ -1208,6 +1224,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         #[cfg(feature = "cluster")]
         cluster,
         wasm_filter: wasm_filter_handle,
+        _wasm_reloader: wasm_reloader_handle,
     })
 }
 

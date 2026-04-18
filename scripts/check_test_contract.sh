@@ -51,10 +51,16 @@ IN_SCOPE=(
     lvqr-rtsp
     # lvqr-archive
     # Session 85 (Tier 4 item 4.2 A): lvqr-wasm scaffold
-    # landed with proptest only. Sessions 86/87 close the
-    # remaining slots; the educational warnings in the
-    # meantime are the forcing function for the follow-up
-    # sessions.
+    # landed with proptest only. Session 86 B added a real
+    # RTMP-through-the-tap integration test, and session 87 C
+    # added a hot-reload integration test; both live cross-crate
+    # in `lvqr-cli/tests/wasm_{frame_counter,hot_reload}.rs`
+    # (accepted case-by-case per tests/CONTRACT.md) so the
+    # integration + E2E educational warnings on this crate
+    # remain until either the tests move in-tree or a future
+    # session plumbs a per-crate integration exemption through
+    # this script. Fuzz + conformance slots stay open pending
+    # a WASM trap-surface fuzzer.
     lvqr-wasm
 )
 
