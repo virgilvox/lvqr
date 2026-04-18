@@ -39,6 +39,7 @@ members = [
     "crates/lvqr-observability",
     "crates/lvqr-soak",
     "crates/lvqr-test-utils",
+    "crates/lvqr-wasm",
 ]
 
 [workspace.package]
@@ -136,6 +137,12 @@ opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace", "metric
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "trace", "metrics"] }
 tracing-opentelemetry = "0.28"
 
+# WASM host (Tier 4 item 4.2). Component model + WASI 0.2 stable as of 25.0.
+# Any upgrade gets its own session per TIER_4_PLAN.md dependency-pin table.
+# `notify` is pulled in at session A for session-87's hot-reload path.
+wasmtime = { version = "25", default-features = false, features = ["runtime", "cranelift"] }
+notify = "6"
+
 # Internal crates
 lvqr-core = { version = "0.4.0", path = "crates/lvqr-core" }
 lvqr-moq = { version = "0.4.0", path = "crates/lvqr-moq" }
@@ -162,6 +169,7 @@ lvqr-cli = { version = "0.4.0", path = "crates/lvqr-cli" }
 lvqr-cluster = { version = "0.4.0", path = "crates/lvqr-cluster" }
 lvqr-observability = { version = "0.4.0", path = "crates/lvqr-observability" }
 lvqr-soak = { version = "0.4.0", path = "crates/lvqr-soak" }
+lvqr-wasm = { version = "0.4.0", path = "crates/lvqr-wasm" }
 
 [profile.release]
 lto = true

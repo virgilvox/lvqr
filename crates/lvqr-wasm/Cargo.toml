@@ -1,0 +1,31 @@
+[package]
+name = "lvqr-wasm"
+description = "Server-side WASM per-fragment filter host for LVQR (Tier 4 item 4.2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["wasm", "wasmtime", "filter", "lvqr", "streaming"]
+categories = ["multimedia", "wasm"]
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+lvqr-fragment = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+wasmtime = { workspace = true }
+# notify is pulled in at session A so session-87's hot-reload path has the
+# import available without a second Cargo edit; the watcher itself is not
+# wired until that session.
+notify = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+# Assemble tiny WAT snippets into WASM bytes at test time so the test suite
+# does not depend on pre-compiled .wasm fixtures or an external toolchain
+# like cargo-component.
+wat = "1"
