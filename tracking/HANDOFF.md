@@ -1,8 +1,159 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE against TIER_3_PLAN; Tier 4 item 4.2 A+B DONE; 729 tests, 26 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE against TIER_3_PLAN; Tier 4 item 4.2 COMPLETE; 733 tests, 26 crates
 
-**Last Updated**: 2026-04-17 (session 86 close -- two landings in one session: (1) hygiene sweep (HANDOFF rotated, AUDIT archive, `lvqr-wasm` added to contract, README honesty block); (2) Tier 4 item 4.2 session B (WasmFragmentObserver + `--wasm-filter` CLI + frame-counter example + RTMP E2E). 729 workspace tests, 0 failed, 1 ignored. Next session is 4.2 C: hot reload via notify + a second example filter.
+**Last Updated**: 2026-04-18 (session 87 close -- Tier 4 item 4.2 session C landed: `WasmFilterReloader` via `notify::RecommendedWatcher` on the parent directory, atomic `SharedFilter::replace` swap, 82-byte `redact-keyframes.wasm` drop-all example, committed `cargo run --example build_fixtures` helper that rebuilds both `.wat -> .wasm` fixtures deterministically, and an RTMP hot-reload E2E at `crates/lvqr-cli/tests/wasm_hot_reload.rs`. Item 4.2 overall is DONE; next session is Tier 4 item 4.1 session A (io_uring archive writes). Workspace tests 733 passing, 0 failed, 1 ignored.
+
+## Session 87 close (2026-04-18)
+
+### What shipped (1 feat commit + 1 close doc commit expected)
+
+1. **Tier 4 item 4.2 session C: WASM filter hot-reload**
+   (pending commit). Full writeup in the feat commit
+   message; synopsis here.
+
+   New module `crates/lvqr-wasm/src/reloader.rs` (~250
+   LOC including 3 unit tests). `WasmFilterReloader::spawn(path,
+   filter)` canonicalises `path`, watches the **parent
+   directory** via `notify::recommended_watcher` (parent-dir
+   watch is the portable best practice: macOS FSEvents and
+   Linux inotify both deliver rename-into-place events cleanly
+   when the target file is replaced atomically; watching the
+   file itself loses events on atomic saves). A background
+   worker thread drains the `notify::Event` mpsc, filters by
+   canonicalised target path + `EventKind::Create|Modify|Any`,
+   debounces for 50 ms (`DEFAULT_DEBOUNCE`), re-runs
+   `WasmFilter::load` on the path, and calls
+   `SharedFilter::replace` on success. A compile failure logs
+   a `tracing::warn` and keeps the previous module live.
+
+   Atomic semantics documented at the top of `reloader.rs`:
+   `SharedFilter::replace` takes the same `Mutex` that every
+   `FragmentFilter::apply` call holds, so in-flight applies
+   finish on the OLD module and the very next apply observes
+   the NEW module. No partial-state visibility.
+
+   `Drop` ordering matters: sends the shutdown signal, **then
+   drops the watcher** (which closes the `mpsc::Sender` in the
+   notify callback and wakes the worker out of its blocking
+   `recv()`), **then** `join()`s the worker. Without that
+   ordering the join deadlocks. One design iteration: the
+   first draft stored the watcher as a plain (non-`Option`)
+   field and hung every reloader-bearing test's teardown for
+   60+ seconds until the fix landed.
+
+   Example filter:
+   `crates/lvqr-wasm/examples/redact-keyframes.{wat,wasm}`.
+   The `.wasm` is 82 bytes, byte-identical across rebuilds,
+   returns `-1` from `on_fragment` so every fragment is
+   dropped. Paired with a new
+   `cargo run -p lvqr-wasm --example build_fixtures`
+   helper that walks `examples/*.wat` and regenerates
+   the sibling `.wasm` files via `wat::parse_str`, so future
+   sessions do not need `wat2wasm` or `wasm-tools` on PATH to
+   rebuild either fixture. `frame-counter.wasm` round-trips
+   byte-identical through the new helper so the session-86
+   fixture is unchanged on disk.
+
+   CLI integration: `lvqr-cli::start` now spawns a
+   `WasmFilterReloader` alongside
+   `install_wasm_filter_bridge` whenever `--wasm-filter` is
+   set. `ServerHandle` gets a new
+   `_wasm_reloader: Option<WasmFilterReloader>` field held
+   solely for its `Drop` side effect. No new public API on
+   `ServerHandle`; the reloader surfaces indirectly through
+   the existing `WasmFilterBridgeHandle` counters which
+   operators already watch to verify a deployed filter.
+
+   Integration test at
+   `crates/lvqr-cli/tests/wasm_hot_reload.rs` (~350 LOC).
+   Seeds a tempdir `filter.wasm` with a copy of
+   `frame-counter.wasm`, starts a `TestServer` pointed at
+   it, publishes a real RTMP broadcast (`live/hot-reload-
+   before`) via the proven `rml_rtmp` handshake +
+   `ClientSession` pattern, asserts tap observed at least
+   one fragment with `dropped == 0`, drops the RTMP session,
+   atomically-renames `redact-keyframes.wasm` over
+   `filter.wasm`, sleeps 500 ms for the watcher, publishes a
+   second broadcast (`live/hot-reload-after`), and polls for
+   `fragments_dropped > 0` on the new broadcast with a 10 s
+   budget. Total wall-clock: ~1 s on a warm-cache Apple
+   Silicon run.
+
+2. **Test-contract script comment refresh**
+   (pending commit). `scripts/check_test_contract.sh` still
+   reports `lvqr-wasm` integration + E2E slots as missing
+   because the tests live cross-crate in
+   `lvqr-cli/tests/wasm_{frame_counter,hot_reload}.rs`
+   (accepted case-by-case per `tests/CONTRACT.md`). Updated
+   the inline comment to reflect session-87 reality: both
+   integration tests now exist, and the educational warnings
+   will remain until a future session either moves the tests
+   in-tree or extends the script with a per-crate integration
+   exemption mechanism. Fuzz + conformance slots stay open
+   pending a WASM trap-surface fuzzer.
+
+### Tests shipped
+
+| # | Test | Passes? |
+|---|---|---|
+| 3 | `reloader::tests::*` in `lvqr-wasm/src/reloader.rs` | ok |
+| 1 | `wasm_filter_hot_reload_flips_drop_behavior_mid_stream` in `lvqr-cli/tests/wasm_hot_reload.rs` | ok |
+
+Total workspace tests: **733** (+4 from session 86's 729).
+
+### Ground truth (session 87 close, pre-close-doc)
+
+* **Head**: session-87 feat commit pending on `main` before
+  this close-doc commit lands. Local main is 1 commit ahead
+  of origin/main at the end of session 86 close; after the
+  feat + this close-doc lands locally, main will be 3 ahead.
+  Do NOT push without direct user instruction.
+* **Tests**: **733** passed, 0 failed, 1 ignored.
+* **CI gates locally clean**: fmt, clippy workspace
+  --all-targets --benches -- -D warnings, test --workspace
+  all green.
+* **Workspace**: 26 crates, unchanged.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** (A + B + C DONE) | 85 (A) / 86 (B) / 87 (C) |
+| 4.1 | io_uring archive writes | PLANNED | 88-89 |
+| 4.3 | C2PA signed media | PLANNED | 90-91 |
+| 4.8 | One-token-all-protocols | PLANNED | 92-93 |
+| 4.5 | In-process AI agents | PLANNED | 94-97 |
+| 4.4 | Cross-cluster federation | PLANNED | 98-100 |
+| 4.6 | Server-side transcoding | PLANNED | 101-103 |
+| 4.7 | Latency SLO scheduling | PLANNED | 104-105 |
+
+### Session 88 entry point
+
+**Tier 4 item 4.1 session A: io_uring archive writes.**
+
+Deliverable per `tracking/TIER_4_PLAN.md` section 4.1 session A:
+
+1. Feature-gated `tokio-uring` path for init + media segment
+   writes in `lvqr-archive`. Feature `io-uring` off by
+   default; Linux-only. Wire through
+   `IndexingFragmentObserver::write_all` so archive segments
+   go through `tokio-uring::fs` when the feature is on and
+   `tokio::fs` otherwise.
+2. Graceful runtime fallback: if `tokio_uring::start` fails
+   (kernel < 5.6, container without io_uring syscalls), log
+   a `warn` and drop back to `tokio::fs` without propagating
+   the error.
+3. Gate macOS CI on the non-feature path; add a Linux-only
+   `cargo test --features io-uring` job to
+   `.github/workflows/ci.yml` as a separate cell, not a
+   matrix.
+
+Expected scope: ~250-400 lines; no new crate. Risk: tokio-
+uring requires a current-thread runtime. The archive writer
+already runs on its own per-broadcast task so this should be
+compatible with `lvqr-cli::start`'s multi-thread runtime
+without any flavor change, but verify at first attempt.
 
 ## Session 86 close (2026-04-17)
 

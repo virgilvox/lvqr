@@ -102,7 +102,7 @@ At the observed 10-15 sessions per calendar week velocity and
 to end. Buffer for integration + carry-over: 3 sessions. Total
 budget: **27 sessions** (85 through 111).
 
-## 4.2 -- WASM per-fragment filters (3 weeks, 6-9 sessions)
+## 4.2 -- WASM per-fragment filters (3 weeks, 6-9 sessions) -- **COMPLETE (sessions 85-87)**
 
 ### Scope (what lands)
 
@@ -185,7 +185,7 @@ impl WasmFilter {
 |---|---|---|---|---|
 | 85 | A | Scaffold `lvqr-wasm`; pin `wasmtime = "25"` at workspace; `FragmentFilter` trait + `WasmFilter` core-WASM impl (on_fragment(ptr,len)->i32; negative=drop, non-negative N=keep first N bytes); fail-open runtime; SharedFilter wrapper with replace() for session-C hot reload; 9 unit tests + 1 proptest (256 cases). Core WASM chosen over component model for scope narrowing; trait surface is stable either way. | `cargo test -p lvqr-wasm` | **DONE (session 85)** |
 | 86 | B | `WasmFilterBridgeHandle` + `install_wasm_filter_bridge(registry, filter)` registered as on_entry_created callback; per-(broadcast, track) atomic counters (seen/kept/dropped) + `lvqr_wasm_fragments_total{outcome=keep|drop}` metric. `--wasm-filter <path>` (env `LVQR_WASM_FILTER`) on lvqr-cli; 82-byte pre-compiled `frame-counter.wasm` example; RTMP E2E via TestServer asserts seen > 0 and dropped == 0. **Read-only tap in v1**: drop returns update counters but downstream subscribers see the original fragment unchanged. Full stream-modifying pipeline deferred to v1.1. | `cargo test -p lvqr-cli --test wasm_frame_counter`; 4 observer unit tests; cargo test --workspace | **DONE (session 86)** |
-| 87 | C | Hot-reload via `notify::RecommendedWatcher`; `WasmFilterReloader` calls `SharedFilter::replace(new_filter)` on file change. `redact-keyframes` example filter (returns -1 always). E2E test publishes RTMP with frame-counter, swaps the file to redact-keyframes, publishes more RTMP, asserts dropped counter increments. | `cargo test -p lvqr-cli --test wasm_hot_reload` | pending |
+| 87 | C | Hot-reload via `notify::RecommendedWatcher` watching the parent directory (portable across macOS FSEvents + Linux inotify); `WasmFilterReloader` debounces for 50 ms then calls `SharedFilter::replace(new_filter)` on file change. Atomicity documented at the module level: in-flight `apply` calls finish on the OLD module because both `apply` and `replace` take the same `Mutex`. `redact-keyframes.wasm` example filter (82 bytes, returns -1 always). Committed `cargo run -p lvqr-wasm --example build_fixtures` helper regenerates both `.wat -> .wasm` fixtures deterministically. RTMP E2E at `crates/lvqr-cli/tests/wasm_hot_reload.rs` publishes phase-1 with frame-counter, asserts dropped==0, atomically swaps in redact-keyframes, sleeps 500 ms, publishes phase-2 with a different broadcast name, polls for fragments_dropped > 0 within 10 s. Total wall-clock ~1 s on a warm-cache Apple Silicon run. | `cargo test -p lvqr-cli --test wasm_hot_reload` | **DONE (session 87)** |
 
 ### Risks + mitigations
 
