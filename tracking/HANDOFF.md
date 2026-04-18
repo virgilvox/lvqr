@@ -1,8 +1,228 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.2 COMPLETE; 4.1 session A1 DONE (archive writer extracted); 739 tests, 26 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.2 COMPLETE; 4.1 sessions A1 + A2 DONE (io-uring feature gate landed behind `lvqr-archive --features io-uring` on Linux); 739 tests, 26 crates
 
-**Last Updated**: 2026-04-18 (session 88 close -- Tier 4 item 4.1 session A replanned + session A1 landed: lifted the DVR archive writer out of `lvqr_cli::archive::BroadcasterArchiveIndexer::drain` into a new `lvqr_archive::writer` module (`write_segment` + `segment_path`, `ArchiveError::Io` variant, 5 unit tests), refreshed `TIER_4_PLAN.md` section 4.1 to replace the stale `IndexingFragmentObserver` references with the current `BroadcasterArchiveIndexer` architecture, and split original session A into A1 (this session, done) + A2 (next session, io-uring feature + runtime-integration question documented). No behavior change; workspace tests 739 passing, 0 failed, 1 ignored. Session 89 entry point is Tier 4 item 4.1 session A2.
+**Last Updated**: 2026-04-18 (session 89 close -- Tier 4 item 4.1 session A2 landed: feature-gated `tokio-uring` write path in `lvqr_archive::writer::write_segment`. Workspace pin `tokio-uring = "0.5"` under a `cfg(target_os = "linux")` target block in `lvqr-archive/Cargo.toml`; default-off `io-uring` feature flips the body to a per-call `tokio_uring::start` + `fs::File::write_all_at` + `sync_all` + `close` sequence inside the caller's existing `spawn_blocking` closure. Process-global `OnceLock<bool>` latch catches `tokio_uring::start` setup failures via `std::panic::catch_unwind` (the upstream API unwraps `Runtime::new` internally), logs a single `tracing::warn!`, and pins `std::fs::write` for the rest of the process. New CI job `archive-io-uring` runs `cargo clippy + cargo test -p lvqr-archive --features io-uring` on ubuntu-latest; existing macOS + ubuntu matrix cells stay on the default feature path. Workspace tests 739 passing, 0 failed, 1 ignored on macOS (the new `write_segment_io_uring_matches_std_bytes` test is `cfg(all(linux, io-uring))` gated out). Session 90 entry point is Tier 4 item 4.1 session B (criterion bench + `docs/deployment.md` "when to enable io-uring" section).
+
+## Session 89 close (2026-04-18)
+
+### What shipped
+
+1. **Tier 4 item 4.1 session A2: feature-gated
+   tokio-uring write path** (`8c71f8c`). One-file body
+   swap inside `lvqr_archive::writer` per the A1
+   contract. Cross-crate call shape unchanged:
+   `lvqr_cli::archive::BroadcasterArchiveIndexer::drain`
+   still calls `write_segment(archive_dir, broadcast,
+   track, seq, payload)` inside `tokio::task::
+   spawn_blocking` and records the returned `PathBuf`
+   on the matching `SegmentRef::path`. The io-uring
+   path is invisible to callers.
+
+   `Cargo.toml` (workspace) gains a
+   `tokio-uring = "0.5"` pin next to the Tier 4 4.2
+   `wasmtime` + `notify` pins. Declared once at the
+   workspace level so the version is a single-file
+   bump. `crates/lvqr-archive/Cargo.toml` pulls it in
+   only under `[target.'cfg(target_os = "linux")'.
+   dependencies]` with `optional = true`, and a new
+   default-off `io-uring` feature activates it via
+   `dep:tokio-uring`. macOS + Windows builds never
+   resolve or compile tokio-uring; the feature is
+   accepted as a no-op on non-Linux because the
+   runtime code paths are gated
+   `cfg(all(target_os = "linux", feature = "io-uring"))`.
+
+   `crates/lvqr-archive/src/writer.rs`:
+   `write_segment`'s outer signature
+   (`fn(archive_dir, broadcast, track, seq, payload)
+   -> Result<PathBuf, ArchiveError>`) is unchanged.
+   The body splits into `write_payload_std` (always
+   present; wraps `std::fs::write`) and
+   `write_payload_io_uring` (Linux + feature; wraps
+   `tokio_uring::start` inside
+   `std::panic::catch_unwind`). `create_dir_all` stays
+   on `std::fs` because tokio-uring 0.5 exposes no
+   mkdir primitive; the archive tree is amortised
+   across thousands of segments per broadcast so the
+   extra syscall is noise.
+
+   Fallback design: tokio-uring 0.5's
+   `tokio_uring::start` calls
+   `runtime::Runtime::new(&builder()).unwrap()`
+   internally, with no fallible variant on
+   `Builder::start` either. `catch_unwind` is the only
+   way to observe a kernel-side setup failure (kernel
+   < 5.6, seccomp / sandbox without `io_uring_*`
+   syscalls) without aborting the process. A
+   process-global `static IO_URING_AVAILABLE:
+   OnceLock<bool>` traps the first setup failure, emits
+   a single `tracing::warn!`, and latches
+   `std::fs::write` for the rest of the process.
+   On-path `io::Error`s from `File::create` /
+   `write_all_at` / `sync_all` / `close` after the
+   runtime comes up surface as `ArchiveError::Io`
+   without tripping the latch, so the next segment
+   retries io_uring cleanly.
+
+   New CI job `archive-io-uring` in
+   `.github/workflows/ci.yml`: `cargo clippy -p
+   lvqr-archive --features io-uring --all-targets --
+   -D warnings` + `cargo test -p lvqr-archive
+   --features io-uring` on `ubuntu-latest`. Separate
+   job rather than a matrix cell on the existing
+   `test` job so macOS CI time does not grow. The
+   existing ubuntu + macos matrix on the default
+   feature path is unchanged.
+
+   Plan refresh (`tracking/TIER_4_PLAN.md` section
+   4.1): A2 row flipped to **DONE (session 89)** with
+   the shipped-option note. Risks section gains a
+   bullet documenting the `tokio_uring::start`
+   panic-on-setup nuance so session B knows the
+   `catch_unwind` is deliberate and not a bug.
+
+2. **Session 89 close doc** (this commit).
+
+### Tests shipped
+
+| # | Test | Passes? |
+|---|---|---|
+| 1 | `writer::tests::write_segment_io_uring_matches_std_bytes` in `lvqr-archive/src/writer.rs` | cfg-gated on `all(target_os = "linux", feature = "io-uring")`; runs on the new `archive-io-uring` CI job only. Asserts byte-identity vs. the payload + that the OnceLock fallback latch did NOT trip (a trip on a recent kernel signals an environmental problem, not a code bug). |
+
+Total workspace tests on macOS: **739** (unchanged
+from session 88; the io-uring test is cfg-gated out
+locally). The Linux `archive-io-uring` job adds one
+additional test to the Linux-specific count.
+
+### Ground truth (session 89 close)
+
+* **Head**: `8c71f8c` (feat) on `main` before this
+  close-doc commit lands; after both commits local
+  main is 2 commits ahead of `origin/main` at session
+  89 close. Verify via
+  `git log --oneline origin/main..main` before any
+  push. Do NOT push without direct user instruction.
+* **Tests**: **739** passed, 0 failed, 1 ignored on
+  macOS.
+* **CI gates locally clean**: `cargo fmt --all --
+  --check`, `cargo clippy --workspace --all-targets
+  --benches -- -D warnings`, `cargo test --workspace`
+  all green. `cargo clippy -p lvqr-archive --features
+  io-uring --all-targets -- -D warnings` also green
+  on macOS (the feature is a compile-time no-op on
+  non-Linux so clippy is still meaningful cover for
+  the std path under the feature flag).
+* **Workspace**: 26 crates, unchanged.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **A1 + A2 DONE**, B pending | 88 (A1) / 89 (A2) / 90 (B) |
+| 4.3 | C2PA signed media | PLANNED | 91-92 |
+| 4.8 | One-token-all-protocols | PLANNED | 93-94 |
+| 4.5 | In-process AI agents | PLANNED | 95-98 |
+| 4.4 | Cross-cluster federation | PLANNED | 99-101 |
+| 4.6 | Server-side transcoding | PLANNED | 102-104 |
+| 4.7 | Latency SLO scheduling | PLANNED | 105-106 |
+
+### Runtime-integration findings (for session 90 B)
+
+Per the plan note, A2 ships option (a) (per-segment
+`tokio_uring::start` inside `spawn_blocking`) and
+leaves option (b) (persistent current-thread runtime
+pinned to a dedicated writer thread) for B to decide
+based on criterion numbers. A few observations the
+bench should carry forward:
+
+* **Per-call runtime setup cost is the variable to
+  measure.** Each `tokio_uring::start` constructs a
+  fresh io_uring submission queue + completion queue
+  pair (default entries from
+  `tokio_uring::builder()`). On a 4 KiB unit-test
+  payload this is not visible but on a 64 KiB segment
+  the setup may still dominate the actual write. The
+  bench at `crates/lvqr-archive/benches/
+  io_uring_vs_std.rs` should parameterise segment size
+  across `[4 KiB, 64 KiB, 256 KiB, 1 MiB]` so the
+  crossover point is visible.
+
+* **`catch_unwind` is in the hot path.** Session B
+  should measure the cost of the `AssertUnwindSafe`
+  wrapper + the catch_unwind call itself, not just
+  the io_uring submission. If the overhead is
+  non-trivial, an alternative is to do the probe once
+  via a dedicated "io_uring availability" check at
+  startup, set the latch to the outcome, and skip the
+  `catch_unwind` on every subsequent call. This is a
+  follow-up for B's write-up, not an A2 change.
+
+* **The OnceLock fallback has not been observed in
+  test.** The new `write_segment_io_uring_matches_std_bytes`
+  test asserts the latch is NOT `Some(false)` on a
+  recent-kernel runner. If the Linux CI job ever
+  reports a latch trip, it almost certainly means the
+  GitHub Actions image dropped `io_uring_*` from the
+  default seccomp profile (has happened historically
+  with container runtimes) rather than a code bug.
+  Document the failure mode in B's
+  `docs/deployment.md` section so operators know what
+  a cold-start `tracing::warn!` from lvqr-archive
+  means in production.
+
+* **`create_dir_all` staying on std::fs is a
+  principled choice, not a shortcut.** tokio-uring 0.5
+  has no mkdir / mkdirat primitive. The archive tree
+  is `<root>/<broadcast>/<track>/` and segments live
+  under the `<track>` leaf, so the tree-creation cost
+  is O(broadcasts * tracks) while segment writes are
+  O(broadcasts * tracks * segments_per_track); for any
+  DVR window longer than a few seconds the mkdir cost
+  is negligible. If `io_uring_mkdirat` lands upstream
+  this can be revisited, but it is explicitly
+  anti-scope for session B.
+
+### Session 90 entry point
+
+**Tier 4 item 4.1 session B: criterion bench + docs.**
+
+Deliverable per `tracking/TIER_4_PLAN.md` section 4.1
+session B:
+
+1. New bench `crates/lvqr-archive/benches/
+   io_uring_vs_std.rs` under criterion. Compare
+   `write_segment` throughput (MB/s) + p99 latency
+   between the std::fs body and the io-uring body on
+   a 1-hour synthetic broadcast. Parameterise segment
+   size across `[4 KiB, 64 KiB, 256 KiB, 1 MiB]` so
+   the crossover point is visible. Run via
+   `cargo bench -p lvqr-archive --features io-uring`
+   on Linux (macOS cannot exercise io_uring; the
+   bench file needs a `cfg(all(target_os = "linux",
+   feature = "io-uring"))` guard on its bench
+   harness so macOS `cargo bench --workspace` does
+   not fail).
+2. `docs/deployment.md` gains a "when to enable the
+   io_uring backend" section citing the bench
+   numbers. Include the OnceLock fallback failure
+   mode so operators recognise the cold-start
+   `tracing::warn!`.
+3. If the bench shows the per-segment
+   `tokio_uring::start` setup cost dominates writes
+   on small segments, plan-and-land option (b)
+   (persistent current-thread runtime on a dedicated
+   writer thread) as a session-B extension or a new
+   session C. Leave it out of session B's first
+   commit until the numbers force it.
+
+Expected scope: ~250-400 LOC (bench + docs section +
+any small refactors the bench surfaces). Biggest risk:
+the bench result may show io-uring is net-negative on
+small segments, in which case the default-off feature
+is the right ship state and the docs section needs to
+be honest about it.
 
 ## Session 88 close (2026-04-18)
 
