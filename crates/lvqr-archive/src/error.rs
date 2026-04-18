@@ -36,4 +36,14 @@ pub enum ArchiveError {
     /// the future `tokio-uring` path.
     #[error("archive I/O error: {0}")]
     Io(String),
+
+    /// C2PA provenance signing failed (Tier 4 item 4.3). Gated on
+    /// the `c2pa` crate feature so downstream consumers not building
+    /// with provenance support do not see a dead variant they cannot
+    /// construct. Inner string carries the failure site + the
+    /// `c2pa::Error` `Display`; callers log it without taking a
+    /// transitive dep on `c2pa-rs` at the API boundary.
+    #[cfg(feature = "c2pa")]
+    #[error("c2pa error: {0}")]
+    C2pa(String),
 }

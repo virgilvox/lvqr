@@ -154,6 +154,17 @@ notify = "6"
 # in `lvqr-archive` so macOS + Windows builds never see it in their dep graph.
 tokio-uring = "0.5"
 
+# C2PA provenance (Tier 4 item 4.3). Pinned to 0.80 because c2pa-rs is
+# pre-1.0 and the `Builder` / `Signer` API shape has moved between releases;
+# any upgrade gets its own session per TIER_4_PLAN.md's "Dependencies to
+# pin" row. Pulled in by `lvqr-archive` only when built with `--features
+# c2pa` (default off). We disable c2pa-rs's default features (which pull
+# the vendored OpenSSL C build + reqwest + ureq for remote-manifest fetch)
+# and opt into `rust_native_crypto` so the crypto closure stays
+# pure-Rust; LVQR signs in-process and does not need the remote-manifest
+# HTTP stacks.
+c2pa = { version = "0.80", default-features = false, features = ["rust_native_crypto"] }
+
 # Internal crates
 lvqr-core = { version = "0.4.0", path = "crates/lvqr-core" }
 lvqr-moq = { version = "0.4.0", path = "crates/lvqr-moq" }

@@ -87,6 +87,9 @@ mod index;
 mod segment;
 pub mod writer;
 
+#[cfg(feature = "c2pa")]
+pub mod provenance;
+
 pub use error::ArchiveError;
 pub use index::{RedbSegmentIndex, SegmentIndex};
 pub use segment::SegmentRef;

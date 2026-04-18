@@ -15,6 +15,16 @@ redb = "2"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+# C2PA provenance signing (Tier 4 item 4.3). Optional; pulled in by the
+# `c2pa` feature. Pinned to 0.80 per `tracking/TIER_4_PLAN.md`'s dependency-
+# pin row; any minor bump gets its own session because c2pa-rs is pre-1.0 and
+# regularly changes `Builder` / `Signer` trait shape between releases.
+c2pa = { workspace = true, optional = true }
+# Only pulled in by the `c2pa` feature -- used to construct the manifest
+# JSON fed into `c2pa::Builder::from_json`. Inherited from the workspace so
+# the version matches every other crate that touches JSON.
+serde_json = { workspace = true, optional = true }
+
 # Linux-only io_uring runtime for the `io-uring` feature (Tier 4 item 4.1
 # session A2). Gated on `target_os = "linux"` so macOS + Windows builds never
 # resolve the crate. `optional = true` lets the `io-uring` feature pull it in
@@ -28,6 +38,14 @@ tokio-uring = { workspace = true, optional = true }
 # `tokio-uring` dep is target-gated above. See `src/writer.rs` for the split
 # write path + OnceLock fallback to `std::fs` on setup failure.
 io-uring = ["dep:tokio-uring"]
+# Enable C2PA provenance signing of archived assets (Tier 4 item 4.3).
+# Default off because c2pa-rs pulls a large transitive closure (COSE / JUMBF
+# / image-format handlers) that operators without a provenance requirement
+# should not have to link against. The workspace pin disables c2pa-rs's
+# default features so the crypto closure stays pure-Rust (no vendored
+# OpenSSL C build) and the HTTP stacks for remote-manifest fetch are left
+# out entirely.
+c2pa = ["dep:c2pa", "dep:serde_json"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -37,6 +55,12 @@ tempfile = "3"
 # workflow to diff the two paths on their own host; see
 # `docs/deployment.md` for the runbook.
 criterion = { workspace = true }
+# rcgen generates the fixture signing certificate + private key for the
+# `c2pa_sign` integration test so the repo does not have to vendor a
+# pre-built cert + key pair that can expire. Always a dev-dep because the
+# test binary compiles unconditionally; the test body itself is gated on
+# `feature = "c2pa"` so it is a no-op when the feature is off.
+rcgen = { workspace = true }
 
 [[bench]]
 name = "io_uring_vs_std"

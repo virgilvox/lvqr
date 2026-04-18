@@ -71,6 +71,28 @@ jobs:
       - name: Test (lvqr-archive, io-uring feature)
         run: cargo test -p lvqr-archive --features io-uring
 
+  # Tier 4 item 4.3 session A: exercise the `provenance::sign_asset_bytes`
+  # primitive through the `c2pa` feature. Separate job so macOS CI time does
+  # not grow by ~2 minutes per build (c2pa-rs pulls a sizable transitive
+  # closure for COSE + JUMBF + image-format handlers). The feature builds on
+  # every target but we only wire a CI cell for Linux because the primitive
+  # is platform-agnostic and one Linux cell is sufficient coverage.
+  archive-c2pa:
+    name: Archive (c2pa feature, Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: archive-c2pa-v1
+      - name: Clippy (lvqr-archive, c2pa feature)
+        run: cargo clippy -p lvqr-archive --features c2pa --all-targets -- -D warnings
+      - name: Test (lvqr-archive, c2pa feature)
+        run: cargo test -p lvqr-archive --features c2pa
+
   audit:
     name: Supply Chain (cargo-audit)
     runs-on: ubuntu-latest

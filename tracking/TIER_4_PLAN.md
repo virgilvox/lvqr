@@ -278,45 +278,130 @@ impl WasmFilter {
   catch_unwind block should be swapped for the explicit
   error. Session B's bench is a good place to revisit.
 
-## 4.3 -- C2PA signed media (1 week, 2 sessions)
+## 4.3 -- C2PA signed media (2 sessions, 91-92)
+
+### Plan-vs-code status (refreshed session 91 A)
+
+The session-84 plan said "on `finalize()` (broadcaster
+disconnect), the archive emits a C2PA manifest ... of
+the finalized MP4 bytes." The actual archive
+architecture (confirmed session 91 A via
+`lvqr_cli::archive::BroadcasterArchiveIndexer::drain`
++ `lvqr_fragment::FragmentBroadcasterRegistry`) is:
+
+* **No finalize event.** The drain task exits silently
+  when `FragmentStream::next_fragment` returns `None`;
+  the registry exposes `on_entry_created` but no
+  `on_entry_removed` or broadcast-end hook.
+* **No init.mp4 on disk.** Init bytes live in memory
+  in `FragmentBroadcaster::meta()`; subscribers
+  reconstruct init from their subscription snapshot.
+  Only the `.m4s` media segments exist under
+  `<archive_dir>/<broadcast>/<track>/`.
+* **No single finalized MP4.** The archive is a stream
+  of fragments keyed by `(broadcast, track, start_dts)`
+  in the redb index, not a concatenated file.
+
+So "sign the finalized MP4" has no referent today.
+Session A ships the signing primitive that is
+independent of this mismatch; session B owns the
+finalize-asset construction (persist init bytes +
+register a broadcast-end lifecycle hook + concatenate
+segments by dts) and the admin verify route together.
+This re-scope is the session-88 A1 precedent: when
+plan and code disagree, refresh the plan alongside
+the code change.
 
 ### Scope (what lands)
 
-1. `lvqr-archive` gains a `C2paConfig` field:
-   `signing_cert_path`, `private_key_path`, `assertion_creator`.
-2. On `finalize()` (broadcaster disconnect), the archive
-   emits a C2PA manifest asserting authorship + the SHA-256
-   of the finalized MP4 bytes. Uses `c2pa-rs` 0.x.
-3. A new admin route `GET /playback/verify/{broadcast}`
-   that runs `c2pa::Reader::from_file(...)` on the archive
-   file and returns the asserted identity + validation
-   status as JSON.
-4. Integration test: ingest one RTMP broadcast with
-   C2PA configured, let it finalize, verify the manifest
-   parses.
+1. `c2pa` compile-time feature on `lvqr-archive`
+   (default off). Pulls `c2pa = "0.80"` with
+   `default-features = false, features =
+   ["rust_native_crypto"]` so the crypto closure stays
+   pure-Rust (no vendored OpenSSL C build) and the
+   remote-manifest HTTP stacks (reqwest + ureq) are
+   absent.
+2. `lvqr_archive::provenance::C2paConfig` operator
+   configuration (signing cert path, private key path,
+   creator-assertion name, signing algorithm, optional
+   RFC 3161 TSA URL). `C2paSigningAlg` 1:1 with
+   `c2pa::SigningAlg` so downstream consumers do not
+   need a direct `c2pa-rs` dep to construct a
+   `C2paConfig`. `ArchiveError::C2pa(String)`
+   error variant, feature-gated.
+3. `sign_asset_bytes(&config, format, bytes) ->
+   Result<SignedAsset, ArchiveError>` primitive.
+   Wraps `c2pa::Builder::from_context(Context::new())
+   .with_definition(manifest_json)`, `set_no_embed(
+   true)`, `set_intent(BuilderIntent::Edit)`, and
+   `sign(&signer, format, &mut src, &mut dst)`
+   against in-memory cursors. Returns the (unchanged)
+   asset bytes + the sidecar manifest bytes so the
+   caller chooses on-disk layout.
+4. Finalize-asset construction: given a
+   `(broadcast, track)` pair, build the bytes to
+   sign by persisting init bytes at first-write time
+   + concatenating `init + segments ordered by dts`
+   when the drain task terminates; hook a
+   broadcast-end lifecycle callback onto
+   `FragmentBroadcasterRegistry` so the finalize
+   task fires at the right moment.
+5. `GET /playback/verify/{broadcast}` admin route
+   that runs `c2pa::Reader::from_manifest_data_and_stream`
+   against the signed asset + sidecar manifest and
+   returns the asserted identity + validation status
+   as JSON.
+6. End-to-end test: ingest one RTMP broadcast with
+   C2PA configured, let the broadcaster disconnect,
+   verify the manifest parses via the admin route.
 
 ### Anti-scope
 
-* **Live-signed streams.** Streaming C2PA (sign-as-you-go)
-  is research and is deferred; the MVP signs at finalize
-  only. File-at-rest signing covers the dominant
-  provenance use case (legal discovery, broadcast archive,
-  journalism).
-* **Custom trust roots.** The MVP uses the Adobe test CA
-  roots bundled with `c2pa-rs`. Operator-supplied PKI is
-  a follow-up.
+* **Live-signed streams.** Streaming C2PA (sign-as-
+  you-go) is research and is deferred; the MVP signs
+  at finalize only. File-at-rest signing covers the
+  dominant provenance use case (legal discovery,
+  broadcast archive, journalism).
+* **Custom trust roots.** The MVP uses c2pa-rs's
+  default `CertificateTrustPolicy`. Operator-supplied
+  PKI is a follow-up.
+* **Reader-side c2pa outside the admin route.** The
+  playback file-handler stays unaware of C2PA; only
+  the admin verify route reads manifests.
 
 ### Session decomposition
 
-| # | Session | Deliverable | Verification |
-|---|---|---|---|
-| 91 | A | `C2paConfig` + finalize-time signing hook in `lvqr-archive`. | `cargo test -p lvqr-archive --test c2pa_sign` |
-| 92 | B | `/playback/verify/{broadcast}` admin route + E2E verification test. | `cargo test -p lvqr-cli --test c2pa_verify_e2e` |
+| # | Session | Deliverable | Verification | Status |
+|---|---|---|---|---|
+| 91 | A | `c2pa` feature on `lvqr-archive` + `C2paConfig` / `C2paSigningAlg` / `SignedAsset` / `sign_asset_bytes` primitive in new `provenance` module. `ArchiveError::C2pa(String)` feature-gated variant. Integration test `tests/c2pa_sign.rs` with error-path coverage live + happy-path `#[ignore]`'d pending a C2PA-spec-compliant cert-chain fixture (rcgen 0.13's default output trips `CertificateProfileError::InvalidCertificate`; generic variant covers ~8 failure branches and pinpointing the missing extension is deferred to session B where the verify-route work naturally needs the fixture anyway). New `archive-c2pa` CI job on `ubuntu-latest` running `cargo clippy + cargo test -p lvqr-archive --features c2pa`. Plan refresh above to reflect the archive-is-a-stream reality the session-84 plan was silent about. | `cargo test -p lvqr-archive --features c2pa --test c2pa_sign` green (1 passed, 1 ignored); `cargo clippy --workspace --all-targets --benches -- -D warnings` clean; `cargo test --workspace` unchanged at 739 passed. | **DONE (session 91)** |
+| 92 | B | (a) Proper cert-chain fixture so the happy-path `c2pa_sign` test unignores: options are (i) rcgen with full extension control, (ii) vendored CA/leaf under `tests/fixtures/c2pa/` with a 2099 `notAfter`, (iii) `CertificateTrustPolicy::passthrough()` behind a `c2pa-test-bypass-cert-check` feature. (b) Finalize-asset construction: persist init bytes at first-write time under `<archive>/<broadcast>/<track>/init.mp4`, add an `on_entry_removed` broadcast-end lifecycle callback to `FragmentBroadcasterRegistry`, and concat init + segments ordered by dts into the bytes fed to `sign_asset_bytes` when the drain task terminates. (c) `GET /playback/verify/{broadcast}` admin route that reads the signed asset + sidecar and returns asserted identity + validation status as JSON, using `c2pa::Reader::from_manifest_data_and_stream`. (d) E2E test: RTMP publish, let disconnect, hit `/playback/verify`, assert manifest parses + creator matches config. | `cargo test -p lvqr-archive --features c2pa --test c2pa_sign` has 2 passed 0 ignored; `cargo test -p lvqr-cli --test c2pa_verify_e2e` green. | pending |
 
 ### Risks + mitigations
 
-* **c2pa-rs API churn.** Pin to a specific 0.x version
-  behind the workspace dep. Revisit on 1.0.
+* **c2pa-rs API churn.** Pin to 0.80 behind the
+  workspace dep. The `Builder::from_json` → `from_context
+  + with_definition` migration (deprecation landed in
+  0.80) is already absorbed into session A's primitive;
+  any further API shape change gets its own session.
+* **Certificate-profile strictness.** c2pa-rs validates
+  against C2PA spec §14.5.1 at sign time: approved EKU
+  from the crate's `valid_eku_oids.cfg` allow-list,
+  digitalSignature KU, AKI extension present, not
+  self-signed, within validity window, supported
+  signature algorithm. rcgen's default output does not
+  satisfy every branch and the error surface collapses
+  to a single `InvalidCertificate` variant so
+  distinguishing which check failed requires either
+  enabling c2pa's `validation_log` or vendoring a
+  spec-compliant fixture. Session B owns this work.
+* **Dep bloat.** The `c2pa` feature adds ~20 transitive
+  crates (img-parts, quick-xml, rasn-*, ring,
+  ed25519-dalek, p256/p384/p521, etc.). Operators who
+  do not need provenance should not have to link
+  against them; that is why the feature is default off.
+  `default-features = false` on the workspace pin
+  keeps the closure to rust_native_crypto only -- no
+  vendored OpenSSL C build, no reqwest/ureq.
 
 ## 4.8 -- One-token-all-protocols (1 week, 2 sessions)
 
