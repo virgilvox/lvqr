@@ -157,11 +157,11 @@ persistent current-thread runtime in a follow-up.
 
 ## Session 87 close (2026-04-18)
 
-### What shipped (1 feat commit + 1 close doc commit expected)
+### What shipped (1 feat commit + 1 close doc commit)
 
 1. **Tier 4 item 4.2 session C: WASM filter hot-reload**
-   (pending commit). Full writeup in the feat commit
-   message; synopsis here.
+   (`2fc8196`). Full writeup in the feat commit message;
+   synopsis here.
 
    New module `crates/lvqr-wasm/src/reloader.rs` (~250
    LOC including 3 unit tests). `WasmFilterReloader::spawn(path,
@@ -231,8 +231,8 @@ persistent current-thread runtime in a follow-up.
    budget. Total wall-clock: ~1 s on a warm-cache Apple
    Silicon run.
 
-2. **Test-contract script comment refresh**
-   (pending commit). `scripts/check_test_contract.sh` still
+2. **Test-contract script comment refresh** (folded into
+   `2fc8196`). `scripts/check_test_contract.sh` still
    reports `lvqr-wasm` integration + E2E slots as missing
    because the tests live cross-crate in
    `lvqr-cli/tests/wasm_{frame_counter,hot_reload}.rs`
@@ -244,6 +244,8 @@ persistent current-thread runtime in a follow-up.
    exemption mechanism. Fuzz + conformance slots stay open
    pending a WASM trap-surface fuzzer.
 
+3. **Session 87 close doc** (`b4c2263`).
+
 ### Tests shipped
 
 | # | Test | Passes? |
@@ -253,20 +255,21 @@ persistent current-thread runtime in a follow-up.
 
 Total workspace tests: **733** (+4 from session 86's 729).
 
-### Ground truth (session 87 close, pre-close-doc)
+### Ground truth (session 87 close)
 
-* **Head**: session-87 feat commit pending on `main` before
-  this close-doc commit lands. Local main is 1 commit ahead
-  of origin/main at the end of session 86 close; after the
-  feat + this close-doc lands locally, main will be 3 ahead.
-  Do NOT push without direct user instruction.
+* **Head**: `2fc8196` (feat) on `main` before the close-doc
+  commit (`b4c2263`) landed. After both commits: local
+  main was 2 commits ahead of origin/main on session 87
+  close. Session 88 added 2 more (feat `ec7ef01` + close
+  `8f1be03`), bringing the count to 4 commits ahead at
+  session 88 close.
 * **Tests**: **733** passed, 0 failed, 1 ignored.
 * **CI gates locally clean**: fmt, clippy workspace
   --all-targets --benches -- -D warnings, test --workspace
   all green.
 * **Workspace**: 26 crates, unchanged.
 
-### Tier 4 execution status
+### Tier 4 execution status (session 87 view)
 
 | # | Item | Status | Sessions |
 |---|---|---|---|
