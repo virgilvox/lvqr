@@ -1,8 +1,171 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE against TIER_3_PLAN; Tier 4 item 4.2 session A DONE; 724 tests, 26 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE against TIER_3_PLAN; Tier 4 item 4.2 A+B DONE; 729 tests, 26 crates
 
-**Last Updated**: 2026-04-17 (session 86 hygiene sweep -- HANDOFF rotated (sessions 1-83 moved to `archive/HANDOFF-tier0-3.md`); legacy AUDIT-*.md moved to `archive/`; `lvqr-wasm` added to the 5-artifact contract IN_SCOPE list; README gets a "what is NOT shipped yet" honesty block. No code changes. Then session 86 itself: Tier 4 item 4.2 session B (WasmFragmentObserver + `--wasm-filter` CLI + frame-counter example + RTMP E2E).
+**Last Updated**: 2026-04-17 (session 86 close -- two landings in one session: (1) hygiene sweep (HANDOFF rotated, AUDIT archive, `lvqr-wasm` added to contract, README honesty block); (2) Tier 4 item 4.2 session B (WasmFragmentObserver + `--wasm-filter` CLI + frame-counter example + RTMP E2E). 729 workspace tests, 0 failed, 1 ignored. Next session is 4.2 C: hot reload via notify + a second example filter.
+
+## Session 86 close (2026-04-17)
+
+### What shipped (3 commits total)
+
+1. **Hygiene sweep** (`67763d1`). HANDOFF.md rotated from
+   11,734 lines (564 KB) down to 345 lines; sessions 83 back
+   to 1 archived verbatim to
+   `tracking/archive/HANDOFF-tier0-3.md`. Five legacy AUDIT
+   docs (`AUDIT-2026-04-10.md`,
+   `AUDIT-2026-04-13.md`, `AUDIT-INTERNAL-*`,
+   `AUDIT-READINESS-*`, `notes-2026-04-10.md`) moved via `git
+   mv` to `tracking/archive/` with a new
+   `tracking/archive/README.md` mapping each file to its
+   role. `lvqr-wasm` added to the 5-artifact contract
+   IN_SCOPE list so the educational warnings for its missing
+   fuzz + integration + conformance slots surface as the
+   forcing function for sessions 86/87. README gets a "what
+   is NOT shipped yet" block so a casual reader cannot miss
+   the ROADMAP Tier 3 items TIER_3_PLAN scoped out
+   (webhooks, DVR scrub UI, hot reload, captions + SCTE-35,
+   stream key CRUD) plus all pending Tier 4 items. No code
+   changes; test count unchanged at 724.
+
+2. **Tier 4 item 4.2 session B: WASM observer + CLI + E2E**
+   (`efca5ce`). Full writeup in the feat commit message;
+   synopsis here.
+
+   New module `crates/lvqr-wasm/src/observer.rs` (~230
+   LOC). `WasmFilterBridgeHandle` is clonable, holds
+   per-`(broadcast, track)` atomic counters (fragments_seen
+   / kept / dropped) in a `DashMap`, and holds the per-
+   broadcaster tokio tasks alive for the server lifetime.
+   `install_wasm_filter_bridge(registry, filter) -> handle`
+   registers an `on_entry_created` callback on the shared
+   `FragmentBroadcasterRegistry`; each fresh broadcaster
+   spawns one tokio task that subscribes, runs every
+   fragment through `filter.apply`, increments counters, and
+   fires `lvqr_wasm_fragments_total{outcome=keep|drop}`
+   metrics.
+
+   The tap is **read-only** in v1 (session-B scope
+   narrowing). Drop returns update counters but the original
+   fragment still flows to HLS / DASH / WHEP / MoQ / archive
+   unchanged. Full stream-modifying pipelines are deferred
+   to v1.1; the two clean design options (ingest-side filter
+   wiring per protocol, or broadcaster-side interceptor
+   inside `lvqr-fragment`) are documented at the top of
+   `observer.rs` for whichever session picks it up.
+
+   CLI + config surfaces:
+
+   * `ServeConfig.wasm_filter: Option<PathBuf>` (loopback
+     default `None`).
+   * `--wasm-filter <path>` / `LVQR_WASM_FILTER` clap arg in
+     `lvqr-cli`.
+   * `ServerHandle.wasm_filter() -> Option<&WasmFilterBridgeHandle>`.
+   * `TestServerConfig::with_wasm_filter(path)` +
+     `TestServer::wasm_filter()` passthrough.
+
+   `start()` loads + compiles the module via
+   `WasmFilter::load` and installs the bridge BEFORE any
+   ingest listener accepts traffic, so the very first
+   fragment of the very first broadcast flows through the
+   filter.
+
+   Example filter: `crates/lvqr-wasm/examples/frame-counter.
+   wat` + an 82-byte pre-compiled `frame-counter.wasm`. The
+   filter is a no-op that returns the input length
+   unchanged; the interesting behaviour is host-side
+   counting.
+
+   Integration test
+   `crates/lvqr-cli/tests/wasm_frame_counter.rs` (~260
+   LOC) publishes a real two-keyframe RTMP broadcast through
+   a TestServer pointed at the committed .wasm and asserts
+   the tap observed fragments on `live/frame-counter`, with
+   zero drops and kept == seen > 0. No mocks, no stdout
+   capture; reads straight off the bridge handle.
+
+3. **Session 86 close doc** (this commit).
+
+### Tests shipped
+
+| # | Test | Passes? |
+|---|---|---|
+| 4 | `observer::tests::*` in `lvqr-wasm/src/observer.rs` | ok |
+| 1 | `wasm_frame_counter_sees_every_ingested_fragment` in `lvqr-cli/tests/wasm_frame_counter.rs` | ok |
+
+Total workspace tests: **729** (+5 from session 85's 724).
+
+### Ground truth (session 86 close)
+
+* **Head**: `efca5ce` on `main` (feat) before this close-doc
+  commit lands. Local main was even with origin/main after
+  the hygiene-sweep push (`67763d1`); this session adds two
+  more commits on top. Do NOT push without direct user
+  instruction.
+* **Tests**: 729 passed, 0 failed, 1 ignored.
+* **CI gates locally clean**: fmt, clippy workspace --all-
+  targets --benches -- -D warnings, test --workspace all
+  green.
+* **Workspace**: 26 crates, unchanged.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **A + B DONE**, C pending | 85 (A) / 86 (B) / 87 (C) |
+| 4.1 | io_uring archive writes | PLANNED | 88-89 |
+| 4.3 | C2PA signed media | PLANNED | 90-91 |
+| 4.8 | One-token-all-protocols | PLANNED | 92-93 |
+| 4.5 | In-process AI agents | PLANNED | 94-97 |
+| 4.4 | Cross-cluster federation | PLANNED | 98-100 |
+| 4.6 | Server-side transcoding | PLANNED | 101-103 |
+| 4.7 | Latency SLO scheduling | PLANNED | 104-105 |
+
+### Session 87 entry point
+
+**Tier 4 item 4.2 session C: hot reload + a second example
+filter that actually drops.**
+
+Deliverable per `tracking/TIER_4_PLAN.md` section 4.2
+session C:
+
+1. `WasmFilter::load` keeps its current shape; add a new
+   `WasmFilterReloader` that watches the .wasm path via
+   `notify::RecommendedWatcher`, compiles the new module on
+   change, and calls `SharedFilter::replace(new_filter)`
+   (the replace method shipped in session A).
+2. In-flight `apply` calls finish on the OLD module; the
+   next fragment uses the new one. Document atomicity at
+   the call boundary.
+3. Second example filter at
+   `crates/lvqr-wasm/examples/redact-keyframes.{wat,wasm}`
+   that returns -1 on every call (drops every fragment).
+   Committed pre-compiled alongside the existing
+   frame-counter.
+4. Integration test
+   `crates/lvqr-cli/tests/wasm_hot_reload.rs` at
+   ~200 LOC. Publishes RTMP, asserts the frame-counter
+   tap sees fragments with dropped=0. Then copies
+   redact-keyframes.wasm over the configured filter path.
+   Gives the watcher a beat to notice. Publishes more
+   RTMP. Asserts subsequent fragments increment the
+   dropped counter.
+
+Expected scope: ~300-400 lines. Risk: notify's file-watch
+semantics differ across macOS (FSEvents) vs Linux
+(inotify). The existing lvqr-archive recorder has similar
+exposure and landed green; worst case we use polling mode
+which costs a 100 ms latency.
+
+Also bring session C: update
+`scripts/check_test_contract.sh` if needed -- the
+lvqr-wasm integration slot is now met by
+`tests/wasm_frame_counter.rs` (via `lvqr-cli`); the
+fuzz + conformance slots remain open until a future
+session.
+
+## Session 85 close (2026-04-17)
+
+### What shipped (1 feat commit, +1414 / -14 lines)
 
 ### Plan-faithful vs roadmap-complete
 
