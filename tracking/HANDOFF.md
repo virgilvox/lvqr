@@ -1,8 +1,271 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 COMPLETE; 739 tests, 26 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 COMPLETE; 4.3 A DONE (C2PA primitive landed; finalize + verify route deferred to session 92 B); 739 tests, 26 crates
 
-**Last Updated**: 2026-04-18 (session 90 close -- Tier 4 item 4.1 session B landed: criterion bench `crates/lvqr-archive/benches/io_uring_vs_std.rs` parameterised across `[4 KiB, 64 KiB, 256 KiB, 1 MiB]` segment sizes + new `docs/deployment.md` section "Archive: `io_uring` write backend (Linux-only)" covering when to enable, how to measure via criterion saved baselines, the `OnceLock` cold-start warn operator runbook, and caveats. Item 4.1 is COMPLETE (sessions 88-90). Workspace tests unchanged on macOS: 739 passing, 0 failed, 1 ignored (benches do not add test count; the io-uring test is still cfg-gated out locally). Session 91 entry point is Tier 4 item 4.3 session A (C2PA finalize-time signing hook in `lvqr-archive`).
+**Last Updated**: 2026-04-18 (session 91 close -- Tier 4 item 4.3 session A landed: c2pa feature + `lvqr_archive::provenance::sign_asset_bytes` primitive + plan refresh. Session-84 plan described a "sign the finalized MP4 bytes on finalize()" workflow that does not match the actual archive-is-a-stream architecture; session 91 refreshed TIER_4_PLAN.md section 4.3 to acknowledge this and re-scoped B to absorb finalize-asset construction + the deferred cert fixture. Primitive is live behind `--features c2pa` with a 2-test integration suite (error-path live, happy-path `#[ignore]`'d pending a C2PA-spec-compliant cert chain). Workspace tests 739 passing, 0 failed, 1 ignored on macOS. Session 92 entry point is Tier 4 item 4.3 session B (cert fixture + finalize-asset construction + admin verify route + E2E).
+
+## Session 91 close (2026-04-18)
+
+### What shipped
+
+1. **Tier 4 item 4.3 session A: C2PA feature +
+   `provenance::sign_asset_bytes` primitive + plan
+   refresh** (`1c34428`). Two deliverables in one
+   commit, session-88-A1 style: a legitimate code
+   landing plus the plan rewrite that makes sense of
+   the landing's scope.
+
+   **Plan-vs-code delta** captured in the refreshed
+   `tracking/TIER_4_PLAN.md` section 4.3: the session-84
+   plan said "on `finalize()` (broadcaster disconnect),
+   the archive emits a C2PA manifest ... of the
+   finalized MP4 bytes". The actual architecture has no
+   finalize event, no init.mp4 on disk, and no single
+   finalized MP4 -- the archive is a redb-indexed stream
+   of `.m4s` fragments under
+   `<archive_dir>/<broadcast>/<track>/`. "Sign the
+   finalized MP4" has no referent today. A scout via the
+   Explore agent confirmed three specifics:
+   `BroadcasterArchiveIndexer::drain` exits silently on
+   `FragmentStream::next_fragment` returning `None`,
+   `FragmentBroadcasterRegistry` has `on_entry_created`
+   but no matching broadcast-end hook, and
+   `FragmentBroadcaster::meta()` holds init bytes in
+   memory only. The refreshed plan re-scopes B to absorb
+   the finalize-asset construction (init-bytes
+   persistence + registry lifecycle hook + segment
+   concatenation by dts) alongside the admin verify
+   route + E2E. 4.3 stays at 2 sessions total.
+
+   **Primitive** lives in a new
+   `crates/lvqr-archive/src/provenance.rs` (~200 LOC)
+   behind the `c2pa` feature (default off). Workspace
+   pin `c2pa = { version = "0.80", default-features =
+   false, features = ["rust_native_crypto"] }` so the
+   crypto closure stays pure-Rust (no vendored OpenSSL
+   C build) and the remote-manifest HTTP stacks
+   (reqwest + ureq) are absent. Public surface:
+
+   * `C2paConfig` -- cert path, key path, creator
+     name, alg, optional TSA URL.
+   * `C2paSigningAlg` -- LVQR-owned enum 1:1 with
+     `c2pa::SigningAlg` so downstream consumers do not
+     need a direct c2pa-rs dep to build a config.
+   * `SignedAsset { asset_bytes, manifest_bytes }` --
+     sidecar-mode output; asset passes through
+     unchanged via `Builder::set_no_embed(true)`.
+   * `sign_asset_bytes(&config, format, bytes)` --
+     bytes-in / bytes-out primitive. Uses the non-
+     deprecated `Builder::from_context(Context::new())
+     .with_definition(manifest_json)` path (0.80
+     deprecated `Builder::from_json`). Manifest carries
+     one `stds.schema-org.CreativeWork` assertion
+     whose `Person.name` is `config.assertion_creator`,
+     constructed via `serde_json::json!` so operator-
+     supplied names are JSON-escaped correctly.
+
+   `ArchiveError::C2pa(String)` variant feature-gated
+   so downstream consumers without c2pa do not see a
+   dead variant.
+
+   **Integration test** at
+   `crates/lvqr-archive/tests/c2pa_sign.rs` gated on
+   `#![cfg(feature = "c2pa")]`:
+
+   * Error path live: `sign_asset_bytes_reports_c2pa_
+     error_on_missing_cert_file` asserts missing-cert
+     surfaces as `ArchiveError::Io` with the path in
+     the message. Proves the primitive reads config +
+     surfaces errors cleanly.
+   * Happy path `#[ignore]`'d: c2pa-rs 0.80 validates
+     the signing cert against C2PA spec §14.5.1 at
+     sign time and rejects the rcgen-generated chain
+     (even with a 2-cert CA + leaf using
+     emailProtection EKU + digitalSignature KU) with
+     the generic `CertificateProfileError::
+     InvalidCertificate`. That variant collapses ~8
+     failure branches without a validation_log hook at
+     this API layer, so pinpointing the exact missing
+     extension takes more iteration than session A
+     budgets for. The test's doc comment documents
+     three unignore paths for session B: (a) rcgen
+     with full extension control, (b) vendored
+     fixture with 2099 `notAfter`, (c) passthrough
+     trust policy behind a new
+     `c2pa-test-bypass-cert-check` feature.
+
+   **CI**: new `archive-c2pa` job on `ubuntu-latest`
+   runs `cargo clippy + cargo test -p lvqr-archive
+   --features c2pa`. Separate job rather than a matrix
+   cell on the existing `test` job so macOS CI time
+   does not grow by ~2 minutes (c2pa-rs pulls ~20
+   transitive crates; all pure-Rust with our
+   default-features-off config).
+
+2. **Session 91 close doc** (this commit).
+
+### Tests shipped
+
+| # | Test | Passes? |
+|---|---|---|
+| 1 | `sign_asset_bytes_reports_c2pa_error_on_missing_cert_file` in `crates/lvqr-archive/tests/c2pa_sign.rs` | ok (feature-gated; runs on the `archive-c2pa` CI job + locally with `--features c2pa`) |
+| 0 (ignored) | `sign_asset_bytes_emits_non_empty_c2pa_manifest_for_minimal_jpeg` | `#[ignore]`'d pending session B's cert fixture |
+
+Workspace totals on macOS: **739** passed, 0 failed,
+1 ignored. Feature-gated c2pa test does not count
+toward the default-feature workspace total; it adds
++1 passed / +1 ignored when the `c2pa` feature is on.
+
+### Ground truth (session 91 close)
+
+* **Head**: `1c34428` (feat) on `main` before this
+  close-doc commit lands; after it lands local main
+  is 6 commits ahead of `origin/main` (sessions 89
+  feat + close, 90 feat + close, 91 feat + close).
+  Verify via `git log --oneline origin/main..main`
+  before any push. Do NOT push without direct user
+  instruction.
+* **Tests**: **739** passed, 0 failed, 1 ignored on
+  macOS (default features).
+* **CI gates locally clean**: `cargo fmt --all --
+  --check`, `cargo clippy --workspace --all-targets
+  --benches -- -D warnings`, `cargo test --workspace`
+  all green. `cargo clippy -p lvqr-archive --features
+  c2pa --all-targets -- -D warnings` clean on macOS.
+  `cargo test -p lvqr-archive --features c2pa` green
+  (26 lib + 1 c2pa_sign + 1 ignored).
+* **Workspace**: 26 crates, unchanged.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 / 89 / 90 |
+| 4.3 | C2PA signed media | **A DONE**, B pending | 91 (A) / 92 (B) |
+| 4.8 | One-token-all-protocols | PLANNED | 93-94 |
+| 4.5 | In-process AI agents | PLANNED | 95-98 |
+| 4.4 | Cross-cluster federation | PLANNED | 99-101 |
+| 4.6 | Server-side transcoding | PLANNED | 102-104 |
+| 4.7 | Latency SLO scheduling | PLANNED | 105-106 |
+
+### Session 92 entry point
+
+**Tier 4 item 4.3 session B: cert fixture +
+finalize-asset construction + admin verify route +
+E2E.** Absorbed scope from the session-84 plan's
+session B + session A's deferred items per the
+session-91 re-scope.
+
+Deliverables per the refreshed
+`tracking/TIER_4_PLAN.md` section 4.3 row B:
+
+(a) **Cert-chain fixture** so the happy-path
+`c2pa_sign::sign_asset_bytes_emits_non_empty_c2pa_
+manifest_for_minimal_jpeg` test unignores. Pick one
+of three paths documented in the test's doc comment:
+
+  * rcgen with full extension control (explicit AKI/
+    SKI, basic-constraints criticality, explicit
+    validity window). Requires digging into which of
+    the ~8 failure branches in
+    `CertificateProfileError::InvalidCertificate` is
+    tripping. Enable c2pa-rs's `validation_log` or
+    build a scratch binary that prints the log to
+    debug.
+  * Vendored test CA + end-entity under
+    `crates/lvqr-archive/tests/fixtures/c2pa/` with a
+    far-future `notAfter` (2099-era) and a README
+    noting the expiry. Cleanest long-term: removes
+    the rcgen dev-dep for this test entirely and
+    removes fixture-construction flakiness.
+  * `CertificateTrustPolicy::passthrough()` behind a
+    new `c2pa-test-bypass-cert-check` feature. Lets
+    the test run end-to-end without production-grade
+    PKI. Caveat: the primitive signs with a trust-
+    bypassed policy, so the test no longer validates
+    that the cert profile is compliant -- the
+    primitive may let bad certs through at sign time
+    in production if the feature leaks. Mark the
+    feature loudly.
+
+(b) **Finalize-asset construction** in
+`lvqr-archive` + the CLI drain task. Three moving
+pieces:
+
+  * Persist init bytes to disk at first-write time.
+    Today `FragmentBroadcaster::meta()` holds them
+    in memory only. Options: write once when the
+    first segment lands, at
+    `<archive_dir>/<broadcast>/<track>/init.mp4`;
+    or generalise the on-disk layout to include a
+    `metadata.json` sidecar per `(broadcast,
+    track)` with the init bytes base64-encoded in
+    it. Decide + document in B's feat commit.
+  * Broadcast-end lifecycle hook on
+    `FragmentBroadcasterRegistry`. Currently the
+    registry exposes `on_entry_created` only; add a
+    matching `on_entry_removed` (or a more general
+    `LifecycleObserver`) so the drain-task-
+    termination path can notify listeners. This is
+    a shared primitive -- future sessions (4.4
+    federation, 4.5 AI agents) may also want to
+    react to broadcast-end events.
+  * Segment-concat helper in `lvqr-archive` that
+    produces the bytes to feed to
+    `sign_asset_bytes`. Walks the redb index for
+    the broadcast + track, reads segments in
+    start_dts order, concatenates with the init
+    bytes, returns a `Vec<u8>`. At today's archive
+    segment sizes (<= 1 MiB) the in-memory buffer
+    is fine; if that ever grows too large we swap
+    to a streaming `impl Read + Seek`.
+
+(c) **`GET /playback/verify/{broadcast}`** admin
+route in `lvqr-cli`. Reads the signed asset +
+sidecar manifest from disk, calls
+`c2pa::Reader::from_manifest_data_and_stream`,
+returns a JSON object `{ signer: String, signed_at:
+Option<DateTime>, valid: bool, errors: Vec<String>
+}`. Auth per existing `/admin` routes (admin
+token).
+
+(d) **E2E test** at
+`crates/lvqr-cli/tests/c2pa_verify_e2e.rs`. Starts
+a `TestServer` with `C2paConfig` pointed at the
+session-B cert fixture; publishes one RTMP
+broadcast; drops the publisher to trigger
+finalize; hits `GET /playback/verify/{broadcast}`
+and asserts the JSON has `valid: true` + the
+expected signer.
+
+Expected scope: ~500-800 LOC (cert fixture + three
+archive changes + CLI route + E2E test + docs
+section). Biggest risk: the lifecycle-hook addition
+to `FragmentBroadcasterRegistry` is a load-bearing
+primitive that future items will also consume, so
+the API shape is worth a short design discussion
+before coding. Second risk: the cert-fixture branch
+identification may still be non-obvious even with
+validation_log enabled; budget 1-2 hours for that
+alone.
+
+Pre-session checklist:
+
+- Read `tracking/TIER_4_PLAN.md` section 4.3 top-to-
+  bottom (now accurate post-session-91 refresh).
+- Run `cargo test -p lvqr-archive --features c2pa
+  --test c2pa_sign -- --ignored --nocapture` and
+  read the full c2pa error output -- that narrows
+  which profile branch is tripping before any code
+  changes.
+- Decide cert-fixture path (rcgen / vendored /
+  passthrough feature) before coding the verify
+  route; the route's test depends on the fixture
+  choice.
+- Decide finalize-asset layout (flat `init.mp4` vs.
+  `metadata.json` sidecar) and document in the feat
+  commit.
 
 ## Session 90 close (2026-04-18)
 
