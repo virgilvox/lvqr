@@ -1,8 +1,175 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Cluster plane COMPLETE; Tier 3 observability H (OTLP span exporter) DONE; 709 tests, 25 crates
+## Project Status: v0.4.0 -- Cluster plane COMPLETE; Tier 3 observability H + I (OTLP spans + metrics) DONE; 711 tests, 25 crates
 
-**Last Updated**: 2026-04-17 (session 81 close -- Tier 3 session H landed: LVQR_OTLP_ENDPOINT now drives a real OTLP gRPC span exporter behind tracing-opentelemetry 0.28 + opentelemetry 0.27).
+**Last Updated**: 2026-04-17 (session 82 close -- Tier 3 session I landed: LVQR_OTLP_ENDPOINT now drives BOTH an OTLP span exporter (session H) and an OTLP metric exporter (session I). The existing `metrics::counter!` / `gauge!` / `histogram!` call sites flow out OTLP via a `metrics::Recorder` bridge that lvqr-cli composes with the Prometheus scrape recorder through `metrics_util::FanoutBuilder`).
+
+## Session 82 close (2026-04-17)
+
+### What shipped (1 commit, +752 / -45 lines)
+
+1. **Tier 3 session I: OTLP metric exporter + metrics-crate bridge**
+   (`7caa8d4`). Delivers the observability-plane row I in
+   `tracking/TIER_3_PLAN.md`.
+
+   New module `crates/lvqr-observability/src/metric_bridge.rs`
+   (~230 LOC). `OtelMetricsRecorder` is a
+   [`metrics::Recorder`] impl that forwards every
+   `metrics::counter!` / `gauge!` / `histogram!` call site to
+   an OTel [`SdkMeterProvider`]. Instruments are interned by
+   metric name in `DashMap`s; call-site labels flow as
+   per-record OTel attributes. Counter and histogram
+   round-trip cleanly (`Counter<u64>::add`,
+   `Histogram<f64>::record`). Gauges use an
+   `UpDownCounter<f64>` with an `AtomicU64`-backed
+   last-absolute-value cache so `GaugeFn::set(v)` emits
+   `(v - last)` as a delta on the up-down counter, keeping the
+   exported running total converged. Known limitation
+   documented in the module docs: concurrent `.set` under
+   contention can drop a write; session J follow-up can switch
+   to per-`(name, labels)` `ObservableGauge` if any call site
+   ever needs it (none do today).
+
+   Workspace `Cargo.toml`:
+   * `metrics-util = "0.19"` added as a direct workspace dep
+     so `lvqr-cli` can reach `metrics_util::FanoutBuilder`.
+     Version matches the one already in the lockfile via
+     `metrics-exporter-prometheus` transitives.
+   * `opentelemetry_sdk` + `opentelemetry-otlp` gain the
+     `"metrics"` feature alongside the existing `"trace"`.
+     The OTel family stays at 0.27 per the TIER_3_PLAN
+     dependency-pin table.
+
+   `lvqr-observability/src/lib.rs`:
+   * New `build_meter_provider(config, exporter) ->
+     SdkMeterProvider` helper, symmetric to
+     `build_tracer_provider`. Wraps the exporter in a
+     `PeriodicReader` over `runtime::Tokio`, shares the
+     `Resource` from `build_resource`.
+   * `init()` now builds BOTH the tracer AND meter provider
+     when `otlp_endpoint.is_some()`, constructs an
+     `OtelMetricsRecorder` from the meter provider, and
+     stashes all three on the handle. Does NOT install the
+     metric recorder as the `metrics` crate global -- the
+     caller owns that decision.
+   * `ObservabilityHandle` gains `meter_provider` +
+     `metrics_recorder` fields plus `take_metrics_recorder`
+     and `meter_provider` accessors. `Drop` extended to
+     force-flush + shutdown the meter provider.
+
+   `lvqr-cli`:
+   * `ServeConfig` gains
+     `otel_metrics_recorder: Option<OtelMetricsRecorder>`.
+     `loopback_ephemeral` + `TestServerConfig` default it to
+     `None`.
+   * `lvqr-cli::start` refactors the Prometheus install block
+     into a four-arm match over `(install_prometheus,
+     otel_metrics_recorder)`:
+       - Both set: `PrometheusBuilder::build_recorder()` + the
+         OTLP recorder composed via
+         `metrics_util::layers::FanoutBuilder`, installed as
+         the single global `metrics` recorder. The Prometheus
+         `handle` is captured before the fanout swallows the
+         recorder so the admin `/metrics` scrape route still
+         works.
+       - Prom only: unchanged legacy path
+         (`install_recorder`).
+       - OTLP only: `metrics::set_global_recorder(otel)`.
+       - Neither: no recorder (no-op metrics).
+   * `lvqr-cli::main`: the observability handle is now `mut`
+     so `take_metrics_recorder` runs once right after `init`;
+     the recorder threads through `serve_from_args` into
+     `ServeConfig.otel_metrics_recorder`. The handle is
+     explicitly `drop`ped after `serve_from_args` returns so
+     the tracer + meter providers force-flush + shutdown on
+     the same scope boundary.
+
+   Integration test at
+   `crates/lvqr-observability/tests/metric_export.rs` (2
+   tests):
+   * `counter_increment_reaches_otel_exporter`: two
+     `metrics::counter!(name, "type"=>"video").increment(v)`
+     calls under a `with_local_recorder` scope sum to 10 on
+     the exported `Sum<u64>`. Asserts call-site labels
+     propagate onto the OTel `KeyValue` attributes and the
+     instrumentation scope is `lvqr-observability`. Confirms
+     `PushMetricExporter::shutdown` fires when the provider
+     shuts down.
+   * `gauge_set_converges_via_delta_updates`: emits
+     increment/decrement/set on the same gauge metric name
+     and confirms the metric reaches the exporter (tests the
+     `UpDownCounter<f64>` + last-value delta path).
+
+### Ground truth (session 82 close, pre-session-close-doc commit)
+
+* **Head**: `7caa8d4` on `main`. v0.4.0. Local main is **3
+  commits ahead of origin/main** (sessions 81 + 82). No push
+  without explicit user instruction.
+* **Tests**: 711 passed, 0 failed, 1 ignored. Delta from
+  session 81: +2 (the two new metric integration tests).
+* **Code**: +752 / -45 net across the feat commit. Touched 10
+  files: workspace `Cargo.toml` + `Cargo.lock`, observability
+  `Cargo.toml` / `lib.rs` + new `metric_bridge.rs` + new
+  `tests/metric_export.rs`, cli `Cargo.toml` / `lib.rs` /
+  `main.rs`, test-utils `test_server.rs`.
+* **Workspace**: 25 crates, unchanged.
+* **CI gates locally clean**: `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets --benches -- -D
+  warnings`, `cargo test --workspace` all green.
+
+### Tier 3 progress
+
+| Session | Deliverable | Status |
+|---|---|---|
+| A-B-C-D-E (71-75) | Scaffold, 2-node, ownership, capacity, config + admin | DONE |
+| F1-F2c (76-79) | Endpoints KV + HLS/DASH/RTSP redirect + auto-claim | DONE |
+| G (80) | lvqr-observability scaffold + OTLP env-var gating | DONE |
+| H (81) | OTLP span exporter + in-memory collector test | DONE |
+| **I (82)** | **OTLP metric exporter + metrics-crate bridge + fanout wiring** | **DONE** |
+| J (83) | JSON log + trace_id correlation | pending |
+
+**12 of 13 Tier 3 sessions complete.** One remaining: session
+J (JSON log + trace_id correlation). After J lands, Tier 3 is
+closed and the project moves to Tier 4 differentiators (WASM
+filters, C2PA, federation, AI agents, io_uring -- each 1-page
+MVP-capped at 3 weeks per ROADMAP).
+
+### Session 83 entry point
+
+**Tier 3 session J: JSON log + trace_id correlation.**
+
+Deliverable per `tracking/TIER_3_PLAN.md` observability-plane:
+
+1. When `config.json_logs` is true (or `LVQR_LOG_JSON=true`),
+   flip the stdout fmt layer from the default pretty
+   human-readable format to structured JSON one-event-per-line.
+   Use `tracing_subscriber::fmt::layer().json()` or the
+   equivalent builder chain. Keep the EnvFilter handling
+   unchanged.
+2. Emit `trace_id` + `span_id` as fields on every log event
+   when a span context is active. `tracing-opentelemetry`
+   exposes a `OpenTelemetrySpanExt` that surfaces the current
+   span's OTel context; bridge that into the fmt layer via a
+   custom `FormatFields` or a
+   `tracing_subscriber::Layer` that injects the fields. The
+   tracing-opentelemetry README / examples show the pattern.
+3. Integration test at
+   `crates/lvqr-observability/tests/log_correlation.rs` that
+   captures a log line emitted inside a synthetic span and
+   asserts the captured line carries both `trace_id` and
+   `span_id` matching the parent span's OTel context.
+
+Expected scope: ~200-400 lines. Mostly fmt-layer plumbing +
+the test harness; smaller than sessions H / I.
+
+Risk to flag on entry: the JSON fmt layer interacts with the
+fmt layer composition already installed by sessions G/H/I. If
+we need different layer behavior when `json_logs` is true vs
+false, the registry composition in `init()` needs to be
+generic over layer type -- that may push the fmt-layer build
+into a helper that returns `Box<dyn Layer>` to keep the
+types uniform, or we build two variants of the registry
+assembly up front.
 
 ## Session 81 close (2026-04-17)
 

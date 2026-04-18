@@ -278,7 +278,7 @@ Integration surface:
 |---|---|---|---|---|
 | G | 80 | `crates/lvqr-observability/` scaffold. `ObservabilityConfig::from_env` + stdout fmt layer. Wire into `lvqr-cli`. | Regression: existing tests unchanged; start logs still render. | DONE |
 | H | 81 | OTLP span exporter. When `LVQR_OTLP_ENDPOINT` is set, spans flow out. | Integration test: in-memory `SpanExporter` captures a synthetic `tracing::info_span!` through the `tracing_opentelemetry` layer; `TraceIdRatioBased(0.0)` regression guard. | DONE |
-| I | 82 | OTLP metric exporter. `metrics-rs` counters flow out. | Integration test: in-memory OTLP collector reads `fragments_emitted` after one synthetic emit. | pending |
+| I | 82 | OTLP metric exporter + `metrics` crate bridge. `metrics::counter!` / `gauge!` / `histogram!` call sites flow out OTLP, fanouted with the existing Prometheus exporter via `metrics_util::FanoutBuilder` when both are enabled. | Integration test: in-memory `PushMetricExporter` captures two counter increments that sum to the expected total; label attributes propagate; `set` on gauges converges via delta updates. | DONE |
 | J | 83 | JSON log + trace_id correlation. | `cargo test -p lvqr-observability --test log_correlation` -- a captured log line carries the expected trace_id. | pending |
 
 Four sessions for the observability plane (G-J landed across sessions 80-83).
