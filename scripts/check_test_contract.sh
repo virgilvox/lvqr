@@ -50,6 +50,12 @@ IN_SCOPE=(
     # lvqr-srt
     lvqr-rtsp
     # lvqr-archive
+    # Session 85 (Tier 4 item 4.2 A): lvqr-wasm scaffold
+    # landed with proptest only. Sessions 86/87 close the
+    # remaining slots; the educational warnings in the
+    # meantime are the forcing function for the follow-up
+    # sessions.
+    lvqr-wasm
 )
 
 REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)

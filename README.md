@@ -64,13 +64,27 @@ AI agents, cross-cluster federation) as Tier 4 on the roadmap.
   renewal, per-node capacity advertisement, LWW config, HLS/DASH/
   RTSP redirect-to-owner, `/api/v1/cluster/{nodes,broadcasts,config}`
 
-**Stability signal:** 711 workspace tests, 0 failures, 1 ignored.
+**Stability signal:** 724 workspace tests, 0 failures, 1 ignored.
 `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
 --benches -- -D warnings`, and `cargo test --workspace` all green
 on every session close. The 5-artifact test contract
 (proptest + fuzz + integration + E2E + conformance) applies to
 every wire-format crate; see [`tests/CONTRACT.md`](tests/CONTRACT.md)
 for the current crate-by-crate scorecard.
+
+**What's NOT shipped yet (honest gaps the marketing-faced docs
+easily miss):** webhook-based auth providers, OAuth2 / JWKS
+dynamic key discovery, HMAC signed URLs, hot config reload, a
+dedicated DVR scrub web UI, WebVTT caption segmenter +
+SCTE-35 passthrough, stream-key CRUD admin API, WHEP audio
+(AAC → Opus transcoder required; unblocks with the Tier 4
+gstreamer bridge), server-side transcoding / ABR ladders,
+WASM per-fragment filters (landing now in Tier 4), C2PA
+signed media, cross-cluster federation, in-process AI
+agents, io_uring archive writes, latency SLO scheduling.
+Every one of these is either explicitly on
+[`tracking/ROADMAP.md`](tracking/ROADMAP.md) Tier 3 / Tier 4
+or documented as out-of-scope for v1. None is a silent gap.
 
 ## Quickstart
 
