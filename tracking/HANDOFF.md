@@ -1,8 +1,159 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE against TIER_3_PLAN; Tier 4 item 4.2 COMPLETE; 733 tests, 26 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.2 COMPLETE; 4.1 session A1 DONE (archive writer extracted); 739 tests, 26 crates
 
-**Last Updated**: 2026-04-18 (session 87 close -- Tier 4 item 4.2 session C landed: `WasmFilterReloader` via `notify::RecommendedWatcher` on the parent directory, atomic `SharedFilter::replace` swap, 82-byte `redact-keyframes.wasm` drop-all example, committed `cargo run --example build_fixtures` helper that rebuilds both `.wat -> .wasm` fixtures deterministically, and an RTMP hot-reload E2E at `crates/lvqr-cli/tests/wasm_hot_reload.rs`. Item 4.2 overall is DONE; next session is Tier 4 item 4.1 session A (io_uring archive writes). Workspace tests 733 passing, 0 failed, 1 ignored.
+**Last Updated**: 2026-04-18 (session 88 close -- Tier 4 item 4.1 session A replanned + session A1 landed: lifted the DVR archive writer out of `lvqr_cli::archive::BroadcasterArchiveIndexer::drain` into a new `lvqr_archive::writer` module (`write_segment` + `segment_path`, `ArchiveError::Io` variant, 5 unit tests), refreshed `TIER_4_PLAN.md` section 4.1 to replace the stale `IndexingFragmentObserver` references with the current `BroadcasterArchiveIndexer` architecture, and split original session A into A1 (this session, done) + A2 (next session, io-uring feature + runtime-integration question documented). No behavior change; workspace tests 739 passing, 0 failed, 1 ignored. Session 89 entry point is Tier 4 item 4.1 session A2.
+
+## Session 88 close (2026-04-18)
+
+### What shipped
+
+1. **Tier 4 item 4.1 session A1: archive writer extraction +
+   plan refresh** (`ec7ef01`). Pure refactor, no behavior
+   change.
+
+   New module `crates/lvqr-archive/src/writer.rs` (~170 LOC
+   including 6 unit tests). Exposes
+   `lvqr_archive::writer::write_segment(archive_dir, broadcast,
+   track, seq, payload) -> Result<PathBuf, ArchiveError>` and
+   `segment_path(archive_dir, broadcast, track, seq) -> PathBuf`,
+   plus a private `SEGMENT_FILENAME_FMT_WIDTH = 8` constant that
+   documents the canonical `<seq:08>.m4s` filename format.
+   `write_segment` is synchronous (matches the previous
+   `std::fs::create_dir_all` + `std::fs::write` behavior) and
+   returns the resulting `PathBuf` on success so callers can
+   record it on the matching `SegmentRef::path`. New
+   `ArchiveError::Io(String)` variant.
+
+   `lvqr-cli/src/archive.rs` refactored to call
+   `lvqr_archive::writer::write_segment` from inside the existing
+   `tokio::task::spawn_blocking` block. The caller-side
+   `BroadcasterArchiveIndexer::segment_path` helper is deleted
+   in favor of the crate-owned one. Behavior is unchanged: same
+   layout, same sequence numbering, same UTF-8 path check before
+   recording into redb, same fail-warn semantics on write error.
+   `rtmp_archive_e2e` still green.
+
+   Unit tests: segment path layout (broadcast/track/seq
+   subdirs + 8-digit zero-pad), overflow past 8 digits is not
+   truncated, `write_segment` creates missing parent dirs,
+   `write_segment` is idempotent on the same `(broadcast,
+   track, seq)` (overwrites the file), `write_segment` returns
+   `ArchiveError::Io` when the archive root is a regular file
+   instead of a directory.
+
+   Crate doc (`lvqr-archive/src/lib.rs`) refreshed: the
+   pre-session-59 comment claiming "Not a segment writer.
+   That is in `lvqr-record`" was stale on both counts (the
+   writer moved to `lvqr-cli` in session 59 and now lives in
+   `lvqr-archive::writer`). Replaced with a "What this crate
+   OWNS" block that calls out the index + the writer; the "NOT"
+   block now only lists HTTP playback + transcoding +
+   rotation.
+
+2. **Plan refresh** (same commit as item 1).
+   `tracking/TIER_4_PLAN.md` section 4.1 rewritten to reflect
+   the session 59-60 architecture. Split the original session
+   A into two sub-sessions:
+
+   * **A1 (this session, DONE)**: writer extraction +
+     `ArchiveError::Io` + plan refresh. No io-uring yet.
+   * **A2 (session 89, pending)**: feature-gated `tokio-uring`
+     path inside `lvqr_archive::writer::write_segment`.
+     Linux-only. Runtime fallback on `tokio_uring::start`
+     failure.
+
+   The plan now documents the tokio-uring runtime-integration
+   nuance the pre-session-88 plan was silent about: LVQR runs
+   multi-thread tokio, but `tokio-uring` needs a current-thread
+   runtime. Option (a) spin `tokio_uring::start` per segment
+   inside `spawn_blocking`; option (b) pin a long-lived
+   current-thread runtime to a dedicated writer thread. A2
+   ships option (a); session B's bench decides whether (b)
+   pays for itself.
+
+3. **Session 88 close doc** (this commit).
+
+### Tests shipped
+
+| # | Test | Passes? |
+|---|---|---|
+| 6 | `writer::tests::*` in `lvqr-archive/src/writer.rs` | ok |
+
+No new integration tests -- the refactor is pure substitution
+and `rtmp_archive_e2e` + `playback_surface_honors_shared_auth`
+already cover the cross-crate call path.
+
+Total workspace tests: **739** (+6 from session 87's 733).
+
+### Ground truth (session 88 close)
+
+* **Head**: `ec7ef01` (refactor) on `main` before this
+  close-doc commit lands; after it lands local main is
+  several commits ahead of origin/main (session-87 feat +
+  session-87 close + session-88 feat + this close doc all
+  queued locally). Verify via
+  `git log --oneline origin/main..main` before any push.
+  Do NOT push without direct user instruction.
+* **Tests**: **739** passed, 0 failed, 1 ignored.
+* **CI gates locally clean**: fmt, clippy workspace
+  --all-targets --benches -- -D warnings, test --workspace
+  all green.
+* **Workspace**: 26 crates, unchanged.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **A1 DONE**, A2 + B pending | 88 (A1) / 89 (A2) / 90 (B) |
+| 4.3 | C2PA signed media | PLANNED | 91-92 |
+| 4.8 | One-token-all-protocols | PLANNED | 93-94 |
+| 4.5 | In-process AI agents | PLANNED | 95-98 |
+| 4.4 | Cross-cluster federation | PLANNED | 99-101 |
+| 4.6 | Server-side transcoding | PLANNED | 102-104 |
+| 4.7 | Latency SLO scheduling | PLANNED | 105-106 |
+
+Session numbering slipped by one because item 4.1 is now 3
+sessions instead of 2; downstream item numbers shifted
+accordingly. The plan-as-written budget (27 sessions total
+for Tier 4) is unchanged because 4.1's extension comes out
+of the original 3-session buffer.
+
+### Session 89 entry point
+
+**Tier 4 item 4.1 session A2: `io-uring` feature on
+`lvqr_archive::writer::write_segment`.**
+
+Deliverable per the refreshed
+`tracking/TIER_4_PLAN.md` section 4.1 A2 row:
+
+1. Add `tokio-uring = "0.5"` workspace dep, gated on
+   `target_os = "linux"`. Pin the exact version.
+2. Add `io-uring` feature to `lvqr-archive` (default off).
+   When on + target is Linux, `write_segment` spins a
+   short-lived `tokio_uring::start` inside its body and
+   issues `tokio_uring::fs::File::create` +
+   `write_all_at`. The caller stays unchanged; the
+   `spawn_blocking` + sync-call shape survives.
+3. Runtime fallback: if `tokio_uring::start` fails (kernel
+   < 5.6, container sandbox without io_uring syscalls),
+   log a `warn` once per process and fall back to the
+   `std::fs` path for this write and all subsequent ones.
+   Session 89 A2 uses a `std::sync::OnceLock<bool>` for
+   the feature-disabled latch so the first failure pins
+   the fallback state and subsequent calls skip the probe.
+4. No new unit tests for the io-uring path on macOS; a
+   `#[cfg(target_os = "linux")]` integration test runs on
+   a GitHub Actions `ubuntu-latest` job in
+   `.github/workflows/ci.yml` as a separate cell.
+
+Expected scope: ~200-350 LOC (module changes + CI cell +
+workspace dep pin). Risk: the per-segment
+`tokio_uring::start` overhead may dwarf the io_uring win
+on small (<100 KB) segments; session B's bench is the
+forcing function that decides whether to promote to a
+persistent current-thread runtime in a follow-up.
 
 ## Session 87 close (2026-04-18)
 
