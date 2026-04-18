@@ -1,8 +1,201 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Cluster plane COMPLETE; observability G scaffolded; 706 tests, 25 crates
+## Project Status: v0.4.0 -- Cluster plane COMPLETE; Tier 3 observability H (OTLP span exporter) DONE; 709 tests, 25 crates
 
-**Last Updated**: 2026-04-17 (session 80 close + push event -- cross-session audit 73-79 + Tier 3 session G, then 48 commits pushed to origin/main).
+**Last Updated**: 2026-04-17 (session 81 close -- Tier 3 session H landed: LVQR_OTLP_ENDPOINT now drives a real OTLP gRPC span exporter behind tracing-opentelemetry 0.28 + opentelemetry 0.27).
+
+## Session 81 close (2026-04-17)
+
+### What shipped (1 commit queued for session-close doc commit, +732 / -93 lines)
+
+1. **Tier 3 session H: OTLP span exporter** (`d9e5c3e`).
+   Delivers the observability-plane row H in
+   `tracking/TIER_3_PLAN.md`.
+
+   Dependency pins landed on the workspace root
+   `Cargo.toml` so future sibling crates inherit the same
+   versions: `opentelemetry = "0.27"`,
+   `opentelemetry_sdk = { "0.27", features = ["rt-tokio", "trace"] }`,
+   `opentelemetry-otlp = { "0.27", features = ["grpc-tonic", "trace"] }`,
+   `tracing-opentelemetry = "0.28"`. Matches the
+   "Dependencies to pin" table verbatim.
+
+   `crates/lvqr-observability/src/lib.rs` gains three
+   production-visible pieces:
+
+   * `build_resource(config)` -- internal helper that merges
+     `service.name` (from `config.service_name`) with every
+     `(k, v)` pair in `config.resource_attributes` and
+     returns an `opentelemetry_sdk::Resource`. Called from
+     both `init()` and the integration test so the test
+     exercises the same merge logic production uses.
+   * `build_tracer_provider(config, exporter)` -- public
+     helper that builds a `TracerProvider` from a supplied
+     `SpanExporter`, wrapped in a `BatchSpanProcessor` over
+     `runtime::Tokio`, with the resource and
+     `Sampler::TraceIdRatioBased(trace_sample_ratio)`
+     applied. Production passes an OTLP gRPC exporter; the
+     integration test passes an in-memory shim.
+   * `init()` now composes through
+     `tracing_subscriber::registry()` with three layers:
+     `EnvFilter`, stdout `fmt::layer()`, and (when
+     `otlp_endpoint.is_some()`) a `tracing_opentelemetry`
+     layer bound to the newly-built tracer. Also calls
+     `opentelemetry::global::set_tracer_provider` so context
+     propagators see the same provider.
+
+   `ObservabilityHandle` upgrades:
+
+   * `tracer_provider: Option<TracerProvider>` field now
+     actually holds the provider when OTLP is active.
+   * `Drop` impl calls `force_flush` then `shutdown` on the
+     provider so pending spans are not lost at process exit.
+     Errors are logged via `eprintln!` rather than
+     propagated -- we can't usefully act on them during
+     shutdown.
+
+   Integration test at
+   `crates/lvqr-observability/tests/span_export.rs`:
+
+   * `in_memory_exporter_captures_synthetic_span` --
+     installs a tracing-opentelemetry layer on a scoped
+     subscriber, emits a `tracing::info_span!`, flushes via
+     `provider.force_flush` plus a 200 ms margin for the
+     batch runtime, and asserts the in-memory exporter
+     captured a span named `synthetic-rtsp-describe` with
+     the expected resource attributes and a non-empty
+     instrumentation scope. Explicit `provider.shutdown()`
+     drives the exporter's shutdown hook, mirroring the
+     Drop path `ObservabilityHandle` takes in production.
+   * `zero_sample_ratio_drops_every_span` --
+     `TraceIdRatioBased(0.0)` drops every span; the exporter
+     receives nothing. Regression guard on the sampler
+     wiring.
+
+   New lib unit test
+   `build_resource_merges_service_name_and_attrs` covers the
+   attribute-merge logic directly.
+
+   `lvqr-cli` unchanged: the existing
+   `lvqr_observability::init(ObservabilityConfig::from_env())`
+   call at `crates/lvqr-cli/src/main.rs:219` picks up the
+   new OTLP path automatically when operators set
+   `LVQR_OTLP_ENDPOINT=http://localhost:4317` without a
+   rebuild.
+
+### Ground truth (session 81 close, pre-session-close-doc commit)
+
+* **Head**: `d9e5c3e` on `main`. v0.4.0. Local main is **1 commit
+  ahead of origin/main** (this feat commit; session-close doc
+  commit lands next and will make it 2 ahead). No push without
+  explicit user instruction.
+* **Tests**: 709 passed, 0 failed, 1 ignored across the workspace.
+  Delta from session 80: +3 (one lib unit test + two integration
+  tests).
+* **Code**: +732 / -93 net across Cargo.toml (+9), Cargo.lock
+  (OTel family transitives), observability Cargo.toml (+14), lib
+  (rewrite, +178 / -93), integration test (new, 200 lines).
+* **Workspace**: 25 crates, unchanged.
+* **CI gates locally clean**: `cargo fmt --all --check`, `cargo
+  clippy --workspace --all-targets --benches -- -D warnings`,
+  `cargo test --workspace` all green.
+
+### Tier 3 progress
+
+| Session | Deliverable | Status |
+|---|---|---|
+| A-B-C-D-E (71-75) | Scaffold, 2-node, ownership, capacity, config + admin | DONE |
+| F1 (76) | Endpoints KV + HLS redirect mechanism | DONE |
+| F2a (77) | lvqr-cli wiring + HLS e2e | DONE |
+| F2b (78) | DASH + RTSP redirect + e2e | DONE |
+| F2c (79) | Ingest auto-claim on first broadcast | DONE |
+| G (80) | lvqr-observability scaffold + OTLP env-var gating | DONE |
+| **H (81)** | **OTLP span exporter + in-memory collector test** | **DONE** |
+| I (82) | OTLP metric exporter | pending |
+| J (83) | JSON log + trace_id correlation | pending |
+
+**11 of 13 Tier 3 sessions complete.** Remaining 2 are metric
+export + JSON log correlation. Session I (82) is the symmetric
+path to this one: `opentelemetry_sdk::metrics::SdkMeterProvider`
+over the same OTLP gRPC endpoint, bridged from `metrics::counter!`
+/ `gauge!` calls already peppered through the codebase. Session
+J (83) flips the fmt layer to JSON when `LVQR_LOG_JSON=true` and
+emits `trace_id` / `span_id` correlation fields on every log
+line while a span is active.
+
+### Session 82 entry point
+
+**Tier 3 session I: OTLP metric exporter.**
+
+Deliverable per `tracking/TIER_3_PLAN.md` observability-plane:
+
+1. Add the metrics-rs bridge dep. The established shim for the
+   `metrics` crate into `opentelemetry_sdk::metrics` is
+   `metrics-exporter-opentelemetry` (crate name may also surface
+   as `metrics-otlp` / `metrics_opentelemetry` depending on
+   upstream); evaluate options before pulling a new dep. If no
+   published shim hits the quality bar, a thin in-crate
+   `metrics::Recorder` impl that forwards into a
+   `SdkMeterProvider` is acceptable for this tier since the
+   `metrics::counter!` / `gauge!` call sites are already in
+   place.
+2. When `config.otlp_endpoint.is_some()`, build a
+   `SdkMeterProvider` alongside the existing `TracerProvider`.
+   Share the same `Resource` via `build_resource(&config)`.
+3. Install the bridge so every existing `metrics::counter!(...)`
+   / `gauge!(...)` / `histogram!(...)` call flows out OTLP on
+   the configured push interval (default 5 s) without requiring
+   any call-site changes in other crates.
+4. Park the `SdkMeterProvider` in the `_meter_provider` slot on
+   `ObservabilityHandle`. Extend the existing `Drop` impl to
+   flush + shutdown it.
+5. Integration test analogous to `tests/span_export.rs`:
+   in-memory metric exporter, one `metrics::counter!` increment,
+   assert it reaches the exporter. Offline.
+
+Expected scope: ~400-600 lines including the bridge shim. One
+commit. Session-close doc + memory refresh in a second commit.
+
+Risk to flag when starting: if the metrics-rs-to-OTel bridge
+requires pinning a different `opentelemetry_sdk` feature (e.g.
+`metrics` instead of `trace`), that feature needs to be added to
+the workspace dep in a way that does not regress session 81's
+span path. The clean solution is to feature-gate on our side
+too.
+
+## Push event (2026-04-17, after session 80 close)
+
+After session 80 closed, the 48-commit backlog that had been
+sitting on local `main` since session 62 (the backlog itself
+accumulated because the "push only on direct instruction"
+rule means the runtime never pushed opportunistically) was
+pushed to `origin/main`. The per-session close blocks below
+record their ground-truth state at session-close time --
+"N commits queued but NOT pushed" -- which is historically
+accurate but no longer the current state. The current state
+is: local `main` and `origin/main` are both at `23df772`;
+zero commits queued.
+
+Verification done before `git push origin main`:
+
+* `git log origin/main..HEAD --format='%an <%ae>' | sort -u`
+  -> exactly one line: `Moheeb Zara <hackbuildvideo@gmail.com>`.
+* `git log origin/main..HEAD --format='%(trailers:key=Co-authored-by)'`
+  -> empty. Zero `Co-authored-by` trailers across the 48
+  commits.
+* Grep for `claude|anthropic|assistant|co-authored` in commit
+  messages -> only false positives (audit-report text
+  saying "no Claude attribution was added").
+
+Post-push:
+
+* `git rev-list --count origin/main..HEAD` -> `0`.
+* Tip commit on both local and origin: `23df772` (docs
+  session 80 close).
+
+(Superseded by session 81 close above: local is now ahead of
+origin by the session-81 feat commit + this session-close doc
+commit; do not push without direct user instruction.)
 
 ## Push event (2026-04-17, after session 80 close)
 
@@ -158,9 +351,12 @@ are OTLP wire implementation + JSON log correlation.
   `rtsp_play_emits_rtcp_sender_report_after_interval` is now
   deterministic (see audit commit above).
 
-### Session 81 entry point
+### Session 81 entry point (landed; see session 81 close at top)
 
 **Tier 3 session H: OTLP span exporter + in-memory collector test.**
+Landed as commit `d9e5c3e`. See the session 81 close block at
+the top of this document for the full writeup; the entry-point
+scope below is preserved as historical context.
 
 Deliverable per `tracking/TIER_3_PLAN.md` observability-plane:
 1. Add `opentelemetry`, `opentelemetry_sdk`,
@@ -180,6 +376,8 @@ Deliverable per `tracking/TIER_3_PLAN.md` observability-plane:
 
 Expected scope: ~300-500 lines. Most of it is plumbing
 around the OTel SDK's setup API; test harness is ~100 lines.
+Actual: +732 / -93 (most of Cargo.lock delta is transitive
+OTel + tonic pulls).
 
 ## Session 79 close (2026-04-17)
 

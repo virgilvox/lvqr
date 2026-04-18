@@ -274,14 +274,14 @@ Integration surface:
 
 ### Decomposition into sessions
 
-| # | Session | Deliverable | Verification |
-|---|---|---|---|
-| G | 77 | `crates/lvqr-observability/` scaffold. `ObservabilityConfig::from_env` + stdout fmt layer. Wire into `lvqr-cli`. | Regression: existing tests unchanged; start logs still render. |
-| H | 78 | OTLP span exporter. When `LVQR_OTLP_ENDPOINT` is set, spans flow out. | Integration test: in-memory OTLP collector receives at least one span from a synthetic RTSP DESCRIBE. |
-| I | 79 | OTLP metric exporter. `metrics-rs` counters flow out. | Integration test: in-memory OTLP collector reads `fragments_emitted` after one synthetic emit. |
-| J | 80 | JSON log + trace_id correlation. | `cargo test -p lvqr-observability --test log_correlation` -- a captured log line carries the expected trace_id. |
+| # | Session | Deliverable | Verification | Status |
+|---|---|---|---|---|
+| G | 80 | `crates/lvqr-observability/` scaffold. `ObservabilityConfig::from_env` + stdout fmt layer. Wire into `lvqr-cli`. | Regression: existing tests unchanged; start logs still render. | DONE |
+| H | 81 | OTLP span exporter. When `LVQR_OTLP_ENDPOINT` is set, spans flow out. | Integration test: in-memory `SpanExporter` captures a synthetic `tracing::info_span!` through the `tracing_opentelemetry` layer; `TraceIdRatioBased(0.0)` regression guard. | DONE |
+| I | 82 | OTLP metric exporter. `metrics-rs` counters flow out. | Integration test: in-memory OTLP collector reads `fragments_emitted` after one synthetic emit. | pending |
+| J | 83 | JSON log + trace_id correlation. | `cargo test -p lvqr-observability --test log_correlation` -- a captured log line carries the expected trace_id. | pending |
 
-Four sessions for the observability plane.
+Four sessions for the observability plane (G-J landed across sessions 80-83).
 
 ## Total Tier 3 ETA
 
