@@ -1,8 +1,271 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 COMPLETE; 4.3 A DONE (C2PA primitive landed; finalize + verify route deferred to session 92 B); 739 tests, 26 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 COMPLETE; 4.3 A + B1 DONE (c2pa signing primitive + composition helpers); B2 pending (finalize orchestration + admin verify route + E2E); 739 tests, 26 crates
 
-**Last Updated**: 2026-04-18 (session 91 close -- Tier 4 item 4.3 session A landed: c2pa feature + `lvqr_archive::provenance::sign_asset_bytes` primitive + plan refresh. Session-84 plan described a "sign the finalized MP4 bytes on finalize()" workflow that does not match the actual archive-is-a-stream architecture; session 91 refreshed TIER_4_PLAN.md section 4.3 to acknowledge this and re-scoped B to absorb finalize-asset construction + the deferred cert fixture. Primitive is live behind `--features c2pa` with a 2-test integration suite (error-path live, happy-path `#[ignore]`'d pending a C2PA-spec-compliant cert chain). Workspace tests 739 passing, 0 failed, 1 ignored on macOS. Session 92 entry point is Tier 4 item 4.3 session B (cert fixture + finalize-asset construction + admin verify route + E2E).
+**Last Updated**: 2026-04-18 (session 92 close -- Tier 4 item 4.3 session B1 landed: added `provenance::concat_assets` + `provenance::write_signed_pair` composition primitives (5 unit tests) and a new `C2paConfig.trust_anchor_pem` field routed through `c2pa::Context::with_settings({"trust": {"user_anchors": ...}})` so operators with a private CA have a first-class path. Confirmed during this session that `user_anchors` addresses chain validation only -- the structural-profile check in c2pa 0.80 remains the blocker for the happy-path `c2pa_sign` test. Re-scoped 4.3 from 2 sessions (91-92) to 3 sessions (91-93); original session-B scope split into B1 (shipped) + B2 (pending). Workspace tests 739 passing on macOS; `--features c2pa` adds +5 passed + 1 integration + 1 ignored. Session 93 entry point is 4.3 B2 (cert fixture + finalize-asset orchestration + admin verify route + E2E).
+
+## Session 92 close (2026-04-18)
+
+### What shipped
+
+1. **Tier 4 item 4.3 session B1: provenance composition
+   primitives + trust-anchor config + plan split**
+   (`6ca1889`). Two code deliverables plus a plan
+   refresh that re-scopes B from one big session to
+   two. Session-88 A1 precedent: honest acknowledgment
+   that four independent surfaces in one session is
+   too much.
+
+   **B scope split rationale**. Original session 92 B
+   combined four deliverables:
+   (a) cert-chain fixture (debug c2pa's structural
+       profile check OR vendor PKI; isolated),
+   (b) finalize-asset orchestration (broadcast-end
+       lifecycle hook on `FragmentBroadcasterRegistry`
+       that 4.4 federation + 4.5 AI agents will also
+       consume, plus init-bytes persistence + drain-
+       task integration),
+   (c) admin verify route (straightforward axum handler
+       once the sign side wires up),
+   (d) E2E that composes the above.
+   Compressing them into one session risks bikeshedding
+   the registry lifecycle API under E2E-failure
+   pressure. Session B1 ships (a-prep) + the pure
+   composition helpers that any caller needs; session
+   B2 takes on the cross-crate orchestration + verify
+   route + E2E.
+
+   **Code landed**:
+
+   * `C2paConfig.trust_anchor_pem: Option<String>`
+     field. `sign_asset_bytes` routes it through
+     `c2pa::Context::with_settings({"trust":
+     {"user_anchors": ...}})` so operators with a
+     private CA have a first-class path. This is the
+     production workflow: point `trust_anchor_pem` at
+     the CA bundle that issued the signing cert, and
+     c2pa-rs's chain validator recognises it as a
+     trust root.
+   * `provenance::concat_assets(&[impl AsRef<Path>])
+     -> Result<Vec<u8>, ArchiveError>`. Reads a
+     caller-supplied ordered list of paths into one
+     buffer. Session B2's finalize task walks the redb
+     segment index in `start_dts` order, collects
+     `PathBuf`s, and feeds them to this helper to
+     produce the bytes-to-sign. Decoupling keeps the
+     primitive redb-free and testable.
+   * `provenance::write_signed_pair(asset_path,
+     manifest_path, &SignedAsset) -> Result<(),
+     ArchiveError>`. Writes both files with on-demand
+     parent-dir creation, matching
+     `writer::write_segment`'s semantics. Session B2
+     lands
+     `<archive>/<broadcast>/<track>/finalized.<ext>`
+     +
+     `<archive>/<broadcast>/<track>/finalized.c2pa`
+     together.
+   * 5 new unit tests in `provenance::tests`: concat
+     order preservation, concat missing-path error
+     naming, concat empty input, write_signed_pair
+     parent-dir creation + overwrite semantics.
+
+   **Cert-fixture debug outcome**. One time-boxed
+   attempt this session to unignore the happy-path
+   test via `Settings.trust.user_anchors` confirmed:
+   that path addresses trust-chain validation only,
+   not the structural-profile validation that is
+   failing. c2pa 0.80's `verify.verify_trust`
+   setting is `pub(crate)` so bypassing profile
+   checks from outside the crate is not currently
+   possible without either a c2pa upgrade or a light
+   wrapper. Test docblock updated accordingly. Three
+   viable fixture options remain for B2:
+   (i) rcgen with full extension control (explicit
+       AKI/SKI, basic-constraints criticality,
+       validity window),
+   (ii) vendored CA + leaf pair under
+        `tests/fixtures/c2pa/` with a 2099 `notAfter`
+        + README noting expiry,
+   (iii) a test-only feature that wraps c2pa's
+         `CertificateTrustPolicy::passthrough()`.
+
+2. **Plan refresh** (same commit as item 1).
+   `tracking/TIER_4_PLAN.md` section 4.3 re-headers
+   from "2 sessions, 91-92" to "3 sessions, 91-93".
+   Session 92 B row split into B1 DONE + B2 pending
+   with expanded scope. Risks section unchanged.
+
+3. **Session 92 close doc** (this commit).
+
+### Tests shipped
+
+| # | Test | Passes? |
+|---|---|---|
+| 5 | `provenance::tests::*` in `crates/lvqr-archive/src/provenance.rs` (feature-gated on `c2pa`) -- concat order, missing-path error, empty input, write_signed_pair parent-dir creation + overwrite | ok (run on the `archive-c2pa` CI cell + locally with `--features c2pa`) |
+
+Totals: `cargo test -p lvqr-archive`: **26** (unchanged
+on default features). `cargo test -p lvqr-archive
+--features c2pa`: **31** lib (+5 from session 91) + 1
+integration + 1 ignored. Workspace total: **739**
+(unchanged; feature-gated tests do not count toward
+default-feature workspace).
+
+### Ground truth (session 92 close)
+
+* **Head**: `6ca1889` (feat) on `main` before this
+  close-doc commit lands; after it lands local main
+  is 8 commits ahead of `origin/main` (sessions 89
+  feat+close, 90 feat+close, 91 feat+close, 92
+  feat+close). Verify via `git log --oneline
+  origin/main..main` before any push. Do NOT push
+  without direct user instruction.
+* **Tests**: **739** passed, 0 failed, 1 ignored on
+  macOS (default features).
+* **CI gates locally clean**: `cargo fmt --all --
+  --check`, `cargo clippy --workspace --all-targets
+  --benches -- -D warnings`, `cargo test --workspace`
+  all green. `cargo clippy -p lvqr-archive --features
+  c2pa --all-targets -- -D warnings` clean. `cargo
+  test -p lvqr-archive --features c2pa` green (31
+  lib + 1 c2pa_sign + 1 ignored).
+* **Workspace**: 26 crates, unchanged.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 / 89 / 90 |
+| 4.3 | C2PA signed media | **A + B1 DONE**, B2 pending | 91 (A) / 92 (B1) / 93 (B2) |
+| 4.8 | One-token-all-protocols | PLANNED | 94-95 |
+| 4.5 | In-process AI agents | PLANNED | 96-99 |
+| 4.4 | Cross-cluster federation | PLANNED | 100-102 |
+| 4.6 | Server-side transcoding | PLANNED | 103-105 |
+| 4.7 | Latency SLO scheduling | PLANNED | 106-107 |
+
+Tier 4 item 4.3 grew from 2 sessions to 3 at session
+92's replan. Downstream items shift +1 (e.g., 4.8 was
+93-94, now 94-95). Tier 4 budget unchanged at 27
+sessions (85-111) because the extension absorbs into
+the tier-wide buffer (same pattern 4.1 followed at
+session 88).
+
+### Session 93 entry point
+
+**Tier 4 item 4.3 session B2: cert fixture +
+finalize-asset orchestration + admin verify route +
+E2E.**
+
+Deliverables per the refreshed
+`tracking/TIER_4_PLAN.md` section 4.3 row B2:
+
+(a) **Cert-chain fixture** so the happy-path
+`c2pa_sign::sign_asset_bytes_emits_non_empty_c2pa_
+manifest_for_minimal_jpeg` test unignores. Three
+options (ranked by likelihood-to-work):
+
+  * rcgen with explicit extension control. Needs
+    `rcgen::CustomExtension` for AKI/SKI content +
+    basic-constraints criticality. Investigate which
+    branch of c2pa's cert profile check rejects the
+    current rcgen chain by enabling c2pa's
+    `validation_log` or running c2pa's own tests in
+    isolation to confirm what a passing cert looks
+    like. Ideally the shortest path.
+  * Vendor a static CA + leaf PEM pair with a 2099
+    `notAfter`. Cleanest long-term: removes the
+    rcgen dev-dep for this test + removes fixture
+    construction flakiness. Generate once via `openssl
+    req -new -x509 ...` (or a trusted CA fixture from
+    c2pa-rs's own test suite if it has a reusable
+    bundle) and commit under
+    `crates/lvqr-archive/tests/fixtures/c2pa/` with a
+    README noting the expiry.
+  * Wrap `c2pa::CertificateTrustPolicy::passthrough()`
+    behind a test-only feature. Problem: c2pa 0.80's
+    `verify.verify_trust` setting is `pub(crate)` so
+    this requires either upstreaming a PR or waiting
+    on a c2pa version with public access. Last
+    resort.
+
+(b) **Finalize-asset orchestration**. Three moving
+pieces:
+
+  * Add a broadcast-end lifecycle hook to
+    `lvqr_fragment::FragmentBroadcasterRegistry`.
+    Current surface has `on_entry_created` (line 102
+    of `crates/lvqr-fragment/src/registry.rs`); add a
+    matching `on_entry_removed` or a more general
+    `LifecycleObserver` trait that also covers
+    `on_entry_created`. This is a load-bearing
+    primitive that 4.4 (cross-cluster federation)
+    and 4.5 (AI agents) will also want -- design the
+    API shape before coding. Specifically think about
+    whether the callback fires synchronously on drop
+    (risky, callbacks from Drop can deadlock) or on
+    an explicit `registry.remove()` call (safer but
+    requires callers to know to remove).
+  * Persist init bytes to disk at first-segment-write
+    time. Today `FragmentBroadcaster::meta()` holds
+    them in memory only. Layout decision: flat
+    `<archive>/<broadcast>/<track>/init.mp4` vs.
+    `metadata.json` sidecar. The flat approach is
+    simpler but the JSON sidecar scales better if we
+    later add timescale / SPS / PPS metadata. Pick
+    and document in the B2 feat commit.
+  * Extend `lvqr_cli::archive::BroadcasterArchiveIndexer::
+    drain` to call `lvqr_archive::provenance::
+    concat_assets` (walking the redb index for this
+    `(broadcast, track)` in `start_dts` order and
+    prepending the init bytes) + `sign_asset_bytes` +
+    `write_signed_pair` when the drain task
+    terminates AND `C2paConfig` is `Some`.
+
+(c) **`GET /playback/verify/{broadcast}`** admin
+route in `lvqr-cli`. Reads the signed asset +
+sidecar manifest from
+`<archive>/<broadcast>/<track>/finalized.<ext>` +
+`.c2pa`, calls
+`c2pa::Reader::from_manifest_data_and_stream`,
+returns a JSON object `{ signer: String, signed_at:
+Option<DateTime>, valid: bool, errors: Vec<String>
+}`. Auth per existing `/admin` routes.
+
+(d) **E2E test** at
+`crates/lvqr-cli/tests/c2pa_verify_e2e.rs`. Starts a
+`TestServer` with `C2paConfig` pointed at the
+session-B2 cert fixture; publishes one RTMP
+broadcast; drops the publisher to trigger finalize;
+hits `GET /playback/verify/{broadcast}` and asserts
+the JSON has `valid: true` + the expected signer.
+
+Expected scope: ~600-900 LOC (cert fixture + three
+archive-side changes + CLI route + E2E test).
+Biggest risks:
+- Registry lifecycle-hook API design affects 4.4 +
+  4.5; worth a short design sketch before coding.
+- Cert-fixture branch identification may still be
+  non-obvious even after enabling validation_log;
+  budget 1-2 hours for that alone.
+- The drain-task termination path runs inside tokio;
+  `write_signed_pair` is sync so it needs
+  `spawn_blocking` like `write_segment` does.
+
+Pre-session checklist:
+- Read `tracking/TIER_4_PLAN.md` section 4.3 fully.
+- Run `cargo test -p lvqr-archive --features c2pa
+  --test c2pa_sign -- --ignored --nocapture` with
+  any trace-logging added to c2pa's validation_log
+  to pinpoint the specific profile-check branch
+  that rejects the rcgen chain.
+- Decide cert-fixture path (rcgen / vendored /
+  passthrough) before coding the verify route.
+- Decide finalize-asset layout (flat `init.mp4` vs.
+  `metadata.json` sidecar) and document in the feat
+  commit.
+- Sketch the registry lifecycle-hook API shape in
+  prose in the feat commit before wiring -- this is
+  a shared primitive for Tier 4 items 4.4 + 4.5 too.
 
 ## Session 91 close (2026-04-18)
 
