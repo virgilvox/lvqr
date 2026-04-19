@@ -419,7 +419,7 @@ route than originally specified.
   keeps the closure to rust_native_crypto only -- no
   vendored OpenSSL C build, no reqwest/ureq.
 
-## 4.8 -- One-token-all-protocols (1 week, 2 sessions, 95-96; A DONE, B pending)
+## 4.8 -- One-token-all-protocols (1 week, 2 sessions, 95-96; **COMPLETE**)
 
 ### Plan-vs-code status (refreshed session 94 close)
 
@@ -553,7 +553,7 @@ change.
 | # | Session | Deliverable | Verification | Status |
 |---|---|---|---|---|
 | 95 | A | `lvqr-auth` extractor helpers (5 protocols) under `lvqr_auth::extract`; wired into `lvqr-whip` (new 401 gate on POST offer), `lvqr-srt` (new `ServerRejectReason::Unauthorized` on streamid-parse), `lvqr-rtsp` (new `401 Unauthorized` on ANNOUNCE + RECORD); migrated `lvqr-ingest` RTMP bridge + `lvqr-cli` WS ingest onto shared helpers. `AuthContext::Publish` gains `broadcast: Option<String>` for per-broadcast JWT binding on publish; `JwtAuthProvider::check`'s Publish branch enforces it when Some. `TestServerConfig::with_whip()` added. `docs/auth.md` ships. | `cargo test -p lvqr-auth --lib` 29 passed; `cargo clippy --workspace --all-targets --benches -- -D warnings` clean; `cargo test --workspace` 783 passed / 0 failed / 1 ignored (up from 758; +16 extract, +1 jwt publish-bind, +3 whip router, +5 rtsp gate). | **DONE (session 95)** |
-| 96 | B | Integration test: one JWT, five protocols, one `TestServer` at `crates/lvqr-cli/tests/one_token_all_protocols.rs`. Publishes via each of RTMP/WHIP/SRT/RTSP + subscribes via WS with the same token. Asserts per-protocol allow + wrong-token reject. `TestServerConfig::with_whip()` is already there (landed in 95 A). | `cargo test -p lvqr-cli --test one_token_all_protocols` | pending |
+| 96 | B | Cross-protocol auth E2E at `crates/lvqr-cli/tests/one_token_all_protocols.rs`: one `TestServer` with RTMP + WHIP + SRT + RTSP + `JwtAuthProvider`; one publish-scoped JWT bound to `live/cam1` is admitted by every surface, a wrong-secret JWT is denied by every surface (RTMP drop / WHIP 401 / SRT `ConnectionRefused` from 2401 / RTSP 401), and a JWT bound to `live/other` published against `live/cam1` is denied on WHIP/SRT/RTSP but **admitted** on RTMP (the documented anti-scope: RTMP carries the JWT as the stream key so `extract_rtmp` passes `broadcast: None` and `JwtAuthProvider` skips the per-broadcast binding). Three `#[tokio::test]` cases. No new production code -- session 95 A shipped every building block. | `cargo test -p lvqr-cli --test one_token_all_protocols` 3 passed; `cargo clippy --workspace --all-targets --benches -- -D warnings` clean; `cargo test --workspace` 786 passed / 0 failed / 1 ignored (up from 783; +3 cross-protocol). | **DONE (session 96)** |
 
 ### Risks + mitigations
 
