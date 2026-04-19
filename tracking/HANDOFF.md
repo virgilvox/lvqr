@@ -2,7 +2,7 @@
 
 ## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 COMPLETE (end-to-end C2PA provenance: signing primitive + composition helpers + cert fixture + finalize orchestrators + drain-terminated finalize + admin verify route + E2E); 758 tests, 26 crates
 
-**Last Updated**: 2026-04-19 (session 94 closed; session 93 closed 2026-04-18). Tier 4 item 4.3 session B3 landed end-to-end C2PA provenance: `FragmentBroadcasterRegistry::on_entry_removed` lifecycle hook (mirrors `on_entry_created`, fires synchronously on successful `remove()` with lock released, NEVER from Drop -- load-bearing primitive for 4.4 + 4.5); `RtmpMoqBridge::on_unpublish` now calls `registry.remove` for both tracks so drain tasks see `next_fragment() -> None` per-broadcast (was per-server-shutdown); flat `<archive>/<broadcast>/<track>/init.mp4` layout + `write_init` writer helper; `BroadcasterArchiveIndexer::drain` invokes `finalize_broadcast_signed` inside spawn_blocking when drain terminates with `C2paConfig` configured; `GET /playback/verify/{broadcast}` admin route via `c2pa::Reader::with_manifest_data_and_stream`; E2E test `c2pa_verify_e2e.rs` exercises the full path (RTMP publish -> unpublish -> finalize -> verify). Breaking API refactor on `C2paConfig`: new `C2paSignerSource` enum replaces inline PEM fields with `CertKeyFiles { .. }` + `Custom(Arc<dyn c2pa::Signer + Send + Sync>)` variants -- the Custom variant is the E2E path (`c2pa::EphemeralSigner` without disk PEMs) and the HSM / KMS operator story. Feature plumbing: `lvqr-cli` gains `c2pa` feature; `lvqr-test-utils` gains `c2pa` + `TestServerConfig::with_c2pa(..)`. Workspace tests 758 passing on macOS (up from 739; +4 registry, +4 writer, +2 c2pa_sign Custom-source, +1 c2pa_verify_e2e, +5 provenance lib tests now active in workspace builds, +3 misc). Session 95 entry point is Tier 4 item 4.8 (One-token-all-protocols).
+**Last Updated**: 2026-04-19 (handoff staged for session 95 entry; session 94 closed 2026-04-19). Tier 4 item 4.3 session B3 landed end-to-end C2PA provenance: `FragmentBroadcasterRegistry::on_entry_removed` lifecycle hook (mirrors `on_entry_created`, fires synchronously on successful `remove()` with lock released, NEVER from Drop -- load-bearing primitive for 4.4 + 4.5); `RtmpMoqBridge::on_unpublish` now calls `registry.remove` for both tracks so drain tasks see `next_fragment() -> None` per-broadcast (was per-server-shutdown); flat `<archive>/<broadcast>/<track>/init.mp4` layout + `write_init` writer helper; `BroadcasterArchiveIndexer::drain` invokes `finalize_broadcast_signed` inside spawn_blocking when drain terminates with `C2paConfig` configured; `GET /playback/verify/{broadcast}` admin route via `c2pa::Reader::with_manifest_data_and_stream`; E2E test `c2pa_verify_e2e.rs` exercises the full path (RTMP publish -> unpublish -> finalize -> verify). Breaking API refactor on `C2paConfig`: new `C2paSignerSource` enum replaces inline PEM fields with `CertKeyFiles { .. }` + `Custom(Arc<dyn c2pa::Signer + Send + Sync>)` variants -- the Custom variant is the E2E path (`c2pa::EphemeralSigner` without disk PEMs) and the HSM / KMS operator story. Feature plumbing: `lvqr-cli` gains `c2pa` feature; `lvqr-test-utils` gains `c2pa` + `TestServerConfig::with_c2pa(..)`. Workspace tests 758 passing on macOS (up from 739; +4 registry, +4 writer, +2 c2pa_sign Custom-source, +1 c2pa_verify_e2e, +5 provenance lib tests now active in workspace builds, +3 misc). Session 95 entry point is Tier 4 item 4.8 session A (One-token-all-protocols) -- see the refreshed `Plan-vs-code status` under TIER_4_PLAN.md section 4.8 for the scope-up vs. the session-84 original (three ingest crates have NO auth call-site today; session 95 must add new call-sites not just collapse existing extractors).
 
 ## Session 94 close (2026-04-19)
 
@@ -202,51 +202,137 @@ session reserve.
 
 **Tier 4 item 4.8 session A: One-token-all-protocols.**
 
-Deliverables per `tracking/TIER_4_PLAN.md` section 4.8:
+Scoped + scouted against the live code at session 94
+close (2026-04-19). See `tracking/TIER_4_PLAN.md`
+section 4.8 for the full deliverables table and the
+Plan-vs-code status block that captures the three
+drifts below.
 
-(a) **`lvqr-auth::normalized_auth(request_kind)`**: new
-helper that, given a JWT (via `--jwt-secret`), returns
-the same `AuthDecision` regardless of whether the
-request arrived over RTMP, WHIP, SRT, RTSP, MoQ, or
-WebSocket.
+**Drift 1: `normalized_auth` is really an extractor,
+not a verifier.** `lvqr_auth::AuthProvider::check(
+&AuthContext)` already returns a uniform
+`AuthDecision` across protocols. `JwtAuthProvider`
+already handles Publish + Subscribe + Admin variants.
+What session 95 A must add is the protocol-specific
+EXTRACTOR layer that turns each protocol's token
+carrier into a uniform `AuthContext`. The verifier
+side is done.
 
-(b) **Plumb through all five ingest surfaces**
-(`lvqr-ingest`, `lvqr-whip`, `lvqr-srt`, `lvqr-rtsp`,
-`lvqr-cli` WS ingest). Call the normalised helper
-instead of per-protocol one-offs. No behavioural
-change for operators using static tokens; JWT users
-gain the uniform claim surface.
+**Drift 2: three ingest crates have NO auth call-site
+today.** Scout at session 94 close found:
 
-(c) **Documented JWT claim shape** in `docs/auth.md`
-(new document).
+  - `lvqr-ingest` (RTMP): calls `auth.check` at
+    `bridge.rs:456` on `AuthContext::Publish`. JWT
+    is carried as the stream key (existing
+    `JwtAuthProvider` convention).
+  - `lvqr-relay` (MoQ): calls `auth.check` at
+    `server.rs:155` on `AuthContext::Subscribe`.
+  - `lvqr-cli` (WS relay + WS ingest + playback):
+    calls at `lib.rs:1289` (WS relay subscribe),
+    `lib.rs:1415` (WS ingest publish), and the
+    playback router in `archive.rs`.
+  - `lvqr-whip`: **ZERO auth references anywhere.**
+  - `lvqr-srt`: **ZERO auth references anywhere.**
+  - `lvqr-rtsp`: **ZERO auth references anywhere.**
 
-(d) **Integration test**: one JWT accepted by all five
-ingest paths against the same `TestServer` instance
-(`cargo test -p lvqr-cli --test one_token_all_
-protocols`).
+Session 95 A must ADD auth call-sites to whip / srt
+/ rtsp, not "migrate existing one-offs". Estimate
+shifts ~+200 LOC vs the session-84 plan.
 
-Pre-session checklist:
-- Read `tracking/TIER_4_PLAN.md` section 4.8 (line
-  408 in the current file) fully.
-- Read `crates/lvqr-auth/src/*` to understand the
-  current `AuthProvider` + `AuthContext` shape. Key
-  questions: does the current `check()` API take
-  enough context to normalise across protocols, or
-  does it need extension?
-- Check each ingest crate's current auth wiring.
-  Likely there are per-protocol token extractors
-  that must be collapsed onto the normalised helper.
+**Drift 3: session decomposition table had stale
+numbers.** Fixed in session 94 close: 4.8 is now 95
+/96 (was 92/93); 4.5 is 97-100 (was 94-97); 4.4 is
+101-103 (was 98-100); 4.6 is 104-106 (was 101-103);
+4.7 is 107-108 (was 104-105). Tier 4 budget
+unchanged at 27 sessions (85-111).
 
-Expected scope: ~300-500 LOC split across 2 sessions
-(95 A + 96 B). Session A is the helper + plumbing;
-session B is the cross-protocol integration test and
-docs.
+**Token-carrier inventory for the extractor layer**:
 
-Biggest risk: SRT's `streamid` format is quirky (an
-m=token string embedded in a `:`-separated URL-like
-field). The per-protocol extractor takes raw bytes
-and hands them to the normalised verifier -- that
-shape survives.
+  - RTMP: stream key IS the JWT. Existing.
+  - WHIP: `Authorization: Bearer <jwt>` on the
+    POST /whip/{broadcast} HTTP offer. Standard.
+  - SRT: `streamid` handshake parameter. No industry
+    standard. Proposed LVQR shape: `m=publish,r=<
+    broadcast>,t=<jwt>` (`,`-separated KV pairs).
+    Document in `docs/auth.md`.
+  - RTSP: `Authorization: Bearer <jwt>` on
+    ANNOUNCE + RECORD. Verify `rtsp-types` passes
+    the header through; if not, extend the server's
+    header handling -- small isolated change.
+  - WS: existing `?token=<jwt>` query fallback +
+    `Authorization: Bearer` header. Already handled.
+
+**Deliverables (per TIER_4_PLAN row 95 A)**:
+
+(a) New `lvqr-auth::extract` module (or similar)
+with per-protocol `extract_<proto>` helpers that
+build `AuthContext` from the protocol's token
+carrier. Unit tests per helper.
+
+(b) Wire into `lvqr-whip` + `lvqr-srt` +
+`lvqr-rtsp` (new call-sites) + `lvqr-ingest` +
+`lvqr-cli` WS ingest (migrations to the shared
+extractor).
+
+(c) `docs/auth.md` (new): JWT claim shape (`sub`,
+`exp`, `scope`, optional `iss`, `aud`, `broadcast`)
++ per-protocol carrier conventions + one worked
+example per protocol.
+
+(d) `TestServerConfig::with_whip()` helper added
+if missing (needed by session 96 B's E2E).
+
+Session 96 B lands the cross-protocol E2E at
+`crates/lvqr-cli/tests/one_token_all_protocols.rs`.
+
+**Pre-session checklist**:
+
+1. Read `tracking/TIER_4_PLAN.md` section 4.8
+   fully (lines 422-574 in current file).
+2. Confirm the current `AuthContext` enum's
+   coverage against the extractor plan. If SRT
+   needs a new context variant or a
+   `metadata: HashMap<String,String>` side
+   channel, decide + update before wiring.
+3. Read `crates/lvqr-whip/src/*`, `crates/lvqr-
+   srt/src/*`, `crates/lvqr-rtsp/src/*` to pick
+   the right plumbing point (typically the
+   connection-accept / SDP-offer / streamid-parse
+   path).
+4. Verify the workspace default `cargo test`
+   stays green after each call-site add; the
+   `NoopAuthProvider` default means adding a
+   gate is behaviour-preserving for existing
+   tests.
+
+**Verification gates (session 95 A close)**:
+
+  - `cargo fmt --all`
+  - `cargo clippy --workspace --all-targets --benches -- -D warnings`
+  - `cargo test -p lvqr-auth --lib`
+  - `cargo test --workspace` no regression from 758
+  - `git log -1 --format='%an <%ae>'` reads
+    `Moheeb Zara <hackbuildvideo@gmail.com>` alone
+
+Expected scope: ~500-700 LOC split across 95 A + 96
+B (scope-up from the session-84 plan's ~300-500
+estimate because of drift 2).
+
+**Biggest risks**, ranked:
+
+1. SRT streamid format choice. Whatever session 95
+   picks, other SRT ingestors (OBS, ffmpeg) must be
+   able to produce it. The `m=publish,r=...,t=...`
+   shape is de-facto in the SRT community; document
+   first, code second.
+2. RTSP header passthrough. `rtsp-types` may or may
+   not surface `Authorization` to the server
+   handler cleanly. If not, the extractor falls
+   back to reading the raw request and extending
+   the RTSP server's header handling.
+3. `TestServerConfig::with_whip()` may not exist.
+   Check before the E2E -- if absent, session 95 A
+   adds it as a byproduct of the plumbing pass.
 
 ## Session 93 close (2026-04-18)
 

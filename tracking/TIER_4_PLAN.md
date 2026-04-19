@@ -419,23 +419,121 @@ route than originally specified.
   keeps the closure to rust_native_crypto only -- no
   vendored OpenSSL C build, no reqwest/ureq.
 
-## 4.8 -- One-token-all-protocols (1 week, 2 sessions)
+## 4.8 -- One-token-all-protocols (1 week, 2 sessions, 95-96)
+
+### Plan-vs-code status (refreshed session 94 close)
+
+Session 94 close scouted the current auth surface
+before session 95 starts. Key findings that shift the
+scope of what A lands:
+
+* **`lvqr-auth::AuthProvider::check(&AuthContext)` is
+  already the normalised decision surface.** Decision
+  shape (`AuthDecision::{Allow, Deny{reason}}`) does
+  not vary by protocol. `JwtAuthProvider` already
+  handles all three `AuthContext` variants (Publish,
+  Subscribe, Admin) with the `scope` / `broadcast`
+  claims the session-84 plan calls for. So the
+  `normalized_auth(request_kind)` helper the plan
+  names is really an EXTRACTOR layer, not a verifier
+  layer -- its job is to turn each protocol's
+  idiosyncratic token carrier into a uniform
+  `AuthContext` that the existing `AuthProvider::
+  check` consumes.
+
+* **Three of the five ingest surfaces have NO auth
+  call-site today.** `lvqr-whip`, `lvqr-srt`, and
+  `lvqr-rtsp` contain zero `AuthContext` / `auth.
+  check` references. The session-84 "plumb through
+  all five ingest crates ... instead of their per-
+  protocol one-offs" phrasing assumed existing
+  extractors that do not exist. Session 95 A must
+  ADD auth call-sites to these three AND unify the
+  extractor layer for all five. This is a scope-up
+  from the original plan, similar in spirit to the
+  session-91 "archive-is-a-stream" re-scope of 4.3.
+
+* **Two ingest surfaces already call
+  `AuthContext::Publish` today**:
+  - `lvqr_ingest::bridge` (RTMP): `bridge.rs:456`
+    inside `on_publish`. Pulls from the RTMP
+    connection's (app, key) pair. JWT is carried as
+    the RTMP stream key per `JwtAuthProvider`'s
+    existing convention.
+  - `lvqr_cli` WS ingest: `lib.rs:1415`. Token
+    extracted from the WS upgrade URL's `?token=`
+    query or Authorization header.
+
+* **Three subscribe call-sites already exist**: the
+  MoQ relay (`lvqr_relay::server:155`), the WS
+  relay (`lvqr_cli::lib:1289`), and the playback
+  router (`lvqr_cli::archive::playback_auth_gate`).
+  All use `AuthContext::Subscribe` with the token
+  extracted via a small protocol-specific helper.
+
+* **Token-carrier inventory (per protocol, for the
+  extractor layer)**:
+  - RTMP: stream key IS the JWT (existing
+    `JwtAuthProvider::Publish` shape).
+  - WHIP: HTTP `Authorization: Bearer <jwt>` on the
+    POST /whip/{broadcast} SDP offer. Standard.
+  - SRT: `streamid` handshake parameter. No bearer
+    convention. De facto format: `#!::r=<resource>,m=
+    request,t=<token>` or similar `,`-separated KV
+    pairs. Session 95 picks a shape and documents.
+  - RTSP: `Authorization: Bearer <jwt>` on ANNOUNCE +
+    RECORD (for publish) or DESCRIBE + PLAY (for
+    subscribe -- though LVQR's RTSP surface is
+    publish-only today). RTSP headers work the same
+    as HTTP.
+  - MoQ / WebSocket: existing `?token=<jwt>` query
+    fallback + `Authorization: Bearer` on the
+    initial upgrade. Already handled.
+
+Net re-scope for session 95 A: ship a new module
+`lvqr_auth::extract` (or similar) with five per-
+protocol `fn extract_<proto>(...) -> AuthContext`
+helpers, wire them into three new call-sites
+(whip/srt/rtsp) and migrate two existing call-sites
+(rtmp/ws-ingest) onto the shared helpers. The
+decision surface (`AuthProvider::check`) does not
+change.
 
 ### Scope (what lands)
 
-1. `lvqr-auth` gains a `normalized_auth(request_kind)`
-   helper: given a JWT (via `--jwt-secret`), returns the
-   same `AuthDecision` regardless of whether the request
-   arrived over RTMP, WHIP, SRT, RTSP, MoQ, or WebSocket.
-2. All five ingest surfaces (`lvqr-ingest`, `lvqr-whip`,
-   `lvqr-srt`, `lvqr-rtsp`, `lvqr-cli` WS ingest) call the
-   normalised helper instead of their per-protocol
-   one-offs. No behavioural change for operators using
-   static tokens; JWT users gain the uniform claim surface.
-3. Documented JWT claim shape in `docs/auth.md` (new
-   document).
-4. Integration test: one JWT accepted by all five ingest
-   paths against the same `TestServer` instance.
+1. `lvqr-auth` gains per-protocol extractor helpers
+   (likely a new `extract` module or small family
+   of free functions) that convert each protocol's
+   token carrier (RTMP stream key, WHIP
+   `Authorization` header, SRT streamid KV pairs,
+   RTSP header, WS token query/header) into a
+   uniform `AuthContext`. `AuthProvider::check` is
+   unchanged. Given a JWT (via `--jwt-secret`), the
+   same token produces the same `AuthDecision`
+   regardless of protocol.
+2. The three ingest surfaces that have no auth call-
+   site today (`lvqr-whip`, `lvqr-srt`, `lvqr-rtsp`)
+   gain one. The two ingest surfaces that already
+   have a call-site (`lvqr-ingest`, `lvqr-cli` WS
+   ingest) migrate to the shared extractor. No
+   behavioural change for operators running
+   `NoopAuthProvider` (every protocol stays open
+   access). Static-token operators get a uniform
+   call-site but no claim-surface change. JWT users
+   gain the uniform claim surface across five
+   protocols.
+3. `docs/auth.md` documents the JWT claim shape
+   (`sub`, `exp`, `scope`, optional `iss`, `aud`,
+   `broadcast`) + the per-protocol carrier
+   conventions (header vs streamid vs query vs
+   stream-key) + one worked example per protocol.
+4. Integration test: one JWT accepted by all five
+   ingest paths against the same `TestServer`
+   instance. Requires `TestServer` to bind RTMP +
+   WHIP + SRT + RTSP + WS ingest simultaneously
+   (`TestServerConfig::with_srt()` + `with_rtsp()`
+   already exist; WHIP wiring needs a
+   `TestServerConfig::with_whip()` added if absent).
 
 ### Anti-scope
 
@@ -446,13 +544,16 @@ route than originally specified.
   a flat `(sub, broadcast, scope)` tuple regardless of
   protocol. Protocol-specific claims (e.g. RTMP vs WHIP
   metadata) are out of scope.
+* **Revocation / token introspection.** A revoked
+  token's validity depends on `exp`; there is no
+  revocation list.
 
 ### Session decomposition
 
-| # | Session | Deliverable | Verification |
-|---|---|---|---|
-| 92 | A | `normalized_auth` in `lvqr-auth`; plumb through all five ingest crates. | `cargo test -p lvqr-auth --lib` |
-| 93 | B | Integration test: one JWT, five protocols, one `TestServer`. | `cargo test -p lvqr-cli --test one_token_all_protocols` |
+| # | Session | Deliverable | Verification | Status |
+|---|---|---|---|---|
+| 95 | A | `lvqr-auth` extractor helpers (5 protocols); wire into `lvqr-whip` + `lvqr-srt` + `lvqr-rtsp` (new call-sites) + `lvqr-ingest` + `lvqr-cli` WS ingest (migrations). `TestServerConfig::with_whip()` if missing. `docs/auth.md` draft with claim shape + carrier conventions. | `cargo test -p lvqr-auth --lib`; `cargo clippy --workspace --all-targets --benches -- -D warnings` clean; `cargo test --workspace` no regression. | pending |
+| 96 | B | Integration test: one JWT, five protocols, one `TestServer` at `crates/lvqr-cli/tests/one_token_all_protocols.rs`. Publishes via each of RTMP/WHIP/SRT/RTSP + subscribes via WS with the same token. Asserts per-protocol allow + wrong-token reject. | `cargo test -p lvqr-cli --test one_token_all_protocols` | pending |
 
 ### Risks + mitigations
 
@@ -460,8 +561,19 @@ route than originally specified.
   format). Handled by a thin per-protocol extractor that
   feeds the normalised verifier with the raw token bytes;
   the verifier itself stays protocol-agnostic.
+* **SRT streamid format choice.** No industry
+  standard. Session 95 A picks one (likely `m=publish,
+  r=<broadcast>,t=<jwt>`) and documents; operators
+  using other ingestors (ffmpeg, OBS SRT) get the
+  expected shape in docs. If a later integration
+  conflicts, the extractor is a single-file diff.
+* **RTSP DIGEST vs Bearer.** RTSP 2.0 supports
+  Authorization: Bearer. LVQR's `rtsp-types`-based
+  server should pass the header through. If not,
+  session 95 extends the server's header
+  handling -- small isolated change.
 
-## 4.5 -- In-process AI agents framework (3 weeks, 6-8 sessions)
+## 4.5 -- In-process AI agents framework (3 weeks, 4 sessions, 97-100)
 
 ### Scope (what lands)
 
@@ -498,10 +610,10 @@ route than originally specified.
 
 | # | Session | Deliverable | Verification |
 |---|---|---|---|
-| 94 | A | `lvqr-agent` scaffold + `Agent` trait + test harness. | `cargo test -p lvqr-agent --lib` |
-| 95 | B | `WhisperCaptionsAgent` reading AAC audio, feeding whisper-rs. | `cargo test -p lvqr-agent --test whisper_basic` |
-| 96 | C | Captions track publish via `lvqr-moq`; HLS subtitle rendition wiring in `lvqr-hls`. | `cargo test -p lvqr-cli --test captions_hls_e2e` |
-| 97 | D | `--whisper-model` CLI + lifecycle + E2E demo. | Manual: ffmpeg publish + browser hls.js playback with captions visible. |
+| 97 | A | `lvqr-agent` scaffold + `Agent` trait + test harness. | `cargo test -p lvqr-agent --lib` |
+| 98 | B | `WhisperCaptionsAgent` reading AAC audio, feeding whisper-rs. | `cargo test -p lvqr-agent --test whisper_basic` |
+| 99 | C | Captions track publish via `lvqr-moq`; HLS subtitle rendition wiring in `lvqr-hls`. | `cargo test -p lvqr-cli --test captions_hls_e2e` |
+| 100 | D | `--whisper-model` CLI + lifecycle + E2E demo. | Manual: ffmpeg publish + browser hls.js playback with captions visible. |
 
 ### Risks + mitigations
 
@@ -516,7 +628,7 @@ route than originally specified.
   the budget, cut multi-language validation and
   `--whisper-language` flag; ship English-only.
 
-## 4.4 -- Cross-cluster federation (2 weeks, 4 sessions)
+## 4.4 -- Cross-cluster federation (2 weeks, 3 sessions, 101-103)
 
 ### Scope (what lands)
 
@@ -551,9 +663,9 @@ route than originally specified.
 
 | # | Session | Deliverable | Verification |
 |---|---|---|---|
-| 98 | A | `FederationLink` config + MoQ subscribe loop. | `cargo test -p lvqr-cluster --test federation_unit` |
-| 99 | B | Two-cluster integration test: A publishes, B subscribes via link. | `cargo test -p lvqr-cli --test federation_two_cluster` |
-| 100 | C | Admin route `/api/v1/cluster/federation` + reconnect on link failure. | `cargo test -p lvqr-cli --test federation_reconnect` |
+| 101 | A | `FederationLink` config + MoQ subscribe loop. | `cargo test -p lvqr-cluster --test federation_unit` |
+| 102 | B | Two-cluster integration test: A publishes, B subscribes via link. | `cargo test -p lvqr-cli --test federation_two_cluster` |
+| 103 | C | Admin route `/api/v1/cluster/federation` + reconnect on link failure. | `cargo test -p lvqr-cli --test federation_reconnect` |
 
 ### Risks + mitigations
 
@@ -566,7 +678,7 @@ route than originally specified.
   priority order). Each link's `auth_token` is a JWT
   minted for the remote cluster's audience.
 
-## 4.6 -- Server-side transcoding (2 weeks, 4 sessions)
+## 4.6 -- Server-side transcoding (2 weeks, 3 sessions, 104-106)
 
 ### Scope (what lands)
 
@@ -598,9 +710,9 @@ route than originally specified.
 
 | # | Session | Deliverable | Verification |
 |---|---|---|---|
-| 101 | A | Scaffold `lvqr-transcode`; gstreamer-rs pipeline for one 720p rendition. | `cargo test -p lvqr-transcode --test basic_720p` |
-| 102 | B | Ladder generation; multi-rendition publish. | `cargo test -p lvqr-cli --test transcode_ladder` |
-| 103 | C | Hardware encoder feature flags; benchmark NVENC vs x264. | Documented in `docs/deployment.md`. |
+| 104 | A | Scaffold `lvqr-transcode`; gstreamer-rs pipeline for one 720p rendition. | `cargo test -p lvqr-transcode --test basic_720p` |
+| 105 | B | Ladder generation; multi-rendition publish. | `cargo test -p lvqr-cli --test transcode_ladder` |
+| 106 | C | Hardware encoder feature flags; benchmark NVENC vs x264. | Documented in `docs/deployment.md`. |
 
 ### Risks + mitigations
 
@@ -612,7 +724,7 @@ route than originally specified.
   deadlock under backpressure. Mitigation: bounded queue
   with drop-oldest policy on the fragment-in side.
 
-## 4.7 -- Latency SLO scheduling (1 week, 2 sessions)
+## 4.7 -- Latency SLO scheduling (1 week, 2 sessions, 107-108)
 
 ### Scope (what lands)
 
@@ -637,8 +749,8 @@ route than originally specified.
 
 | # | Session | Deliverable | Verification |
 |---|---|---|---|
-| 104 | A | Histogram wiring + `/api/v1/slo` route. | `cargo test -p lvqr-admin --test slo_route` |
-| 105 | B | Grafana alert pack + documentation. | Manual: Grafana imports the JSON. |
+| 107 | A | Histogram wiring + `/api/v1/slo` route. | `cargo test -p lvqr-admin --test slo_route` |
+| 108 | B | Grafana alert pack + documentation. | Manual: Grafana imports the JSON. |
 
 ### Risks + mitigations
 
