@@ -1,8 +1,252 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 COMPLETE; 4.3 A + B1 + B2 DONE (c2pa primitive + composition helpers + EphemeralSigner cert breakthrough + finalize orchestrators); B3 pending (drain wiring + verify route + E2E); 739 tests, 26 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 COMPLETE (end-to-end C2PA provenance: signing primitive + composition helpers + cert fixture + finalize orchestrators + drain-terminated finalize + admin verify route + E2E); 758 tests, 26 crates
 
-**Last Updated**: 2026-04-19 (handoff staged for session 94 entry; session 93 closed 2026-04-18). Tier 4 item 4.3 session B2 landed: cert-fixture breakthrough via `c2pa::EphemeralSigner` (publicly re-exported from c2pa 0.80, generates spec-compliant Ed25519 chains in memory using c2pa-rs's own `ephemeral_cert` module + rasn_pkix). The session-91 happy-path test that was `#[ignore]`'d through sessions 91-92 because rcgen-generated chains kept tripping `CertificateProfileError::InvalidCertificate` is now live -- 3 c2pa_sign tests pass with 0 ignored. Sign-side refactor: extracted `sign_asset_with_signer(&dyn c2pa::Signer, &SignOptions, ...)` low-level primitive; `sign_asset_bytes` delegates after reading PEMs. Two new orchestrators: `finalize_broadcast_signed` + `_with_signer` compose concat + sign + write_signed_pair. rcgen dropped from dev-deps. Re-scoped 4.3 from 3 sessions (91-93) to 4 sessions (91-94); session-92 B was split into B1 (shipped 92) + B2 (shipped 93) + B3 (pending). Workspace tests 739 passing on macOS. Session 94 entry point is 4.3 B3 (drain-task integration + broadcast-end lifecycle hook on `FragmentBroadcasterRegistry` + init-bytes persistence + admin verify route + E2E).
+**Last Updated**: 2026-04-19 (session 94 closed; session 93 closed 2026-04-18). Tier 4 item 4.3 session B3 landed end-to-end C2PA provenance: `FragmentBroadcasterRegistry::on_entry_removed` lifecycle hook (mirrors `on_entry_created`, fires synchronously on successful `remove()` with lock released, NEVER from Drop -- load-bearing primitive for 4.4 + 4.5); `RtmpMoqBridge::on_unpublish` now calls `registry.remove` for both tracks so drain tasks see `next_fragment() -> None` per-broadcast (was per-server-shutdown); flat `<archive>/<broadcast>/<track>/init.mp4` layout + `write_init` writer helper; `BroadcasterArchiveIndexer::drain` invokes `finalize_broadcast_signed` inside spawn_blocking when drain terminates with `C2paConfig` configured; `GET /playback/verify/{broadcast}` admin route via `c2pa::Reader::with_manifest_data_and_stream`; E2E test `c2pa_verify_e2e.rs` exercises the full path (RTMP publish -> unpublish -> finalize -> verify). Breaking API refactor on `C2paConfig`: new `C2paSignerSource` enum replaces inline PEM fields with `CertKeyFiles { .. }` + `Custom(Arc<dyn c2pa::Signer + Send + Sync>)` variants -- the Custom variant is the E2E path (`c2pa::EphemeralSigner` without disk PEMs) and the HSM / KMS operator story. Feature plumbing: `lvqr-cli` gains `c2pa` feature; `lvqr-test-utils` gains `c2pa` + `TestServerConfig::with_c2pa(..)`. Workspace tests 758 passing on macOS (up from 739; +4 registry, +4 writer, +2 c2pa_sign Custom-source, +1 c2pa_verify_e2e, +5 provenance lib tests now active in workspace builds, +3 misc). Session 95 entry point is Tier 4 item 4.8 (One-token-all-protocols).
+
+## Session 94 close (2026-04-19)
+
+### What shipped
+
+1. **Tier 4 item 4.3 session B3: drain-terminated
+   C2PA finalize + admin verify route + E2E**
+   (`56ba151`). Five deliverables in one commit,
+   closing out item 4.3:
+
+   **(a) `on_entry_removed` lifecycle hook on
+   `FragmentBroadcasterRegistry`**. Mirror of
+   `on_entry_created` -- `(broadcast, track, &Arc<
+   FragmentBroadcaster>)` triple, fires synchronously
+   from `remove()` after the map write lock is
+   released (callbacks may freely re-enter the
+   registry), in installation order, NEVER from Drop
+   (deterministic fire point for 4.4 federation
+   gossip + 4.5 agent shutdown; no Drop-reentrancy
+   hazards). `RtmpMoqBridge::on_unpublish` now calls
+   `registry.remove(stream_name, "0.mp4")` + audio so
+   drain tasks see `next_fragment() -> None` per-
+   broadcast (was per-server-shutdown).
+
+   **(b) Init-bytes persistence** to flat
+   `<archive>/<broadcast>/<track>/init.mp4`. Layout
+   picked over `metadata.json` sidecar for three
+   reasons (parallels segment layout for non-c2pa
+   consumers, bytes already MP4 so concat is literal,
+   no extra JSON surface needed today). New
+   `lvqr_archive::writer::write_init` +
+   `init_segment_path` + `INIT_SEGMENT_FILENAME`
+   helpers. Drain task refreshes meta each loop
+   iteration and persists on first fragment where
+   init is set.
+
+   **(c) Drain-task integration**.
+   `BroadcasterArchiveIndexer::drain` takes
+   `Option<C2paConfig>` (feature-gated) and, on
+   while-loop exit, spawn_blocking's
+   `finalize_broadcast_signed` which reads
+   `init.mp4`, walks the redb segment index in
+   `start_dts` order, concats, signs, writes
+   `finalized.mp4` + `finalized.c2pa`. Errors log
+   `warn!`; no retry.
+
+   **(d) Admin verify route**.
+   `GET /playback/verify/{*broadcast}` (`crates/lvqr-
+   cli/src/archive.rs::verify_router`) reads the
+   finalize pair off disk, calls
+   `c2pa::Reader::from_context(Context::new()).
+   with_manifest_data_and_stream(..)`, returns JSON
+   `{ signer, signed_at, valid, validation_state,
+   errors }`. `validation_state` is the stable
+   string form of `c2pa::ValidationState`
+   (`"Invalid"` / `"Valid"` / `"Trusted"`); `valid`
+   is true for Valid + Trusted. `errors` filters out
+   `signingCredential.untrusted` (c2pa-rs itself
+   treats it as non-fatal). Auth runs the same
+   subscribe-token gate the sister `/playback/*`
+   routes use.
+
+   **(e) E2E test** at
+   `crates/lvqr-cli/tests/c2pa_verify_e2e.rs`. Real
+   RTMP publish via `rml_rtmp`, drop publisher, poll
+   for `finalized.c2pa` on disk with a 10 s budget,
+   hit `/playback/verify/live/dvr`, assert
+   `valid=true`, `validation_state="Valid"`,
+   non-empty signer, empty errors; also asserts 404
+   on an unknown broadcast.
+
+   **Breaking API change**. New `C2paSignerSource`
+   enum with `CertKeyFiles { signing_cert_path,
+   private_key_path, signing_alg,
+   timestamp_authority_url }` +
+   `Custom(Arc<dyn c2pa::Signer + Send + Sync>)`
+   variants. The old inline PEM fields on
+   `C2paConfig` move into the `CertKeyFiles`
+   variant; migration is a single-file diff per
+   operator:
+
+   ```
+   // was:
+   C2paConfig {
+       signing_cert_path, private_key_path,
+       signing_alg, timestamp_authority_url,
+       assertion_creator, trust_anchor_pem,
+   }
+   // now:
+   C2paConfig {
+       signer_source: C2paSignerSource::CertKeyFiles {
+           signing_cert_path, private_key_path,
+           signing_alg, timestamp_authority_url,
+       },
+       assertion_creator, trust_anchor_pem,
+   }
+   ```
+
+   The `Custom` variant covers two real shapes with
+   one enum: tests using `c2pa::EphemeralSigner`
+   (no disk PEMs -- the B3 E2E shape), operators
+   with HSM / KMS-backed keys wrapping their signer
+   behind `c2pa::Signer`. Per CLAUDE.md's no-backwards-
+   compat-shims rule, there is no migration helper;
+   existing callers update the struct literal. Two
+   new unit tests
+   (`sign_asset_bytes_with_custom_signer_source_
+   delegates_to_ephemeral_signer`,
+   `finalize_broadcast_signed_with_custom_signer_
+   source_writes_pair_to_disk`) lock the enum-
+   branching behaviour.
+
+   **Feature plumbing**:
+   * `lvqr-cli` gains a `c2pa` feature enabling
+     `lvqr-archive/c2pa` + `dep:c2pa` (default off;
+     `full` meta-feature adds it).
+   * `ServeConfig.c2pa: Option<C2paConfig>` is
+     `#[cfg(feature = "c2pa")]` so the struct stays
+     ABI-stable across feature flips.
+   * `lvqr-test-utils` gains a `c2pa` feature +
+     `TestServerConfig::with_c2pa(..)` builder.
+     Enabled via dev-deps on `lvqr-cli` so
+     `cargo test -p lvqr-cli --features c2pa`
+     activates the full stack.
+
+   **Plan refresh**. `tracking/TIER_4_PLAN.md`
+   section 4.3 header flipped to COMPLETE; the B3
+   row flipped to DONE with a full description of
+   what landed.
+
+2. **Session 94 close doc** (this commit).
+
+### Tests shipped
+
+| # | Test surface | Added this session |
+|---|---|---|
+| a | `crates/lvqr-fragment/src/registry.rs` unit tests | 4 new: `on_entry_removed_fires_exactly_once_per_successful_remove`, `on_entry_removed_multiple_callbacks_all_fire_in_installation_order`, `on_entry_removed_callback_receives_the_just_removed_arc`, `on_entry_removed_callback_may_reenter_registry_without_deadlock` |
+| b | `crates/lvqr-archive/src/writer.rs` unit tests | 4 new: `init_segment_path_follows_broadcast_track_layout`, `write_init_creates_missing_parent_dirs_and_writes_bytes`, `write_init_is_idempotent_overwrites_existing_file`, `write_init_returns_io_error_when_archive_dir_is_a_file` |
+| c | `crates/lvqr-archive/tests/c2pa_sign.rs` | 2 new: `sign_asset_bytes_with_custom_signer_source_delegates_to_ephemeral_signer`, `finalize_broadcast_signed_with_custom_signer_source_writes_pair_to_disk`. Existing 3 migrated to the `C2paSignerSource::CertKeyFiles` enum shape. |
+| d | `crates/lvqr-cli/tests/c2pa_verify_e2e.rs` | 1 new: `rtmp_publish_then_unpublish_yields_verifiable_c2pa_manifest` -- the full RTMP + finalize + verify E2E |
+
+Workspace totals: **758** passed, 0 failed, 1 ignored
+(up from session 93's 739 / 0 / 1). The +19 breakdown:
++4 registry, +4 writer, +2 c2pa_sign, +1 c2pa_verify_e2e,
++5 provenance lib tests that are now activated in
+workspace builds because `lvqr-test-utils`'s new `c2pa`
+dev-dep feature pulls in `lvqr-archive/c2pa`, +3 misc
+(re-counted doctests across feature configurations).
+The 1 remaining ignored test is the pre-existing
+`moq_sink` doctest unrelated to 4.3.
+
+### Ground truth (session 94 close)
+
+* **Head**: `56ba151` (feat) before this close-doc
+  commit lands; after both land local main is 13
+  commits ahead of `origin/main` (sessions 89-94 feat
+  + close, plus the session-94 hygiene commit on top
+  of 93's close-doc commit). Verify via `git log
+  --oneline origin/main..main` before any push.
+  Do NOT push without direct user instruction.
+* **Tests**: **758** passed, 0 failed, 1 ignored on
+  macOS (default features). With `--features c2pa`
+  on lvqr-archive: 35 lib + 5 integration, 0 ignored.
+  With `--features c2pa` on lvqr-cli: +1 E2E
+  (`c2pa_verify_e2e`), 0 ignored.
+* **CI gates locally clean**:
+  * `cargo fmt --all`
+  * `cargo clippy --workspace --all-targets --benches -- -D warnings`
+  * `cargo clippy -p lvqr-archive --features c2pa --all-targets -- -D warnings`
+  * `cargo clippy -p lvqr-cli --features c2pa --all-targets -- -D warnings`
+  * `cargo test -p lvqr-archive --features c2pa`
+  * `cargo test -p lvqr-cli --test rtmp_archive_e2e`
+    (no regression after the `registry.remove` wiring)
+  * `cargo test -p lvqr-cli --features c2pa --test c2pa_verify_e2e`
+  * `cargo test --workspace`
+* **Workspace**: 26 crates, unchanged.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 / 89 / 90 |
+| 4.3 | C2PA signed media | **COMPLETE** | 91 (A) / 92 (B1) / 93 (B2) / 94 (B3) |
+| 4.8 | One-token-all-protocols | PLANNED | 95-96 |
+| 4.5 | In-process AI agents | PLANNED | 97-100 |
+| 4.4 | Cross-cluster federation | PLANNED | 101-103 |
+| 4.6 | Server-side transcoding | PLANNED | 104-106 |
+| 4.7 | Latency SLO scheduling | PLANNED | 107-108 |
+
+Three of eight Tier 4 items are now complete (4.2, 4.1,
+4.3). Downstream sessions unchanged from session 93's
+view; tier budget still 27 sessions (85-111) with one
+session reserve.
+
+### Session 95 entry point
+
+**Tier 4 item 4.8 session A: One-token-all-protocols.**
+
+Deliverables per `tracking/TIER_4_PLAN.md` section 4.8:
+
+(a) **`lvqr-auth::normalized_auth(request_kind)`**: new
+helper that, given a JWT (via `--jwt-secret`), returns
+the same `AuthDecision` regardless of whether the
+request arrived over RTMP, WHIP, SRT, RTSP, MoQ, or
+WebSocket.
+
+(b) **Plumb through all five ingest surfaces**
+(`lvqr-ingest`, `lvqr-whip`, `lvqr-srt`, `lvqr-rtsp`,
+`lvqr-cli` WS ingest). Call the normalised helper
+instead of per-protocol one-offs. No behavioural
+change for operators using static tokens; JWT users
+gain the uniform claim surface.
+
+(c) **Documented JWT claim shape** in `docs/auth.md`
+(new document).
+
+(d) **Integration test**: one JWT accepted by all five
+ingest paths against the same `TestServer` instance
+(`cargo test -p lvqr-cli --test one_token_all_
+protocols`).
+
+Pre-session checklist:
+- Read `tracking/TIER_4_PLAN.md` section 4.8 (line
+  408 in the current file) fully.
+- Read `crates/lvqr-auth/src/*` to understand the
+  current `AuthProvider` + `AuthContext` shape. Key
+  questions: does the current `check()` API take
+  enough context to normalise across protocols, or
+  does it need extension?
+- Check each ingest crate's current auth wiring.
+  Likely there are per-protocol token extractors
+  that must be collapsed onto the normalised helper.
+
+Expected scope: ~300-500 LOC split across 2 sessions
+(95 A + 96 B). Session A is the helper + plumbing;
+session B is the cross-protocol integration test and
+docs.
+
+Biggest risk: SRT's `streamid` format is quirky (an
+m=token string embedded in a `:`-separated URL-like
+field). The per-protocol extractor takes raw bytes
+and hands them to the normalised verifier -- that
+shape survives.
 
 ## Session 93 close (2026-04-18)
 
