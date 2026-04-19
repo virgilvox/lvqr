@@ -183,15 +183,18 @@ lvqr-archive = { version = "0.4.0", path = "crates/lvqr-archive" }
 lvqr-signal = { version = "0.4.0", path = "crates/lvqr-signal" }
 lvqr-admin = { version = "0.4.0", path = "crates/lvqr-admin" }
 lvqr-auth = { version = "0.4.0", path = "crates/lvqr-auth" }
-lvqr-conformance = { version = "0.4.0", path = "crates/lvqr-conformance" }
+# publish = false; path-only so consumer dev-dep manifests stay strippable on `cargo publish`.
+lvqr-conformance = { path = "crates/lvqr-conformance" }
 lvqr-record = { version = "0.4.0", path = "crates/lvqr-record" }
 lvqr-rtsp = { version = "0.4.0", path = "crates/lvqr-rtsp" }
 lvqr-srt = { version = "0.4.0", path = "crates/lvqr-srt" }
-lvqr-test-utils = { version = "0.4.0", path = "crates/lvqr-test-utils" }
+# publish = false; path-only so consumer dev-dep manifests stay strippable on `cargo publish`.
+lvqr-test-utils = { path = "crates/lvqr-test-utils" }
 lvqr-cli = { version = "0.4.0", path = "crates/lvqr-cli" }
 lvqr-cluster = { version = "0.4.0", path = "crates/lvqr-cluster" }
 lvqr-observability = { version = "0.4.0", path = "crates/lvqr-observability" }
-lvqr-soak = { version = "0.4.0", path = "crates/lvqr-soak" }
+# publish = false; path-only on principle (no consumer dev-deps on it today).
+lvqr-soak = { path = "crates/lvqr-soak" }
 lvqr-wasm = { version = "0.4.0", path = "crates/lvqr-wasm" }
 lvqr-agent = { version = "0.4.0", path = "crates/lvqr-agent" }
 
