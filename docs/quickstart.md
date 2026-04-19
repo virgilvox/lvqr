@@ -246,7 +246,7 @@ values. Where a config-driven deploy is essential, systemd with
 
 ## Next steps
 
-- [`architecture.md`](architecture.md) -- how the 25 crates fit
+- [`architecture.md`](architecture.md) -- how the 27 crates fit
   together and the ten load-bearing architectural decisions
 - [`deployment.md`](deployment.md) -- systemd, TLS, reverse
   proxy, firewall, Prometheus + OTLP collectors

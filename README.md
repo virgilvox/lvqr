@@ -64,45 +64,92 @@ AI agents, cross-cluster federation) as Tier 4 on the roadmap.
   renewal, per-node capacity advertisement, LWW config, HLS/DASH/
   RTSP redirect-to-owner, `/api/v1/cluster/{nodes,broadcasts,config}`
 
-**Programmable data plane (Tier 4 shipped so far):**
-- WASM per-fragment filter runtime via `wasmtime 25`
-  (`--wasm-filter <path>` / `LVQR_WASM_FILTER`): guest modules
-  observe every ingested fragment through
-  `on_fragment(ptr, len) -> i32`; negative returns drop,
-  non-negative keep. Fail-open: a module that fails to compile or
-  traps passes the fragment through unchanged. Hot-reload via
-  `notify`-watched parent directory: rewriting the `.wasm` file
-  atomically swaps the running filter in place; in-flight calls
-  finish on the old module, subsequent calls see the new one.
-  Ships with two example filters (`frame-counter`, `redact-keyframes`)
-  under `crates/lvqr-wasm/examples/`. v1 is a read-only tap: the
-  filter drives per-broadcast keep/drop counters and the
-  `lvqr_wasm_fragments_total{outcome=keep|drop}` metric; downstream
-  egress sees the original fragment unchanged.
+**Programmable data plane (Tier 4 -- 4 of 8 items
+landed, 1 scaffolded):**
 
-**Stability signal:** 739 workspace tests, 0 failures, 1 ignored.
-`cargo fmt --all --check`, `cargo clippy --workspace --all-targets
---benches -- -D warnings`, and `cargo test --workspace` all green
-on every session close. The 5-artifact test contract
-(proptest + fuzz + integration + E2E + conformance) applies to
-every wire-format crate; see [`tests/CONTRACT.md`](tests/CONTRACT.md)
-for the current crate-by-crate scorecard.
+- **WASM per-fragment filter runtime** (item 4.2,
+  COMPLETE) via `wasmtime 25` (`--wasm-filter <path>` /
+  `LVQR_WASM_FILTER`): guest modules observe every
+  ingested fragment through `on_fragment(ptr, len) ->
+  i32`; negative returns drop, non-negative keep.
+  Fail-open: a module that fails to compile or traps
+  passes the fragment through unchanged. Hot-reload via
+  `notify`-watched parent directory atomically swaps the
+  running filter; in-flight calls finish on the old
+  module, subsequent calls see the new one. Two example
+  filters (`frame-counter`, `redact-keyframes`) under
+  `crates/lvqr-wasm/examples/`. v1 is a read-only tap;
+  downstream egress sees the original fragment
+  unchanged.
+- **io_uring archive writes** (item 4.1, COMPLETE)
+  under `lvqr-archive`'s `io-uring` feature flag on
+  Linux. macOS + Windows builds keep the synchronous
+  writer; the runtime path is a single feature swap.
+- **C2PA signed media** (item 4.3, COMPLETE):
+  drain-terminated finalize on broadcast end writes
+  `<archive>/<broadcast>/<track>/finalized.mp4` +
+  `finalized.c2pa` next to segment files; admin route
+  `GET /playback/verify/{*broadcast}` returns a JSON
+  validation report (`{ signer, signed_at, valid,
+  validation_state, errors }`) backed by `c2pa-rs`'s
+  `Reader::with_manifest_data_and_stream`. Behind the
+  `c2pa` feature on `lvqr-cli`. Dual signer source:
+  `CertKeyFiles { signing_cert_path, private_key_path,
+  signing_alg, timestamp_authority_url }` for operators
+  with on-disk PEMs; `Custom(Arc<dyn c2pa::Signer +
+  Send + Sync>)` for HSM / KMS-backed keys.
+- **One-token-all-protocols auth** (item 4.8,
+  COMPLETE): one `JwtAuthProvider` admits the same
+  publisher across RTMP (stream key IS the JWT), WHIP
+  (`Authorization: Bearer`), SRT (`streamid=m=publish,
+  r=<broadcast>,t=<jwt>`), RTSP (`Authorization:
+  Bearer`), and WS ingest (`lvqr.bearer.<jwt>`
+  subprotocol or fallback). Per-broadcast claim binding
+  enforced where the carrier knows the broadcast name
+  at auth time. End-to-end matrix locked into
+  `crates/lvqr-cli/tests/one_token_all_protocols.rs`.
+  See [`docs/auth.md`](docs/auth.md).
+- **In-process AI agents framework scaffold**
+  (item 4.5 session A, DONE; B-D pending): `lvqr-agent`
+  ships the `Agent` trait + `AgentContext` + factory +
+  `AgentRunner` lifecycle wiring. One drain task per
+  agent per `(broadcast, track)`, panic-isolated via
+  `catch_unwind`, per-`(agent, broadcast, track)` stats
+  + `lvqr_agent_fragments_total{agent}` metric. Session
+  98 will drop in `WhisperCaptionsAgent` against this
+  surface without re-deriving the registry-wiring
+  boilerplate.
 
-**What's NOT shipped yet (honest gaps the marketing-faced docs
-easily miss):** webhook-based auth providers, OAuth2 / JWKS
-dynamic key discovery, HMAC signed URLs, hot config reload, a
-dedicated DVR scrub web UI, WebVTT caption segmenter +
-SCTE-35 passthrough, stream-key CRUD admin API, WHEP audio
-(AAC to Opus transcoder required; unblocks with the Tier 4
-gstreamer bridge), server-side transcoding / ABR ladders,
-C2PA signed media, cross-cluster federation, in-process AI
-agents, io_uring archive writes (landing as Tier 4 item 4.1;
-A1 writer extraction is in, A2 adds the feature-gated
-`tokio-uring` path), latency SLO scheduling, stream-
-modifying WASM filter pipelines (the v1 WASM runtime is a
-read-only tap). Every one of these is either explicitly on
-[`tracking/ROADMAP.md`](tracking/ROADMAP.md) Tier 3 / Tier 4
-or documented as out-of-scope for v1. None is a silent gap.
+**Stability signal:** 796 workspace tests, 0 failures,
+1 ignored (the pre-existing `moq_sink` doctest).
+`cargo fmt --all --check`, `cargo clippy --workspace
+--all-targets --benches -- -D warnings`, and
+`cargo test --workspace` all green on every session
+close. The 5-artifact test contract (proptest + fuzz +
+integration + E2E + conformance) applies to every
+wire-format crate; see
+[`tests/CONTRACT.md`](tests/CONTRACT.md) for the
+current crate-by-crate scorecard.
+
+**What's NOT shipped yet (honest gaps the marketing-
+faced docs easily miss):** webhook-based auth
+providers, OAuth2 / JWKS dynamic key discovery, HMAC
+signed URLs, hot config reload, a dedicated DVR
+scrub web UI, WebVTT caption segmenter + SCTE-35
+passthrough, stream-key CRUD admin API, WHEP audio
+(AAC to Opus transcoder required; unblocks with the
+Tier 4 transcoding item), server-side transcoding /
+ABR ladders (item 4.6, planned 104-106),
+cross-cluster federation (item 4.4, planned
+101-103), latency SLO scheduling (item 4.7, planned
+107-108), stream-modifying WASM filter pipelines (v1
+WASM runtime is a read-only tap), concrete
+`WhisperCaptionsAgent` (item 4.5 sessions B-D ship
+the model + CLI + HLS subtitle rendition wiring).
+Every one of these is either explicitly on
+[`tracking/ROADMAP.md`](tracking/ROADMAP.md) Tier 3 /
+Tier 4 or documented as out-of-scope for v1. None is
+a silent gap.
 
 ## Quickstart
 
@@ -309,7 +356,7 @@ cargo build --release
 
 ## Crate map
 
-The workspace is 26 crates organised along the Tier-2 unified
+The workspace is 27 crates organised along the Tier-2 unified
 data plane: one segmenter, every protocol is a projection.
 
 ```
@@ -348,12 +395,13 @@ Cluster + observability
 
 Programmable data plane
   lvqr-wasm          -- wasmtime fragment-filter runtime + notify hot-reload
+  lvqr-agent         -- in-process AI agents framework (trait + runner + lifecycle)
 
 Infrastructure
   lvqr-cli           -- single-binary composition root
-  lvqr-conformance   -- reference fixtures + external validator wrappers
+  lvqr-conformance   -- reference fixtures + external validator wrappers (publish = false)
   lvqr-test-utils    -- TestServer harness (publish = false)
-  lvqr-soak          -- long-run soak driver
+  lvqr-soak          -- long-run soak driver (publish = false)
 ```
 
 ## Load-bearing architectural decisions

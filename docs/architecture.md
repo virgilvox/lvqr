@@ -1,6 +1,6 @@
 # Architecture
 
-LVQR is a 25-crate Rust workspace built around one central
+LVQR is a 27-crate Rust workspace built around one central
 claim: every track in the system is a sequence of `Fragment`
 values, and every protocol the server speaks is a projection
 over that shared fragment stream. The architecture is
@@ -9,7 +9,7 @@ adding RTSP or WHIP does not turn into a data-plane rewrite.
 
 This document maps the system at the level that matters for
 new contributors: the unified data model, the three planes
-(data / cluster / observability), the 25 crates that
+(data / cluster / observability), the 27 crates that
 implement them, and the ten load-bearing architectural
 decisions you must preserve before touching cross-crate
 boundaries.
@@ -150,12 +150,12 @@ sites in `lvqr-ingest` / `lvqr-relay` / `lvqr-admin` /
 
 Full reference: [`docs/observability.md`](observability.md).
 
-## The 25 crates
+## The 27 crates
 
 ```
 Data model and transport facade
   lvqr-core          -- StreamId, TrackName, Frame, EventBus, RelayStats
-  lvqr-fragment      -- Fragment model, FragmentMeta, MoqTrackSink
+  lvqr-fragment      -- Fragment model, FragmentMeta, MoqTrackSink, FragmentBroadcasterRegistry
   lvqr-moq           -- facade over moq-lite (version churn isolation)
 
 Codecs and segmenter
@@ -176,21 +176,25 @@ Egress
   lvqr-mesh          -- peer mesh topology planner (media relay: Tier 4)
 
 Auth, storage, admin
-  lvqr-auth          -- noop / static-token / HS256 JWT providers
+  lvqr-auth          -- noop / static-token / HS256 JWT providers + per-protocol extractors
   lvqr-record        -- fMP4 disk recorder subscribed to EventBus
-  lvqr-archive       -- redb segment index for DVR scrub + /playback/*
+  lvqr-archive       -- redb segment index for DVR scrub + /playback/* + io_uring writer + C2PA finalize
   lvqr-signal        -- WebRTC signaling for mesh peer assignments
   lvqr-admin         -- /api/v1/*, /metrics, /healthz, /readyz, auth mw
 
 Cluster and observability
   lvqr-cluster       -- chitchat membership, ownership, capacity, config
-  lvqr-observability -- tracing/OTLP, metrics-crate → OTLP bridge
+  lvqr-observability -- tracing/OTLP, metrics-crate -> OTLP bridge
+
+Programmable data plane (Tier 4)
+  lvqr-wasm          -- wasmtime per-fragment filter host + notify hot-reload
+  lvqr-agent         -- in-process AI agents framework (Agent trait + AgentRunner + lifecycle)
 
 Composition and test infrastructure
   lvqr-cli           -- single-binary composition root (lvqr serve)
-  lvqr-conformance   -- reference fixtures + external validator wrappers
+  lvqr-conformance   -- reference fixtures + external validator wrappers (publish = false)
   lvqr-test-utils    -- TestServer harness (publish = false)
-  lvqr-soak          -- long-run soak driver
+  lvqr-soak          -- long-run soak driver (publish = false)
 ```
 
 Every crate that owns a wire format or parser ships the
