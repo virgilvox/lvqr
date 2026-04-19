@@ -1,8 +1,268 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 COMPLETE; 4.3 A + B1 DONE (c2pa signing primitive + composition helpers); B2 pending (finalize orchestration + admin verify route + E2E); 739 tests, 26 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 COMPLETE; 4.3 A + B1 + B2 DONE (c2pa primitive + composition helpers + EphemeralSigner cert breakthrough + finalize orchestrators); B3 pending (drain wiring + verify route + E2E); 739 tests, 26 crates
 
-**Last Updated**: 2026-04-18 (session 92 close -- Tier 4 item 4.3 session B1 landed: added `provenance::concat_assets` + `provenance::write_signed_pair` composition primitives (5 unit tests) and a new `C2paConfig.trust_anchor_pem` field routed through `c2pa::Context::with_settings({"trust": {"user_anchors": ...}})` so operators with a private CA have a first-class path. Confirmed during this session that `user_anchors` addresses chain validation only -- the structural-profile check in c2pa 0.80 remains the blocker for the happy-path `c2pa_sign` test. Re-scoped 4.3 from 2 sessions (91-92) to 3 sessions (91-93); original session-B scope split into B1 (shipped) + B2 (pending). Workspace tests 739 passing on macOS; `--features c2pa` adds +5 passed + 1 integration + 1 ignored. Session 93 entry point is 4.3 B2 (cert fixture + finalize-asset orchestration + admin verify route + E2E).
+**Last Updated**: 2026-04-18 (session 93 close -- Tier 4 item 4.3 session B2 landed: cert-fixture breakthrough via `c2pa::EphemeralSigner` (publicly re-exported from c2pa 0.80, generates spec-compliant Ed25519 chains in memory using c2pa-rs's own `ephemeral_cert` module + rasn_pkix). The session-91 happy-path test that was `#[ignore]`'d through sessions 91-92 because rcgen-generated chains kept tripping `CertificateProfileError::InvalidCertificate` is now live -- 3 c2pa_sign tests pass with 0 ignored. Sign-side refactor: extracted `sign_asset_with_signer(&dyn c2pa::Signer, &SignOptions, ...)` low-level primitive; `sign_asset_bytes` delegates after reading PEMs. Two new orchestrators: `finalize_broadcast_signed` + `_with_signer` compose concat + sign + write_signed_pair. rcgen dropped from dev-deps. Re-scoped 4.3 from 3 sessions (91-93) to 4 sessions (91-94); session-92 B was split into B1 (shipped 92) + B2 (shipped 93) + B3 (pending). Workspace tests 739 passing on macOS. Session 94 entry point is 4.3 B3 (drain-task integration + broadcast-end lifecycle hook on `FragmentBroadcasterRegistry` + init-bytes persistence + admin verify route + E2E).
+
+## Session 93 close (2026-04-18)
+
+### What shipped
+
+1. **Tier 4 item 4.3 session B2: cert fixture +
+   sign-side composability + finalize orchestrators**
+   (`868c378`). Three deliverables in one commit, all
+   converging on "the c2pa primitive is now end-to-end
+   testable and composable for the drain-task wiring."
+
+   **Cert-fixture breakthrough**. Discovery:
+   `c2pa::EphemeralSigner` is publicly re-exported from
+   c2pa 0.80 (in `pub use utils::{ephemeral_signer::
+   EphemeralSigner, ...}`). It generates C2PA-spec-
+   compliant Ed25519 cert chains in memory using
+   c2pa-rs's own private `ephemeral_cert` module +
+   rasn_pkix -- exactly the extension layout
+   (digitalSignature KU, emailProtection EKU, basic-
+   constraints with cA=FALSE on EE, AKI/SKI, v3) the
+   structural-profile check wants. The session-91
+   happy-path test (`#[ignore]`'d through sessions
+   91-92 because rcgen-generated chains kept tripping
+   `CertificateProfileError::InvalidCertificate`)
+   unignores via this signer with zero PEM-fixture
+   maintenance + zero calendar-expiry risk. The chain
+   is generated per-test-run.
+
+   **Sign-side composability refactor**:
+
+   * New `provenance::SignOptions { assertion_creator,
+     trust_anchor_pem }` -- the subset of `C2paConfig`
+     that is independent of PEM paths + signing alg.
+     Lets `sign_asset_with_signer` callers construct
+     only what the lower-level primitive needs.
+   * New `provenance::sign_asset_with_signer(&dyn
+     c2pa::Signer, &SignOptions, format, bytes) ->
+     Result<SignedAsset, ArchiveError>` -- low-level
+     primitive that takes any `c2pa::Signer` impl.
+     Tests use `EphemeralSigner`; advanced operators
+     with HSM-backed or KMS-backed keys call this
+     directly.
+   * `sign_asset_bytes` (path-based primitive) now
+     delegates to `_with_signer` after reading PEMs +
+     constructing the signer. The high-level shape
+     for production operators is unchanged.
+
+   **Finalize orchestrators**:
+
+   * `finalize_broadcast_signed_with_signer(signer,
+     options, init_bytes, segment_paths, format,
+     asset_path, manifest_path) -> SignedAsset` --
+     composes `concat_assets` (init + segments in
+     order) + `sign_asset_with_signer` +
+     `write_signed_pair`. Returns SignedAsset so
+     caller can log size or inspect bytes without re-
+     reading from disk. `init_bytes` is taken as a
+     parameter so this primitive stays agnostic to
+     where init persistence lives -- session 94's
+     call.
+   * `finalize_broadcast_signed(&C2paConfig, ...)`
+     -- high-level convenience that reads PEMs then
+     delegates. Single call site for session 94's
+     drain integration.
+
+   **Test suite migration in `tests/c2pa_sign.rs`**:
+   3 tests, 0 ignored. The rcgen-based
+   `build_test_chain` helper + the `#[ignore]`'d
+   happy-path test are deleted in favor of:
+
+   - `sign_asset_with_signer_emits_non_empty_c2pa_
+     manifest_for_minimal_jpeg` (live, was ignored
+     through 91-92).
+   - `finalize_broadcast_signed_with_signer_writes_
+     asset_and_manifest_pair_to_disk` (new; init-only
+     "broadcast" exercising concat + sign + write
+     end-to-end with real on-disk reads to verify
+     round-trip).
+   - `sign_asset_bytes_reports_c2pa_error_on_missing_
+     cert_file` (live, unchanged).
+
+   **Cleanup**: rcgen dropped from `lvqr-archive`'s
+   dev-deps + Cargo.lock. The only consumer was the
+   deleted fixture builder.
+
+   **Plan refresh**: section 4.3 header "3 sessions,
+   91-93" → "4 sessions, 91-94". B2 row flipped to
+   **DONE (session 93)** with the cert-fixture-
+   breakthrough note + composability + finalize-
+   orchestrator scope. New B3 row covers the
+   remaining drain integration + verify route + E2E.
+
+2. **Session 93 close doc** (this commit).
+
+### Tests shipped
+
+| # | Test | Passes? |
+|---|---|---|
+| 2 | `sign_asset_with_signer_emits_non_empty_c2pa_manifest_for_minimal_jpeg` (was `#[ignore]`'d through sessions 91-92, now live) + `finalize_broadcast_signed_with_signer_writes_asset_and_manifest_pair_to_disk` (new) in `crates/lvqr-archive/tests/c2pa_sign.rs` | both ok (feature-gated; runs on the `archive-c2pa` CI cell + locally with `--features c2pa`) |
+
+`cargo test -p lvqr-archive --features c2pa --test
+c2pa_sign`: 3 passed, 0 ignored. Previously 1 passed +
+1 ignored. The c2pa-sign happy-path ignore is gone.
+
+Workspace totals on macOS: **739** passed, 0 failed,
+1 ignored (default features). The 1 remaining ignored
+test is unrelated to 4.3 -- it predates this work.
+
+### Ground truth (session 93 close)
+
+* **Head**: `868c378` (feat) on `main` before this
+  close-doc commit lands; after both lands local main
+  is 10 commits ahead of `origin/main` (sessions 89
+  feat+close, 90 feat+close, 91 feat+close, 92
+  feat+close, 93 feat+close). Verify via `git log
+  --oneline origin/main..main` before any push. Do
+  NOT push without direct user instruction.
+* **Tests**: **739** passed, 0 failed, 1 ignored on
+  macOS (default features). With `--features c2pa`:
+  31 lib + 3 integration, 0 ignored.
+* **CI gates locally clean**: `cargo fmt --all --
+  --check`, `cargo clippy --workspace --all-targets
+  --benches -- -D warnings`, `cargo test --workspace`
+  all green. `cargo clippy -p lvqr-archive --features
+  c2pa --all-targets -- -D warnings` clean.
+* **Workspace**: 26 crates, unchanged.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 / 89 / 90 |
+| 4.3 | C2PA signed media | **A + B1 + B2 DONE**, B3 pending | 91 (A) / 92 (B1) / 93 (B2) / 94 (B3) |
+| 4.8 | One-token-all-protocols | PLANNED | 95-96 |
+| 4.5 | In-process AI agents | PLANNED | 97-100 |
+| 4.4 | Cross-cluster federation | PLANNED | 101-103 |
+| 4.6 | Server-side transcoding | PLANNED | 104-106 |
+| 4.7 | Latency SLO scheduling | PLANNED | 107-108 |
+
+Tier 4 item 4.3 grew from 3 sessions (post-92 split)
+to 4 (post-93 split). Downstream items shift +1 vs.
+session 92's view (e.g., 4.8 was 94-95, now 95-96).
+Tier 4 budget unchanged at 27 sessions (85-111)
+because the extension absorbs into the tier-wide
+buffer.
+
+### Session 94 entry point
+
+**Tier 4 item 4.3 session B3: drain-task integration
++ admin verify route + E2E.**
+
+Deliverables per the refreshed
+`tracking/TIER_4_PLAN.md` section 4.3 row B3:
+
+(a) **Broadcast-end lifecycle hook on
+`lvqr_fragment::FragmentBroadcasterRegistry`**.
+Current surface (line 102 of
+`crates/lvqr-fragment/src/registry.rs`) has
+`on_entry_created`; add a matching `on_entry_removed`
+or a more general `LifecycleObserver` trait covering
+both. Load-bearing primitive that 4.4 (cross-cluster
+federation) + 4.5 (AI agents) will also consume --
+**design the API shape before coding.** Specifically
+decide:
+  * Callback fires on `Drop` (risky -- callbacks from
+    Drop can deadlock if they take locks the dropping
+    thread holds; tokio runtime semantics in Drop are
+    constrained) vs. explicit `registry.remove()`
+    (safer but requires callers to know to remove).
+  * Sync vs. async callback signature (the registry
+    currently mixes both via `tokio::spawn` from
+    callback closures -- consistent or split?).
+  * Error propagation policy (callbacks panic-safe
+    or panic-propagating).
+
+(b) **Persist init bytes to disk at first-segment-
+write time**. Today `FragmentBroadcaster::meta()`
+holds them in memory only. Layout decision:
+  * Flat `<archive>/<broadcast>/<track>/init.mp4` --
+    simpler, parallel to the segment files,
+    independently reachable for non-c2pa consumers.
+  * `metadata.json` sidecar with the init bytes
+    base64-encoded -- scales better if we later add
+    per-track metadata (timescale, SPS/PPS,
+    codec_string, etc.).
+
+  Pick + document in B3's feat commit.
+
+(c) **Extend `lvqr_cli::archive::
+BroadcasterArchiveIndexer::drain`** to call
+`lvqr_archive::provenance::finalize_broadcast_signed`
+inside `tokio::task::spawn_blocking` when the drain
+task terminates AND `C2paConfig` is `Some`. The B2-
+landed orchestrator is one call: pass init bytes
+(read from the layout decided in (b)), segment paths
+(walk the redb index for this `(broadcast, track)`
+in `start_dts` order), format (`"video/mp4"` for
+CMAF), asset path
+(`<archive>/<broadcast>/<track>/finalized.mp4`), and
+manifest path (`finalized.c2pa`).
+
+(d) **`GET /playback/verify/{broadcast}`** admin
+route in `lvqr-cli`. Reads the signed asset +
+sidecar manifest from disk, calls
+`c2pa::Reader::from_manifest_data_and_stream`,
+returns a JSON object `{ signer: String, signed_at:
+Option<DateTime>, valid: bool, errors: Vec<String>
+}`. Auth per existing `/admin` routes.
+
+(e) **E2E test** at
+`crates/lvqr-cli/tests/c2pa_verify_e2e.rs`. Starts a
+`TestServer` with `C2paConfig` (using EphemeralSigner-
+generated PEMs written to disk -- or, alternatively,
+we expose a `C2paSignerConfig` enum that lets the
+test pass an in-memory signer); publishes one RTMP
+broadcast; drops the publisher to trigger finalize;
+hits `GET /playback/verify/{broadcast}` and asserts
+the JSON has `valid: true` (or expected
+verification status given an ephemeral CA) + the
+expected signer.
+
+  Note on the E2E cert path: in production the
+  operator points `C2paConfig.signing_cert_path` at a
+  PEM file. For the E2E test we need to either (a)
+  extract PEMs from EphemeralSigner via a
+  `serialize_pem_pair() -> (cert_pem, key_pem)`
+  helper added to `provenance` (would require c2pa-rs
+  to expose them, which it does NOT -- the PEMs are
+  built inside `EphemeralSigner::new` and not stored
+  on the struct), or (b) extend `C2paConfig` with a
+  `Signer` trait-object alternative, or (c) replicate
+  EphemeralSigner's chain-generation logic ourselves
+  (substantial new code). Decide before writing the
+  E2E.
+
+Expected scope: ~600-800 LOC (registry hook + init
+persistence + drain integration + verify route + E2E
++ docs). Biggest risks:
+- Registry lifecycle-hook API design affects 4.4 +
+  4.5; budget time for prose-sketch + review before
+  wiring.
+- Cert-path-for-E2E decision (above).
+- The drain-task termination path runs inside tokio;
+  `finalize_broadcast_signed` is sync so it needs
+  `spawn_blocking` like `write_segment` does.
+
+Pre-session checklist:
+- Read `tracking/TIER_4_PLAN.md` section 4.3 row B3
+  fully.
+- Sketch the registry lifecycle-hook API in prose +
+  paste into the feat commit before wiring -- shared
+  primitive for Tier 4 items 4.4 + 4.5 too.
+- Decide init-bytes layout (flat `init.mp4` vs.
+  `metadata.json` sidecar) and document.
+- Decide E2E cert path (operator-shape PEM file vs.
+  Signer-trait-object extension to `C2paConfig`).
+- Confirm `c2pa::Reader::from_manifest_data_and_stream`
+  is the right verify entry; check signature in
+  c2pa 0.80 source.
 
 ## Session 92 close (2026-04-18)
 
