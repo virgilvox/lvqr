@@ -15,6 +15,7 @@ axum = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 h264-reader = { workspace = true }
+lvqr-auth = { workspace = true }
 lvqr-cmaf = { workspace = true }
 lvqr-codec = { workspace = true }
 lvqr-core = { workspace = true }

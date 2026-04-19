@@ -419,7 +419,7 @@ route than originally specified.
   keeps the closure to rust_native_crypto only -- no
   vendored OpenSSL C build, no reqwest/ureq.
 
-## 4.8 -- One-token-all-protocols (1 week, 2 sessions, 95-96)
+## 4.8 -- One-token-all-protocols (1 week, 2 sessions, 95-96; A DONE, B pending)
 
 ### Plan-vs-code status (refreshed session 94 close)
 
@@ -552,8 +552,8 @@ change.
 
 | # | Session | Deliverable | Verification | Status |
 |---|---|---|---|---|
-| 95 | A | `lvqr-auth` extractor helpers (5 protocols); wire into `lvqr-whip` + `lvqr-srt` + `lvqr-rtsp` (new call-sites) + `lvqr-ingest` + `lvqr-cli` WS ingest (migrations). `TestServerConfig::with_whip()` if missing. `docs/auth.md` draft with claim shape + carrier conventions. | `cargo test -p lvqr-auth --lib`; `cargo clippy --workspace --all-targets --benches -- -D warnings` clean; `cargo test --workspace` no regression. | pending |
-| 96 | B | Integration test: one JWT, five protocols, one `TestServer` at `crates/lvqr-cli/tests/one_token_all_protocols.rs`. Publishes via each of RTMP/WHIP/SRT/RTSP + subscribes via WS with the same token. Asserts per-protocol allow + wrong-token reject. | `cargo test -p lvqr-cli --test one_token_all_protocols` | pending |
+| 95 | A | `lvqr-auth` extractor helpers (5 protocols) under `lvqr_auth::extract`; wired into `lvqr-whip` (new 401 gate on POST offer), `lvqr-srt` (new `ServerRejectReason::Unauthorized` on streamid-parse), `lvqr-rtsp` (new `401 Unauthorized` on ANNOUNCE + RECORD); migrated `lvqr-ingest` RTMP bridge + `lvqr-cli` WS ingest onto shared helpers. `AuthContext::Publish` gains `broadcast: Option<String>` for per-broadcast JWT binding on publish; `JwtAuthProvider::check`'s Publish branch enforces it when Some. `TestServerConfig::with_whip()` added. `docs/auth.md` ships. | `cargo test -p lvqr-auth --lib` 29 passed; `cargo clippy --workspace --all-targets --benches -- -D warnings` clean; `cargo test --workspace` 783 passed / 0 failed / 1 ignored (up from 758; +16 extract, +1 jwt publish-bind, +3 whip router, +5 rtsp gate). | **DONE (session 95)** |
+| 96 | B | Integration test: one JWT, five protocols, one `TestServer` at `crates/lvqr-cli/tests/one_token_all_protocols.rs`. Publishes via each of RTMP/WHIP/SRT/RTSP + subscribes via WS with the same token. Asserts per-protocol allow + wrong-token reject. `TestServerConfig::with_whip()` is already there (landed in 95 A). | `cargo test -p lvqr-cli --test one_token_all_protocols` | pending |
 
 ### Risks + mitigations
 

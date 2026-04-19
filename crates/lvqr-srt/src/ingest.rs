@@ -2,9 +2,11 @@
 //! + Fragment emission.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
+use lvqr_auth::{AuthDecision, NoopAuthProvider, SharedAuth, extract};
 use lvqr_cmaf::{
     AudioInitParams, HevcInitParams, VideoInitParams, build_moof_mdat, write_aac_init_segment, write_avc_init_segment,
     write_hevc_init_segment,
@@ -14,6 +16,7 @@ use lvqr_codec::ts::{PesPacket, StreamType, TsDemuxer};
 use lvqr_core::{EventBus, RelayEvent};
 use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags};
 use lvqr_ingest::{publish_fragment, publish_init};
+use srt_tokio::access::{RejectReason, ServerRejectReason};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -23,6 +26,7 @@ pub struct SrtIngestServer {
     addr: SocketAddr,
     pre_bound: Option<tokio::net::UdpSocket>,
     registry: FragmentBroadcasterRegistry,
+    auth: SharedAuth,
 }
 
 impl SrtIngestServer {
@@ -31,6 +35,7 @@ impl SrtIngestServer {
             addr,
             pre_bound: None,
             registry: FragmentBroadcasterRegistry::new(),
+            auth: Arc::new(NoopAuthProvider),
         }
     }
 
@@ -42,7 +47,18 @@ impl SrtIngestServer {
             addr,
             pre_bound: None,
             registry,
+            auth: Arc::new(NoopAuthProvider),
         }
+    }
+
+    /// Install a shared auth provider. The provider is consulted on
+    /// every accepted SRT connection request before the socket
+    /// handshake completes. On `AuthDecision::Deny` the request is
+    /// rejected with `ServerRejectReason::Unauthorized` (SRT code
+    /// 2401) and no task spawns.
+    pub fn with_auth(mut self, auth: SharedAuth) -> Self {
+        self.auth = auth;
+        self
     }
 
     /// Handle to the broadcaster registry. Consumers call
@@ -70,6 +86,7 @@ impl SrtIngestServer {
             addr,
             pre_bound,
             registry,
+            auth,
         } = self;
         let builder = srt_tokio::SrtListener::builder();
         let (mut listener, mut incoming) = match pre_bound {
@@ -89,8 +106,30 @@ impl SrtIngestServer {
                 req = incoming.incoming().next() => {
                     let Some(req) = req else { break };
                     let stream_id = req.stream_id().map(|s: &srt_tokio::options::StreamId| s.to_string());
-                    let broadcast = stream_id.unwrap_or_else(|| "srt/default".into());
                     let remote = req.remote();
+                    let streamid_raw = stream_id.clone().unwrap_or_default();
+
+                    // Parse the streamid KV payload to uncover the
+                    // target broadcast (`r=`) and bearer token (`t=`).
+                    // `extract_srt` tolerates any KV order and ignores
+                    // unknown keys; a blank / missing streamid yields
+                    // an empty-token AuthContext that the provider
+                    // then evaluates (Noop admits, Jwt / static
+                    // denies).
+                    let ctx = extract::extract_srt(&streamid_raw);
+                    let broadcast = match &ctx {
+                        lvqr_auth::AuthContext::Publish { broadcast: Some(b), .. } if !b.is_empty() => b.clone(),
+                        _ => stream_id.clone().unwrap_or_else(|| "srt/default".into()),
+                    };
+
+                    if let AuthDecision::Deny { reason } = auth.check(&ctx) {
+                        warn!(%remote, %broadcast, reason = %reason, "SRT connection rejected by auth");
+                        if let Err(e) = req.reject(RejectReason::Server(ServerRejectReason::Unauthorized)).await {
+                            warn!(%remote, error = %e, "SRT reject failed");
+                        }
+                        continue;
+                    }
+
                     info!(%broadcast, %remote, "SRT connection request");
 
                     let socket = match req.accept(None).await {

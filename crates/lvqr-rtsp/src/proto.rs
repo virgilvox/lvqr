@@ -157,6 +157,18 @@ impl Response {
         Self::new(500, "Internal Server Error")
     }
 
+    /// RTSP/1.0 `401 Unauthorized`. Emitted when the configured
+    /// [`lvqr_auth::AuthProvider`] denies an ANNOUNCE or RECORD.
+    /// RFC 2326 §11.1 lists 401 as valid; clients accepting bearer
+    /// auth (ffmpeg, GStreamer) will retry with the `Authorization`
+    /// header on the next request if the server also carries a
+    /// matching `WWW-Authenticate`. LVQR does not advertise one --
+    /// the client was expected to set `Authorization: Bearer <jwt>`
+    /// up front.
+    pub fn unauthorized() -> Self {
+        Self::new(401, "Unauthorized")
+    }
+
     /// RTSP/1.0 `302 Moved Temporarily` with a `Location:` header.
     /// Used by the cluster redirect-to-owner path when a DESCRIBE
     /// or PLAY for a broadcast this node does not host resolves to

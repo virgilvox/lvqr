@@ -7,8 +7,26 @@ use std::sync::Arc;
 /// MoQ session accept loops).
 #[derive(Debug, Clone)]
 pub enum AuthContext {
-    /// RTMP publish: identified by the application name and stream key.
-    Publish { app: String, key: String },
+    /// Publish: a client is pushing a broadcast through an ingest protocol.
+    ///
+    /// * `app` is a short label for the ingest surface (e.g. `"live"` for RTMP,
+    ///   `"whip"`, `"srt"`, `"rtsp"`, `"ws"`). Static-token providers ignore it;
+    ///   JWT providers log it.
+    /// * `key` carries the bearer credential. For RTMP the stream key IS the
+    ///   JWT (per the existing convention); for the other protocols the
+    ///   extractor layer (`lvqr_auth::extract`) pulls the token off an
+    ///   `Authorization` header, SRT `streamid`, or WS subprotocol/query.
+    /// * `broadcast` is the intended broadcast name (`app/stream`) when the
+    ///   ingest surface knows it at auth time. WHIP/SRT/RTSP/WS ingest all
+    ///   know it because it comes from the URL or streamid KV. RTMP leaves
+    ///   it `None` because the stream key encodes the JWT and the broadcast
+    ///   name on the wire is still `app/key` (already exposed separately).
+    ///   When `Some`, JWT providers enforce the `broadcast` claim binding.
+    Publish {
+        app: String,
+        key: String,
+        broadcast: Option<String>,
+    },
     /// Subscribe (viewer): optional bearer token plus the broadcast name.
     Subscribe { token: Option<String>, broadcast: String },
     /// Admin API access: bearer token from the `Authorization` header.

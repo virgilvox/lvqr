@@ -6,7 +6,7 @@
 /// and the MoQ ecosystem (moq-js).
 use bytes::Bytes;
 use dashmap::DashMap;
-use lvqr_auth::{AuthContext, NoopAuthProvider, SharedAuth};
+use lvqr_auth::{NoopAuthProvider, SharedAuth, extract};
 use lvqr_core::{EventBus, RelayEvent};
 use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta, MoqTrackSink};
 use lvqr_moq::Track;
@@ -452,13 +452,8 @@ impl RtmpMoqBridge {
 
         // Wire the bridge's auth provider into RTMP publish validation.
         let auth = self.auth.clone();
-        let validate: AuthCallback = Arc::new(move |app: &str, key: &str| {
-            auth.check(&AuthContext::Publish {
-                app: app.to_string(),
-                key: key.to_string(),
-            })
-            .is_allow()
-        });
+        let validate: AuthCallback =
+            Arc::new(move |app: &str, key: &str| auth.check(&extract::extract_rtmp(app, key)).is_allow());
         server.set_validate_publish(validate);
         server
     }

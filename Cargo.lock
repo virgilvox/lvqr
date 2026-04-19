@@ -3105,6 +3105,7 @@ dependencies = [
  "base64",
  "bytes",
  "criterion",
+ "lvqr-auth",
  "lvqr-cmaf",
  "lvqr-codec",
  "lvqr-core",
@@ -3158,6 +3159,7 @@ version = "0.4.0"
 dependencies = [
  "bytes",
  "futures-util",
+ "lvqr-auth",
  "lvqr-cmaf",
  "lvqr-codec",
  "lvqr-core",
@@ -3235,6 +3237,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "h264-reader",
+ "lvqr-auth",
  "lvqr-cmaf",
  "lvqr-codec",
  "lvqr-core",

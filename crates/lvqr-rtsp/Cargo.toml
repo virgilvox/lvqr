@@ -13,6 +13,7 @@ categories = ["multimedia", "network-programming"]
 [dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
+lvqr-auth = { workspace = true }
 lvqr-cmaf = { workspace = true }
 lvqr-codec = { workspace = true }
 lvqr-core = { workspace = true }

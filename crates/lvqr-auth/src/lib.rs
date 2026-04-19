@@ -20,6 +20,7 @@
 //! ```
 
 mod error;
+pub mod extract;
 mod noop;
 mod provider;
 mod static_provider;

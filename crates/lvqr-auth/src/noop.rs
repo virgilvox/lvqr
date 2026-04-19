@@ -21,7 +21,8 @@ mod tests {
         assert!(
             p.check(&AuthContext::Publish {
                 app: "live".into(),
-                key: "x".into()
+                key: "x".into(),
+                broadcast: None,
             })
             .is_allow()
         );

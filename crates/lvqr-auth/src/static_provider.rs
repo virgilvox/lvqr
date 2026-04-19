@@ -68,7 +68,11 @@ fn ct_eq(a: &str, b: &str) -> bool {
 impl AuthProvider for StaticAuthProvider {
     fn check(&self, ctx: &AuthContext) -> AuthDecision {
         match ctx {
-            AuthContext::Publish { app: _, key } => match &self.config.publish_key {
+            AuthContext::Publish {
+                app: _,
+                key,
+                broadcast: _,
+            } => match &self.config.publish_key {
                 None => AuthDecision::Allow,
                 Some(expected) if ct_eq(expected, key) => AuthDecision::Allow,
                 Some(_) => AuthDecision::deny("invalid publish key"),
@@ -95,6 +99,7 @@ mod tests {
         AuthContext::Publish {
             app: "live".into(),
             key: key.into(),
+            broadcast: None,
         }
     }
     fn ctx_subscribe(token: Option<&str>) -> AuthContext {

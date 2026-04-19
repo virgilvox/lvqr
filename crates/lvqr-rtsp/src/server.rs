@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
+use lvqr_auth::{AuthDecision, NoopAuthProvider, SharedAuth, extract};
 use lvqr_cmaf::{
     AudioInitParams, HevcInitParams, RawSample, VideoInitParams, build_moof_mdat, write_aac_init_segment,
     write_avc_init_segment, write_hevc_init_segment,
@@ -12,6 +13,7 @@ use lvqr_codec::hevc as hevc_codec;
 use lvqr_core::{EventBus, RelayEvent};
 use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags};
 use lvqr_ingest::{publish_fragment, publish_init};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -49,6 +51,7 @@ pub struct RtspServer {
     pre_bound: Option<TcpListener>,
     registry: FragmentBroadcasterRegistry,
     owner_resolver: Option<OwnerResolver>,
+    auth: SharedAuth,
 }
 
 impl RtspServer {
@@ -58,6 +61,7 @@ impl RtspServer {
             pre_bound: None,
             registry: FragmentBroadcasterRegistry::new(),
             owner_resolver: None,
+            auth: Arc::new(NoopAuthProvider),
         }
     }
 
@@ -70,6 +74,7 @@ impl RtspServer {
             pre_bound: None,
             registry,
             owner_resolver: None,
+            auth: Arc::new(NoopAuthProvider),
         }
     }
 
@@ -79,6 +84,17 @@ impl RtspServer {
     /// Returns self for chained construction.
     pub fn with_owner_resolver(mut self, resolver: OwnerResolver) -> Self {
         self.owner_resolver = Some(resolver);
+        self
+    }
+
+    /// Install a shared auth provider. The provider is consulted on
+    /// ANNOUNCE and RECORD (RTSP publish entry points). On
+    /// `AuthDecision::Deny` the server responds with
+    /// `401 Unauthorized` and the session remains unchanged.
+    /// DESCRIBE / PLAY are subscribe-side and currently pass
+    /// through unchecked; LVQR's RTSP surface is publish-only today.
+    pub fn with_auth(mut self, auth: SharedAuth) -> Self {
+        self.auth = auth;
         self
     }
 
@@ -107,6 +123,7 @@ impl RtspServer {
             pre_bound,
             registry,
             owner_resolver,
+            auth,
         } = self;
         let listener = match pre_bound {
             Some(l) => l,
@@ -133,6 +150,7 @@ impl RtspServer {
                     let server_addr = local_addr;
                     let conn_registry = registry.clone();
                     let conn_resolver = owner_resolver.clone();
+                    let conn_auth = auth.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(
                             socket,
@@ -141,6 +159,7 @@ impl RtspServer {
                             &ev,
                             &conn_registry,
                             conn_resolver,
+                            conn_auth,
                             conn_shutdown,
                         )
                         .await
@@ -169,6 +188,8 @@ struct ConnectionState {
     /// instead of the synthetic empty SDP. `None` disables the
     /// redirect path entirely (single-node deployments).
     owner_resolver: Option<OwnerResolver>,
+    /// Auth provider consulted on ANNOUNCE + RECORD.
+    auth: SharedAuth,
     /// Sink for bytes the main loop should write to the TCP socket.
     /// RTSP responses and interleaved RTP frames from PLAY drain
     /// tasks both flow through this channel so the socket is
@@ -195,6 +216,7 @@ struct ConnectionState {
     prev_audio_dts: Option<u64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut socket: TcpStream,
     remote: SocketAddr,
@@ -202,6 +224,7 @@ async fn handle_connection(
     events: &EventBus,
     registry: &FragmentBroadcasterRegistry,
     owner_resolver: Option<OwnerResolver>,
+    auth: SharedAuth,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = vec![0u8; 8192];
@@ -220,6 +243,7 @@ async fn handle_connection(
         server_addr,
         registry: registry.clone(),
         owner_resolver,
+        auth,
         writer_tx: writer_tx.clone(),
         conn_cancel: conn_cancel.clone(),
         h264_depack: H264Depacketizer::new(),
@@ -728,6 +752,22 @@ async fn handle_request(conn: &mut ConnectionState, req: &proto::Request) -> Res
         }
     }
 
+    // Auth gate on publish entry points. ANNOUNCE opens the ingest
+    // session and RECORD starts it; both are publish operations,
+    // so both consult the shared `AuthProvider`. A Deny here
+    // returns `401` without mutating connection state. DESCRIBE /
+    // PLAY are subscribe-side and not gated today (LVQR's RTSP
+    // surface is publish-only).
+    if matches!(req.method, Method::Announce | Method::Record) {
+        let broadcast = extract_broadcast(&req.uri);
+        let auth_header = req.headers.get("Authorization");
+        let ctx = extract::extract_rtsp(&broadcast, auth_header);
+        if let AuthDecision::Deny { reason } = conn.auth.check(&ctx) {
+            warn!(method = %req.method, %broadcast, reason = %reason, "RTSP auth denied");
+            return Response::unauthorized().with_cseq(cseq);
+        }
+    }
+
     match req.method {
         Method::Options => handle_options(cseq),
         Method::Describe => handle_describe(conn, req, cseq),
@@ -1081,6 +1121,7 @@ mod tests {
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry: FragmentBroadcasterRegistry::new(),
             owner_resolver: None,
+            auth: Arc::new(NoopAuthProvider),
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
@@ -1145,6 +1186,7 @@ mod tests {
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry,
             owner_resolver: None,
+            auth: Arc::new(NoopAuthProvider),
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
@@ -1187,6 +1229,7 @@ mod tests {
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry: FragmentBroadcasterRegistry::new(),
             owner_resolver: None,
+            auth: Arc::new(NoopAuthProvider),
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
@@ -1258,6 +1301,7 @@ mod tests {
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry: FragmentBroadcasterRegistry::new(),
             owner_resolver: None,
+            auth: Arc::new(NoopAuthProvider),
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
@@ -1349,6 +1393,7 @@ mod tests {
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry: FragmentBroadcasterRegistry::new(),
             owner_resolver: None,
+            auth: Arc::new(NoopAuthProvider),
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
@@ -1441,6 +1486,7 @@ mod tests {
             server_addr: "127.0.0.1:8554".parse().unwrap(),
             registry: FragmentBroadcasterRegistry::new(),
             owner_resolver: resolver,
+            auth: Arc::new(NoopAuthProvider),
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
@@ -1535,5 +1581,117 @@ mod tests {
         let resp = handle_request(&mut conn, &req).await;
         assert_eq!(resp.status, 302);
         assert_eq!(resp.headers.get("Location"), Some("rtsp://a.local:8554/live/test"));
+    }
+
+    // --- Auth gate (Tier 4 item 4.8 session A) -----------------------
+
+    struct GateAuth {
+        want: &'static str,
+    }
+
+    impl lvqr_auth::AuthProvider for GateAuth {
+        fn check(&self, ctx: &lvqr_auth::AuthContext) -> lvqr_auth::AuthDecision {
+            let lvqr_auth::AuthContext::Publish { key, .. } = ctx else {
+                return lvqr_auth::AuthDecision::deny("non-publish on RTSP");
+            };
+            if key == self.want {
+                lvqr_auth::AuthDecision::Allow
+            } else {
+                lvqr_auth::AuthDecision::deny("wrong token")
+            }
+        }
+    }
+
+    fn conn_with_auth(auth: SharedAuth) -> ConnectionState {
+        let mut c = empty_conn_with_resolver(None);
+        c.auth = auth;
+        c
+    }
+
+    fn announce_req(uri: &str, cseq: u32, authorization: Option<&str>) -> proto::Request {
+        let sdp = "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=Test\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:track1\r\n";
+        let mut headers = proto::Headers::new();
+        headers.insert("CSeq".into(), cseq.to_string());
+        headers.insert("Content-Type".into(), "application/sdp".into());
+        headers.insert("Content-Length".into(), sdp.len().to_string());
+        if let Some(v) = authorization {
+            headers.insert("Authorization".into(), v.to_string());
+        }
+        proto::Request {
+            method: Method::Announce,
+            uri: uri.to_string(),
+            version: proto::RtspVersion::V1_0,
+            headers,
+            body: sdp.as_bytes().to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn announce_with_valid_bearer_is_accepted() {
+        let auth: SharedAuth = Arc::new(GateAuth { want: "good" });
+        let mut conn = conn_with_auth(auth);
+        let req = announce_req("rtsp://localhost:8554/live/cam1", 1, Some("Bearer good"));
+        let resp = handle_request(&mut conn, &req).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(conn.sessions.len(), 1, "ANNOUNCE created the session");
+    }
+
+    #[tokio::test]
+    async fn announce_missing_authorization_yields_401() {
+        let auth: SharedAuth = Arc::new(GateAuth { want: "good" });
+        let mut conn = conn_with_auth(auth);
+        let req = announce_req("rtsp://localhost:8554/live/cam1", 2, None);
+        let resp = handle_request(&mut conn, &req).await;
+        assert_eq!(resp.status, 401);
+        assert_eq!(resp.headers.get("CSeq"), Some("2"));
+        assert!(conn.sessions.is_empty(), "denied ANNOUNCE must not create a session");
+    }
+
+    #[tokio::test]
+    async fn announce_with_wrong_bearer_yields_401() {
+        let auth: SharedAuth = Arc::new(GateAuth { want: "good" });
+        let mut conn = conn_with_auth(auth);
+        let req = announce_req("rtsp://localhost:8554/live/cam1", 3, Some("Bearer wrong"));
+        let resp = handle_request(&mut conn, &req).await;
+        assert_eq!(resp.status, 401);
+        assert!(conn.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_without_bearer_yields_401_even_after_announce() {
+        // Even if the session exists, an un-authenticated RECORD is
+        // refused -- the gate fires on every publish-intent method.
+        let auth: SharedAuth = Arc::new(GateAuth { want: "good" });
+        let mut conn = conn_with_auth(auth);
+        let announce = announce_req("rtsp://localhost:8554/live/cam1", 1, Some("Bearer good"));
+        let resp = handle_request(&mut conn, &announce).await;
+        assert_eq!(resp.status, 200);
+        let session_id = resp.headers.get("Session").unwrap().to_string();
+
+        let mut headers = proto::Headers::new();
+        headers.insert("CSeq".into(), "2".into());
+        headers.insert("Session".into(), session_id);
+        // No Authorization header on the RECORD.
+        let record = proto::Request {
+            method: Method::Record,
+            uri: "rtsp://localhost:8554/live/cam1".into(),
+            version: proto::RtspVersion::V1_0,
+            headers,
+            body: Vec::new(),
+        };
+        let resp = handle_request(&mut conn, &record).await;
+        assert_eq!(resp.status, 401);
+    }
+
+    #[tokio::test]
+    async fn describe_is_not_gated_by_publish_auth() {
+        // Subscribe-side methods pass through even with a strict
+        // publish gate in place -- LVQR's RTSP is publish-only today,
+        // so DESCRIBE / PLAY are not the gate's job.
+        let auth: SharedAuth = Arc::new(GateAuth { want: "good" });
+        let mut conn = conn_with_auth(auth);
+        let req = describe_req("rtsp://localhost:8554/live/test", 7);
+        let resp = handle_request(&mut conn, &req).await;
+        assert_eq!(resp.status, 200);
     }
 }

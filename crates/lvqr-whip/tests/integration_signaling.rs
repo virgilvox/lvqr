@@ -316,3 +316,79 @@ async fn unknown_method_returns_405() {
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
+
+// =====================================================================
+// Auth gate (Tier 4 item 4.8 session A)
+// =====================================================================
+
+/// Static provider that rejects unless the bearer token matches `want`.
+/// Exercises the `extract_whip` -> `auth.check` -> 401 path without
+/// pulling in a JWT provider's full claim surface.
+struct GateAuth {
+    want: &'static str,
+}
+
+impl lvqr_auth::AuthProvider for GateAuth {
+    fn check(&self, ctx: &lvqr_auth::AuthContext) -> lvqr_auth::AuthDecision {
+        let lvqr_auth::AuthContext::Publish { key, .. } = ctx else {
+            return lvqr_auth::AuthDecision::deny("non-publish on WHIP");
+        };
+        if key == self.want {
+            lvqr_auth::AuthDecision::Allow
+        } else {
+            lvqr_auth::AuthDecision::deny("wrong token")
+        }
+    }
+}
+
+#[tokio::test]
+async fn post_offer_with_valid_bearer_returns_201() {
+    let (answerer, _) = StubAnswerer::new();
+    let auth: lvqr_auth::SharedAuth = Arc::new(GateAuth { want: "good" });
+    let server = WhipServer::with_auth_provider(Arc::new(answerer), auth);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/whip/live/test")
+        .header(header::CONTENT_TYPE, "application/sdp")
+        .header(header::AUTHORIZATION, "Bearer good")
+        .body(Body::from("v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n"))
+        .unwrap();
+
+    let response = lvqr_whip::router_for(server.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(server.session_count(), 1);
+}
+
+#[tokio::test]
+async fn post_offer_missing_bearer_returns_401() {
+    let (answerer, _) = StubAnswerer::new();
+    let auth: lvqr_auth::SharedAuth = Arc::new(GateAuth { want: "good" });
+    let server = WhipServer::with_auth_provider(Arc::new(answerer), auth);
+
+    let response = lvqr_whip::router_for(server.clone())
+        .oneshot(sdp_offer("live/test"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(server.session_count(), 0, "denied offer must not create a session");
+}
+
+#[tokio::test]
+async fn post_offer_with_wrong_bearer_returns_401() {
+    let (answerer, _) = StubAnswerer::new();
+    let auth: lvqr_auth::SharedAuth = Arc::new(GateAuth { want: "good" });
+    let server = WhipServer::with_auth_provider(Arc::new(answerer), auth);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/whip/live/test")
+        .header(header::CONTENT_TYPE, "application/sdp")
+        .header(header::AUTHORIZATION, "Bearer bad")
+        .body(Body::from("v=0\r\n"))
+        .unwrap();
+
+    let response = lvqr_whip::router_for(server.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(server.session_count(), 0);
+}

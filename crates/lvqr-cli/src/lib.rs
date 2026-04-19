@@ -23,7 +23,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
-use lvqr_auth::{AuthContext, AuthDecision, NoopAuthProvider, SharedAuth};
+use lvqr_auth::{AuthContext, AuthDecision, NoopAuthProvider, SharedAuth, extract};
 use lvqr_core::{EventBus, RelayEvent};
 use lvqr_dash::{BroadcasterDashBridge, DashConfig};
 use lvqr_fragment::FragmentBroadcasterRegistry;
@@ -757,7 +757,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         let str0m_cfg = lvqr_whip::Str0mIngestConfig { host_ip: addr.ip() };
         let answerer =
             Arc::new(lvqr_whip::Str0mIngestAnswerer::new(str0m_cfg, sink)) as Arc<dyn lvqr_whip::SdpAnswerer>;
-        let server = lvqr_whip::WhipServer::new(answerer);
+        let server = lvqr_whip::WhipServer::with_auth_provider(answerer, auth.clone());
         (Some(server), Some(whip_bridge_arc))
     } else {
         (None, None)
@@ -767,7 +767,8 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // every broadcaster-native consumer picks up SRT publishers
     // automatically.
     let (srt_server, srt_bound) = if let Some(addr) = config.srt_addr {
-        let mut server = lvqr_srt::SrtIngestServer::with_registry(addr, shared_registry.clone());
+        let mut server =
+            lvqr_srt::SrtIngestServer::with_registry(addr, shared_registry.clone()).with_auth(auth.clone());
         let bound = server.bind().await?;
         tracing::info!(addr = %bound, "SRT ingest bound");
         (Some(server), Some(bound))
@@ -782,7 +783,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // enabled, the owner resolver redirects DESCRIBE / PLAY for
     // peer-owned broadcasts with RTSP 302.
     let (rtsp_server, rtsp_bound) = if let Some(addr) = config.rtsp_addr {
-        let mut server = lvqr_rtsp::RtspServer::with_registry(addr, shared_registry.clone());
+        let mut server = lvqr_rtsp::RtspServer::with_registry(addr, shared_registry.clone()).with_auth(auth.clone());
         if let Some(r) = rtsp_owner_resolver.clone() {
             server = server.with_owner_resolver(r);
         }
@@ -1412,10 +1413,9 @@ async fn ws_ingest_handler(
 ) -> Response {
     tracing::info!(broadcast = %broadcast, "WebSocket ingest request");
     let resolved = resolve_ws_token(&headers, &params, "ws_ingest");
-    let decision = state.auth.check(&AuthContext::Publish {
-        app: "ws".to_string(),
-        key: resolved.token.clone().unwrap_or_default(),
-    });
+    let decision = state
+        .auth
+        .check(&extract::extract_ws_ingest(resolved.token.as_deref(), &broadcast));
     if let AuthDecision::Deny { reason } = decision {
         tracing::warn!(broadcast = %broadcast, reason = %reason, "WS ingest denied");
         metrics::counter!("lvqr_auth_failures_total", "entry" => "ws_ingest").increment(1);

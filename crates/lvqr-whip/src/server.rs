@@ -13,6 +13,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use dashmap::DashMap;
+use lvqr_auth::{NoopAuthProvider, SharedAuth};
 use rand::RngCore;
 use std::sync::Arc;
 
@@ -76,6 +77,15 @@ pub enum WhipError {
     /// bind, internal state error). Maps to 500.
     #[error("answerer internal error: {0}")]
     AnswererFailed(String),
+
+    /// The configured [`AuthProvider`] denied the publisher. Maps to
+    /// 401. Carries the provider's reason string so operators
+    /// running `RUST_LOG=debug` can see why without exposing token
+    /// details in the response body.
+    ///
+    /// [`AuthProvider`]: lvqr_auth::AuthProvider
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
 }
 
 impl IntoResponse for WhipError {
@@ -85,6 +95,7 @@ impl IntoResponse for WhipError {
             WhipError::MalformedOffer(_) => StatusCode::BAD_REQUEST,
             WhipError::SessionNotFound => StatusCode::NOT_FOUND,
             WhipError::AnswererFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            WhipError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
         };
         let body = self.to_string();
         (status, body).into_response()
@@ -137,6 +148,10 @@ pub(crate) struct SessionEntry {
 pub(crate) struct WhipState {
     pub answerer: Arc<dyn SdpAnswerer>,
     pub sessions: DashMap<SessionId, SessionEntry>,
+    /// Authentication provider consulted on the POST /whip/{broadcast}
+    /// offer. `NoopAuthProvider` by default (open access), overridden
+    /// via [`WhipServer::with_auth`].
+    pub auth: SharedAuth,
 }
 
 /// Cheaply cloneable handle to the WHIP server.
@@ -153,13 +168,39 @@ pub struct WhipServer {
 
 impl WhipServer {
     /// Build a new server backed by a concrete SDP answerer.
+    ///
+    /// Auth defaults to open access ([`NoopAuthProvider`]); enable a
+    /// specific provider by chaining [`WhipServer::with_auth`].
     pub fn new(answerer: Arc<dyn SdpAnswerer>) -> Self {
         Self {
             state: Arc::new(WhipState {
                 answerer,
                 sessions: DashMap::new(),
+                auth: Arc::new(NoopAuthProvider),
             }),
         }
+    }
+
+    /// Build a new server with a pre-configured auth provider.
+    ///
+    /// Convenience constructor for callers that already hold a shared
+    /// [`SharedAuth`]. Equivalent to `WhipServer::new(answerer).with_auth(auth)`
+    /// but avoids the post-hoc `Arc::make_mut` dance on the internal
+    /// state.
+    pub fn with_auth_provider(answerer: Arc<dyn SdpAnswerer>, auth: SharedAuth) -> Self {
+        Self {
+            state: Arc::new(WhipState {
+                answerer,
+                sessions: DashMap::new(),
+                auth,
+            }),
+        }
+    }
+
+    /// Reference to the auth provider. Exposed so the router can
+    /// consult it without reaching through private state.
+    pub(crate) fn auth(&self) -> &SharedAuth {
+        &self.state.auth
     }
 
     /// Number of active publisher sessions currently registered.
@@ -203,6 +244,10 @@ mod tests {
         assert_eq!(
             WhipError::AnswererFailed("boom".into()).into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            WhipError::Unauthorized("nope".into()).into_response().status(),
+            StatusCode::UNAUTHORIZED
         );
     }
 }

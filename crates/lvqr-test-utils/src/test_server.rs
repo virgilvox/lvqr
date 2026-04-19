@@ -50,6 +50,7 @@ pub struct TestServerConfig {
     dash_enabled: bool,
     srt_enabled: bool,
     rtsp_enabled: bool,
+    whip_enabled: bool,
     #[cfg(feature = "c2pa")]
     c2pa: Option<lvqr_archive::provenance::C2paConfig>,
 }
@@ -129,6 +130,15 @@ impl TestServerConfig {
         self
     }
 
+    /// Enable the WHIP ingest HTTP surface. Needed for cross-protocol
+    /// integration tests that exercise the `POST /whip/{broadcast}`
+    /// ingest path. Tier 4 item 4.8 session A added this builder to
+    /// support session 96 B's one-token-all-protocols E2E.
+    pub fn with_whip(mut self) -> Self {
+        self.whip_enabled = true;
+        self
+    }
+
     /// Install a WASM fragment filter from a file path before
     /// any ingest listener starts. The server holds the
     /// `WasmFilterBridgeHandle` on `ServerHandle`; tests read
@@ -168,7 +178,7 @@ impl TestServer {
             hls_target_duration_secs: 2,
             hls_part_target_ms: 200,
             whep_addr: None,
-            whip_addr: None,
+            whip_addr: if config.whip_enabled { Some(ephemeral) } else { None },
             dash_addr: if config.dash_enabled { Some(ephemeral) } else { None },
             rtsp_addr: if config.rtsp_enabled { Some(ephemeral) } else { None },
             srt_addr: if config.srt_enabled { Some(ephemeral) } else { None },
@@ -244,6 +254,13 @@ impl TestServer {
         self.handle
             .rtsp_addr()
             .expect("RTSP ingest not enabled on this TestServer; call with_rtsp() to enable")
+    }
+
+    /// Bound WHIP ingest HTTP address. Panics if WHIP was not enabled.
+    pub fn whip_addr(&self) -> SocketAddr {
+        self.handle
+            .whip_addr()
+            .expect("WHIP ingest not enabled on this TestServer; call with_whip() to enable")
     }
 
     /// WASM filter tap handle (read-only). Returns `None` when

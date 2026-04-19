@@ -82,10 +82,13 @@ impl JwtAuthProvider {
 impl AuthProvider for JwtAuthProvider {
     fn check(&self, ctx: &AuthContext) -> AuthDecision {
         let (token, required_scope, broadcast_filter): (&str, AuthScope, Option<&str>) = match ctx {
-            AuthContext::Publish { app, key } => {
-                // For RTMP publish, the stream key carries the JWT.
+            AuthContext::Publish { app, key, broadcast } => {
+                // RTMP carries the JWT as the stream key and sets
+                // `broadcast = None`; WHIP/SRT/RTSP/WS-ingest all know
+                // the target broadcast and pass `Some(name)`, which
+                // enables per-broadcast claim binding below.
                 let _ = app;
-                (key.as_str(), AuthScope::Publish, None)
+                (key.as_str(), AuthScope::Publish, broadcast.as_deref())
             }
             AuthContext::Subscribe { token, broadcast } => {
                 let Some(t) = token.as_deref() else {
@@ -164,8 +167,46 @@ mod tests {
         let decision = p.check(&AuthContext::Publish {
             app: "live".into(),
             key: token,
+            broadcast: None,
         });
         assert!(!decision.is_allow());
+    }
+
+    #[test]
+    fn publish_broadcast_filter_enforced_when_present() {
+        let p = JwtAuthProvider::new(JwtAuthConfig {
+            secret: "secret".into(),
+            issuer: None,
+            audience: None,
+        })
+        .unwrap();
+        let token = make_token("secret", AuthScope::Publish, Some("live/cam1"));
+        assert!(
+            p.check(&AuthContext::Publish {
+                app: "whip".into(),
+                key: token.clone(),
+                broadcast: Some("live/cam1".into()),
+            })
+            .is_allow()
+        );
+        assert!(
+            !p.check(&AuthContext::Publish {
+                app: "whip".into(),
+                key: token.clone(),
+                broadcast: Some("live/other".into()),
+            })
+            .is_allow()
+        );
+        // Without an extractor-supplied broadcast, binding is skipped; the
+        // scope still admits the token (the RTMP convention).
+        assert!(
+            p.check(&AuthContext::Publish {
+                app: "live".into(),
+                key: token,
+                broadcast: None,
+            })
+            .is_allow()
+        );
     }
 
     #[test]

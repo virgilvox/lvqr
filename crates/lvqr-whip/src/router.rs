@@ -26,6 +26,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Router, body::Bytes};
+use lvqr_auth::{AuthDecision, extract};
 
 /// Build the axum router wired to the given [`WhipServer`]. Mount
 /// under `lvqr-cli`'s dedicated `--whip-port` axum binding or
@@ -107,6 +108,14 @@ async fn handle_offer(
     // session id and appends it to the path when building the
     // `Location` header.
     let broadcast = path;
+
+    let auth_header = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+    let ctx = extract::extract_whip(&broadcast, auth_header);
+    if let AuthDecision::Deny { reason } = server.auth().check(&ctx) {
+        tracing::warn!(broadcast = %broadcast, reason = %reason, "WHIP offer denied");
+        return Err(WhipError::Unauthorized(reason));
+    }
+
     let (handle, answer) = server.state.answerer.create_session(&broadcast, &body)?;
 
     let session_id = SessionId::new_random();
