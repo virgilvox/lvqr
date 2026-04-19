@@ -40,10 +40,13 @@ use rcgen::{
 use tempfile::TempDir;
 
 /// Build a throwaway two-cert chain (CA + end-entity signer) usable with
-/// c2pa-rs's `create_signer::from_keys`. Returns `(cert_chain_pem, signer_key_pem)`.
-/// The chain PEM concatenates the leaf first, then the CA, matching the
-/// convention c2pa-rs + every COSE verifier expect.
-fn build_test_chain() -> (String, String) {
+/// c2pa-rs's `create_signer::from_keys`. Returns
+/// `(cert_chain_pem, signer_key_pem, ca_anchor_pem)`. The chain PEM
+/// concatenates the leaf first then the CA, matching the COSE x5chain
+/// convention; the anchor PEM is the CA cert alone, suitable for feeding
+/// into `C2paConfig.trust_anchor_pem` so c2pa-rs's chain validator
+/// recognises this CA as a trust root.
+fn build_test_chain() -> (String, String, String) {
     // Root CA.
     let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("CA key");
     let mut ca_params = CertificateParams::new(vec!["lvqr-test-ca.local".to_string()]).expect("CA params");
@@ -69,9 +72,10 @@ fn build_test_chain() -> (String, String) {
         .signed_by(&leaf_key, &ca_cert, &ca_key)
         .expect("CA-sign leaf");
 
-    let chain_pem = format!("{}{}", leaf_cert.pem(), ca_cert.pem());
+    let ca_anchor_pem = ca_cert.pem();
+    let chain_pem = format!("{}{}", leaf_cert.pem(), ca_anchor_pem);
     let key_pem = leaf_key.serialize_pem();
-    (chain_pem, key_pem)
+    (chain_pem, key_pem, ca_anchor_pem)
 }
 
 /// 155-byte 1x1 black JPEG. Contains SOI + APP0 JFIF header + DQT (luma
@@ -94,35 +98,41 @@ const MINIMAL_JPEG: &[u8] = &[
 ];
 
 /// Happy-path end-to-end signing test. Currently `#[ignore]`'d because
-/// c2pa-rs 0.80 validates the signing certificate against C2PA spec
-/// §14.5.1 at sign time and rejects the rcgen-generated chain this
-/// fixture produces with `CertificateProfileError::InvalidCertificate`
-/// (the generic variant covers ~8 failure branches so pinpointing the
-/// exact missing extension takes more iteration than session 91 A
-/// budgets for). The primitive API + error path are already covered by
-/// `sign_asset_bytes_reports_c2pa_error_on_missing_cert_file`. Session
-/// 92 B owns unignoring this test: the admin verify-route work
-/// naturally requires a production-shape chain fixture (or an
-/// operator-supplied test CA bundle) that should slot in here.
+/// c2pa-rs 0.80 validates the signing certificate's *profile*
+/// (structural extensions per C2PA spec §14.5.1 -- AKI presence,
+/// basic-constraints criticality, key-usage bit layout, etc.) at sign
+/// time and rejects the rcgen-0.13-generated chain this fixture
+/// produces with the generic
+/// `CertificateProfileError::InvalidCertificate`. The trust-chain
+/// check via `C2paConfig.trust_anchor_pem` is wired correctly
+/// (operator-facing production path), but the profile check fires
+/// independently and its error variant collapses ~8 failure branches
+/// without surfacing which one. Session 92 B (cert fixture) attempted
+/// `Settings.trust.user_anchors` via `Context::with_settings` and
+/// confirmed that path addresses trust-chain validation only, not
+/// profile validation.
 ///
-/// Options on the table for B:
+/// Three unignore paths remain for a future session:
 ///
 /// * Generate the chain with more extension control than rcgen 0.13
-///   surfaces by default (explicit AKI/SKI, basic-constraints
-///   criticality, explicit validity window).
-/// * Vendor a fixed test CA + end-entity under
+///   surfaces by default -- explicit AKI/SKI, basic-constraints
+///   criticality, explicit validity window.
+/// * Vendor a fixed test CA + end-entity PEM pair under
 ///   `crates/lvqr-archive/tests/fixtures/c2pa/` with a far-future
 ///   `notAfter` (2099-era) and a README noting the expiry.
 /// * Adopt c2pa-rs's own `CertificateTrustPolicy::passthrough()`
-///   behind a new `c2pa-test-bypass-cert-check` feature so the happy
-///   path is exercisable without production-grade PKI.
+///   behind a new `c2pa-test-bypass-cert-check` feature -- note that
+///   the relevant setting `verify.verify_trust` is `pub(crate)` in
+///   c2pa 0.80 so bypassing profile checks from outside the crate
+///   is not currently possible without a feature / version bump.
 ///
-/// Remove the `#[ignore]` + remove this docblock when session B lands.
+/// Remove the `#[ignore]` + remove this docblock when the fixture
+/// lands.
 #[test]
-#[ignore = "session 91 A: cert chain from rcgen fails c2pa's profile check; fixture work tracked in session 92 B"]
+#[ignore = "c2pa-rs 0.80 profile check rejects rcgen chains; fixture pending"]
 fn sign_asset_bytes_emits_non_empty_c2pa_manifest_for_minimal_jpeg() {
     let tmp = TempDir::new().expect("create tempdir");
-    let (chain_pem, key_pem) = build_test_chain();
+    let (chain_pem, key_pem, ca_anchor_pem) = build_test_chain();
 
     let cert_path = tmp.path().join("sign.pem");
     let key_path = tmp.path().join("sign.key");
@@ -135,6 +145,7 @@ fn sign_asset_bytes_emits_non_empty_c2pa_manifest_for_minimal_jpeg() {
         assertion_creator: "LVQR Test Operator".to_string(),
         signing_alg: C2paSigningAlg::Es256,
         timestamp_authority_url: None,
+        trust_anchor_pem: Some(ca_anchor_pem),
     };
 
     let signed = sign_asset_bytes(&config, "image/jpeg", MINIMAL_JPEG)
@@ -165,6 +176,7 @@ fn sign_asset_bytes_reports_c2pa_error_on_missing_cert_file() {
         assertion_creator: "missing-file test".to_string(),
         signing_alg: C2paSigningAlg::Es256,
         timestamp_authority_url: None,
+        trust_anchor_pem: None,
     };
 
     let err = sign_asset_bytes(&config, "image/jpeg", MINIMAL_JPEG)
