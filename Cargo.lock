@@ -2781,6 +2781,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lvqr-agent"
+version = "0.4.0"
+dependencies = [
+ "bytes",
+ "dashmap",
+ "lvqr-fragment",
+ "metrics",
+ "parking_lot",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lvqr-archive"
 version = "0.4.0"
 dependencies = [

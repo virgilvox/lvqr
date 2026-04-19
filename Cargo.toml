@@ -40,6 +40,7 @@ members = [
     "crates/lvqr-soak",
     "crates/lvqr-test-utils",
     "crates/lvqr-wasm",
+    "crates/lvqr-agent",
 ]
 
 [workspace.package]
@@ -192,6 +193,7 @@ lvqr-cluster = { version = "0.4.0", path = "crates/lvqr-cluster" }
 lvqr-observability = { version = "0.4.0", path = "crates/lvqr-observability" }
 lvqr-soak = { version = "0.4.0", path = "crates/lvqr-soak" }
 lvqr-wasm = { version = "0.4.0", path = "crates/lvqr-wasm" }
+lvqr-agent = { version = "0.4.0", path = "crates/lvqr-agent" }
 
 [profile.release]
 lto = true

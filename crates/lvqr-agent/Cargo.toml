@@ -1,0 +1,22 @@
+[package]
+name = "lvqr-agent"
+description = "In-process AI agents framework for LVQR (Tier 4 item 4.5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["lvqr", "streaming", "agent", "fragment"]
+categories = ["multimedia"]
+
+[dependencies]
+dashmap = { workspace = true }
+lvqr-fragment = { workspace = true }
+metrics = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }

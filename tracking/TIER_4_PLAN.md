@@ -573,7 +573,7 @@ change.
   session 95 extends the server's header
   handling -- small isolated change.
 
-## 4.5 -- In-process AI agents framework (3 weeks, 4 sessions, 97-100)
+## 4.5 -- In-process AI agents framework (3 weeks, 4 sessions, 97-100; A DONE, B-D pending)
 
 ### Scope (what lands)
 
@@ -608,12 +608,12 @@ change.
 
 ### Session decomposition
 
-| # | Session | Deliverable | Verification |
-|---|---|---|---|
-| 97 | A | `lvqr-agent` scaffold + `Agent` trait + test harness. | `cargo test -p lvqr-agent --lib` |
-| 98 | B | `WhisperCaptionsAgent` reading AAC audio, feeding whisper-rs. | `cargo test -p lvqr-agent --test whisper_basic` |
-| 99 | C | Captions track publish via `lvqr-moq`; HLS subtitle rendition wiring in `lvqr-hls`. | `cargo test -p lvqr-cli --test captions_hls_e2e` |
-| 100 | D | `--whisper-model` CLI + lifecycle + E2E demo. | Manual: ffmpeg publish + browser hls.js playback with captions visible. |
+| # | Session | Deliverable | Verification | Status |
+|---|---|---|---|---|
+| 97 | A | New `crates/lvqr-agent` (workspace member, AGPL-3.0-or-later, edition 2024). Surface: `Agent` sync trait (`on_start(&AgentContext)` + `on_fragment(&Fragment)` + `on_stop()` lifecycle, all default-no-op except `on_fragment`); `AgentContext { broadcast, track, meta: FragmentMeta }`; `AgentFactory { name, build(&AgentContext) -> Option<Box<dyn Agent>> }` (per-stream opt-in via `None`); `AgentRunner` builder + `install(&FragmentBroadcasterRegistry) -> AgentRunnerHandle`. The runner wires one `on_entry_created` callback that subscribes synchronously inside the callback and spawns one tokio drain task per agent factory opts in for; the natural `BroadcasterStream::Closed` termination IS the broadcast-stop signal (no separate `on_entry_removed` wiring -- it would race the drain loop). Every `on_start`/`on_fragment`/`on_stop` call wrapped in `std::panic::catch_unwind(AssertUnwindSafe(..))`; panics are logged + counted on `AgentStats::panics` + bumped on `lvqr_agent_panics_total{agent,phase=start\|fragment\|stop}`; `on_fragment` panics do NOT terminate the drain loop (one bad frame must not kill the agent), `on_start` panics DO skip the drain entirely. `AgentRunnerHandle` exposes per-`(agent, broadcast, track)` `fragments_seen` + `panics` + `tracked()` -- mirror of `WasmFilterBridgeHandle`. `lvqr_agent_fragments_total{agent}` counter bumps once per fragment. No CLI wiring this session (session 98 threads it through `lvqr_cli::start` with the WhisperCaptionsFactory). No concrete agent. | `cargo fmt --all` clean; `cargo clippy --workspace --all-targets --benches -- -D warnings` clean; `cargo test -p lvqr-agent` 8 lib + 1 integration + 1 doctest = 10 passed; `cargo test --workspace` 796 passed / 0 failed / 1 ignored (up from 786; +8 lib runner tests, +1 integration, +1 doctest). | **DONE (session 97)** |
+| 98 | B | `WhisperCaptionsAgent` reading AAC audio, feeding whisper-rs. Drops in as a `Box<dyn Agent>` from a `WhisperCaptionsFactory` registered on `AgentRunner` -- no changes to `lvqr-agent` itself. | `cargo test -p lvqr-agent --test whisper_basic` | pending |
+| 99 | C | Captions track publish via `lvqr-moq`; HLS subtitle rendition wiring in `lvqr-hls`. | `cargo test -p lvqr-cli --test captions_hls_e2e` | pending |
+| 100 | D | `--whisper-model` CLI + lifecycle + E2E demo. CLI threads `AgentRunner::install` through `lvqr_cli::start`. | Manual: ffmpeg publish + browser hls.js playback with captions visible. | pending |
 
 ### Risks + mitigations
 
