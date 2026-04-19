@@ -50,6 +50,8 @@ pub struct TestServerConfig {
     dash_enabled: bool,
     srt_enabled: bool,
     rtsp_enabled: bool,
+    #[cfg(feature = "c2pa")]
+    c2pa: Option<lvqr_archive::provenance::C2paConfig>,
 }
 
 impl TestServerConfig {
@@ -83,6 +85,21 @@ impl TestServerConfig {
     /// into `<dir>/<broadcast>/<track>/<seq>.m4s` as they arrive.
     pub fn with_archive_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.archive_dir = Some(dir.into());
+        self
+    }
+
+    /// Install a pre-built `C2paConfig` so the TestServer's archive
+    /// drain task runs broadcast-end finalize (writes
+    /// `finalized.mp4` + `finalized.c2pa`) and the admin router
+    /// mounts `/playback/verify/{broadcast}`. Requires
+    /// `with_archive_dir(..)` to be called as well; without an
+    /// archive directory the drain task does not spawn and the
+    /// verify route has nothing to read. Gated on
+    /// `feature = "c2pa"` on `lvqr-test-utils`. Tier 4 item 4.3
+    /// session B3.
+    #[cfg(feature = "c2pa")]
+    pub fn with_c2pa(mut self, c2pa: lvqr_archive::provenance::C2paConfig) -> Self {
+        self.c2pa = Some(c2pa);
         self
     }
 
@@ -160,6 +177,8 @@ impl TestServer {
             auth: config.auth,
             record_dir: config.record_dir,
             archive_dir: config.archive_dir,
+            #[cfg(feature = "c2pa")]
+            c2pa: config.c2pa,
             wasm_filter: config.wasm_filter,
             // Prometheus install is process-wide and panics on second
             // call, so tests always disable it. Metrics macros still

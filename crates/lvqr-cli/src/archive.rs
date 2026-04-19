@@ -23,7 +23,11 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
-use lvqr_archive::writer::write_segment;
+#[cfg(feature = "c2pa")]
+use lvqr_archive::provenance::{C2paConfig, finalize_broadcast_signed};
+#[cfg(feature = "c2pa")]
+use lvqr_archive::writer::init_segment_path;
+use lvqr_archive::writer::{write_init, write_segment};
 use lvqr_archive::{RedbSegmentIndex, SegmentIndex, SegmentRef};
 use lvqr_auth::{AuthContext, AuthDecision, SharedAuth};
 use lvqr_fragment::{FragmentBroadcasterRegistry, FragmentStream};
@@ -65,9 +69,45 @@ impl BroadcasterArchiveIndexer {
     /// registry. The callback spawns a drain task per broadcaster on
     /// the current tokio runtime; callers must invoke this from
     /// inside a tokio runtime.
+    ///
+    /// `c2pa_config` is only meaningful when the `c2pa` feature is
+    /// on; it is threaded through to the drain task so broadcast-
+    /// end finalize runs via
+    /// [`lvqr_archive::provenance::finalize_broadcast_signed`] when
+    /// the drain loop terminates (i.e. when every producer-side
+    /// clone of the broadcaster has dropped, typically after the
+    /// RtmpMoqBridge's `on_unpublish` callback calls
+    /// `registry.remove`). On non-c2pa builds the argument is
+    /// accepted as a unit-typed placeholder so the call-site
+    /// signature stays identical -- session 94 B3.
+    #[cfg(feature = "c2pa")]
+    pub fn install(
+        archive_dir: PathBuf,
+        index: Arc<RedbSegmentIndex>,
+        registry: &FragmentBroadcasterRegistry,
+        c2pa_config: Option<C2paConfig>,
+    ) {
+        Self::install_inner(archive_dir, index, registry, c2pa_config);
+    }
+
+    /// Non-c2pa variant: same install semantics without the
+    /// broadcast-end finalize hook.
+    #[cfg(not(feature = "c2pa"))]
     pub fn install(archive_dir: PathBuf, index: Arc<RedbSegmentIndex>, registry: &FragmentBroadcasterRegistry) {
+        Self::install_inner(archive_dir, index, registry, ());
+    }
+
+    fn install_inner(
+        archive_dir: PathBuf,
+        index: Arc<RedbSegmentIndex>,
+        registry: &FragmentBroadcasterRegistry,
+        #[cfg(feature = "c2pa")] c2pa_config: Option<C2paConfig>,
+        #[cfg(not(feature = "c2pa"))] _c2pa_config: (),
+    ) {
         let dir_root = archive_dir;
         let index_root = index;
+        #[cfg(feature = "c2pa")]
+        let c2pa_root = c2pa_config;
         registry.on_entry_created(move |broadcast, track, bc| {
             let dir = dir_root.clone();
             let index = Arc::clone(&index_root);
@@ -97,7 +137,15 @@ impl BroadcasterArchiveIndexer {
             // shutdown bug the session 54 draft discovered for the
             // subscribe path. The BroadcasterStream already owns only
             // the Receiver side, so this is correct.
-            handle.spawn(Self::drain(dir, index, broadcast, track, timescale, sub));
+            #[cfg(feature = "c2pa")]
+            {
+                let c2pa = c2pa_root.clone();
+                handle.spawn(Self::drain(dir, index, broadcast, track, timescale, sub, c2pa));
+            }
+            #[cfg(not(feature = "c2pa"))]
+            {
+                handle.spawn(Self::drain(dir, index, broadcast, track, timescale, sub));
+            }
         });
     }
 
@@ -108,9 +156,55 @@ impl BroadcasterArchiveIndexer {
         track: String,
         timescale: u32,
         mut sub: lvqr_fragment::BroadcasterStream,
+        #[cfg(feature = "c2pa")] c2pa_config: Option<C2paConfig>,
     ) {
         let mut segment_seq: u64 = 0;
+        // Track whether the init segment has been persisted to disk.
+        // The RTMP bridge sets the init segment on the broadcaster's
+        // meta AFTER the FragmentBroadcaster is created (the FLV
+        // sequence header lands after the first get_or_create), so
+        // the subscription's initial snapshot does not carry it. On
+        // each fragment iteration we refresh meta and, if init is
+        // now available and not yet persisted, fire a spawn_blocking
+        // `write_init` to land `<archive>/<broadcast>/<track>/init.mp4`.
+        // Session 94 B3: this is the on-disk surface the drain-
+        // terminated C2PA finalize path reads back.
+        let mut init_persisted = false;
         while let Some(fragment) = sub.next_fragment().await {
+            if !init_persisted {
+                sub.refresh_meta();
+                if let Some(init_bytes) = sub.meta().init_segment.as_ref() {
+                    let dir_for_task = dir.clone();
+                    let broadcast_for_task = broadcast.clone();
+                    let track_for_task = track.clone();
+                    let init_vec = init_bytes.to_vec();
+                    let join = tokio::task::spawn_blocking(move || {
+                        write_init(&dir_for_task, &broadcast_for_task, &track_for_task, &init_vec)
+                    })
+                    .await;
+                    match join {
+                        Ok(Ok(_)) => {
+                            init_persisted = true;
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                error = %e,
+                                broadcast = %broadcast,
+                                track = %track,
+                                "broadcaster archive: write_init failed",
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                broadcast = %broadcast,
+                                track = %track,
+                                "broadcaster archive: write_init join error",
+                            );
+                        }
+                    }
+                }
+            }
             if fragment.duration == 0 {
                 continue;
             }
@@ -121,9 +215,9 @@ impl BroadcasterArchiveIndexer {
             let payload = fragment.payload.clone();
             let length = payload.len() as u64;
             let dir_for_task = dir.clone();
-            let broadcast = broadcast.clone();
-            let track = track.clone();
-            let index = Arc::clone(&index);
+            let broadcast_seg = broadcast.clone();
+            let track_seg = track.clone();
+            let index_task = Arc::clone(&index);
             // Session 88 A1: the segment layout + synchronous
             // write live in `lvqr_archive::writer::write_segment`.
             // `spawn_blocking` is still this caller's job because
@@ -132,13 +226,14 @@ impl BroadcasterArchiveIndexer {
             // will swap the body of `write_segment` behind an
             // `io-uring` feature without touching this call site.
             tokio::task::spawn_blocking(move || {
-                let path = match write_segment(&dir_for_task, &broadcast, &track, segment_seq, payload.as_ref()) {
+                let path = match write_segment(&dir_for_task, &broadcast_seg, &track_seg, segment_seq, payload.as_ref())
+                {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            broadcast = %broadcast,
-                            track = %track,
+                            broadcast = %broadcast_seg,
+                            track = %track_seg,
                             seq = segment_seq,
                             "broadcaster archive: write_segment failed",
                         );
@@ -156,8 +251,8 @@ impl BroadcasterArchiveIndexer {
                     }
                 };
                 let seg = SegmentRef {
-                    broadcast,
-                    track,
+                    broadcast: broadcast_seg,
+                    track: track_seg,
                     segment_seq,
                     start_dts,
                     end_dts,
@@ -167,7 +262,7 @@ impl BroadcasterArchiveIndexer {
                     byte_offset: 0,
                     length,
                 };
-                if let Err(e) = index.record(&seg) {
+                if let Err(e) = index_task.record(&seg) {
                     tracing::warn!(error = ?e, "broadcaster archive: index.record failed");
                 }
             });
@@ -177,6 +272,89 @@ impl BroadcasterArchiveIndexer {
             track = %track,
             "BroadcasterArchiveIndexer: drain terminated (producers closed)",
         );
+
+        // Tier 4 item 4.3 session B3: drain-terminated C2PA finalize.
+        // The while loop above exits when every producer-side clone of
+        // the broadcaster has been dropped -- typically driven by the
+        // RtmpMoqBridge's on_unpublish callback calling
+        // `registry.remove`. That is the per-broadcast moment we
+        // finalize + sign the concatenated asset.
+        #[cfg(feature = "c2pa")]
+        if let Some(config) = c2pa_config {
+            Self::finalize_c2pa(dir, index, broadcast, track, config).await;
+        }
+    }
+
+    /// Drain-termination C2PA finalize. Reads
+    /// `<archive>/<broadcast>/<track>/init.mp4`, walks the redb
+    /// segment index for this `(broadcast, track)` in `start_dts`
+    /// order, and calls
+    /// [`lvqr_archive::provenance::finalize_broadcast_signed`] inside
+    /// `tokio::task::spawn_blocking` (the finalize primitive is sync
+    /// and does on-disk reads + signing, so it needs to leave the
+    /// reactor). Writes `finalized.mp4` + `finalized.c2pa` next to
+    /// the segment files.
+    ///
+    /// Errors are logged at `warn!`; no retry. Operators re-derive
+    /// by inspecting the archive and re-signing manually per the
+    /// session 94 B3 decision.
+    #[cfg(feature = "c2pa")]
+    async fn finalize_c2pa(
+        dir: PathBuf,
+        index: Arc<RedbSegmentIndex>,
+        broadcast: String,
+        track: String,
+        config: C2paConfig,
+    ) {
+        let join = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let init_path = init_segment_path(&dir, &broadcast, &track);
+            let init_bytes = match std::fs::read(&init_path) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(format!(
+                        "init segment not persisted at {}; skipping finalize",
+                        init_path.display()
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!("read init {}: {e}", init_path.display()));
+                }
+            };
+            let rows = index
+                .find_range(&broadcast, &track, 0, u64::MAX)
+                .map_err(|e| format!("index find_range: {e}"))?;
+            if rows.is_empty() {
+                return Err("no archived segments for (broadcast, track); skipping finalize".to_string());
+            }
+            let segment_paths: Vec<PathBuf> = rows.into_iter().map(|r| PathBuf::from(r.path)).collect();
+            let asset_path = dir.join(&broadcast).join(&track).join("finalized.mp4");
+            let manifest_path = dir.join(&broadcast).join(&track).join("finalized.c2pa");
+            let signed = finalize_broadcast_signed(
+                &config,
+                &init_bytes,
+                &segment_paths,
+                "video/mp4",
+                &asset_path,
+                &manifest_path,
+            )
+            .map_err(|e| format!("finalize_broadcast_signed: {e}"))?;
+            tracing::info!(
+                broadcast = %broadcast,
+                track = %track,
+                asset = %asset_path.display(),
+                manifest = %manifest_path.display(),
+                manifest_bytes = signed.manifest_bytes.len(),
+                segments = segment_paths.len(),
+                "C2PA finalize: wrote signed asset and manifest",
+            );
+            Ok(())
+        })
+        .await;
+        match join {
+            Ok(Ok(())) => {}
+            Ok(Err(msg)) => tracing::warn!(error = %msg, "broadcaster archive: c2pa finalize failed"),
+            Err(e) => tracing::warn!(error = %e, "broadcaster archive: c2pa finalize join error"),
+        }
     }
 }
 
@@ -502,5 +680,231 @@ pub(crate) fn playback_router(dir: PathBuf, index: Arc<RedbSegmentIndex>, auth: 
         .route("/playback/latest/{*broadcast}", get(latest_handler))
         .route("/playback/file/{*rel}", get(file_handler))
         .route("/playback/{*broadcast}", get(playback_handler))
+        .with_state(state)
+}
+
+/// Router state for `/playback/verify/{broadcast}`. Only the archive
+/// directory + auth provider are needed; the verify handler reads the
+/// signed asset + sidecar manifest from disk and calls
+/// [`c2pa::Reader`] directly rather than touching the redb index.
+#[cfg(feature = "c2pa")]
+#[derive(Clone)]
+pub(crate) struct VerifyState {
+    pub dir: Arc<PathBuf>,
+    pub auth: SharedAuth,
+}
+
+/// Response shape for `GET /playback/verify/{broadcast}`.
+#[cfg(feature = "c2pa")]
+#[derive(Debug, Serialize)]
+pub(crate) struct VerifyResponse {
+    /// Signer identity as reported by `c2pa::Manifest::issuer`. The
+    /// returned string is the subject of the signing certificate
+    /// (typically the operator's org name or a broadcast identifier);
+    /// `null` when c2pa-rs could not extract a signer (e.g. the
+    /// signature's certificate chain is malformed beyond the
+    /// profile check).
+    pub signer: Option<String>,
+    /// ISO-8601 timestamp as reported by `c2pa::Manifest::time` (the
+    /// RFC 3161 TSA countersignature when present, otherwise the
+    /// signer's local claim-generator time). `null` when the manifest
+    /// carries no signing timestamp.
+    pub signed_at: Option<String>,
+    /// `true` iff `c2pa::Reader::validation_state` returned `Valid`
+    /// or `Trusted` (cryptographic integrity checks passed; trust
+    /// is an operator-trust-list concern, not a cryptographic one).
+    /// `false` for `Invalid` -- manifest parse failure, bad
+    /// signature, or a non-severe validation error that the
+    /// response's `errors` field details.
+    pub valid: bool,
+    /// `c2pa::Reader::validation_state` as a stable string
+    /// (`"Invalid" | "Valid" | "Trusted"`). The stable form is
+    /// exposed so clients can distinguish trust-list-validated
+    /// manifests from cryptographically-valid-but-untrusted ones
+    /// without relying on the enum's Rust discriminant.
+    pub validation_state: &'static str,
+    /// Per-failure validation messages from
+    /// `c2pa::Reader::validation_status`. Contains success and
+    /// informational codes as well; the verify route filters to
+    /// failures only so client callers do not need to know the
+    /// status-code taxonomy to decide "did this pass". Empty when
+    /// no failures were reported.
+    pub errors: Vec<String>,
+}
+
+/// Query parameters for `GET /playback/verify/{*broadcast}`. `track`
+/// defaults to `0.mp4` (video) to match the sister playback routes.
+#[cfg(feature = "c2pa")]
+#[derive(Debug, Deserialize)]
+pub(crate) struct VerifyQuery {
+    #[serde(default)]
+    pub track: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// `GET /playback/verify/{*broadcast}` -- read the drain-terminated
+/// C2PA finalize pair (`finalized.mp4` + `finalized.c2pa`) from the
+/// archive directory and verify the manifest via `c2pa::Reader`.
+///
+/// Returns [`VerifyResponse`] on success, `404` when either file is
+/// missing (i.e. finalize has not run for this stream yet), `500`
+/// when the manifest cannot be parsed even at the structural level.
+/// Auth runs the same subscribe-token gate the other `/playback/*`
+/// handlers use; operators who want a separate admin-token flow can
+/// layer a stricter `AuthProvider` through `SharedAuth`.
+#[cfg(feature = "c2pa")]
+async fn verify_handler(
+    State(state): State<VerifyState>,
+    headers: HeaderMap,
+    AxumPath(broadcast): AxumPath<String>,
+    Query(params): Query<VerifyQuery>,
+) -> Response {
+    let token = extract_bearer(&headers, &params.token);
+    if let Some(resp) = playback_auth_gate(&state.auth, &broadcast, token) {
+        return resp;
+    }
+
+    let track = params.track.as_deref().unwrap_or("0.mp4").to_string();
+    let dir = Arc::clone(&state.dir);
+    let broadcast_owned = broadcast.clone();
+    let track_owned = track.clone();
+    let join = tokio::task::spawn_blocking(move || verify_on_disk(dir.as_path(), &broadcast_owned, &track_owned)).await;
+
+    match join {
+        Ok(Ok(resp)) => Json(resp).into_response(),
+        Ok(Err(VerifyError::NotFound(path))) => (
+            StatusCode::NOT_FOUND,
+            format!("c2pa finalize artefact not found: {path}"),
+        )
+            .into_response(),
+        Ok(Err(VerifyError::Read { path, error })) => {
+            tracing::warn!(path = %path, error = %error, "verify: filesystem read failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("read {path}: {error}")).into_response()
+        }
+        Ok(Err(VerifyError::Parse(msg))) => {
+            tracing::warn!(error = %msg, "verify: c2pa parse failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("c2pa parse error: {msg}")).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "verify: join error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "verify task panicked").into_response()
+        }
+    }
+}
+
+#[cfg(feature = "c2pa")]
+enum VerifyError {
+    NotFound(String),
+    Read { path: String, error: std::io::Error },
+    Parse(String),
+}
+
+#[cfg(feature = "c2pa")]
+fn verify_on_disk(archive_dir: &std::path::Path, broadcast: &str, track: &str) -> Result<VerifyResponse, VerifyError> {
+    let asset_path = archive_dir.join(broadcast).join(track).join("finalized.mp4");
+    let manifest_path = archive_dir.join(broadcast).join(track).join("finalized.c2pa");
+    let asset_bytes = match std::fs::read(&asset_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(VerifyError::NotFound(asset_path.display().to_string()));
+        }
+        Err(e) => {
+            return Err(VerifyError::Read {
+                path: asset_path.display().to_string(),
+                error: e,
+            });
+        }
+    };
+    let manifest_bytes = match std::fs::read(&manifest_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(VerifyError::NotFound(manifest_path.display().to_string()));
+        }
+        Err(e) => {
+            return Err(VerifyError::Read {
+                path: manifest_path.display().to_string(),
+                error: e,
+            });
+        }
+    };
+
+    let reader = c2pa::Reader::from_context(c2pa::Context::new())
+        .with_manifest_data_and_stream(&manifest_bytes, "video/mp4", std::io::Cursor::new(asset_bytes))
+        .map_err(|e| VerifyError::Parse(e.to_string()))?;
+
+    let validation_state = reader.validation_state();
+    let validation_state_str = match validation_state {
+        c2pa::ValidationState::Invalid => "Invalid",
+        c2pa::ValidationState::Valid => "Valid",
+        c2pa::ValidationState::Trusted => "Trusted",
+    };
+    let valid = matches!(
+        validation_state,
+        c2pa::ValidationState::Valid | c2pa::ValidationState::Trusted
+    );
+
+    let signer = reader.active_manifest().and_then(|m| m.issuer());
+    let signed_at = reader.active_manifest().and_then(|m| m.time());
+
+    // `validation_status()` returns a flat list of validation codes;
+    // `validation_results()` is a richer map when populated. Prefer
+    // the richer map and fall back to the flat list. In both cases,
+    // filter out `signingCredential.untrusted` so it does not appear
+    // as a hard error: c2pa-rs itself treats it as non-fatal (see
+    // `Reader::validation_state` in c2pa 0.80's reader.rs -- the
+    // state is still Valid/Trusted when the only codes are
+    // SIGNING_CREDENTIAL_UNTRUSTED). Callers that care about
+    // "cryptographically valid vs. trust-list-validated" read the
+    // `validation_state` field instead.
+    let format_code = |s: &c2pa::validation_status::ValidationStatus| -> String {
+        let code = s.code();
+        match s.explanation() {
+            Some(exp) => format!("{code}: {exp}"),
+            None => code.to_string(),
+        }
+    };
+    let is_hard_failure = |s: &c2pa::validation_status::ValidationStatus| -> bool {
+        s.code() != c2pa::validation_status::SIGNING_CREDENTIAL_UNTRUSTED
+    };
+    let errors: Vec<String> = if let Some(results) = reader.validation_results() {
+        results
+            .active_manifest()
+            .map(|m| m.failure())
+            .into_iter()
+            .flatten()
+            .filter(|s| is_hard_failure(s))
+            .map(format_code)
+            .collect()
+    } else if let Some(statuses) = reader.validation_status() {
+        statuses
+            .iter()
+            .filter(|s| is_hard_failure(s))
+            .map(format_code)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok(VerifyResponse {
+        signer,
+        signed_at,
+        valid,
+        validation_state: validation_state_str,
+        errors,
+    })
+}
+
+/// Build the `/playback/verify` router. Merged into the admin axum
+/// router in `lib.rs::start` when the `c2pa` feature is on AND the
+/// archive directory is configured. Tier 4 item 4.3 session B3.
+#[cfg(feature = "c2pa")]
+pub(crate) fn verify_router(dir: PathBuf, auth: SharedAuth) -> Router {
+    let state = VerifyState {
+        dir: Arc::new(dir),
+        auth,
+    };
+    Router::new()
+        .route("/playback/verify/{*broadcast}", get(verify_handler))
         .with_state(state)
 }

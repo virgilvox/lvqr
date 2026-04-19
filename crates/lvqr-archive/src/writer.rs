@@ -95,6 +95,68 @@ static IO_URING_AVAILABLE: OnceLock<bool> = OnceLock::new();
 /// refactor keeps the format byte-for-byte.
 const SEGMENT_FILENAME_FMT_WIDTH: usize = 8;
 
+/// Canonical on-disk filename for the persisted init segment.
+/// `<archive_dir>/<broadcast>/<track>/init.mp4` -- flat sibling of the
+/// `<seq:08>.m4s` segment files. Session 94 B3 introduced the layout
+/// for Tier 4 item 4.3's drain-terminated C2PA finalize path so the
+/// init bytes are a first-class on-disk artefact rather than living
+/// only in `FragmentBroadcaster::meta()` memory.
+///
+/// Flat `init.mp4` was picked over a `metadata.json` sidecar because
+/// (i) it parallels the `<seq>.m4s` segment layout so non-c2pa
+/// consumers (future `--export` tooling, operator-driven ffprobe
+/// inspection) can reach it with no schema knowledge, (ii) the bytes
+/// are already MP4 (moov + ftyp boxes) so concatenation with the
+/// segment files for a finalize pass is literal byte concat, and
+/// (iii) no JSON codec/timescale/codec_string surface is needed
+/// today -- those values live on the `SegmentRef` rows and the
+/// `FragmentMeta` wire format. If per-track metadata needs ever
+/// grow beyond init bytes, a `metadata.json` sidecar lands alongside
+/// this file without breaking the `init.mp4` contract.
+pub const INIT_SEGMENT_FILENAME: &str = "init.mp4";
+
+/// Canonical on-disk path for the init segment:
+/// `<archive_dir>/<broadcast>/<track>/init.mp4`. See
+/// [`INIT_SEGMENT_FILENAME`].
+pub fn init_segment_path(archive_dir: &Path, broadcast: &str, track: &str) -> PathBuf {
+    archive_dir.join(broadcast).join(track).join(INIT_SEGMENT_FILENAME)
+}
+
+/// Persist the init-segment bytes for one `(broadcast, track)` to
+/// its canonical path, creating any missing parent directories.
+/// Overwrites on repeat calls (the caller typically invokes this
+/// once the first time it observes `FragmentBroadcaster::meta()`
+/// carrying a non-empty `init_segment`; calling a second time with
+/// identical bytes is a cheap idempotent no-op from the
+/// caller's perspective).
+///
+/// Synchronous; callers on a tokio runtime should wrap in
+/// [`tokio::task::spawn_blocking`] the same way [`write_segment`]
+/// does. The bytes are typically small (ftyp + moov, single-digit
+/// KiB for CMAF init segments) so the std::fs path is fine --
+/// the io-uring route reserved for high-throughput segment writes
+/// is not wired here.
+///
+/// Session 94 B3 uses this to persist the init bytes discovered on
+/// the first fragment received in `BroadcasterArchiveIndexer::drain`
+/// so the C2PA finalize orchestrator can concat
+/// `init.mp4 + <seq:08>.m4s...` into the bytes-to-sign buffer when
+/// the drain task terminates.
+pub fn write_init(
+    archive_dir: &Path,
+    broadcast: &str,
+    track: &str,
+    init_bytes: &[u8],
+) -> Result<PathBuf, ArchiveError> {
+    let path = init_segment_path(archive_dir, broadcast, track);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| ArchiveError::Io(format!("create_dir_all {}: {e}", parent.display())))?;
+    }
+    std::fs::write(&path, init_bytes).map_err(|e| ArchiveError::Io(format!("write init {}: {e}", path.display())))?;
+    Ok(path)
+}
+
 /// Canonical on-disk path for a segment:
 /// `<archive_dir>/<broadcast>/<track>/<seq:08>.m4s`.
 ///
@@ -285,6 +347,44 @@ mod tests {
         let bogus_root = dir.path().join("not-a-directory");
         std::fs::write(&bogus_root, b"regular file").unwrap();
         let err = write_segment(&bogus_root, "live", "0.mp4", 1, b"x").unwrap_err();
+        match err {
+            ArchiveError::Io(_) => {}
+            other => panic!("expected ArchiveError::Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_segment_path_follows_broadcast_track_layout() {
+        let dir = TempDir::new().unwrap();
+        let p = init_segment_path(dir.path(), "live/dvr", "0.mp4");
+        assert_eq!(p, dir.path().join("live").join("dvr").join("0.mp4").join("init.mp4"));
+    }
+
+    #[test]
+    fn write_init_creates_missing_parent_dirs_and_writes_bytes() {
+        let dir = TempDir::new().unwrap();
+        let bytes = b"ftyp+moov";
+        let path = write_init(dir.path(), "live/dvr", "0.mp4", bytes).unwrap();
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(path, init_segment_path(dir.path(), "live/dvr", "0.mp4"));
+    }
+
+    #[test]
+    fn write_init_is_idempotent_overwrites_existing_file() {
+        let dir = TempDir::new().unwrap();
+        write_init(dir.path(), "live", "0.mp4", b"first-init").unwrap();
+        write_init(dir.path(), "live", "0.mp4", b"second-init").unwrap();
+        let p = init_segment_path(dir.path(), "live", "0.mp4");
+        assert_eq!(std::fs::read(&p).unwrap(), b"second-init");
+    }
+
+    #[test]
+    fn write_init_returns_io_error_when_archive_dir_is_a_file() {
+        let dir = TempDir::new().unwrap();
+        let bogus_root = dir.path().join("not-a-directory");
+        std::fs::write(&bogus_root, b"regular file").unwrap();
+        let err = write_init(&bogus_root, "live", "0.mp4", b"x").unwrap_err();
         match err {
             ArchiveError::Io(_) => {}
             other => panic!("expected ArchiveError::Io, got {other:?}"),

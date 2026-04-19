@@ -2812,6 +2812,7 @@ dependencies = [
  "anyhow",
  "axum 0.8.8",
  "bytes",
+ "c2pa",
  "clap",
  "dashmap",
  "futures",
@@ -3175,6 +3176,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "lvqr-archive",
  "lvqr-auth",
  "lvqr-cli",
  "lvqr-core",

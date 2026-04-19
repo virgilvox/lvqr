@@ -146,6 +146,7 @@ impl RtmpMoqBridge {
         let raw_observer_audio = self.raw_observer.clone();
         let registry_video = self.registry.clone();
         let registry_audio = self.registry.clone();
+        let registry_unpublish = self.registry.clone();
 
         let on_publish: StreamCallback = Arc::new(move |app: &str, key: &str| {
             let stream_name = format!("{app}/{key}");
@@ -223,6 +224,16 @@ impl RtmpMoqBridge {
                         name: stream_name.clone(),
                     });
                 }
+                // Drop the shared FragmentBroadcaster entries for this
+                // stream so consumer-side drain tasks (archive indexer,
+                // LL-HLS bridge, etc.) see next_fragment() return None and
+                // run their broadcast-end finalize paths. Tier 4 item 4.3
+                // session B3 added this to drive C2PA finalize-on-unpublish
+                // via the registry's on_entry_removed lifecycle hook. Prior
+                // to this, registry entries lived until server shutdown so
+                // per-broadcast finalize never fired in production.
+                registry_unpublish.remove(&stream_name, "0.mp4");
+                registry_unpublish.remove(&stream_name, "1.mp4");
                 info!(stream = %stream_name, "removed MoQ broadcast");
             }
         });

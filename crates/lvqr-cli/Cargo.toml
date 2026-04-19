@@ -20,12 +20,18 @@ path = "src/main.rs"
 
 [features]
 default = ["rtmp", "quinn-transport", "cluster"]
-full = ["rtmp", "quinn-transport", "cluster"]
+full = ["rtmp", "quinn-transport", "cluster", "c2pa"]
 rtmp = ["lvqr-ingest/rtmp"]
 quinn-transport = ["lvqr-relay/quinn-transport"]
 # Enables cluster-mode CLI flags + bootstrap in `start()`. Disabled
 # deployments fall back to the single-node path.
 cluster = ["dep:lvqr-cluster"]
+# Tier 4 item 4.3 session B3: enables the `/playback/verify/{broadcast}`
+# admin route, plumbs `C2paConfig` through `ServeConfig`, and wires
+# `lvqr_archive::provenance::finalize_broadcast_signed` into the drain-
+# task termination path. Default off so operators without a provenance
+# requirement do not link the c2pa-rs transitive closure.
+c2pa = ["lvqr-archive/c2pa", "dep:c2pa"]
 
 [dependencies]
 lvqr-core = { workspace = true }
@@ -50,6 +56,10 @@ lvqr-srt = { workspace = true }
 lvqr-cluster = { workspace = true, optional = true }
 lvqr-observability = { workspace = true }
 lvqr-wasm = { workspace = true }
+# Feature-gated on `c2pa`; exposes `c2pa::Reader` in the admin verify
+# route. Inherited from the workspace so the lockfile-level pin tracks
+# lvqr-archive's.
+c2pa = { workspace = true, optional = true }
 
 axum = { workspace = true }
 bytes = { workspace = true }
@@ -82,8 +92,15 @@ futures-util = "0.3"
 tracing-subscriber = { workspace = true }
 tower = { workspace = true }
 http = "1"
-# Full-stack TestServer for auth_integration.rs.
-lvqr-test-utils = { workspace = true }
+# Full-stack TestServer for auth_integration.rs. The `c2pa` feature
+# is opt-in from the `lvqr-cli/c2pa` feature union: Tier 4 item 4.3
+# session B3's `c2pa_verify_e2e.rs` test uses `TestServerConfig::
+# with_c2pa(..)`, which is gated on `lvqr-test-utils/c2pa`. Activating
+# it here keeps the dev-dep feature unified with the lvqr-cli feature
+# flag when `cargo test -p lvqr-cli --features c2pa` runs, and is a
+# no-op in default builds because dev-dependencies only resolve during
+# test target compilation.
+lvqr-test-utils = { workspace = true, features = ["c2pa"] }
 # JWT minting in auth_integration.rs. Matches the version pulled in
 # transitively through `lvqr-auth/jwt`.
 jsonwebtoken = { workspace = true }

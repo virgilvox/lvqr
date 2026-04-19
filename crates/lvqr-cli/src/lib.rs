@@ -37,6 +37,8 @@ use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
+#[cfg(feature = "c2pa")]
+use crate::archive::verify_router;
 use crate::archive::{BroadcasterArchiveIndexer, playback_router};
 use crate::hls::BroadcasterHlsBridge;
 
@@ -120,6 +122,19 @@ pub struct ServeConfig {
     /// `SegmentRef` against the index. The index + segment files
     /// back the DVR scrub / time-range playback surface (Tier 2.4).
     pub archive_dir: Option<PathBuf>,
+    /// Optional C2PA provenance configuration. When set, every
+    /// `(broadcast, track)` drained by the archive indexer runs the
+    /// broadcast-end finalize path on drain termination (the moment
+    /// every producer-side clone of the broadcaster drops), which
+    /// writes `finalized.mp4` + `finalized.c2pa` next to the segment
+    /// files. The admin router also mounts `GET /playback/verify/
+    /// {broadcast}` for verifying the resulting manifest. Feature-
+    /// gated: the field is accessible only when `lvqr-cli` is built
+    /// with `--features c2pa` so the `c2pa` transitive closure does
+    /// not leak into deployments that do not need provenance.
+    /// Tier 4 item 4.3 session B3.
+    #[cfg(feature = "c2pa")]
+    pub c2pa: Option<lvqr_archive::provenance::C2paConfig>,
     /// Optional path to a WASM fragment filter module. When set,
     /// `start()` loads + compiles the module via
     /// `lvqr_wasm::WasmFilter::load` and installs a filter tap
@@ -215,6 +230,8 @@ impl ServeConfig {
             auth: None,
             record_dir: None,
             archive_dir: None,
+            #[cfg(feature = "c2pa")]
+            c2pa: None,
             wasm_filter: None,
             install_prometheus: false,
             otel_metrics_recorder: None,
@@ -674,6 +691,9 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // registry. Every subsequent ingest-side emit is drained to disk +
     // redb by a per-broadcaster tokio task the indexer spawns.
     if let Some((ref dir, ref index)) = archive_index {
+        #[cfg(feature = "c2pa")]
+        BroadcasterArchiveIndexer::install(dir.clone(), Arc::clone(index), &shared_registry, config.c2pa.clone());
+        #[cfg(not(feature = "c2pa"))]
         BroadcasterArchiveIndexer::install(dir.clone(), Arc::clone(index), &shared_registry);
     }
 
@@ -1060,11 +1080,23 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         };
 
         let combined = admin_router.merge(ws_router);
-        if let Some((ref dir, ref index)) = archive_index {
+        let combined = if let Some((ref dir, ref index)) = archive_index {
             combined.merge(playback_router(dir.clone(), Arc::clone(index), auth.clone()))
         } else {
             combined
-        }
+        };
+        // Tier 4 item 4.3 session B3: feature-gated `/playback/verify/
+        // {broadcast}` admin route. Mounted only when the `c2pa`
+        // feature is on AND an archive directory is configured (the
+        // verify route reads `<archive>/<broadcast>/<track>/
+        // finalized.*` off disk, so an archive is a hard prerequisite).
+        #[cfg(feature = "c2pa")]
+        let combined = if let Some((ref dir, _)) = archive_index {
+            combined.merge(verify_router(dir.clone(), auth.clone()))
+        } else {
+            combined
+        };
+        combined
     }
     .layer(CorsLayer::permissive());
 

@@ -73,45 +73,114 @@
 //! then. Today's archive segment sizes are <= 1 MiB so hundreds of
 //! them fit in memory without issue.
 
+use std::fmt;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::ArchiveError;
 
+/// Source of the `c2pa::Signer` implementation used when signing
+/// archived assets. Two production shapes are supported:
+///
+/// * [`CertKeyFiles`](C2paSignerSource::CertKeyFiles): operator
+///   points at PEM-encoded cert + key files on disk. Session 91 A's
+///   original shape; matches the conventional "operator manages
+///   their own PKI files" deployment.
+/// * [`Custom`](C2paSignerSource::Custom): operator (or test) hands
+///   the sign path an already-constructed [`c2pa::Signer`]. This
+///   covers two real shapes with one enum variant:
+///   - Integration tests using [`c2pa::EphemeralSigner`] (generated
+///     in-memory, no disk PEMs) -- the session 94 B3 E2E shape.
+///   - Operators with HSM-backed or KMS-backed keys wrapping their
+///     signer behind a newtype that implements [`c2pa::Signer`].
+///
+/// Session 94 B3 introduced the enum as a breaking API change on
+/// [`C2paConfig`] (previously the PEM paths + alg + TSA URL lived
+/// directly on the struct). The old shape is now the
+/// `CertKeyFiles` variant; callers that stored paths inline update
+/// to `C2paConfig { signer_source: C2paSignerSource::CertKeyFiles
+/// { .. }, .. }`. The refactor's motivation is test ergonomics --
+/// the B3 E2E must plumb an EphemeralSigner end-to-end without
+/// serializing it to disk first -- plus it cleans up the HSM /
+/// KMS operator story that was a documentation TODO through
+/// session 93.
+#[derive(Clone)]
+pub enum C2paSignerSource {
+    /// Operator-managed PEM files on disk.
+    CertKeyFiles {
+        /// Path to a PEM-encoded signing certificate chain. The leaf
+        /// certificate MUST carry an extended key usage from
+        /// c2pa-rs's allow-list (`emailProtection` 1.3.6.1.5.5.7.3.4,
+        /// `documentSigning` 1.3.6.1.5.5.7.3.36, `timeStamping`
+        /// 1.3.6.1.5.5.7.3.8, `OCSPSigning` 1.3.6.1.5.5.7.3.9, MS
+        /// C2PA 1.3.6.1.4.1.311.76.59.1.9, or C2PA
+        /// 1.3.6.1.4.1.62558.2.1) plus the `digitalSignature` key
+        /// usage bit and must chain to a CA (self-signed leaves are
+        /// rejected per C2PA spec §14.5.1). The PEM concatenates the
+        /// leaf cert first, then the CA.
+        signing_cert_path: PathBuf,
+        /// Path to a PEM-encoded PKCS#8 private key matching the
+        /// leaf cert's subject public key.
+        private_key_path: PathBuf,
+        /// Digital signature algorithm. Must match the private key:
+        /// `Es256` + ECDSA P-256 key, `Ed25519` + Ed25519 key, etc.
+        signing_alg: C2paSigningAlg,
+        /// Optional RFC 3161 Timestamp Authority URL. When set, the
+        /// signer contacts the TSA during `sign` to embed a
+        /// timestamp countersignature in the manifest so the signing
+        /// moment survives cert expiry. `None` leaves the manifest
+        /// without a trusted timestamp -- acceptable for internal
+        /// archives but not for evidentiary use.
+        timestamp_authority_url: Option<String>,
+    },
+    /// Pre-constructed signer implementation. Typical shapes:
+    /// [`c2pa::EphemeralSigner`] for tests, or an operator-supplied
+    /// adapter over an HSM / KMS / cloud-KMS key.
+    Custom(Arc<dyn c2pa::Signer + Send + Sync>),
+}
+
+impl fmt::Debug for C2paSignerSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CertKeyFiles {
+                signing_cert_path,
+                private_key_path,
+                signing_alg,
+                timestamp_authority_url,
+            } => f
+                .debug_struct("CertKeyFiles")
+                .field("signing_cert_path", signing_cert_path)
+                .field("private_key_path", private_key_path)
+                .field("signing_alg", signing_alg)
+                .field("timestamp_authority_url", timestamp_authority_url)
+                .finish(),
+            // `c2pa::Signer` is not `Debug`; emit a placeholder so
+            // `C2paConfig`'s derived `Debug` still prints something
+            // actionable in logs without leaking signer internals.
+            Self::Custom(_) => f.debug_tuple("Custom").field(&"<dyn c2pa::Signer>").finish(),
+        }
+    }
+}
+
 /// Operator-facing C2PA signing configuration. Constructed by the
 /// caller (CLI config, API consumer) and passed to
-/// [`sign_asset_bytes`].
+/// [`sign_asset_bytes`] / [`finalize_broadcast_signed`].
 #[derive(Debug, Clone)]
 pub struct C2paConfig {
-    /// Path to a PEM-encoded signing certificate chain. The leaf
-    /// certificate MUST carry an extended key usage from c2pa-rs's
-    /// allow-list (`emailProtection` 1.3.6.1.5.5.7.3.4,
-    /// `documentSigning` 1.3.6.1.5.5.7.3.36, `timeStamping`
-    /// 1.3.6.1.5.5.7.3.8, `OCSPSigning` 1.3.6.1.5.5.7.3.9, MS C2PA
-    /// 1.3.6.1.4.1.311.76.59.1.9, or C2PA 1.3.6.1.4.1.62558.2.1) plus
-    /// the `digitalSignature` key usage bit and must chain to a CA
-    /// (self-signed leaves are rejected per C2PA spec §14.5.1). The
-    /// PEM concatenates the leaf cert first, then the CA.
-    pub signing_cert_path: PathBuf,
-    /// Path to a PEM-encoded PKCS#8 private key matching the leaf
-    /// cert's subject public key.
-    pub private_key_path: PathBuf,
+    /// How to produce a [`c2pa::Signer`] at sign time. See
+    /// [`C2paSignerSource`]. Session 94 B3's breaking change: this
+    /// replaces the inline `signing_cert_path` / `private_key_path`
+    /// / `signing_alg` / `timestamp_authority_url` fields. The
+    /// `CertKeyFiles` variant carries those fields forward for
+    /// operators using filesystem PEMs.
+    pub signer_source: C2paSignerSource,
     /// Human-readable creator name embedded in the
     /// `stds.schema-org.CreativeWork` author assertion on every
     /// signed asset. Typical value is the operator's org name or a
     /// broadcast identifier.
     pub assertion_creator: String,
-    /// Digital signature algorithm. Must match the private key:
-    /// `Es256` + ECDSA P-256 key, `Ed25519` + Ed25519 key, etc.
-    pub signing_alg: C2paSigningAlg,
-    /// Optional RFC 3161 Timestamp Authority URL. When set, the
-    /// signer contacts the TSA during `sign` to embed a timestamp
-    /// countersignature in the manifest so the signing moment
-    /// survives cert expiry. `None` leaves the manifest without a
-    /// trusted timestamp -- acceptable for internal archives but not
-    /// for evidentiary use.
-    pub timestamp_authority_url: Option<String>,
     /// Optional PEM-encoded trust anchor bundle. Surfaces directly to
     /// `c2pa::Context::with_settings({"trust": {"user_anchors": ...}})`
     /// so c2pa-rs's chain validator accepts certs signed by this CA.
@@ -299,33 +368,46 @@ pub fn sign_asset_with_signer(
     })
 }
 
-/// Sign an asset with the operator's configured cert + key PEM files,
+/// Sign an asset with the operator's configured signer source,
 /// returning the (unchanged) asset bytes plus the sidecar C2PA
 /// manifest. High-level convenience over [`sign_asset_with_signer`]:
-/// reads the cert chain + private key from disk, constructs a
-/// [`c2pa::Signer`] via `c2pa::create_signer::from_keys`, and
-/// delegates. Production operators who keep cert + key on the
-/// filesystem call this; testers and advanced operators with custom
-/// signers call [`sign_asset_with_signer`] directly.
+/// for [`C2paSignerSource::CertKeyFiles`] reads the cert chain +
+/// private key from disk and constructs a [`c2pa::Signer`] via
+/// `c2pa::create_signer::from_keys`; for
+/// [`C2paSignerSource::Custom`] uses the caller-supplied signer
+/// directly. Production operators with filesystem PKI configure the
+/// former; tests with [`c2pa::EphemeralSigner`] and operators with
+/// HSM / KMS-backed keys configure the latter.
 pub fn sign_asset_bytes(
     config: &C2paConfig,
     asset_format: &str,
     asset_bytes: &[u8],
 ) -> Result<SignedAsset, ArchiveError> {
-    let cert_pem = fs::read(&config.signing_cert_path)
-        .map_err(|e| ArchiveError::Io(format!("read c2pa cert {}: {e}", config.signing_cert_path.display())))?;
-    let key_pem = fs::read(&config.private_key_path)
-        .map_err(|e| ArchiveError::Io(format!("read c2pa key {}: {e}", config.private_key_path.display())))?;
-
-    let signer = c2pa::create_signer::from_keys(
-        &cert_pem,
-        &key_pem,
-        config.signing_alg.to_c2pa(),
-        config.timestamp_authority_url.clone(),
-    )
-    .map_err(|e| ArchiveError::C2pa(format!("create_signer: {e}")))?;
-
-    sign_asset_with_signer(&*signer, &SignOptions::from_config(config), asset_format, asset_bytes)
+    let options = SignOptions::from_config(config);
+    match &config.signer_source {
+        C2paSignerSource::CertKeyFiles {
+            signing_cert_path,
+            private_key_path,
+            signing_alg,
+            timestamp_authority_url,
+        } => {
+            let cert_pem = fs::read(signing_cert_path)
+                .map_err(|e| ArchiveError::Io(format!("read c2pa cert {}: {e}", signing_cert_path.display())))?;
+            let key_pem = fs::read(private_key_path)
+                .map_err(|e| ArchiveError::Io(format!("read c2pa key {}: {e}", private_key_path.display())))?;
+            let signer = c2pa::create_signer::from_keys(
+                &cert_pem,
+                &key_pem,
+                signing_alg.to_c2pa(),
+                timestamp_authority_url.clone(),
+            )
+            .map_err(|e| ArchiveError::C2pa(format!("create_signer: {e}")))?;
+            sign_asset_with_signer(&*signer, &options, asset_format, asset_bytes)
+        }
+        C2paSignerSource::Custom(signer) => {
+            sign_asset_with_signer(signer.as_ref(), &options, asset_format, asset_bytes)
+        }
+    }
 }
 
 /// Concatenate the byte contents of the given paths, in the caller-
@@ -443,11 +525,12 @@ pub fn finalize_broadcast_signed_with_signer(
 }
 
 /// High-level convenience over [`finalize_broadcast_signed_with_signer`]:
-/// reads the cert chain + private key from disk per [`C2paConfig`],
-/// constructs a [`c2pa::Signer`], and delegates. Operators running
-/// with filesystem-backed PKI call this from the drain-terminated
-/// finalize path; advanced operators with HSM-backed or KMS-backed
-/// keys call the `_with_signer` variant directly.
+/// consults `config.signer_source` and either reads the cert chain +
+/// private key from disk (for [`C2paSignerSource::CertKeyFiles`]) or
+/// uses the caller-supplied [`c2pa::Signer`] directly (for
+/// [`C2paSignerSource::Custom`]), then delegates. Operators running
+/// with filesystem-backed PKI configure the former; tests and
+/// operators with HSM- or KMS-backed keys configure the latter.
 pub fn finalize_broadcast_signed(
     config: &C2paConfig,
     init_bytes: &[u8],
@@ -456,26 +539,45 @@ pub fn finalize_broadcast_signed(
     asset_path: &Path,
     manifest_path: &Path,
 ) -> Result<SignedAsset, ArchiveError> {
-    let cert_pem = fs::read(&config.signing_cert_path)
-        .map_err(|e| ArchiveError::Io(format!("read c2pa cert {}: {e}", config.signing_cert_path.display())))?;
-    let key_pem = fs::read(&config.private_key_path)
-        .map_err(|e| ArchiveError::Io(format!("read c2pa key {}: {e}", config.private_key_path.display())))?;
-    let signer = c2pa::create_signer::from_keys(
-        &cert_pem,
-        &key_pem,
-        config.signing_alg.to_c2pa(),
-        config.timestamp_authority_url.clone(),
-    )
-    .map_err(|e| ArchiveError::C2pa(format!("create_signer: {e}")))?;
-    finalize_broadcast_signed_with_signer(
-        &*signer,
-        &SignOptions::from_config(config),
-        init_bytes,
-        segment_paths,
-        asset_format,
-        asset_path,
-        manifest_path,
-    )
+    let options = SignOptions::from_config(config);
+    match &config.signer_source {
+        C2paSignerSource::CertKeyFiles {
+            signing_cert_path,
+            private_key_path,
+            signing_alg,
+            timestamp_authority_url,
+        } => {
+            let cert_pem = fs::read(signing_cert_path)
+                .map_err(|e| ArchiveError::Io(format!("read c2pa cert {}: {e}", signing_cert_path.display())))?;
+            let key_pem = fs::read(private_key_path)
+                .map_err(|e| ArchiveError::Io(format!("read c2pa key {}: {e}", private_key_path.display())))?;
+            let signer = c2pa::create_signer::from_keys(
+                &cert_pem,
+                &key_pem,
+                signing_alg.to_c2pa(),
+                timestamp_authority_url.clone(),
+            )
+            .map_err(|e| ArchiveError::C2pa(format!("create_signer: {e}")))?;
+            finalize_broadcast_signed_with_signer(
+                &*signer,
+                &options,
+                init_bytes,
+                segment_paths,
+                asset_format,
+                asset_path,
+                manifest_path,
+            )
+        }
+        C2paSignerSource::Custom(signer) => finalize_broadcast_signed_with_signer(
+            signer.as_ref(),
+            &options,
+            init_bytes,
+            segment_paths,
+            asset_format,
+            asset_path,
+            manifest_path,
+        ),
+    }
 }
 
 #[cfg(test)]

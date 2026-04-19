@@ -31,9 +31,11 @@
 
 use std::fs;
 
+use std::sync::Arc;
+
 use lvqr_archive::provenance::{
-    C2paConfig, C2paSigningAlg, SignOptions, finalize_broadcast_signed_with_signer, sign_asset_bytes,
-    sign_asset_with_signer,
+    C2paConfig, C2paSignerSource, C2paSigningAlg, SignOptions, finalize_broadcast_signed,
+    finalize_broadcast_signed_with_signer, sign_asset_bytes, sign_asset_with_signer,
 };
 use tempfile::TempDir;
 
@@ -143,14 +145,70 @@ fn finalize_broadcast_signed_with_signer_writes_asset_and_manifest_pair_to_disk(
 }
 
 #[test]
+fn sign_asset_bytes_with_custom_signer_source_delegates_to_ephemeral_signer() {
+    // Session 94 B3: the high-level `sign_asset_bytes` path must
+    // accept a pre-constructed c2pa::Signer via C2paSignerSource::
+    // Custom so integration tests (and operators with HSM-/KMS-
+    // backed keys) do not need to serialize PEMs to disk. This
+    // exercises the enum branching inside sign_asset_bytes without
+    // going through the lower-level sign_asset_with_signer primitive.
+    let config = C2paConfig {
+        signer_source: C2paSignerSource::Custom(Arc::new(ephemeral_signer())),
+        assertion_creator: "Custom source test".to_string(),
+        trust_anchor_pem: None,
+    };
+
+    let signed = sign_asset_bytes(&config, "image/jpeg", MINIMAL_JPEG)
+        .expect("sign_asset_bytes via Custom signer source must succeed");
+    assert_eq!(signed.asset_bytes, MINIMAL_JPEG);
+    assert!(signed.manifest_bytes.len() > 64);
+}
+
+#[test]
+fn finalize_broadcast_signed_with_custom_signer_source_writes_pair_to_disk() {
+    // Mirror of the _with_signer test above but routed through the
+    // high-level `finalize_broadcast_signed(&C2paConfig, ..)` entry
+    // point. This is the call shape that
+    // `lvqr_cli::archive::BroadcasterArchiveIndexer::drain` invokes
+    // on broadcast-end; cover it here so the drain integration is
+    // unit-regression-protected regardless of the E2E layer.
+    let tmp = TempDir::new().expect("create tempdir");
+    let asset_path = tmp.path().join("live/bench/finalized.jpg");
+    let manifest_path = tmp.path().join("live/bench/finalized.c2pa");
+    let config = C2paConfig {
+        signer_source: C2paSignerSource::Custom(Arc::new(ephemeral_signer())),
+        assertion_creator: "finalize Custom test".to_string(),
+        trust_anchor_pem: None,
+    };
+
+    let segment_paths: &[std::path::PathBuf] = &[];
+    let signed = finalize_broadcast_signed(
+        &config,
+        MINIMAL_JPEG,
+        segment_paths,
+        "image/jpeg",
+        &asset_path,
+        &manifest_path,
+    )
+    .expect("finalize_broadcast_signed via Custom signer source must succeed");
+
+    assert_eq!(fs::read(&asset_path).unwrap(), signed.asset_bytes);
+    assert_eq!(fs::read(&manifest_path).unwrap(), signed.manifest_bytes);
+    assert_eq!(signed.asset_bytes, MINIMAL_JPEG);
+    assert!(signed.manifest_bytes.len() > 64);
+}
+
+#[test]
 fn sign_asset_bytes_reports_c2pa_error_on_missing_cert_file() {
     let tmp = TempDir::new().expect("create tempdir");
     let config = C2paConfig {
-        signing_cert_path: tmp.path().join("does-not-exist.pem"),
-        private_key_path: tmp.path().join("does-not-exist.key"),
+        signer_source: C2paSignerSource::CertKeyFiles {
+            signing_cert_path: tmp.path().join("does-not-exist.pem"),
+            private_key_path: tmp.path().join("does-not-exist.key"),
+            signing_alg: C2paSigningAlg::Es256,
+            timestamp_authority_url: None,
+        },
         assertion_creator: "missing-file test".to_string(),
-        signing_alg: C2paSigningAlg::Es256,
-        timestamp_authority_url: None,
         trust_anchor_pem: None,
     };
 

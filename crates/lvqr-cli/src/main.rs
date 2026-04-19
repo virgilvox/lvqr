@@ -335,6 +335,8 @@ async fn serve_from_args(
         auth: Some(auth),
         record_dir: args.record_dir,
         archive_dir: args.archive_dir,
+        #[cfg(feature = "c2pa")]
+        c2pa: None,
         wasm_filter: args.wasm_filter,
         install_prometheus: true,
         otel_metrics_recorder,

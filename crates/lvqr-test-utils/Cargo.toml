@@ -9,9 +9,17 @@ rust-version.workspace = true
 authors.workspace = true
 publish = false
 
+[features]
+# Surface the `lvqr-cli/c2pa` feature through TestServer so integration
+# tests that exercise the C2PA finalize + verify path (session 94 B3)
+# can flip the config field on. Default off so the test-utils crate
+# tracks `lvqr-cli`'s default feature set.
+c2pa = ["lvqr-cli/c2pa", "lvqr-archive/c2pa"]
+
 [dependencies]
 lvqr-core = { workspace = true }
 lvqr-cli = { workspace = true }
+lvqr-archive = { workspace = true }
 lvqr-auth = { workspace = true }
 lvqr-wasm = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "net"] }

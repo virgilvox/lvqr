@@ -33,6 +33,16 @@
 //!   Any still-live external clones keep the broadcaster alive until they
 //!   drop too. Subscribers see `Closed` only when the *last* producer clone
 //!   of the sender is gone, matching [`FragmentBroadcaster`]'s contract.
+//!   Session 94 added [`FragmentBroadcasterRegistry::on_entry_removed`]
+//!   which fires synchronously from `remove()` after the map write lock is
+//!   released. The callback is the mirror of
+//!   [`FragmentBroadcasterRegistry::on_entry_created`] and is the
+//!   "broadcast-end" lifecycle signal that Tier 4 item 4.3 (C2PA finalize),
+//!   item 4.4 (cross-cluster federation gossip), and item 4.5 (AI agent
+//!   per-broadcast shutdown) all consume. Firing is driven by explicit
+//!   `remove()` calls from ingest protocols at unpublish time (see
+//!   `lvqr_ingest::bridge`), not by `Drop`, so callbacks observe a
+//!   deterministic ordering and cannot deadlock against producer drops.
 //!
 //! What this is *not*:
 //!
@@ -72,6 +82,7 @@ pub type EntryCallback = Arc<dyn Fn(&str, &str, &Arc<FragmentBroadcaster>) + Sen
 pub struct FragmentBroadcasterRegistry {
     inner: Arc<RwLock<RegistryMap>>,
     callbacks: Arc<RwLock<Vec<EntryCallback>>>,
+    removed_callbacks: Arc<RwLock<Vec<EntryCallback>>>,
 }
 
 impl Default for FragmentBroadcasterRegistry {
@@ -85,6 +96,7 @@ impl FragmentBroadcasterRegistry {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             callbacks: Arc::new(RwLock::new(Vec::new())),
+            removed_callbacks: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -106,6 +118,47 @@ impl FragmentBroadcasterRegistry {
         self.callbacks
             .write()
             .expect("FragmentBroadcasterRegistry callbacks lock poisoned")
+            .push(Arc::new(callback));
+    }
+
+    /// Register a callback to be invoked whenever
+    /// [`FragmentBroadcasterRegistry::remove`] drops a registered
+    /// `(broadcast, track)` entry. The callback receives the triple
+    /// `(broadcast, track, &Arc<FragmentBroadcaster>)` of the just-removed
+    /// entry; callers that need to keep a handle alive past the remove
+    /// call can clone the Arc from inside the callback.
+    ///
+    /// Firing semantics:
+    /// * Exactly once per successful `remove()` that returned `Some`.
+    ///   `remove()` on an absent key is a no-op and does NOT fire callbacks.
+    /// * Synchronously on the thread that called `remove()`, AFTER the map
+    ///   write lock is released, so callbacks may freely re-enter the
+    ///   registry (`get`, `subscribe`, `remove` another entry, etc.)
+    ///   without deadlocking.
+    /// * In installation order across multiple registered callbacks.
+    /// * Never from `Drop`. Drop-based firing is rejected per design:
+    ///   callbacks from `Drop` can deadlock if they take locks the
+    ///   dropping thread already holds, and tokio runtime semantics
+    ///   inside `Drop` are constrained. Explicit `remove()` gives the
+    ///   deterministic fire point Tier 4 items 4.3 / 4.4 / 4.5 need.
+    ///
+    /// Panics propagate to the `remove()` caller; long work should be
+    /// offloaded via `tokio::spawn` from inside the callback, mirroring
+    /// [`on_entry_created`](FragmentBroadcasterRegistry::on_entry_created).
+    ///
+    /// This is the "broadcast-end" lifecycle primitive shared across
+    /// Tier 4 items 4.3 (C2PA finalize-on-broadcast-end), 4.4
+    /// (federation gossip of broadcast removal), and 4.5 (per-broadcast
+    /// AI agent shutdown). The `(broadcast, track, &Arc<...>)` triple
+    /// is identical to `on_entry_created`'s so the same closure shape
+    /// composes for both signals.
+    pub fn on_entry_removed<F>(&self, callback: F)
+    where
+        F: Fn(&str, &str, &Arc<FragmentBroadcaster>) + Send + Sync + 'static,
+    {
+        self.removed_callbacks
+            .write()
+            .expect("FragmentBroadcasterRegistry removed_callbacks lock poisoned")
             .push(Arc::new(callback));
     }
 
@@ -179,11 +232,31 @@ impl FragmentBroadcasterRegistry {
     /// Remove the registry's `Arc` for `(broadcast, track)`. External
     /// clones keep the broadcaster alive until they drop. Returns the
     /// handle that was removed, or `None` if the key was not present.
+    ///
+    /// On a successful remove, every callback registered via
+    /// [`on_entry_removed`](FragmentBroadcasterRegistry::on_entry_removed)
+    /// fires synchronously after the map write lock is released and
+    /// receives the removed `Arc` by reference. Callbacks may freely
+    /// re-enter the registry; see `on_entry_removed` for full firing
+    /// semantics. Calls that hit an absent key return `None` without
+    /// firing any callback.
     pub fn remove(&self, broadcast: &str, track: &str) -> Option<Arc<FragmentBroadcaster>> {
-        self.inner
+        let removed = self
+            .inner
             .write()
             .expect("FragmentBroadcasterRegistry write lock poisoned")
-            .remove(&(broadcast.to_string(), track.to_string()))
+            .remove(&(broadcast.to_string(), track.to_string()));
+        if let Some(ref bc) = removed {
+            let callbacks: Vec<EntryCallback> = self
+                .removed_callbacks
+                .read()
+                .expect("FragmentBroadcasterRegistry removed_callbacks lock poisoned")
+                .clone();
+            for cb in &callbacks {
+                cb(broadcast, track, bc);
+            }
+        }
+        removed
     }
 
     /// Snapshot of every `(broadcast, track)` key currently registered.
@@ -217,6 +290,7 @@ impl Clone for FragmentBroadcasterRegistry {
         Self {
             inner: Arc::clone(&self.inner),
             callbacks: Arc::clone(&self.callbacks),
+            removed_callbacks: Arc::clone(&self.removed_callbacks),
         }
     }
 }
@@ -379,6 +453,115 @@ mod tests {
                 ("b".to_string(), "0.mp4".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn on_entry_removed_fires_exactly_once_per_successful_remove() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let reg = FragmentBroadcasterRegistry::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let seen_keys: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let c = Arc::clone(&counter);
+        let k = Arc::clone(&seen_keys);
+        reg.on_entry_removed(move |b, t, _bc| {
+            c.fetch_add(1, Ordering::Relaxed);
+            k.lock().unwrap().push((b.to_string(), t.to_string()));
+        });
+
+        let _ = reg.get_or_create("a", "0.mp4", mk_meta());
+        let _ = reg.get_or_create("a", "1.mp4", mk_meta());
+        let _ = reg.get_or_create("b", "0.mp4", mk_meta());
+
+        // Hit on a present key fires once.
+        assert!(reg.remove("a", "0.mp4").is_some());
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // Miss on an absent key does NOT fire.
+        assert!(reg.remove("ghost", "0.mp4").is_none());
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // A second remove on the same key is a miss and does NOT fire.
+        assert!(reg.remove("a", "0.mp4").is_none());
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // Different keys fire independently.
+        assert!(reg.remove("a", "1.mp4").is_some());
+        assert!(reg.remove("b", "0.mp4").is_some());
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+
+        let keys = seen_keys.lock().unwrap().clone();
+        assert_eq!(
+            keys,
+            vec![
+                ("a".to_string(), "0.mp4".to_string()),
+                ("a".to_string(), "1.mp4".to_string()),
+                ("b".to_string(), "0.mp4".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn on_entry_removed_multiple_callbacks_all_fire_in_installation_order() {
+        use std::sync::Mutex;
+
+        let reg = FragmentBroadcasterRegistry::new();
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let o = Arc::clone(&order);
+        reg.on_entry_removed(move |_, _, _| o.lock().unwrap().push("first"));
+        let o = Arc::clone(&order);
+        reg.on_entry_removed(move |_, _, _| o.lock().unwrap().push("second"));
+
+        let _ = reg.get_or_create("x", "0.mp4", mk_meta());
+        assert!(reg.remove("x", "0.mp4").is_some());
+        assert_eq!(&*order.lock().unwrap(), &vec!["first", "second"]);
+    }
+
+    #[test]
+    fn on_entry_removed_callback_receives_the_just_removed_arc() {
+        let reg = FragmentBroadcasterRegistry::new();
+        let seen: Arc<std::sync::Mutex<Option<Arc<FragmentBroadcaster>>>> = Arc::new(std::sync::Mutex::new(None));
+        let seen_clone = Arc::clone(&seen);
+        reg.on_entry_removed(move |_, _, bc| {
+            *seen_clone.lock().unwrap() = Some(Arc::clone(bc));
+        });
+
+        let handle = reg.get_or_create("live", "0.mp4", mk_meta());
+        assert!(reg.remove("live", "0.mp4").is_some());
+        let captured = seen.lock().unwrap().take().expect("callback ran");
+        assert!(
+            Arc::ptr_eq(&handle, &captured),
+            "callback received the same Arc that get_or_create handed out"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_entry_removed_callback_may_reenter_registry_without_deadlock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Re-entrancy is the load-bearing property: remove() drops its
+        // write lock before firing callbacks so callbacks can freely
+        // call back into the registry (e.g. to gossip, to inspect
+        // remaining keys) without tripping RwLock re-entrance panics.
+        let reg = FragmentBroadcasterRegistry::new();
+        let fired = Arc::new(AtomicBool::new(false));
+
+        let reg_clone = reg.clone();
+        let fired_clone = Arc::clone(&fired);
+        reg.on_entry_removed(move |b, t, _bc| {
+            assert!(
+                reg_clone.get(b, t).is_none(),
+                "removed entry is already gone by the time the callback fires"
+            );
+            let _snapshot = reg_clone.keys();
+            fired_clone.store(true, Ordering::Relaxed);
+        });
+
+        let _ = reg.get_or_create("live", "0.mp4", mk_meta());
+        assert!(reg.remove("live", "0.mp4").is_some());
+        assert!(fired.load(Ordering::Relaxed), "callback ran");
     }
 
     #[test]
