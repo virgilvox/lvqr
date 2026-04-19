@@ -1,8 +1,154 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 COMPLETE (end-to-end C2PA provenance); 4.8 session A COMPLETE (one-token-all-protocols extractor layer + new WHIP/SRT/RTSP auth gates); 783 tests, 26 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 COMPLETE (one-JWT-every-protocol proof landed); 786 tests, 26 crates
 
-**Last Updated**: 2026-04-19 (session 95 close). Tier 4 item 4.8 session A landed the one-token-all-protocols extractor layer: new `lvqr_auth::extract` module with five per-protocol helpers (`extract_rtmp`, `extract_whip`, `extract_srt`, `extract_rtsp`, `extract_ws_ingest`) that convert each protocol's token carrier into a uniform `AuthContext::Publish`; three ingest crates (`lvqr-whip`, `lvqr-srt`, `lvqr-rtsp`) gain brand-new auth call-sites (they had zero references before); two existing call-sites (`lvqr-ingest` RTMP bridge + `lvqr-cli` WS ingest) migrate onto the shared helpers. Breaking `AuthContext::Publish` gains `broadcast: Option<String>` so `JwtAuthProvider` can enforce the `broadcast` claim on publish for WHIP/SRT/RTSP/WS ingest (present) while skipping it on RTMP (None, because the stream key IS the JWT). `WhipServer::with_auth_provider` + `SrtIngestServer::with_auth` + `RtspServer::with_auth` builders thread `ServeConfig.auth` through to all five ingest surfaces. `TestServerConfig::with_whip()` added for session 96 B. `docs/auth.md` ships with claim shape + per-protocol carrier conventions + one worked example per protocol. Workspace tests: **783** passing (up from 758; +16 extract, +1 jwt publish-bind, +3 whip router, +5 rtsp gate). Session 96 entry point is Tier 4 item 4.8 session B (one-JWT-five-protocols E2E at `crates/lvqr-cli/tests/one_token_all_protocols.rs`).
+**Last Updated**: 2026-04-19 (session 96 close). Tier 4 item 4.8 session B landed the cross-protocol authentication E2E at `crates/lvqr-cli/tests/one_token_all_protocols.rs`: a single `TestServer` with RTMP + WHIP + SRT + RTSP + `JwtAuthProvider` is exercised three ways. (1) A publish-scoped JWT bound to `live/cam1` is admitted by every surface (RTMP key-as-JWT publish accepted, WHIP non-401 status, SRT socket connect succeeds, RTSP ANNOUNCE 200). (2) A token signed with a different secret is denied by every surface (RTMP server drops the connection mid-handshake, WHIP 401, SRT surfaces `ConnectionRefused` from `ServerRejectReason::Unauthorized` 2401, RTSP 401). (3) A token bound to `live/other` published against `live/cam1` is denied on WHIP/SRT/RTSP (those carry the broadcast at auth time and the provider enforces the `broadcast` claim binding) but **admitted** on RTMP -- the documented anti-scope: `extract_rtmp` passes `broadcast: None` because the stream key IS the JWT, so the binding check is skipped. Item 4.8 closes here; the entire one-token-all-protocols layer is now production-proven end-to-end. No new production code in this session: session 95 A shipped every building block. Workspace tests: **786** passing (up from 783; +3 cross-protocol E2E). Session 97 entry point is Tier 4 item 4.5 session A (in-process AI agents framework -- read `tracking/TIER_4_PLAN.md` section 4.5 row 97 A).
+
+## Session 96 close (2026-04-19)
+
+### What shipped
+
+1. **Tier 4 item 4.8 session B: one-JWT-every-
+   protocol cross-protocol E2E** (this commit).
+
+   New integration test at
+   `crates/lvqr-cli/tests/one_token_all_protocols.rs`
+   exercises the full session-95-A wiring on a single
+   `TestServer` instance. Three `#[tokio::test]`
+   cases per the matrix the handoff pinned:
+
+   * **`one_publish_jwt_admits_every_protocol`** --
+     positive path. Mints one publish-scoped JWT bound
+     to `live/cam1` and drives every ingest surface
+     with it: RTMP via `rml_rtmp` publish handshake
+     (stream key IS the JWT, broadcast on the wire is
+     `live/<jwt>`); WHIP via raw HTTP POST with
+     `Authorization: Bearer <jwt>` and a minimal SDP
+     body that passes the `Content-Type: application/
+     sdp` + non-empty checks; SRT via `srt-tokio`
+     caller with streamid `m=publish,r=live/cam1,
+     t=<jwt>`; RTSP via raw TCP ANNOUNCE with
+     `Authorization: Bearer <jwt>`. Asserts publish
+     accepted on RTMP, WHIP returned a non-401
+     status, SRT socket connected (deny would be
+     `ConnectionRefused` from
+     `ServerRejectReason::Unauthorized`), RTSP
+     ANNOUNCE returned 200.
+   * **`wrong_secret_jwt_is_rejected_everywhere`** --
+     negative path. A token signed with a different
+     secret is decoded as an error by
+     `JwtAuthProvider`, and every protocol must
+     refuse: RTMP server drops the socket
+     (rml_rtmp's `validate_publish` returning false
+     causes the connection task to `return Ok(())`),
+     WHIP 401, SRT `io::ErrorKind::ConnectionRefused`
+     surfaced from the SRT handshake reject, RTSP 401.
+   * **`wrong_broadcast_jwt_is_rejected_on_whip_srt
+     _rtsp_only`** -- the documented per-protocol
+     asymmetry. A JWT bound to `live/other`
+     published against `live/cam1` is denied by
+     WHIP/SRT/RTSP because they each carry the
+     target broadcast at auth time and
+     `JwtAuthProvider`'s Publish branch enforces the
+     `broadcast` claim binding when present. RTMP is
+     **admitted** because `extract_rtmp` passes
+     `broadcast: None` (the broadcast on the wire is
+     `app/key` where `key` is the JWT itself, so
+     adding a binding would double-count). The
+     anti-scope is documented in
+     `crates/lvqr-auth/src/extract.rs::extract_rtmp`
+     and the rationale baked into
+     `JwtAuthProvider::check`.
+
+   **Test infrastructure**. The test relies entirely
+   on existing dev-deps (`rml_rtmp`, `srt-tokio`,
+   `jsonwebtoken`, `lvqr-test-utils`) and the
+   session 95 A `TestServerConfig::with_whip()`
+   builder. No new production code, no new dev-deps.
+   The minimal SDP offer body
+   `b"v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n"` is
+   intentionally bare-bones: it's enough to pass the
+   `require_sdp_content_type` + non-empty checks so
+   the auth gate fires, and the test then accepts
+   any non-401 response as proof that auth allowed.
+   The `str0m` answerer may 400 or 201 the offer
+   downstream; either way the gate fired Allow.
+
+   **Race-condition pad on RTMP** (one-line gotcha):
+   the helper sleeps 50ms between the end of the
+   handshake and the `connect` command so the
+   server's post-handshake control messages (window
+   ack size, set peer bandwidth, onBWDone) arrive
+   before the client serializes connect. Without it,
+   the deserializer sees connect-response chunks
+   interleaved with the prerequisite control
+   messages and cannot reassemble them. Same wait
+   pattern as `crates/lvqr-cli/tests/rtmp_archive
+   _e2e.rs::connect_and_publish`. Documented inline.
+
+   **Plan refresh**.
+   `tracking/TIER_4_PLAN.md` section 4.8 header
+   flipped to **COMPLETE**; the 96 B row flipped to
+   DONE with the deliverable + verification record.
+   Item 4.8 takes its final spot in the Tier 4
+   execution status table next to 4.1 / 4.2 / 4.3.
+
+2. **Session 96 close doc** (this commit).
+
+### Tests shipped
+
+| # | Test surface | Added this session |
+|---|---|---|
+| a | `crates/lvqr-cli/tests/one_token_all_protocols.rs` | 3 new: positive (one JWT five protocols), wrong-secret deny everywhere, wrong-broadcast deny on WHIP/SRT/RTSP only (RTMP admits) |
+
+Workspace totals: **786** passed, 0 failed, 1
+ignored (up from session 95's 783 / 0 / 1). The +3
+breakdown is the three new cross-protocol cases.
+The 1 remaining ignored test is the pre-existing
+`moq_sink` doctest unrelated to 4.8.
+
+### Ground truth (session 96 close)
+
+* **Head**: this session's feat commit + close-doc
+  commit. Local main is N+2 commits ahead of
+  `origin/main` after both land. Verify via
+  `git log --oneline origin/main..main` before any
+  push. Do NOT push without direct user
+  instruction.
+* **Tests**: **786** passed, 0 failed, 1 ignored on
+  macOS (default features). With `--features c2pa`:
+  unchanged (35 lib + 5 integration on
+  lvqr-archive; +1 E2E on lvqr-cli).
+* **CI gates locally clean**:
+  * `cargo fmt --all`
+  * `cargo clippy --workspace --all-targets --benches -- -D warnings`
+  * `cargo test -p lvqr-cli --test one_token_all_protocols` 3 passed
+  * `cargo test --workspace` 786 / 0 / 1
+* **Workspace**: 26 crates, unchanged.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 / 89 / 90 |
+| 4.3 | C2PA signed media | **COMPLETE** | 91 (A) / 92 (B1) / 93 (B2) / 94 (B3) |
+| 4.8 | One-token-all-protocols | **COMPLETE** | 95 (A) / 96 (B) |
+| 4.5 | In-process AI agents | PLANNED | 97-100 |
+| 4.4 | Cross-cluster federation | PLANNED | 101-103 |
+| 4.6 | Server-side transcoding | PLANNED | 104-106 |
+| 4.7 | Latency SLO scheduling | PLANNED | 107-108 |
+
+### Session 97 entry point
+
+**Tier 4 item 4.5 session A: in-process AI agents
+framework.** Read `tracking/TIER_4_PLAN.md` section
+4.5 row 97 A for the scoped deliverable. The
+on-entry-created / on-entry-removed lifecycle hooks
+on `FragmentBroadcasterRegistry` (mint candidates
+flagged in session 94's close + session 95's status
+memory) are load-bearing for 4.5 and ready to be
+consumed.
 
 ## Session 95 close (2026-04-19)
 
