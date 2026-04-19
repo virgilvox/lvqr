@@ -174,8 +174,48 @@ pub struct SignedAsset {
     pub manifest_bytes: Vec<u8>,
 }
 
-/// Sign an asset with the operator's configured cert + key, returning
-/// the (unchanged) asset bytes plus the sidecar C2PA manifest.
+/// Low-level sign options: the subset of [`C2paConfig`] that is
+/// independent of PEM paths + signing algorithm. [`sign_asset_with_signer`]
+/// takes these alongside any [`c2pa::Signer`] impl so tests can use the
+/// in-process [`c2pa::EphemeralSigner`] (which produces C2PA-spec-
+/// compliant certs in-memory, no disk PEMs) and operators with bespoke
+/// key-storage backends (HSMs, KMS, etc.) can bring their own signer.
+/// Production config flows through [`sign_asset_bytes`] which reads
+/// PEMs from disk and constructs a signer via
+/// `c2pa::create_signer::from_keys`.
+#[derive(Debug, Clone)]
+pub struct SignOptions {
+    /// Human-readable creator name embedded in the
+    /// `stds.schema-org.CreativeWork` author assertion. Mirrors
+    /// [`C2paConfig::assertion_creator`].
+    pub assertion_creator: String,
+    /// Optional PEM trust anchor bundle. Mirrors
+    /// [`C2paConfig::trust_anchor_pem`]. When set, wired through
+    /// `c2pa::Context::with_settings({"trust": {"user_anchors": ...}})`
+    /// so c2pa-rs's chain validator accepts certs signed by this CA.
+    pub trust_anchor_pem: Option<String>,
+}
+
+impl SignOptions {
+    fn from_config(config: &C2paConfig) -> Self {
+        Self {
+            assertion_creator: config.assertion_creator.clone(),
+            trust_anchor_pem: config.trust_anchor_pem.clone(),
+        }
+    }
+}
+
+/// Sign an asset with the caller-supplied [`c2pa::Signer`], returning
+/// the (unchanged) asset bytes plus the sidecar C2PA manifest. Lower-
+/// level variant of [`sign_asset_bytes`] -- the path-based flow reads
+/// PEMs then delegates here.
+///
+/// Session 93 B2 added this signature to let tests use
+/// [`c2pa::EphemeralSigner`] (which generates C2PA-spec-compliant
+/// ephemeral certs in memory) without the PEM-fixture problem that
+/// blocked the happy-path test through sessions 91-92. Operators
+/// running with HSM-backed or KMS-backed keys can also call this
+/// primitive directly with their own [`c2pa::Signer`] implementation.
 ///
 /// `asset_format` is an IANA MIME type (`"image/jpeg"`, `"video/mp4"`,
 /// etc.) or a c2pa-rs known extension alias. The handler is selected
@@ -185,29 +225,17 @@ pub struct SignedAsset {
 /// The manifest carries:
 /// * A `ClaimGeneratorInfo` naming `"lvqr"` + this crate's version.
 /// * One `stds.schema-org.CreativeWork` assertion with a single
-///   `Person` author whose `name` is `config.assertion_creator`.
+///   `Person` author whose `name` is `options.assertion_creator`.
 /// * No ingredients. Ingredient chains are meaningful when an asset
 ///   is derived from another C2PA-signed asset; an archive's source
 ///   is an RTMP ingest which has no upstream manifest, so there is
 ///   nothing to ingredient.
-pub fn sign_asset_bytes(
-    config: &C2paConfig,
+pub fn sign_asset_with_signer(
+    signer: &dyn c2pa::Signer,
+    options: &SignOptions,
     asset_format: &str,
     asset_bytes: &[u8],
 ) -> Result<SignedAsset, ArchiveError> {
-    let cert_pem = fs::read(&config.signing_cert_path)
-        .map_err(|e| ArchiveError::Io(format!("read c2pa cert {}: {e}", config.signing_cert_path.display())))?;
-    let key_pem = fs::read(&config.private_key_path)
-        .map_err(|e| ArchiveError::Io(format!("read c2pa key {}: {e}", config.private_key_path.display())))?;
-
-    let signer = c2pa::create_signer::from_keys(
-        &cert_pem,
-        &key_pem,
-        config.signing_alg.to_c2pa(),
-        config.timestamp_authority_url.clone(),
-    )
-    .map_err(|e| ArchiveError::C2pa(format!("create_signer: {e}")))?;
-
     // Minimal manifest. Built via serde_json::json! so the operator-
     // supplied creator name is JSON-escaped correctly; embedding it via
     // `format!` would break on any creator containing `"` or `\`.
@@ -224,7 +252,7 @@ pub fn sign_asset_bytes(
                 "@type": "CreativeWork",
                 "author": [{
                     "@type": "Person",
-                    "name": config.assertion_creator,
+                    "name": options.assertion_creator,
                 }],
             },
         }],
@@ -240,7 +268,7 @@ pub fn sign_asset_bytes(
     // chain validator treats the custom CA as a trust root. Without
     // this, c2pa-rs's default trust list (the public C2PA conformance
     // roots) rejects any cert signed by a private CA.
-    let context = if let Some(anchor_pem) = config.trust_anchor_pem.as_deref() {
+    let context = if let Some(anchor_pem) = options.trust_anchor_pem.as_deref() {
         let settings_json = serde_json::json!({
             "trust": {
                 "user_anchors": anchor_pem,
@@ -262,13 +290,42 @@ pub fn sign_asset_bytes(
     let mut source = Cursor::new(asset_bytes.to_vec());
     let mut dest = Cursor::new(Vec::<u8>::new());
     let manifest_bytes = builder
-        .sign(&*signer, asset_format, &mut source, &mut dest)
+        .sign(signer, asset_format, &mut source, &mut dest)
         .map_err(|e| ArchiveError::C2pa(format!("sign: {e}")))?;
 
     Ok(SignedAsset {
         asset_bytes: dest.into_inner(),
         manifest_bytes,
     })
+}
+
+/// Sign an asset with the operator's configured cert + key PEM files,
+/// returning the (unchanged) asset bytes plus the sidecar C2PA
+/// manifest. High-level convenience over [`sign_asset_with_signer`]:
+/// reads the cert chain + private key from disk, constructs a
+/// [`c2pa::Signer`] via `c2pa::create_signer::from_keys`, and
+/// delegates. Production operators who keep cert + key on the
+/// filesystem call this; testers and advanced operators with custom
+/// signers call [`sign_asset_with_signer`] directly.
+pub fn sign_asset_bytes(
+    config: &C2paConfig,
+    asset_format: &str,
+    asset_bytes: &[u8],
+) -> Result<SignedAsset, ArchiveError> {
+    let cert_pem = fs::read(&config.signing_cert_path)
+        .map_err(|e| ArchiveError::Io(format!("read c2pa cert {}: {e}", config.signing_cert_path.display())))?;
+    let key_pem = fs::read(&config.private_key_path)
+        .map_err(|e| ArchiveError::Io(format!("read c2pa key {}: {e}", config.private_key_path.display())))?;
+
+    let signer = c2pa::create_signer::from_keys(
+        &cert_pem,
+        &key_pem,
+        config.signing_alg.to_c2pa(),
+        config.timestamp_authority_url.clone(),
+    )
+    .map_err(|e| ArchiveError::C2pa(format!("create_signer: {e}")))?;
+
+    sign_asset_with_signer(&*signer, &SignOptions::from_config(config), asset_format, asset_bytes)
 }
 
 /// Concatenate the byte contents of the given paths, in the caller-
@@ -339,6 +396,86 @@ pub fn write_signed_pair(asset_path: &Path, manifest_path: &Path, signed: &Signe
     fs::write(manifest_path, &signed.manifest_bytes)
         .map_err(|e| ArchiveError::Io(format!("write manifest {}: {e}", manifest_path.display())))?;
     Ok(())
+}
+
+/// Finalize one `(broadcast, track)` archive: concatenate
+/// `init_bytes + segment_paths[0]..n` in the caller-supplied order,
+/// sign the resulting asset via the caller-supplied
+/// [`c2pa::Signer`], and write the signed asset + sidecar manifest
+/// to disk. Returns the [`SignedAsset`] so the caller can log
+/// manifest size or inspect bytes without re-reading from disk.
+///
+/// This is a pure orchestration helper: it composes
+/// [`concat_assets`] + [`sign_asset_with_signer`] +
+/// [`write_signed_pair`]. Session 94 B3 wires it into
+/// `lvqr_cli::archive::BroadcasterArchiveIndexer::drain`'s
+/// termination path inside a `tokio::task::spawn_blocking` closure
+/// (the fn is sync; the caller already owns a blocking-friendly
+/// execution context per the session 91 A writer refactor).
+///
+/// Deciding where `init_bytes` comes from is session 94's problem
+/// (flat `<archive>/<broadcast>/<track>/init.mp4` vs.
+/// `metadata.json` sidecar is still open). This helper stays agnostic
+/// by taking the bytes as a parameter.
+///
+/// # Errors
+///
+/// Propagates [`ArchiveError::Io`] (concat reads or on-disk writes)
+/// and [`ArchiveError::C2pa`] (signing).
+pub fn finalize_broadcast_signed_with_signer(
+    signer: &dyn c2pa::Signer,
+    options: &SignOptions,
+    init_bytes: &[u8],
+    segment_paths: &[impl AsRef<Path>],
+    asset_format: &str,
+    asset_path: &Path,
+    manifest_path: &Path,
+) -> Result<SignedAsset, ArchiveError> {
+    let mut concat_bytes = Vec::with_capacity(init_bytes.len());
+    concat_bytes.extend_from_slice(init_bytes);
+    if !segment_paths.is_empty() {
+        let seg_bytes = concat_assets(segment_paths)?;
+        concat_bytes.extend_from_slice(&seg_bytes);
+    }
+    let signed = sign_asset_with_signer(signer, options, asset_format, &concat_bytes)?;
+    write_signed_pair(asset_path, manifest_path, &signed)?;
+    Ok(signed)
+}
+
+/// High-level convenience over [`finalize_broadcast_signed_with_signer`]:
+/// reads the cert chain + private key from disk per [`C2paConfig`],
+/// constructs a [`c2pa::Signer`], and delegates. Operators running
+/// with filesystem-backed PKI call this from the drain-terminated
+/// finalize path; advanced operators with HSM-backed or KMS-backed
+/// keys call the `_with_signer` variant directly.
+pub fn finalize_broadcast_signed(
+    config: &C2paConfig,
+    init_bytes: &[u8],
+    segment_paths: &[impl AsRef<Path>],
+    asset_format: &str,
+    asset_path: &Path,
+    manifest_path: &Path,
+) -> Result<SignedAsset, ArchiveError> {
+    let cert_pem = fs::read(&config.signing_cert_path)
+        .map_err(|e| ArchiveError::Io(format!("read c2pa cert {}: {e}", config.signing_cert_path.display())))?;
+    let key_pem = fs::read(&config.private_key_path)
+        .map_err(|e| ArchiveError::Io(format!("read c2pa key {}: {e}", config.private_key_path.display())))?;
+    let signer = c2pa::create_signer::from_keys(
+        &cert_pem,
+        &key_pem,
+        config.signing_alg.to_c2pa(),
+        config.timestamp_authority_url.clone(),
+    )
+    .map_err(|e| ArchiveError::C2pa(format!("create_signer: {e}")))?;
+    finalize_broadcast_signed_with_signer(
+        &*signer,
+        &SignOptions::from_config(config),
+        init_bytes,
+        segment_paths,
+        asset_format,
+        asset_path,
+        manifest_path,
+    )
 }
 
 #[cfg(test)]

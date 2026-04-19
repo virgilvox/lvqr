@@ -55,12 +55,12 @@ tempfile = "3"
 # workflow to diff the two paths on their own host; see
 # `docs/deployment.md` for the runbook.
 criterion = { workspace = true }
-# rcgen generates the fixture signing certificate + private key for the
-# `c2pa_sign` integration test so the repo does not have to vendor a
-# pre-built cert + key pair that can expire. Always a dev-dep because the
-# test binary compiles unconditionally; the test body itself is gated on
-# `feature = "c2pa"` so it is a no-op when the feature is off.
-rcgen = { workspace = true }
+# Note: rcgen was a dev-dep through session 92 for generating fixture
+# signing certs in the `c2pa_sign` integration test. Session 93 B2
+# replaced that path with `c2pa::EphemeralSigner`, which generates
+# C2PA-spec-compliant Ed25519 chains in memory using c2pa-rs's own
+# `ephemeral_cert` module. The dev-dep was dropped at the same time
+# because no other lvqr-archive test needs it.
 
 [[bench]]
 name = "io_uring_vs_std"

@@ -1,90 +1,48 @@
 //! `cargo test -p lvqr-archive --features c2pa --test c2pa_sign`
 //!
-//! Tier 4 item 4.3 session A integration test for the
-//! [`lvqr_archive::provenance::sign_asset_bytes`] primitive. Gated on
-//! `feature = "c2pa"` so `cargo test -p lvqr-archive` (default features)
-//! compiles this file as an empty binary and skips it, matching the
-//! io-uring test pattern.
+//! Tier 4 item 4.3 sessions A (session 91) + B1 (session 92) + B2
+//! (session 93). Integration coverage for
+//! [`lvqr_archive::provenance`]:
 //!
-//! Fixture: an ephemeral two-certificate chain (test root CA + end-entity
-//! signing cert) generated per-run via `rcgen`. c2pa-rs validates
-//! certificate profile at sign time per C2PA spec §14.5.1 -- the signing
-//! cert must carry an approved EKU (`emailProtection` is the simplest
-//! from c2pa's bundled allow-list), must not be self-signed, must have a
-//! `digitalSignature` key usage bit, and must chain to a CA. A flat
-//! self-signed leaf is rejected. Vendoring a static chain in the repo
-//! would expire on a fixed calendar date; generating per-run trades
-//! ~2 ms of CPU for a test that cannot rot.
+//! * [`sign_asset_with_signer`](lvqr_archive::provenance::sign_asset_with_signer)
+//!   end-to-end via [`c2pa::EphemeralSigner`]. Session 93's cert-
+//!   fixture breakthrough: c2pa-rs 0.80 publicly exports
+//!   `EphemeralSigner` which generates C2PA-spec-compliant Ed25519
+//!   cert chains in memory (its own `ephemeral_cert` module builds
+//!   them with rasn_pkix and the exact extensions c2pa-rs's
+//!   profile check wants). This replaces the session-91 rcgen-based
+//!   chain that the profile check kept rejecting with the generic
+//!   `CertificateProfileError::InvalidCertificate`. The
+//!   EphemeralSigner path is the canonical test-time signer in both
+//!   c2pa-rs's own suite and this one.
 //!
-//! Asset: a 155-byte 1x1 black JPEG carrying SOI + JFIF APP0 + DQT (luma
-//! quant table) + SOF0 (baseline, 1x1 greyscale) + DHT + SOS + scan +
-//! EOI. c2pa-rs's JPEG handler uses `jfifdump` which strictly validates
-//! every marker's length + structure, so a 22-byte SOI/APP0/EOI stub is
-//! rejected -- the fixture has to carry the real DQT / DHT tables a
-//! baseline JPEG decoder needs. We pick JPEG rather than a CMAF fragment
-//! because an archive segment (raw `moof+mdat` without an accompanying
-//! `ftyp`/`moov` init) is not a self-contained ISO BMFF file and would
-//! need session B's finalized-asset construction to sign meaningfully.
-//! Session A tests the primitive's public API contract, not LVQR's
-//! finalize workflow.
+//! * [`finalize_broadcast_signed_with_signer`](lvqr_archive::provenance::finalize_broadcast_signed_with_signer)
+//!   orchestration end-to-end: init-bytes + (empty) segment list →
+//!   sign → write_signed_pair on disk → read back and assert.
+//!
+//! * [`sign_asset_bytes`](lvqr_archive::provenance::sign_asset_bytes)
+//!   error path when the configured PEM files are missing.
+//!
+//! Gated on `feature = "c2pa"` so `cargo test -p lvqr-archive`
+//! (default features) compiles this file as an empty binary and
+//! skips it, matching the io-uring test pattern.
 
 #![cfg(feature = "c2pa")]
 
 use std::fs;
 
-use lvqr_archive::provenance::{C2paConfig, C2paSigningAlg, sign_asset_bytes};
-use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
-    PKCS_ECDSA_P256_SHA256,
+use lvqr_archive::provenance::{
+    C2paConfig, C2paSigningAlg, SignOptions, finalize_broadcast_signed_with_signer, sign_asset_bytes,
+    sign_asset_with_signer,
 };
 use tempfile::TempDir;
 
-/// Build a throwaway two-cert chain (CA + end-entity signer) usable with
-/// c2pa-rs's `create_signer::from_keys`. Returns
-/// `(cert_chain_pem, signer_key_pem, ca_anchor_pem)`. The chain PEM
-/// concatenates the leaf first then the CA, matching the COSE x5chain
-/// convention; the anchor PEM is the CA cert alone, suitable for feeding
-/// into `C2paConfig.trust_anchor_pem` so c2pa-rs's chain validator
-/// recognises this CA as a trust root.
-fn build_test_chain() -> (String, String, String) {
-    // Root CA.
-    let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("CA key");
-    let mut ca_params = CertificateParams::new(vec!["lvqr-test-ca.local".to_string()]).expect("CA params");
-    ca_params
-        .distinguished_name
-        .push(DnType::CommonName, "LVQR Test Root CA");
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign CA");
-
-    // End-entity signer. EKU = emailProtection is the simplest value from
-    // c2pa-rs's `valid_eku_oids.cfg` allow-list; code_signing is NOT on
-    // that list.
-    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
-    let mut leaf_params = CertificateParams::new(vec!["lvqr-test-signer.local".to_string()]).expect("leaf params");
-    leaf_params
-        .distinguished_name
-        .push(DnType::CommonName, "LVQR C2PA Test Signer");
-    leaf_params.is_ca = IsCa::NoCa;
-    leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-    leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::EmailProtection];
-    let leaf_cert = leaf_params
-        .signed_by(&leaf_key, &ca_cert, &ca_key)
-        .expect("CA-sign leaf");
-
-    let ca_anchor_pem = ca_cert.pem();
-    let chain_pem = format!("{}{}", leaf_cert.pem(), ca_anchor_pem);
-    let key_pem = leaf_key.serialize_pem();
-    (chain_pem, key_pem, ca_anchor_pem)
-}
-
-/// 155-byte 1x1 black JPEG. Contains SOI + APP0 JFIF header + DQT (luma
-/// quant table) + SOF0 (baseline, 1x1 greyscale) + DHT (DC + AC Huffman
-/// tables) + SOS + compressed scan + EOI. c2pa-rs's JPEG handler uses
-/// `jfifdump` which strictly validates every marker's length + structure,
-/// so a minimal JPEG has to carry the real DQT / DHT tables the
-/// baseline-decoder needs. These bytes are the canonical "smallest valid
-/// JPEG" from the JFIF test corpus (1x1 pixel, single luma channel).
+/// 155-byte 1x1 black JPEG. SOI + JFIF APP0 + DQT + SOF0 + DHT + SOS +
+/// scan + EOI. c2pa-rs's JPEG handler uses `jfifdump` which strictly
+/// validates every marker, so a 22-byte SOI/APP0/EOI stub is rejected
+/// -- this fixture carries the real DQT / DHT tables a baseline JPEG
+/// decoder needs. Smallest structurally-valid JPEG for c2pa's
+/// signing path.
 const MINIMAL_JPEG: &[u8] = &[
     0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x01, 0x00, 0x60, 0x00, 0x60, 0x00,
     0x00, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08,
@@ -97,59 +55,28 @@ const MINIMAL_JPEG: &[u8] = &[
     0x00, 0x00, 0x3f, 0x00, 0x57, 0xff, 0xd9,
 ];
 
-/// Happy-path end-to-end signing test. Currently `#[ignore]`'d because
-/// c2pa-rs 0.80 validates the signing certificate's *profile*
-/// (structural extensions per C2PA spec §14.5.1 -- AKI presence,
-/// basic-constraints criticality, key-usage bit layout, etc.) at sign
-/// time and rejects the rcgen-0.13-generated chain this fixture
-/// produces with the generic
-/// `CertificateProfileError::InvalidCertificate`. The trust-chain
-/// check via `C2paConfig.trust_anchor_pem` is wired correctly
-/// (operator-facing production path), but the profile check fires
-/// independently and its error variant collapses ~8 failure branches
-/// without surfacing which one. Session 92 B (cert fixture) attempted
-/// `Settings.trust.user_anchors` via `Context::with_settings` and
-/// confirmed that path addresses trust-chain validation only, not
-/// profile validation.
-///
-/// Three unignore paths remain for a future session:
-///
-/// * Generate the chain with more extension control than rcgen 0.13
-///   surfaces by default -- explicit AKI/SKI, basic-constraints
-///   criticality, explicit validity window.
-/// * Vendor a fixed test CA + end-entity PEM pair under
-///   `crates/lvqr-archive/tests/fixtures/c2pa/` with a far-future
-///   `notAfter` (2099-era) and a README noting the expiry.
-/// * Adopt c2pa-rs's own `CertificateTrustPolicy::passthrough()`
-///   behind a new `c2pa-test-bypass-cert-check` feature -- note that
-///   the relevant setting `verify.verify_trust` is `pub(crate)` in
-///   c2pa 0.80 so bypassing profile checks from outside the crate
-///   is not currently possible without a feature / version bump.
-///
-/// Remove the `#[ignore]` + remove this docblock when the fixture
-/// lands.
-#[test]
-#[ignore = "c2pa-rs 0.80 profile check rejects rcgen chains; fixture pending"]
-fn sign_asset_bytes_emits_non_empty_c2pa_manifest_for_minimal_jpeg() {
-    let tmp = TempDir::new().expect("create tempdir");
-    let (chain_pem, key_pem, ca_anchor_pem) = build_test_chain();
+fn ephemeral_signer() -> c2pa::EphemeralSigner {
+    c2pa::EphemeralSigner::new("lvqr-c2pa-test.local").expect("generate ephemeral c2pa signer")
+}
 
-    let cert_path = tmp.path().join("sign.pem");
-    let key_path = tmp.path().join("sign.key");
-    fs::write(&cert_path, &chain_pem).expect("write cert chain pem");
-    fs::write(&key_path, &key_pem).expect("write key pem");
-
-    let config = C2paConfig {
-        signing_cert_path: cert_path,
-        private_key_path: key_path,
+fn default_options() -> SignOptions {
+    SignOptions {
         assertion_creator: "LVQR Test Operator".to_string(),
-        signing_alg: C2paSigningAlg::Es256,
-        timestamp_authority_url: None,
-        trust_anchor_pem: Some(ca_anchor_pem),
-    };
+        // EphemeralSigner's CA is not in c2pa-rs's default trust list,
+        // but sign-time validation does not require trust (post-sign
+        // reader-side verification would). Leave `None` and rely on
+        // the profile-check-only guarantee.
+        trust_anchor_pem: None,
+    }
+}
 
-    let signed = sign_asset_bytes(&config, "image/jpeg", MINIMAL_JPEG)
-        .expect("sign_asset_bytes must succeed on a valid cert + minimal JPEG");
+#[test]
+fn sign_asset_with_signer_emits_non_empty_c2pa_manifest_for_minimal_jpeg() {
+    let signer = ephemeral_signer();
+    let options = default_options();
+
+    let signed = sign_asset_with_signer(&signer, &options, "image/jpeg", MINIMAL_JPEG)
+        .expect("sign_asset_with_signer must succeed with the c2pa-rs EphemeralSigner");
 
     assert!(
         !signed.manifest_bytes.is_empty(),
@@ -161,9 +88,57 @@ fn sign_asset_bytes_emits_non_empty_c2pa_manifest_for_minimal_jpeg() {
          container to be at least a few hundred bytes even for a minimal asset",
         signed.manifest_bytes.len()
     );
+    assert_eq!(
+        signed.asset_bytes, MINIMAL_JPEG,
+        "sidecar-mode asset passthrough must return identical bytes"
+    );
+}
+
+#[test]
+fn finalize_broadcast_signed_with_signer_writes_asset_and_manifest_pair_to_disk() {
+    let tmp = TempDir::new().expect("create tempdir");
+    let asset_path = tmp.path().join("live/bench/finalized.jpg");
+    let manifest_path = tmp.path().join("live/bench/finalized.c2pa");
+
+    let signer = ephemeral_signer();
+    let options = default_options();
+
+    // Init-only "broadcast": the init bytes ARE the whole asset, zero
+    // media segments. That is the production shape for a broadcast
+    // that disconnects before producing any data; it also keeps the
+    // test's concat-path behavior exercised without needing a
+    // multi-JPEG fixture (c2pa's JPEG handler needs exactly one
+    // syntactically-valid JPEG and multiple concatenated JPEGs would
+    // fail structural validation).
+    let segment_paths: &[std::path::PathBuf] = &[];
+    let signed = finalize_broadcast_signed_with_signer(
+        &signer,
+        &options,
+        MINIMAL_JPEG,
+        segment_paths,
+        "image/jpeg",
+        &asset_path,
+        &manifest_path,
+    )
+    .expect("finalize_broadcast_signed_with_signer must succeed");
+
+    let asset_on_disk = fs::read(&asset_path).expect("asset file must exist");
+    let manifest_on_disk = fs::read(&manifest_path).expect("manifest file must exist");
+    assert_eq!(
+        asset_on_disk, signed.asset_bytes,
+        "on-disk asset must match SignedAsset.asset_bytes"
+    );
+    assert_eq!(
+        manifest_on_disk, signed.manifest_bytes,
+        "on-disk manifest must match SignedAsset.manifest_bytes"
+    );
+    assert_eq!(
+        signed.asset_bytes, MINIMAL_JPEG,
+        "init-only finalize must round-trip the input bytes"
+    );
     assert!(
-        !signed.asset_bytes.is_empty(),
-        "asset passthrough must return non-empty bytes in sidecar mode"
+        !signed.manifest_bytes.is_empty() && signed.manifest_bytes.len() > 64,
+        "manifest must be a real COSE+JUMBF container, not a stub"
     );
 }
 

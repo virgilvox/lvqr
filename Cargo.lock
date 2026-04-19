@@ -2786,7 +2786,6 @@ version = "0.4.0"
 dependencies = [
  "c2pa",
  "criterion",
- "rcgen 0.13.2",
  "redb",
  "serde_json",
  "tempfile",
