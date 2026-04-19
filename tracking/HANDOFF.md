@@ -1,8 +1,244 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 COMPLETE (one-JWT-every-protocol proof landed); 786 tests, 26 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 COMPLETE; 4.5 session A DONE (lvqr-agent scaffold landed); 796 tests, 27 crates
 
-**Last Updated**: 2026-04-19 (session 96 close). Tier 4 item 4.8 session B landed the cross-protocol authentication E2E at `crates/lvqr-cli/tests/one_token_all_protocols.rs`: a single `TestServer` with RTMP + WHIP + SRT + RTSP + `JwtAuthProvider` is exercised three ways. (1) A publish-scoped JWT bound to `live/cam1` is admitted by every surface (RTMP key-as-JWT publish accepted, WHIP non-401 status, SRT socket connect succeeds, RTSP ANNOUNCE 200). (2) A token signed with a different secret is denied by every surface (RTMP server drops the connection mid-handshake, WHIP 401, SRT surfaces `ConnectionRefused` from `ServerRejectReason::Unauthorized` 2401, RTSP 401). (3) A token bound to `live/other` published against `live/cam1` is denied on WHIP/SRT/RTSP (those carry the broadcast at auth time and the provider enforces the `broadcast` claim binding) but **admitted** on RTMP -- the documented anti-scope: `extract_rtmp` passes `broadcast: None` because the stream key IS the JWT, so the binding check is skipped. Item 4.8 closes here; the entire one-token-all-protocols layer is now production-proven end-to-end. No new production code in this session: session 95 A shipped every building block. Workspace tests: **786** passing (up from 783; +3 cross-protocol E2E). Session 97 entry point is Tier 4 item 4.5 session A (in-process AI agents framework -- read `tracking/TIER_4_PLAN.md` section 4.5 row 97 A).
+**Last Updated**: 2026-04-19 (session 97 close). Tier 4 item 4.5 session A landed the in-process AI agents framework scaffold under a new `crates/lvqr-agent`. Surface: `Agent` sync trait (`on_start(&AgentContext)` + `on_fragment(&Fragment)` + `on_stop()` lifecycle, all default-no-op except `on_fragment`); `AgentContext { broadcast, track, meta: FragmentMeta }`; `AgentFactory { name, build(&AgentContext) -> Option<Box<dyn Agent>> }` (per-stream opt-in via `None`); `AgentRunner` builder + `install(&FragmentBroadcasterRegistry) -> AgentRunnerHandle` that wires one `on_entry_created` callback, subscribes synchronously inside the callback, and spawns one tokio drain task per agent factory opts in for. The natural `BroadcasterStream::Closed` termination IS the broadcast-stop signal; no separate `on_entry_removed` wiring (would race the drain loop and double-fire `on_stop`). Every `on_start`/`on_fragment`/`on_stop` call wrapped in `std::panic::catch_unwind(AssertUnwindSafe(..))`; panics in `on_fragment` are logged + counted but do NOT terminate the drain (one bad frame must not kill the agent), panics in `on_start` DO skip the drain entirely. `AgentRunnerHandle` exposes per-`(agent, broadcast, track)` `fragments_seen` + `panics` counters mirror of `WasmFilterBridgeHandle`. Pattern-matches the four existing `FragmentBroadcasterRegistry` consumers (HLS bridge, archive indexer, WASM filter tap, cluster claim) so session 98 drops a `WhisperCaptionsFactory` in without re-deriving the callback / spawn / drain boilerplate. No CLI wiring (session 100 D). No concrete agent (session 98 B). Workspace tests: **796** passing (up from 786; +8 lib runner tests, +1 integration, +1 doctest). Workspace count now **27 crates** (was 26). Session 98 entry point is Tier 4 item 4.5 session B (`WhisperCaptionsAgent` reading AAC audio + feeding whisper-rs -- read `tracking/TIER_4_PLAN.md` section 4.5 row 98 B).
+
+## Session 97 close (2026-04-19)
+
+### What shipped
+
+1. **Tier 4 item 4.5 session A: `lvqr-agent`
+   scaffold + Agent trait + Runner + lifecycle
+   wiring** (`b8631fa`).
+
+   **New crate `crates/lvqr-agent`**. Workspace
+   member, AGPL-3.0-or-later, edition 2024, lines
+   capped at 120, follows the four existing
+   `FragmentBroadcasterRegistry` consumer patterns
+   exactly (HLS bridge, archive indexer, WASM filter
+   tap, cluster claim renewer). Five files in `src/`:
+   `lib.rs` (re-exports + crate docs), `agent.rs`
+   (Agent trait + AgentContext), `factory.rs`
+   (AgentFactory trait), `runner.rs` (AgentRunner +
+   AgentRunnerHandle + AgentStats + drive task), and
+   one integration test under `tests/`.
+
+   **Surface decisions baked in (carry forward to
+   sessions 98-100)**:
+
+   * `Agent` is **sync**, not async. Agents that
+     need async or blocking work (e.g. whisper-rs) are
+     expected to spawn from inside `on_start`
+     (typical pattern: bounded `tokio::sync::mpsc` to
+     a worker task that owns the heavy state).
+     Putting an async fn on the trait would force
+     `async_trait` boxing or a Pin<Box<dyn Future>>
+     return type and gain nothing for whisper, which
+     is sync anyway. Documented in the trait's
+     module-level rust-docs.
+   * `Agent` is `Send` (no `Sync`). Each agent runs
+     on a single drain task; concurrent calls to the
+     same agent never happen.
+   * **Factory pattern**, not just `Box<dyn Agent>`:
+     a factory is registered per agent *type* on the
+     `AgentRunner`; the factory is consulted on every
+     new `(broadcast, track)` and either returns
+     `Some(Box<dyn Agent>)` or `None` to skip. This
+     is the cleanest way to express "agent type X
+     wants every audio track but no video tracks";
+     `AgentFactory::build(&AgentContext)` gets the
+     full triple to decide on.
+   * **No `on_entry_removed` wiring**. The drain
+     loop's natural termination (every producer-side
+     clone of the broadcaster has been dropped ->
+     `BroadcasterStream::next_fragment()` returns
+     `None` -> drain loop exits -> `on_stop` fires)
+     IS the broadcast-stop signal. Adding a second
+     teardown channel would race the drain loop in
+     flight and double-fire `on_stop`. Documented.
+   * **Panic isolation** via
+     `std::panic::catch_unwind(AssertUnwindSafe(..))`
+     around every `on_start` / `on_fragment` /
+     `on_stop` trait call. Counted on
+     `AgentStats::panics` AND on
+     `lvqr_agent_panics_total{agent, phase=start|fragment|stop}`.
+     `on_fragment` panics do NOT terminate the drain
+     loop; `on_start` panics DO skip the drain
+     entirely (running on_fragment after a failed
+     start would hand fragments to an
+     uninitialised agent). `on_stop` panics are
+     absorbed.
+   * **Per-fragment metric**:
+     `lvqr_agent_fragments_total{agent}` bumps once
+     per fragment regardless of panic outcome.
+     `AgentRunnerHandle::fragments_seen` and
+     `panics` accessors mirror
+     `WasmFilterBridgeHandle::fragments_seen`.
+
+   **Test coverage** (8 lib + 1 integration + 1
+   doctest):
+
+   | # | Test | Asserts |
+   |---|---|---|
+   | 1 | `agent_receives_every_emitted_fragment_then_stops` | start fires once + each emitted fragment lands in `on_fragment` + on_stop fires once after producer drop + remove |
+   | 2 | `factory_returning_none_is_skipped` | a factory that opts out (e.g. audio-only) gets no drain task spawned for the video key |
+   | 3 | `panic_in_on_fragment_is_caught_and_counted_loop_continues` | a panicky agent at group-1 does not kill the drain loop; counters reflect 3 seen + 1 panic; downstream subscriber still sees every fragment unmodified |
+   | 4 | `panic_in_on_start_skips_drain_loop` | on_start panic prevents on_fragment from running; counters reflect 0 seen + 1 panic |
+   | 5 | `empty_runner_installs_callback_but_spawns_nothing` | runner with no factories is a no-op installer |
+   | 6 | `multiple_factories_each_get_their_own_drain_per_broadcast` | two factories on same broadcast each spawn their own drain task with separate stats |
+   | 7 | `agent_runner_default_is_empty` | Default impl |
+   | 8 | `agent_runner_handle_debug_redacts_internals` | Debug impl reports tracked-key count without leaking internals |
+   | 9 | `tests/integration_basic.rs::end_to_end_lifecycle_under_real_registry` | full start -> N fragments -> stop ordering on a multi-thread runtime, mirroring the shape `lvqr_cli::start` will use in session 98 |
+   | 10 | `runner.rs:97 doctest` | `AgentRunner::new().with_factory(F).install(&registry)` API compiles |
+
+   **Workspace registration**. `Cargo.toml`
+   `workspace.members` adds `crates/lvqr-agent`;
+   `workspace.dependencies` adds
+   `lvqr-agent = { version = "0.4.0", path = "crates/lvqr-agent" }`.
+   No CLI dependency edge added this session
+   (session 98 / 100 will add it when the CLI
+   threads `AgentRunner::install` through
+   `lvqr_cli::start`).
+
+   **Plan refresh**.
+   `tracking/TIER_4_PLAN.md` section 4.5 header
+   flipped to "A DONE, B-D pending"; row 97 A
+   scoped up from one-line to the full deliverable +
+   verification record. Rows 98-100 stay as
+   one-liners (the implementing session for each
+   will scope them up in-commit per CLAUDE.md's
+   plan-vs-code rule).
+
+2. **Session 97 close doc** (this commit).
+
+### Tests shipped
+
+| # | Test surface | Added this session |
+|---|---|---|
+| a | `crates/lvqr-agent/src/runner.rs` unit tests | 8 new (lifecycle, opt-out, panic isolation start + fragment, multi-factory, default, debug) |
+| b | `crates/lvqr-agent/tests/integration_basic.rs` | 1 new (end-to-end start-drain-stop on real registry across thread boundary) |
+| c | `crates/lvqr-agent/src/runner.rs` rustdoc example | 1 new (`AgentRunner::new().with_factory(F).install(&registry)` compiles) |
+
+Workspace totals: **796** passed, 0 failed, 1
+ignored (up from session 96's 786 / 0 / 1). The +10
+breakdown is the 8 lib runner tests + 1 integration
++ 1 doctest. The 1 remaining ignored test is the
+pre-existing `moq_sink` doctest unrelated to 4.5.
+
+### Ground truth (session 97 close)
+
+* **Head**: this session's feat commit `b8631fa` +
+  the close-doc commit on local `main`. Local main
+  is now N+2 commits ahead of `origin/main` (4
+  commits ahead total: session 96's two + this
+  session's two). Verify via
+  `git log --oneline origin/main..main` before any
+  push. Do NOT push without direct user
+  instruction.
+* **Tests**: **796** passed, 0 failed, 1 ignored on
+  macOS (default features). With `--features c2pa`:
+  unchanged.
+* **CI gates locally clean**:
+  * `cargo fmt --all`
+  * `cargo clippy --workspace --all-targets --benches -- -D warnings`
+  * `cargo test -p lvqr-agent` 8 lib + 1 integration + 1 doctest = 10 passed
+  * `cargo test --workspace` 796 / 0 / 1
+* **Workspace**: **27 crates** (was 26; +lvqr-agent).
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 / 89 / 90 |
+| 4.3 | C2PA signed media | **COMPLETE** | 91 (A) / 92 (B1) / 93 (B2) / 94 (B3) |
+| 4.8 | One-token-all-protocols | **COMPLETE** | 95 (A) / 96 (B) |
+| 4.5 | In-process AI agents | **A DONE**, B-D pending | 97 (A) / 98 (B) / 99 (C) / 100 (D) |
+| 4.4 | Cross-cluster federation | PLANNED | 101-103 |
+| 4.6 | Server-side transcoding | PLANNED | 104-106 |
+| 4.7 | Latency SLO scheduling | PLANNED | 107-108 |
+
+### Session 98 entry point
+
+**Tier 4 item 4.5 session B: `WhisperCaptionsAgent`
+reading AAC audio, feeding whisper-rs.**
+
+The session-97-A scaffold makes this a self-contained
+deliverable that does NOT touch `lvqr-agent` itself:
+the new agent + factory live in their own module
+(probably `crates/lvqr-agent/src/whisper.rs` behind
+a `whisper` feature flag, or in a dedicated
+`crates/lvqr-agent-whisper/` crate -- the choice is
+session 98 B's to make in-commit). The session 97 A
+plan refresh notes the WhisperCaptionsFactory will
+register against an existing `AgentRunner` -- no
+new abstractions on the agent side.
+
+**Prerequisites already in place**:
+
+* `Agent` / `AgentFactory` / `AgentRunner` /
+  `AgentRunnerHandle` ship in session 97 A.
+* `AgentContext` carries `FragmentMeta`, so the
+  whisper agent reads the AAC track's timescale +
+  init segment without a registry round-trip.
+* Panic isolation around `on_fragment` means a
+  whisper-rs FFI fault on a single fragment will
+  log + count on `lvqr_agent_panics_total{agent="captions",phase="fragment"}`
+  but not kill the drain loop.
+* `lvqr_agent_fragments_total{agent}` is already
+  exported, so the whisper agent's per-broadcast
+  fragment counter shows up in Prometheus
+  immediately.
+
+**Pre-session checklist**:
+
+1. Decide the whisper-rs version pin and
+   `--whisper-model` path semantics; both are
+   session-98-B in-commit refreshes of section 4.5
+   row 98 B.
+2. Decide whether to land the AAC -> PCM decode in
+   `lvqr-agent-whisper` or in `lvqr-codec`. The
+   roadmap says symphonia is the decoder; the
+   integration crate is session-98-B's call.
+3. Confirm `whisper-rs` builds on macOS without GPU
+   features (the `whisper-metal` / `whisper-cuda`
+   feature flags stay deferred per section 4.5
+   anti-scope).
+
+**Verification gates (session 98 B close)**:
+
+* `cargo fmt --all`
+* `cargo clippy --workspace --all-targets --benches -- -D warnings`
+* `cargo test -p lvqr-agent --test whisper_basic`
+  (or `cargo test -p lvqr-agent-whisper` if that
+  crate lands)
+* `cargo test --workspace` (expect no regression
+  from 796)
+* `git log -1 --format='%an <%ae>'` reads
+  `Moheeb Zara <hackbuildvideo@gmail.com>` alone
+
+**Biggest risks**, ranked:
+
+1. **whisper-rs build on macOS**. The crate uses
+   `bindgen` against whisper.cpp; the build can
+   require Xcode CLT. Pin a known-good version and
+   document the rustup toolchain prereqs in
+   `crates/lvqr-agent-whisper/README.md` (or the
+   crate's lib.rs head).
+2. **Test fixture model size**. ggml-tiny is ~75
+   MB; landing it in `lvqr-conformance/fixtures`
+   would balloon the repo. Better: download-on-
+   demand under a `cargo xtask` script or a
+   `WHISPER_MODEL_PATH` env var that gates the
+   whisper test.
+3. **AAC -> PCM via symphonia**. symphonia's AAC
+   decoder is the only mainstream pure-Rust option
+   today; verify the decode path lines up with
+   what the FLV-tagged audio fragments LVQR's
+   ingest produces.
+
+
 
 ## Session 96 close (2026-04-19)
 
