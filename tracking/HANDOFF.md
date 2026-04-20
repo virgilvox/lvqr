@@ -1,8 +1,244 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 COMPLETE; 4.5 sessions A + B DONE (lvqr-agent scaffold + lvqr-agent-whisper concrete agent); 823 tests, 28 crates; **all 25 publishable workspace crates live on crates.io at v0.4.0** + origin/main synced (head `c1632c4`)
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 COMPLETE; 4.5 sessions A + B + C DONE (lvqr-agent scaffold + lvqr-agent-whisper + HLS subtitle rendition); 843 tests, 28 crates
 
-**Last Updated**: 2026-04-21 (post-session-98 publish event). Pushed session 98 commits to `origin/main` (head `c1632c4`); published `lvqr-agent-whisper 0.4.0` to crates.io as a first-time publish (the v0.4.0 release event 16+ hours earlier had drained the rate-limit bucket, but enough refill time had passed that this single publish went through on the first try). Total publishable workspace crates now at **25** (was 24 after the 2026-04-20 release event); the three publish=false helpers (`lvqr-conformance`, `lvqr-test-utils`, `lvqr-soak`) stay local. `cargo install lvqr-cli` still installs the same v0.4.0 binary; the new `lvqr-agent-whisper` is opt-in (consumers add it to their own Cargo.toml + flip the `whisper` feature). No code changes between session 98 close and this publish event.
+**Last Updated**: 2026-04-21 (session 99 close). Tier 4 item 4.5 session C landed the HLS subtitle rendition + captions registry track that bridges the WhisperCaptionsAgent's output through to browser players. Three-crate stitch: `lvqr-hls` ships the `subtitles.rs` module (`SubtitlesServer` with sliding-window cue store + WebVTT serializer + captions playlist with `EXT-X-PROGRAM-DATE-TIME` alignment, plus `MultiHlsServer::ensure_subtitles` / `subtitles` accessors); the master playlist gains the `EXT-X-MEDIA TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE="en",URI="captions/playlist.m3u8"` rendition + `SUBTITLES="subs"` on the variant when captions exist (`VariantStream` extended with `subtitles_group: Option<String>`); new axum routes `/hls/{broadcast}/captions/playlist.m3u8` + `/hls/{broadcast}/captions/seg-{msn}.vtt`. `lvqr-agent-whisper` factory gains `with_caption_registry(FragmentBroadcasterRegistry)`; the agent dual-publishes each `TranscribedCaption` to both the in-process `CaptionStream` (existing public API) AND the registry's `(broadcast, "captions")` track (new wire shape: `Fragment.payload` = UTF-8 cue text, `dts/duration` = wall-clock UNIX ms). `lvqr-cli` ships `BroadcasterCaptionsBridge` mirroring `BroadcasterHlsBridge::install`: `on_entry_created` callback for the `"captions"` track that subscribes synchronously and spawns one drain task per broadcast feeding `CaptionCue` values into `MultiHlsServer::ensure_subtitles`. `ServerHandle::fragment_registry()` + `TestServer::fragment_registry()` accessors added so integration tests can publish captions directly without driving whisper.cpp. The new `crates/lvqr-cli/tests/captions_hls_e2e.rs` exercises the full flow with synthetic fragments. Workspace tests: **843** passing (up from 823; +20 for the new modules + e2e). Workspace count unchanged at **28 crates**. Session 100 entry point is Tier 4 item 4.5 session D (`--whisper-model` CLI flag + `lvqr_cli::start` AgentRunner wiring + ffmpeg-publish-then-browser-playback E2E demo).
+
+## Session 99 close (2026-04-21)
+
+### What shipped
+
+1. **Tier 4 item 4.5 session C: HLS subtitle
+   rendition + captions registry track** (`43c29e5`).
+
+   **Decision baked in**: registry track named
+   `"captions"` (FragmentMeta `wvtt`, timescale 1000)
+   is the wire shape between captions producer and HLS
+   bridge. Per-cue Fragment payload = UTF-8 cue text;
+   `dts` / `duration` = wall-clock UNIX ms. Reasoning:
+   composes with the existing
+   `FragmentBroadcasterRegistry::on_entry_created`
+   consumer family the HLS / archive / WASM filter
+   bridges already drink from; keeps session 100 D's
+   CLI wiring uniform with every other LVQR sink;
+   future-proofs item 4.4 federation gossip.
+
+   **`lvqr-hls`** (~410 LOC + 16 tests):
+   * `subtitles.rs`: `CaptionCue` + `SubtitlesServer`
+     (cheap-to-clone `Arc<RwLock<..>>` with bounded
+     sliding window, default 50 cues). `push_cue`
+     bumps target-duration on the largest cue,
+     evicts the oldest on overflow + bumps
+     `EXT-X-MEDIA-SEQUENCE`. Renders standard HLS
+     playlist (no LL-HLS partials -- subtitles are
+     text-only and small) with per-segment
+     `EXT-X-PROGRAM-DATE-TIME` for wall-clock
+     alignment. `render_segment` emits a WEBVTT body
+     with zero-anchored cue timestamps; the playlist
+     PDT places the cue at its segment's wall-clock.
+     Hand-rolled ISO 8601 UTC formatter using Howard
+     Hinnant's days-since-epoch algorithm so chrono /
+     time stay out of the dep graph.
+   * `master.rs`: `VariantStream` gains
+     `subtitles_group: Option<String>`; renderer
+     emits `SUBTITLES="..."` when set.
+     `MediaRenditionType::Subtitles` was already
+     reserved for future use; the `EXT-X-MEDIA`
+     serializer was already correct for it.
+   * `server.rs`: `MultiHlsServer::ensure_subtitles`
+     / `subtitles` accessors mirror the audio
+     pattern. `BroadcastEntry` carries an
+     `Option<SubtitlesServer>`; `finalize_broadcast`
+     also finalizes subtitles. New axum routes via
+     the existing `/hls/{*path}` catch-all dispatch:
+     `playlist.m3u8` -> playlist body;
+     `seg-{msn}.vtt` -> 200/text/vtt or 404 (cue
+     evicted from the window). `handle_master_playlist`
+     declares the SUBTITLES rendition + adds
+     `SUBTITLES="subs"` to the variant when captions
+     exist; omits both lines when no captions
+     producer is wired (verified by negative test).
+
+   **`lvqr-agent-whisper`**:
+   * `WhisperCaptionsFactory::with_caption_registry(
+     FragmentBroadcasterRegistry)` builder; new
+     `pub const CAPTIONS_TRACK_ID = "captions"`.
+   * `WhisperCaptionsAgent` carries `caption_registry`
+     + `caption_broadcaster` fields. `on_start`
+     lazily creates the captions broadcaster on the
+     registry under `FragmentMeta::new("wvtt",
+     1000)` when the whisper feature is on AND the
+     registry is wired.
+   * `worker::run_inference` now also publishes each
+     cue to the captions broadcaster as a `Fragment`.
+     `dts/duration` = wall-clock UNIX ms (now() at
+     publish time as a v1 proxy for cue start; small
+     lag behind audio is documented as a known v1
+     limitation).
+   * `on_stop` calls `registry.remove(broadcast,
+     "captions")` so the captions HLS drain task
+     sees `Closed` and exits cleanly.
+
+   **`lvqr-cli`**:
+   * New module `captions.rs`:
+     `BroadcasterCaptionsBridge`. Mirror of
+     `BroadcasterHlsBridge::install`. Early-returns
+     for any track other than `"captions"` so it
+     composes safely with the LL-HLS bridge.
+   * Wired in `lvqr_cli::start` next to the existing
+     LL-HLS bridge install.
+   * `ServerHandle::fragment_registry()` accessor;
+     `TestServer::fragment_registry()` mirrors it.
+     `lvqr-test-utils` Cargo.toml gains
+     `lvqr-fragment` regular dep.
+
+   **Tests** (20 new):
+   * 15 lvqr-hls subtitles unit tests (timestamps,
+     WEBVTT body, ISO 8601, sliding window, finalize,
+     URI parsing).
+   * 1 master playlist test for the SUBTITLES
+     rendition + variant attribute.
+   * 1 lvqr-agent-whisper test (`on_stop` without
+     caption_registry is a no-op).
+   * 2 e2e tests in
+     `crates/lvqr-cli/tests/captions_hls_e2e.rs`:
+     positive flow (synthetic video + caption
+     fragment -> assert master + captions playlist +
+     .vtt body); negative (no captions producer ->
+     master omits SUBTITLES).
+   * 1 unrelated bonus: bumped lvqr-hls test count
+     elsewhere via the new master test.
+
+   **Plan refresh**.
+   `tracking/TIER_4_PLAN.md` section 4.5 header
+   flipped to "A + B + C DONE, D pending"; row 99 C
+   scoped up from one-line to the full deliverable +
+   verification record.
+
+2. **Session 99 close doc** (this commit).
+
+### Tests shipped
+
+| # | Test surface | Added this session |
+|---|---|---|
+| a | `crates/lvqr-hls/src/subtitles.rs` | 15 (cue duration; webvtt timestamp formatter; webvtt body; ISO 8601 epoch + recent + ms; empty playlist; push cue + segment; target-duration grows; sliding window evict; finalize ENDLIST + post-finalize push ignored; segment 404; URI round-trip) |
+| b | `crates/lvqr-hls/src/master.rs` | 1 (SUBTITLES rendition + SUBTITLES attribute on variant) |
+| c | `crates/lvqr-agent-whisper/src/agent.rs` | 1 (`on_stop` without caption_registry no-op) |
+| d | `crates/lvqr-cli/tests/captions_hls_e2e.rs` | 2 (positive: synthetic captions land in HLS; negative: no producer means no SUBTITLES rendition) |
+| e | other lvqr-hls regressions auto-passed | 1 (existing variant test re-asserted with new `subtitles_group: None` field) |
+
+Workspace totals: **843** passed, 0 failed, 1
+ignored (up from session 98's 823 / 0 / 1; +20 across
+the new modules + e2e). The 1 remaining ignored is
+the pre-existing `moq_sink` doctest unrelated to 4.5.
+
+### Ground truth (session 99 close)
+
+* **Head**: `43c29e5` (feat) + this close-doc commit.
+  Local main is 2 commits ahead of `origin/main`.
+  Verify via `git log --oneline origin/main..main`.
+  Do NOT push without direct user instruction.
+* **Tests**: **843** passed, 0 failed, 1 ignored on
+  macOS (default features).
+* **CI gates locally clean**:
+  * `cargo fmt --all`
+  * `cargo clippy --workspace --all-targets --benches -- -D warnings`
+  * `cargo test -p lvqr-hls --lib` 50 passed
+  * `cargo test -p lvqr-agent-whisper` 28 passed
+  * `cargo test -p lvqr-cli --test captions_hls_e2e` 2 passed
+  * `cargo test --workspace` 843 / 0 / 1
+* **Workspace**: **28 crates**, unchanged.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 / 89 / 90 |
+| 4.3 | C2PA signed media | **COMPLETE** | 91-94 |
+| 4.8 | One-token-all-protocols | **COMPLETE** | 95 / 96 |
+| 4.5 | In-process AI agents | **A + B + C DONE**, D pending | 97 / 98 / 99 / 100 |
+| 4.4 | Cross-cluster federation | PLANNED | 101-103 |
+| 4.6 | Server-side transcoding | PLANNED | 104-106 |
+| 4.7 | Latency SLO scheduling | PLANNED | 107-108 |
+
+### Session 100 entry point
+
+**Tier 4 item 4.5 session D: `--whisper-model` CLI
+flag + `lvqr_cli::start` AgentRunner wiring +
+ffmpeg-publish-then-browser-playback E2E demo.**
+
+Final session in 4.5. Wires the existing
+`WhisperCaptionsFactory::with_caption_registry(...)
+` builder into the CLI under a new
+`--whisper-model <PATH>` flag (gated on a `whisper`
+Cargo feature on `lvqr-cli` that pulls in
+`lvqr-agent-whisper/whisper`), and produces the
+manual demo per section 4.5 row 100 D: ffmpeg
+publishing English audio + browser hls.js playback
+showing on-screen captions.
+
+**Prerequisites already in place**:
+
+* `WhisperCaptionsFactory::with_caption_registry`
+  exists (session 99 C).
+* `BroadcasterCaptionsBridge` is installed in
+  `lvqr_cli::start` for every server (session 99 C).
+* The HLS subtitle rendition is exposed under
+  `/hls/{broadcast}/captions/...` (session 99 C).
+* `ServerHandle::fragment_registry()` accessor
+  exists (session 99 C); the CLI wiring will hand
+  the registry to the factory, then install the
+  factory on the existing `AgentRunner`
+  (`lvqr_agent::AgentRunner::install` -- session 97
+  A).
+
+**Pre-session checklist**:
+
+1. Decide on the `lvqr-cli` feature flag name
+   (`whisper`? `captions`?). Lean toward `whisper`
+   for symmetry with `lvqr-agent-whisper`'s
+   feature.
+2. Decide on `--whisper-language` (deferred per
+   4.5 anti-scope: English only). Document the
+   anti-scope in the CLI flag's help text.
+3. Pre-test the manual demo on a real .bin file
+   so session 100 D's commit message can include
+   the demo recipe verbatim.
+
+**Verification gates (session 100 D close)**:
+
+* `cargo fmt --all`
+* `cargo clippy --workspace --all-targets --benches -- -D warnings`
+* `cargo test --workspace` (expect no regression
+  from 843)
+* Manual demo: ffmpeg publish English audio ->
+  browser hls.js playback shows on-screen captions
+  within ~5 s of speech.
+* `git log -1 --format='%an <%ae>'` reads
+  `Moheeb Zara <hackbuildvideo@gmail.com>` alone
+
+**Biggest risks**, ranked:
+
+1. **`lvqr-cli` feature graph blow-up**. Adding a
+   `whisper` feature to `lvqr-cli` that pulls in
+   `lvqr-agent-whisper/whisper` means
+   `cargo build -p lvqr-cli --features whisper` now
+   compiles whisper.cpp. Make sure the default
+   `cargo install lvqr-cli` build stays light by
+   keeping the feature OFF by default.
+2. **Demo flake**. Whisper-cpp tiny.en model on
+   a real ffmpeg AAC stream may produce no captions
+   on certain audio (silent / non-English / very
+   short clips). The session 100 D demo recipe
+   should pick a known-English audio source with
+   clear speech (a podcast clip, an audiobook
+   excerpt, etc.).
+3. **CLI argument name + env-var collision**. Pick
+   `--whisper-model` + `LVQR_WHISPER_MODEL` env to
+   match the project's flag conventions.
+
+ Pushed session 98 commits to `origin/main` (head `c1632c4`); published `lvqr-agent-whisper 0.4.0` to crates.io as a first-time publish (the v0.4.0 release event 16+ hours earlier had drained the rate-limit bucket, but enough refill time had passed that this single publish went through on the first try). Total publishable workspace crates now at **25** (was 24 after the 2026-04-20 release event); the three publish=false helpers (`lvqr-conformance`, `lvqr-test-utils`, `lvqr-soak`) stay local. `cargo install lvqr-cli` still installs the same v0.4.0 binary; the new `lvqr-agent-whisper` is opt-in (consumers add it to their own Cargo.toml + flip the `whisper` feature). No code changes between session 98 close and this publish event.
 
 ## Post-session-98 publish event (2026-04-21)
 
