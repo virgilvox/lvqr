@@ -12,6 +12,14 @@ categories = ["network-programming", "multimedia"]
 
 [dependencies]
 lvqr-core = { workspace = true }
+# Tier 4 item 4.4 session A: the federation runner opens outbound MoQ
+# sessions to peer-cluster relays. `lvqr-moq` is the only supported
+# moq-lite facade; `moq-native` is the transport + client builder; `url`
+# carries the remote relay URL + token query parameter.
+lvqr-moq = { workspace = true }
+moq-lite = { workspace = true }
+moq-native = { workspace = true }
+url = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 chitchat = { workspace = true }
@@ -24,3 +32,4 @@ rand = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+toml = { workspace = true }

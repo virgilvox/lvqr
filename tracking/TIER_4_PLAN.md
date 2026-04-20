@@ -628,7 +628,7 @@ change.
   the budget, cut multi-language validation and
   `--whisper-language` flag; ship English-only.
 
-## 4.4 -- Cross-cluster federation (2 weeks, 3 sessions, 101-103)
+## 4.4 -- Cross-cluster federation (2 weeks, 3 sessions, 101-103; A DONE, B-C pending)
 
 ### Scope (what lands)
 
@@ -661,11 +661,11 @@ change.
 
 ### Session decomposition
 
-| # | Session | Deliverable | Verification |
-|---|---|---|---|
-| 101 | A | `FederationLink` config + MoQ subscribe loop. | `cargo test -p lvqr-cluster --test federation_unit` |
-| 102 | B | Two-cluster integration test: A publishes, B subscribes via link. | `cargo test -p lvqr-cli --test federation_two_cluster` |
-| 103 | C | Admin route `/api/v1/cluster/federation` + reconnect on link failure. | `cargo test -p lvqr-cli --test federation_reconnect` |
+| # | Session | Deliverable | Verification | Status |
+|---|---|---|---|---|
+| 101 | A | `FederationLink` config + MoQ subscribe-loop scaffold. `lvqr-cluster` gains `FederationLink { remote_url, auth_token, forwarded_broadcasts: Vec<String> }` (serde, TOML-facing + JSON) plus `FederationRunner::start(links, local_origin, shutdown) -> FederationRunner` that spawns one tokio task per link. Each task opens an outbound MoQ session via `moq_native::Client` against `link.subscription_url()` (which appends the token as `?token=<jwt>` matching `lvqr_relay::server::parse_url_token`), races the connect future with the shared cancellation token so an unreachable peer does not hang shutdown, then drains the remote origin's announcement stream and filters against `link.forwards(name)`. Matched announcements are logged with a structured event; the actual per-track re-publish from the remote `BroadcastConsumer` into the local `OriginProducer` broadcast is deferred to session 102 B where the two-cluster integration test can exercise the full wire path. `FederationRunner::shutdown()` bounds each per-link task wait to a 1 s grace then aborts; the `Drop` impl cancels + aborts for the leak-safety path. New deps on `lvqr-cluster`: `lvqr-moq`, `moq-lite`, `moq-native`, `url`. | `cargo fmt --all` clean; `cargo clippy --workspace --all-targets --benches -- -D warnings` clean; `cargo test -p lvqr-cluster --test federation_unit` 9 passed (config JSON + TOML round trip, `forwarded_broadcasts` serde default, `forwards` exact-match, `subscription_url` token append + error on bad URL, runner start/shutdown with 0 links, runner shutdown bounded even with unreachable remote URL, runner Drop path); `cargo test -p lvqr-cluster --lib` 40 passed (6 new inline tests); `cargo test --workspace` 858 passed / 0 failed / 1 ignored (up from 843; +15 across integration + inline). | **DONE (session 101)** |
+| 102 | B | Two-cluster integration test: A publishes, B subscribes via link. Scoped up from "test only" to also include the per-track re-publish implementation (subscribe remote `0.mp4` / `1.mp4` / `catalog`; copy groups + frames into the local origin's broadcast). | `cargo test -p lvqr-cli --test federation_two_cluster` | pending |
+| 103 | C | Admin route `/api/v1/cluster/federation` + reconnect on link failure. | `cargo test -p lvqr-cli --test federation_reconnect` | pending |
 
 ### Risks + mitigations
 

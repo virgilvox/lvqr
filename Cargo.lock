@@ -2956,13 +2956,18 @@ dependencies = [
  "bytes",
  "chitchat",
  "lvqr-core",
+ "lvqr-moq",
+ "moq-lite",
+ "moq-native",
  "rand 0.8.5",
  "serde",
  "serde_json",
  "tokio",
  "tokio-util",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

@@ -62,6 +62,7 @@ mod broadcast;
 mod capacity;
 mod config;
 mod endpoints;
+mod federation;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -81,6 +82,7 @@ pub use broadcast::{BROADCAST_KEY_PREFIX, BroadcastSummary, Claim, MIN_LEASE};
 pub use capacity::{CAPACITY_KEY, CapacityGauge, NodeCapacity};
 pub use config::{CONFIG_KEY_PREFIX, ConfigEntry};
 pub use endpoints::{ENDPOINTS_KEY, NodeEndpoints};
+pub use federation::{FederationLink, FederationRunner};
 
 /// Default UDP port for the chitchat gossip transport. Matches the
 /// upstream chitchat example's convention. No LVQR listener today
