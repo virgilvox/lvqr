@@ -1,8 +1,287 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 COMPLETE; 4.5 session A DONE (lvqr-agent scaffold landed); 796 tests, 27 crates; **v0.4.0 published to crates.io + pushed to origin/main**
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 COMPLETE; 4.5 sessions A + B DONE (lvqr-agent scaffold + lvqr-agent-whisper concrete agent); 823 tests, 28 crates; v0.4.0 already on crates.io + origin/main
 
-**Last Updated**: 2026-04-20 (v0.4.0 release event). Post-session-97-close release activity: GitHub `origin/main` synced (head `6e98553`); README + docs refreshed for 4-of-8 Tier 4 status (commit `bdb5420`); workspace `Cargo.toml` patched to declare `lvqr-conformance` / `lvqr-test-utils` / `lvqr-soak` as path-only workspace deps (commit `6e98553`) so consumer dev-dep manifests are strippable on `cargo publish` (was the blocker on first publish attempt; cargo's package step rejects dev-deps that have a version field but cannot be resolved on the registry); 24 publishable workspace crates published to crates.io at v0.4.0 (8 version-bumps from 0.3.1 + 16 first-time publishes). Notable name re-use: `lvqr-wasm` 0.3.1 was "browser playback bindings" and 0.4.0 is "server-side WASM filter host" -- different content, same name (deliberate per session-44 refactor). The crates.io rate limit (5-burst then 1 new crate per 10 min) was the long pole: chain ran ~90 min wall-clock. `lvqr-cli 0.4.0` is the consumer-facing entry point (`cargo install lvqr-cli` after the chain settles).
+**Last Updated**: 2026-04-20 (session 98 close). Tier 4 item 4.5 session B landed `crates/lvqr-agent-whisper`, the first concrete `lvqr_agent::Agent` implementation: a `WhisperCaptionsFactory` that opts in only for the audio track (`track_id == "1.mp4"`) and a `WhisperCaptionsAgent` that subscribes to the broadcast's audio stream, extracts raw AAC frames from each fragment's `moof + mdat` payload, decodes via symphonia (using the `AudioSpecificConfig` parsed out of the init segment), buffers PCM up to a configurable window (default 5 s), and runs whisper.cpp inference on a dedicated OS worker thread to emit `TranscribedCaption` values onto a public `tokio::sync::broadcast`-backed `CaptionStream`. Heavy deps (`whisper-rs 0.16` + `symphonia 0.6.0-alpha.2 [aac]`) gated behind a default-OFF `whisper` Cargo feature so `cargo build --workspace` stays fast. Always-available surface (`TranscribedCaption`, `CaptionStream`, factory, agent stub, mdat parser, ASC parser) compiles without the feature so consumers can wire the factory into an `AgentRunner` and the agent contract holds (no-op `on_fragment` with a single debug-log line). With the feature enabled, the worker uses `std::sync::mpsc::sync_channel(64)` for back-pressure-free frame intake and runs `WhisperContext::full` with English-only `Greedy { best_of: 1 }` sampling. Workspace tests: **823** passing (up from 796; +27 new lib tests for agent / asc / caption / factory / decode / mdat). Workspace count now **28 crates** (was 27). Session 99 entry point is Tier 4 item 4.5 session C (captions track publish via `lvqr-moq` + HLS subtitle rendition wiring in `lvqr-hls`).
+
+## Session 98 close (2026-04-20)
+
+### What shipped
+
+1. **Tier 4 item 4.5 session B: `lvqr-agent-whisper`
+   crate** (`ac989d8`).
+
+   **Crate-layout decision baked in (carry forward
+   to sessions 99-100)**: dedicated crate
+   `crates/lvqr-agent-whisper`, NOT a feature-gated
+   module inside `lvqr-agent`. Reasoning in the
+   crate's lib.rs:
+
+   * Clean isolation: whisper-rs (bindgen + cmake
+     against whisper.cpp) and symphonia (AAC decoder
+     + format demuxers) do not touch lvqr-agent's
+     dep graph.
+   * Mirrors the `lvqr-archive` optional-c2pa
+     pattern at the workspace level.
+   * Future GPU features (`whisper-metal`,
+     `whisper-cuda`) will live here without bloating
+     lvqr-agent.
+
+   **Feature gating decision**: `whisper-rs 0.16` +
+   `symphonia 0.6.0-alpha.2` are pulled in only when
+   the `whisper` Cargo feature is enabled (default
+   OFF). Without the feature the crate ships its
+   always-available surface so `cargo build
+   --workspace` stays fast and CI runners without
+   Xcode CLT / cmake / libclang do not have to
+   compile whisper.cpp on every push.
+
+   **Always-available surface** (compiled by the
+   default no-feature build):
+
+   * `TranscribedCaption { broadcast, start_ts,
+     end_ts, text }` in the source track's
+     timescale.
+   * `CaptionStream`: cheaply-cloneable
+     `tokio::sync::broadcast`-backed fan-out
+     (capacity 256). `subscribe()` returns
+     `Receiver`; subscribers connecting after a
+     publish do NOT see prior captions (mirror of
+     `FragmentBroadcaster`).
+   * `WhisperCaptionsFactory`: `name() = "captions"`;
+     `build()` opts in only when
+     `ctx.track == "1.mp4"`. Cheaply cloneable;
+     inner `WhisperConfig` is `Arc`'d so all
+     per-broadcast agents share the model path +
+     window. Captions handle is also shared so
+     downstream consumers can `subscribe()` before
+     install.
+   * `WhisperCaptionsAgent`: holds the state
+     captured at `on_start` plus an
+     `Option<WorkerHandle>`. Without the feature
+     `on_fragment` is a debug-log no-op (one log
+     line per broadcast, not per frame).
+   * `mdat::extract_first_mdat`: walks BMFF
+     top-level boxes by `(size, type)` header,
+     returns the first `mdat` payload as a sliced
+     `Bytes` (no copy). Defensive: rejects truncated
+     headers, sub-header sizes, and declared sizes
+     that overrun the buffer.
+   * `asc::extract_asc`: descends
+     `moov/trak/mdia/minf/stbl/stsd/mp4a/esds`,
+     walks the MPEG-4 descriptor list (ESDescriptor
+     0x03 -> DecoderConfigDescriptor 0x04 ->
+     DecoderSpecificInfo 0x05) with VLE-length
+     support per ISO/IEC 14496-1.
+
+   **Whisper-feature surface** (`--features whisper`):
+
+   * `decode::AacToMonoF32`: stateful symphonia AAC
+     decoder + channel downmix + nearest-neighbour
+     resample to 16 kHz. Symphonia 0.6.0-alpha.2
+     API: `AudioCodecParameters` with `CODEC_ID_AAC`
+     + `with_extra_data(asc)`; decoder via
+     `get_codecs().get_audio_decoder(CODEC_ID_AAC)`.
+     `GenericAudioBufferRef::copy_to_vec_interleaved
+     ::<f32>` pulls interleaved PCM; manual chunked
+     downmix produces mono. Reusable interleaved
+     buffer held across calls so there's only one
+     heap allocation per AAC frame on the hot path.
+   * `worker::spawn` + `WorkerHandle`: spawns one OS
+     thread per agent (NOT a tokio task --
+     whisper.cpp inference is CPU-bound and would
+     starve the runtime). The agent holds a
+     `std::sync::mpsc::sync_channel(64)` `Sender`;
+     `on_fragment` calls `try_send` and drops +
+     warn-logs on a full channel, never
+     back-pressuring the per-broadcast drain task.
+     The worker receives `Frame { dts, aac }`
+     messages, decodes via the `AacToMonoF32`,
+     buffers up to `WhisperConfig::window_ms`
+     (default 5000) of PCM, then runs
+     `WhisperContext::full` with English-only
+     `Greedy { best_of: 1 }` sampling. Segments
+     with non-empty trimmed text are emitted onto
+     `CaptionStream` as `TranscribedCaption` values;
+     `start_ts` / `end_ts` are computed by adding
+     the whisper-segment centisecond timestamps
+     (scaled to source-track timescale) to the
+     window's starting fragment DTS, so consumers
+     can align captions against the source DTS axis.
+     On channel close (sender dropped) the worker
+     drains its remaining PCM, runs one final
+     inference pass, then exits.
+
+   **Test gates**:
+
+   * `tests/whisper_basic.rs`: `#[ignore]`
+     integration test gated on the `whisper` feature
+     AND a `WHISPER_MODEL_PATH` env var. The test
+     docblock documents the
+     `curl ... ggml-tiny.en.bin` fetch process; the
+     model file (~75 MB) is intentionally NOT
+     bundled in `lvqr-conformance/fixtures`. Without
+     the env var the test logs a single line and
+     returns Ok -- absent model is the expected
+     default state, not a failure.
+   * 27 inline `#[cfg(test)]` lib tests covering:
+     mdat malformed-input + empty-mdat (7); ASC
+     descriptor VLE + box-chain round-trip + garbage
+     input (5); CaptionStream pre/post-subscribe
+     semantics + clone state-sharing (3); factory
+     audio-only opt-in + opt-out for video / catalog
+     (5); agent on_fragment with + without mdat +
+     missing-init-segment + sample-rate capture (4);
+     decode resampler identity / down-44100/up-8000
+     / empty input (4) -- gated to whisper feature
+     but mostly verifying the always-available
+     surface.
+
+   **Workspace registration**.
+   `crates/lvqr-agent-whisper` added to
+   `workspace.members` + `workspace.dependencies`.
+   Path-only entry, mirroring `lvqr-agent`.
+
+   **Plan refresh**. `tracking/TIER_4_PLAN.md`
+   section 4.5 header flipped to "A + B DONE, C-D
+   pending"; row 98 B scoped up from one-line to the
+   full deliverable + verification record.
+
+2. **Session 98 close doc** (this commit).
+
+### Tests shipped
+
+| # | Test surface | Added this session |
+|---|---|---|
+| a | `crates/lvqr-agent-whisper/src/mdat.rs` | 7 (happy path, no-mdat, truncated header, lying box size, zero size, empty buffer, empty mdat payload) |
+| b | `crates/lvqr-agent-whisper/src/asc.rs` | 5 (VLE descriptor length 1/2/3-byte + truncated; round-trip extract from synthesized init; garbage / empty input) |
+| c | `crates/lvqr-agent-whisper/src/caption.rs` | 3 (pre/post-subscribe semantics, no-subscriber publish, clone state sharing) |
+| d | `crates/lvqr-agent-whisper/src/factory.rs` | 5 (audio-only opt-in, video opt-out, other-tracks opt-out, name = "captions", config window default + override, captions handle clone) |
+| e | `crates/lvqr-agent-whisper/src/agent.rs` | 4 (no-feature on_fragment is no-op, no-mdat fragment is no-op, sample_rate captured from meta, missing init segment handled gracefully) |
+| f | `crates/lvqr-agent-whisper/src/decode.rs` | 4 (resampler identity, 44100->16000 downsample, empty input, 8000->16000 upsample) -- gated to whisper feature but compiled by default cargo check |
+| g | `crates/lvqr-agent-whisper/tests/whisper_basic.rs` | 1 `#[ignore]` integration test gated on `WHISPER_MODEL_PATH` |
+
+Workspace totals: **823** passed, 0 failed, 1 ignored
+(up from session-97's 796 / 0 / 1; +27 new lib tests).
+The 1 remaining ignored test is the pre-existing
+`moq_sink` doctest unrelated to 4.5.
+
+### Ground truth (session 98 close)
+
+* **Head**: `ac989d8` (feat) + this close-doc
+  commit. Local main is N+2 commits ahead of
+  `origin/main`. Verify via
+  `git log --oneline origin/main..main`. Do NOT
+  push without direct user instruction.
+* **Tests**: **823** passed, 0 failed, 1 ignored on
+  macOS (default features).
+* **CI gates locally clean**:
+  * `cargo fmt --all`
+  * `cargo clippy --workspace --all-targets --benches -- -D warnings`
+  * `cargo test -p lvqr-agent-whisper` 27 passed
+  * `cargo check -p lvqr-agent-whisper --features whisper` clean
+  * `cargo test --workspace` 823 / 0 / 1
+* **Workspace**: **28 crates** (was 27;
+  +`lvqr-agent-whisper`).
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 / 89 / 90 |
+| 4.3 | C2PA signed media | **COMPLETE** | 91-94 |
+| 4.8 | One-token-all-protocols | **COMPLETE** | 95 / 96 |
+| 4.5 | In-process AI agents | **A + B DONE**, C-D pending | 97 / 98 / 99 / 100 |
+| 4.4 | Cross-cluster federation | PLANNED | 101-103 |
+| 4.6 | Server-side transcoding | PLANNED | 104-106 |
+| 4.7 | Latency SLO scheduling | PLANNED | 107-108 |
+
+### Session 99 entry point
+
+**Tier 4 item 4.5 session C: captions track
+publish via `lvqr-moq` + HLS subtitle rendition
+wiring in `lvqr-hls`.**
+
+The session-98-B `WhisperCaptionsFactory::captions()`
+returns a `CaptionStream` clone that downstream
+consumers subscribe to. Session 99 C wires that
+subscription into:
+
+1. A new MoQ track per broadcast at name
+   `<broadcast>/captions`, where each
+   `TranscribedCaption` becomes one MoQ object
+   (caption-fragment-as-MoQ-object follows the
+   existing `Fragment -> MoqTrackSink` projection
+   pattern).
+2. `lvqr-hls`'s `MultiHlsServer` gains a subtitle-
+   rendition group; the master playlist references
+   the captions track via
+   `EXT-X-MEDIA TYPE=SUBTITLES`. Browser hls.js
+   players auto-subscribe.
+
+**Prerequisites already in place**:
+
+* `WhisperCaptionsFactory::captions() -> CaptionStream`
+  is the subscribe entry point (session 98 B).
+* `TranscribedCaption` has `start_ts` / `end_ts` in
+  the source track's timescale, ready for
+  WebVTT-cue serialization.
+* `lvqr-hls`'s `MultiHlsServer` already supports
+  multiple renditions (audio rendition for video
+  broadcasts); subtitle is a third rendition type.
+
+**Pre-session checklist**:
+
+1. Decide: does the captions track go through the
+   shared `FragmentBroadcasterRegistry` (under
+   track id `"captions"`) or stay on its own
+   `CaptionStream`? The registry path makes session
+   100 D's CLI wiring + cluster federation
+   compatibility cleaner, but the standalone
+   stream avoids serializing captions through the
+   Fragment model (which is fMP4-shaped and
+   awkward for WebVTT cues).
+2. Decide: WebVTT serialization in `lvqr-hls` or
+   in `lvqr-agent-whisper`? Likely lvqr-hls because
+   that's where the playlist composition lives.
+3. Decide: caption track init segment shape (HLS
+   subtitle renditions accept a webvtt rendition
+   without an fMP4 wrapper).
+
+**Verification gates (session 99 C close)**:
+
+* `cargo fmt --all`
+* `cargo clippy --workspace --all-targets --benches -- -D warnings`
+* `cargo test -p lvqr-cli --test captions_hls_e2e`
+* `cargo test --workspace` (expect no regression
+  from 823)
+* `git log -1 --format='%an <%ae>'` reads
+  `Moheeb Zara <hackbuildvideo@gmail.com>` alone
+
+**Biggest risks**, ranked:
+
+1. **WebVTT cue alignment**. Whisper's segment
+   timestamps are in centiseconds within an
+   inference window; mapping them onto wall-clock
+   PROGRAM-DATE-TIME requires the broadcast's start
+   PDT plus the source DTS axis. The agent already
+   threads the start fragment DTS into
+   `TranscribedCaption.start_ts`; the HLS bridge
+   needs to add the broadcast's start PDT.
+2. **Late subscriber**. A viewer who joins the HLS
+   stream mid-broadcast will not see captions
+   emitted before they subscribed (CaptionStream is
+   `tokio::sync::broadcast`-backed; no history). For
+   the v1 demo this is acceptable; future work
+   would back the captions with a small DVR window
+   in `lvqr-archive`.
+3. **HLS subtitle rendition browser support**.
+   hls.js handles WebVTT subtitles; native Safari
+   does too. Validate against both before declaring
+   session 100 D demo-ready.
+
+ Post-session-97-close release activity: GitHub `origin/main` synced (head `6e98553`); README + docs refreshed for 4-of-8 Tier 4 status (commit `bdb5420`); workspace `Cargo.toml` patched to declare `lvqr-conformance` / `lvqr-test-utils` / `lvqr-soak` as path-only workspace deps (commit `6e98553`) so consumer dev-dep manifests are strippable on `cargo publish` (was the blocker on first publish attempt; cargo's package step rejects dev-deps that have a version field but cannot be resolved on the registry); 24 publishable workspace crates published to crates.io at v0.4.0 (8 version-bumps from 0.3.1 + 16 first-time publishes). Notable name re-use: `lvqr-wasm` 0.3.1 was "browser playback bindings" and 0.4.0 is "server-side WASM filter host" -- different content, same name (deliberate per session-44 refactor). The crates.io rate limit (5-burst then 1 new crate per 10 min) was the long pole: chain ran ~90 min wall-clock. `lvqr-cli 0.4.0` is the consumer-facing entry point (`cargo install lvqr-cli` after the chain settles).
 
 ## v0.4.0 release event (2026-04-20)
 
