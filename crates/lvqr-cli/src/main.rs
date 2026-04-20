@@ -370,6 +370,12 @@ async fn serve_from_args(
         cluster_advertise_hls: args.cluster_advertise_hls,
         cluster_advertise_dash: args.cluster_advertise_dash,
         cluster_advertise_rtsp: args.cluster_advertise_rtsp,
+        // Federation links are TOML-only for v1; a `--federation-link`
+        // CLI flag gets added in session 103 C alongside the admin
+        // route. Keeping the field empty here means default `lvqr serve`
+        // invocations do not change behavior.
+        #[cfg(feature = "cluster")]
+        federation_links: Vec::new(),
     };
 
     let handle = start(config).await?;

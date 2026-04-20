@@ -2931,6 +2931,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "metrics-util",
  "moq-lite",
+ "moq-native",
  "rcgen 0.13.2",
  "rml_rtmp",
  "rustls",
@@ -2946,6 +2947,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -3273,8 +3275,10 @@ dependencies = [
  "lvqr-archive",
  "lvqr-auth",
  "lvqr-cli",
+ "lvqr-cluster",
  "lvqr-core",
  "lvqr-fragment",
+ "lvqr-moq",
  "lvqr-wasm",
  "rand 0.8.5",
  "rcgen 0.13.2",

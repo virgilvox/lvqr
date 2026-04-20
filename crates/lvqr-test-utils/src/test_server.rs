@@ -55,6 +55,7 @@ pub struct TestServerConfig {
     c2pa: Option<lvqr_archive::provenance::C2paConfig>,
     #[cfg(feature = "whisper")]
     whisper_model: Option<PathBuf>,
+    federation_links: Vec<lvqr_cluster::FederationLink>,
 }
 
 impl TestServerConfig {
@@ -114,6 +115,15 @@ impl TestServerConfig {
     #[cfg(feature = "whisper")]
     pub fn with_whisper_model(mut self, path: impl Into<PathBuf>) -> Self {
         self.whisper_model = Some(path.into());
+        self
+    }
+
+    /// Add a cross-cluster federation link to the TestServer's
+    /// `ServeConfig`. Multiple calls append; call order matches
+    /// `ServeConfig::federation_links` ordering. Tier 4 item 4.4
+    /// session B.
+    pub fn with_federation_link(mut self, link: lvqr_cluster::FederationLink) -> Self {
+        self.federation_links.push(link);
         self
     }
 
@@ -220,6 +230,7 @@ impl TestServer {
             cluster_advertise_hls: None,
             cluster_advertise_dash: None,
             cluster_advertise_rtsp: None,
+            federation_links: config.federation_links,
         };
         let handle = start(serve_config).await?;
         Ok(Self { handle })
@@ -293,6 +304,22 @@ impl TestServer {
     #[cfg(feature = "whisper")]
     pub fn agent_runner(&self) -> Option<&lvqr_agent::AgentRunnerHandle> {
         self.handle.agent_runner()
+    }
+
+    /// Cloneable handle to the server's relay-backing
+    /// [`lvqr_moq::OriginProducer`]. Tier 4 item 4.4 session B
+    /// federation tests use this to inject synthetic MoQ
+    /// broadcasts on one TestServer and assert they propagate to
+    /// another via a configured federation link.
+    pub fn origin(&self) -> &lvqr_moq::OriginProducer {
+        self.handle.origin()
+    }
+
+    /// FederationRunner handle. Returns `None` when no
+    /// [`with_federation_link`](TestServerConfig::with_federation_link)
+    /// builder was invoked. Tier 4 item 4.4 session B.
+    pub fn federation_runner(&self) -> Option<&lvqr_cluster::FederationRunner> {
+        self.handle.federation_runner()
     }
 
     /// Bound SRT ingest UDP address. Panics if SRT was not enabled.

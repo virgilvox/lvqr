@@ -223,6 +223,14 @@ pub struct ServeConfig {
     /// redirect-to-owner path on DESCRIBE / PLAY for peer-owned
     /// broadcasts.
     pub cluster_advertise_rtsp: Option<String>,
+    /// Cross-cluster federation links. Each link opens a single
+    /// outbound MoQ session to a peer cluster's relay and
+    /// re-publishes matching broadcasts into the local origin.
+    /// Empty list disables federation. Feature-gated on `cluster`
+    /// since `FederationLink` lives in `lvqr-cluster`. Tier 4 item
+    /// 4.4.
+    #[cfg(feature = "cluster")]
+    pub federation_links: Vec<lvqr_cluster::FederationLink>,
 }
 
 impl ServeConfig {
@@ -264,6 +272,8 @@ impl ServeConfig {
             cluster_advertise_hls: None,
             cluster_advertise_dash: None,
             cluster_advertise_rtsp: None,
+            #[cfg(feature = "cluster")]
+            federation_links: Vec::new(),
         }
     }
 }
@@ -324,6 +334,21 @@ pub struct ServerHandle {
     /// driving a real ingest protocol. Tier 4 item 4.5
     /// session C added this accessor.
     fragment_registry: FragmentBroadcasterRegistry,
+    /// Clone of the relay-backing `OriginProducer`. Federation
+    /// tests use this to inject synthetic broadcasts on one
+    /// server and verify they propagate to another via a
+    /// configured [`lvqr_cluster::FederationLink`]. Always
+    /// present since every server has an origin; feature gating
+    /// lives on the callers that construct broadcasts through
+    /// this handle.
+    origin: lvqr_moq::OriginProducer,
+    /// `FederationRunner` holding outbound MoQ sessions to peer
+    /// clusters open for the server's lifetime. `None` when
+    /// `ServeConfig::federation_links` is empty. Feature-gated
+    /// on `cluster` since `FederationRunner` lives in
+    /// `lvqr-cluster`. Tier 4 item 4.4 session B.
+    #[cfg(feature = "cluster")]
+    federation_runner: Option<lvqr_cluster::FederationRunner>,
 }
 
 impl ServerHandle {
@@ -385,6 +410,16 @@ impl ServerHandle {
         &self.fragment_registry
     }
 
+    /// Cloneable handle to the relay-backing
+    /// [`lvqr_moq::OriginProducer`]. Used by Tier 4 item 4.4
+    /// integration tests to inject synthetic MoQ broadcasts on
+    /// one server and verify that a configured
+    /// [`lvqr_cluster::FederationLink`] propagates them to a
+    /// peer server.
+    pub fn origin(&self) -> &lvqr_moq::OriginProducer {
+        &self.origin
+    }
+
     /// Cluster handle backing this server, when
     /// [`ServeConfig::cluster_listen`] was `Some` at `start()`
     /// time. Returns `None` for single-node servers. Callers
@@ -394,6 +429,15 @@ impl ServerHandle {
     #[cfg(feature = "cluster")]
     pub fn cluster(&self) -> Option<&std::sync::Arc<lvqr_cluster::Cluster>> {
         self.cluster.as_ref()
+    }
+
+    /// `FederationRunner` handle backing this server, when
+    /// [`ServeConfig::federation_links`] was non-empty at
+    /// `start()` time. Returns `None` otherwise. Tier 4 item
+    /// 4.4 session B.
+    #[cfg(feature = "cluster")]
+    pub fn federation_runner(&self) -> Option<&lvqr_cluster::FederationRunner> {
+        self.federation_runner.as_ref()
     }
 
     /// HTTP URL pointing at a path on the DASH surface, e.g.
@@ -828,6 +872,26 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         BroadcasterDashBridge::install(dash.clone(), &shared_registry);
     }
 
+    // Tier 4 item 4.4 session B: start a FederationRunner against any
+    // configured peer-cluster MoQ relays. Each runner task opens an
+    // outbound MoQ session, drains the remote origin's announcement
+    // stream, filters by the link's forwarded_broadcasts list, and
+    // re-publishes matched broadcasts into the local relay's origin
+    // producer so every MoQ subscriber on this node sees them as if
+    // they were ingested locally. No-op when the links list is empty.
+    // Feature-gated on `cluster` so single-node builds stay thin.
+    #[cfg(feature = "cluster")]
+    let federation_runner_handle = if config.federation_links.is_empty() {
+        None
+    } else {
+        tracing::info!(links = config.federation_links.len(), "starting federation runner");
+        Some(lvqr_cluster::FederationRunner::start(
+            config.federation_links.clone(),
+            relay.origin().clone(),
+            shutdown.clone(),
+        ))
+    };
+
     // Optional WHEP surface. Constructed before the bridge is
     // frozen into an `Arc` so we can attach the `WhepServer` as a
     // `RawSampleObserver`; both the observer clone and the axum
@@ -1230,6 +1294,12 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // the end of the join block.
     let whip_bridge_keepalive = whip_bridge;
 
+    // Clone the relay's OriginProducer for the ServerHandle. `relay`
+    // itself moves into the accept-loop below, so the clone is how
+    // callers (federation tests, admin consumers) reach the origin
+    // for the server's lifetime.
+    let relay_origin = relay.origin().clone();
+
     let join = tokio::spawn(async move {
         let shutdown_on_exit_relay = bg_shutdown_for_task.clone();
         let relay_fut = async move {
@@ -1367,6 +1437,9 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         #[cfg(feature = "whisper")]
         agent_runner: agent_runner_handle,
         fragment_registry: shared_registry,
+        origin: relay_origin,
+        #[cfg(feature = "cluster")]
+        federation_runner: federation_runner_handle,
     })
 }
 

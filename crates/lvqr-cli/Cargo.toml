@@ -125,3 +125,9 @@ lvqr-test-utils = { workspace = true, features = ["c2pa"] }
 jsonwebtoken = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
+# Federation two-cluster E2E test opens a real MoQ client against the
+# second TestServer and reads announcements; it also names
+# `FederationLink` to construct the config. Both are dev-only.
+lvqr-cluster = { workspace = true }
+moq-native = { workspace = true }
+url = { workspace = true }

@@ -92,11 +92,23 @@ pub struct FederationLink {
     /// Glob / prefix patterns are explicitly out of scope for v1.
     #[serde(default)]
     pub forwarded_broadcasts: Vec<String>,
+    /// Disable TLS certificate verification on the outbound MoQ
+    /// session. Defaults to `false` (verify against the operator's
+    /// trust store). Set `true` when both clusters run self-signed
+    /// certs inside a trusted VPC, or when integration tests use
+    /// `TestServer`'s auto-generated self-signed cert.
+    ///
+    /// Security note: disabling verification exposes the federation
+    /// `auth_token` to MITM attackers on the link's network path.
+    /// Only disable inside a topology where the network itself is
+    /// already authenticated (private VPC, mesh WireGuard, etc.).
+    #[serde(default)]
+    pub disable_tls_verify: bool,
 }
 
 impl FederationLink {
     /// New link with the supplied remote URL, auth token, and
-    /// forwarded broadcast list.
+    /// forwarded broadcast list. TLS verification defaults to on.
     pub fn new(
         remote_url: impl Into<String>,
         auth_token: impl Into<String>,
@@ -106,7 +118,16 @@ impl FederationLink {
             remote_url: remote_url.into(),
             auth_token: auth_token.into(),
             forwarded_broadcasts,
+            disable_tls_verify: false,
         }
+    }
+
+    /// Builder: flip TLS verification off. Returns `self` for
+    /// chaining. See [`Self::disable_tls_verify`] for the security
+    /// caveats.
+    pub fn with_disable_tls_verify(mut self, disable: bool) -> Self {
+        self.disable_tls_verify = disable;
+        self
     }
 
     /// Resolve the full subscription URL by parsing [`remote_url`]
@@ -249,18 +270,16 @@ async fn run_link(
     local_origin: lvqr_moq::OriginProducer,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    // Silence unused-var warning until session 102 B wires the
-    // re-publish. The origin is threaded through now so the public
-    // signature does not churn between session 101 A and 102 B.
-    let _local_origin = local_origin;
     let url = link.subscription_url()?;
 
-    let client_config = moq_native::ClientConfig::default();
-    // TLS verification defaults to "verify". Operators running
-    // self-signed clusters inside a trusted VPC will need to provide
-    // a CA chain through the OS trust store; a per-link
-    // `tls_disable_verify` config knob can be added later if
-    // operators need it, but the default stays secure.
+    let mut client_config = moq_native::ClientConfig::default();
+    if link.disable_tls_verify {
+        client_config.tls.disable_verify = Some(true);
+        warn!(
+            remote_url = %link.remote_url,
+            "federation link has TLS verification disabled; auth token exposure on network path is operator's responsibility"
+        );
+    }
     let client = client_config.init().context("init federation moq client")?;
 
     // Announcements from the remote cluster arrive on this origin.
@@ -300,22 +319,30 @@ async fn run_link(
                 };
                 let path_str = path.as_str();
                 let Some(bc) = maybe_bc else {
-                    // Unannounce event. Session 102 B will forward
-                    // these to the local origin to tear down its
-                    // shadow broadcast.
+                    // Unannounce event. moq-lite's local origin will
+                    // surface the shadow broadcast's natural close
+                    // when the remote BroadcastConsumer we captured
+                    // here drops (via forward_broadcast's return).
                     debug!(broadcast = %path_str, "federation: remote unannounce");
                     continue;
                 };
-                let _ = bc; // session 102 B subscribes + re-publishes
                 if !link.forwards(path_str) {
                     debug!(broadcast = %path_str, "federation: ignoring unmatched announcement");
                     continue;
                 }
+                let name = path_str.to_string();
+                let origin = local_origin.clone();
+                let cancel = shutdown.clone();
                 info!(
-                    broadcast = %path_str,
+                    broadcast = %name,
                     remote_url = %link.remote_url,
-                    "federation: forwarded broadcast announced; re-publish deferred to session 102 B"
+                    "federation: forwarding remote broadcast into local origin"
                 );
+                tokio::spawn(async move {
+                    if let Err(e) = forward_broadcast(bc, origin, name.clone(), cancel).await {
+                        warn!(broadcast = %name, error = %e, "federation: forward_broadcast exited with error");
+                    }
+                });
             }
             _ = shutdown.cancelled() => {
                 debug!(remote_url = %link.remote_url, "federation link shutdown requested");
@@ -334,6 +361,119 @@ async fn run_link(
     tokio::time::sleep(Duration::from_millis(50)).await;
     info!(remote_url = %link.remote_url, "federation link disconnected");
     Ok(())
+}
+
+/// LVQR track-name convention. The federation forwarder opens a
+/// subscription against each of these on every forwarded broadcast.
+/// Remote broadcasts that do not publish one (e.g. audio-only) just
+/// see their forwarder sit idle on the absent track until the
+/// broadcast closes.
+///
+/// `catalog` is present so downstream subscribers can discover
+/// per-track metadata without re-deriving it; `0.mp4` + `1.mp4`
+/// are LVQR's video + audio track-name constants that the ingest
+/// bridges (RTMP, WHIP, SRT, RTSP) emit on.
+const FEDERATED_TRACK_NAMES: &[&str] = &["0.mp4", "1.mp4", "catalog"];
+
+/// Spawn one forwarder task per LVQR convention track, copying
+/// groups + frames from the remote broadcast into a fresh local
+/// broadcast. Returns once shutdown fires; the broadcast producer
+/// drops on scope exit, closing the shadow broadcast.
+async fn forward_broadcast(
+    remote_bc: moq_lite::BroadcastConsumer,
+    local_origin: lvqr_moq::OriginProducer,
+    broadcast_name: String,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let mut local_bc = local_origin
+        .create_broadcast(&broadcast_name)
+        .with_context(|| format!("create local federated broadcast `{broadcast_name}`"))?;
+
+    let mut track_handles = Vec::with_capacity(FEDERATED_TRACK_NAMES.len());
+    for name in FEDERATED_TRACK_NAMES {
+        let remote_track = match remote_bc.subscribe_track(&lvqr_moq::Track::new(*name)) {
+            Ok(t) => t,
+            Err(e) => {
+                debug!(
+                    broadcast = %broadcast_name,
+                    track = %name,
+                    error = %e,
+                    "federation: remote subscribe_track failed; skipping"
+                );
+                continue;
+            }
+        };
+        let local_track = match local_bc.create_track(lvqr_moq::Track::new(*name)) {
+            Ok(t) => t,
+            Err(e) => {
+                debug!(
+                    broadcast = %broadcast_name,
+                    track = %name,
+                    error = %e,
+                    "federation: local create_track failed; skipping"
+                );
+                continue;
+            }
+        };
+        let cancel = shutdown.clone();
+        let track_name = name.to_string();
+        let broadcast_name_for_log = broadcast_name.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = forward_track(remote_track, local_track, cancel).await {
+                debug!(
+                    broadcast = %broadcast_name_for_log,
+                    track = %track_name,
+                    error = %e,
+                    "federation: track forwarder exited with error"
+                );
+            }
+        });
+        track_handles.push(handle);
+    }
+
+    // Hold the broadcast producer + track forwarders open until
+    // shutdown. Dropping `local_bc` terminates the shadow broadcast
+    // which is also what we want on natural shutdown.
+    shutdown.cancelled().await;
+    for handle in track_handles {
+        handle.abort();
+    }
+    drop(local_bc);
+    Ok(())
+}
+
+/// Copy groups + frames from a remote `TrackConsumer` into a local
+/// `TrackProducer`. Exits naturally when the remote track closes
+/// (returns `Ok(None)` from `next_group`) or when shutdown fires.
+async fn forward_track(
+    mut remote: lvqr_moq::TrackConsumer,
+    mut local: lvqr_moq::TrackProducer,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    loop {
+        let next = tokio::select! {
+            g = remote.next_group() => g,
+            _ = shutdown.cancelled() => return Ok(()),
+        };
+        let Some(mut remote_group) = next.context("remote next_group")? else {
+            return Ok(());
+        };
+        let mut local_group = local.append_group().context("append local group")?;
+        loop {
+            let frame = tokio::select! {
+                f = remote_group.read_frame() => f,
+                _ = shutdown.cancelled() => {
+                    let _ = local_group.finish();
+                    return Ok(());
+                }
+            };
+            let Some(frame) = frame.context("remote read_frame")? else {
+                break;
+            };
+            local_group.write_frame(frame).context("write local frame")?;
+        }
+        local_group.finish().context("finish local group")?;
+    }
 }
 
 #[cfg(test)]
@@ -399,5 +539,17 @@ mod tests {
     fn forwards_returns_false_for_empty_list() {
         let link = FederationLink::new("https://peer.example:4443/", "t", Vec::new());
         assert!(!link.forwards("anything"));
+    }
+
+    #[test]
+    fn disable_tls_verify_defaults_to_false() {
+        let link = FederationLink::new("https://peer.example:4443/", "t", Vec::new());
+        assert!(!link.disable_tls_verify);
+    }
+
+    #[test]
+    fn with_disable_tls_verify_flips_field() {
+        let link = FederationLink::new("https://peer.example:4443/", "t", Vec::new()).with_disable_tls_verify(true);
+        assert!(link.disable_tls_verify);
     }
 }

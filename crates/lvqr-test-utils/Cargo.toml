@@ -29,6 +29,16 @@ lvqr-archive = { workspace = true }
 lvqr-auth = { workspace = true }
 lvqr-fragment = { workspace = true }
 lvqr-wasm = { workspace = true }
+# Tier 4 item 4.4 session B: TestServer accepts federation links via
+# a `with_federation_link` builder; the public signature names
+# `lvqr_cluster::FederationLink` directly, so we pull the crate in as
+# a regular dep (its transitive surface is already present via
+# `lvqr-cli`'s default `cluster` feature).
+lvqr-cluster = { workspace = true }
+# For the MoQ-client-side federation integration test: constructing a
+# broadcast on one server and subscribing from another requires naming
+# moq-lite types directly. lvqr-moq is the facade.
+lvqr-moq = { workspace = true }
 # Gated on the `whisper` feature: the test-utils `agent_runner()`
 # accessor returns an `&lvqr_agent::AgentRunnerHandle`, so the
 # dep must resolve when the feature is on.
