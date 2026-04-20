@@ -1,8 +1,78 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 + 4.5 COMPLETE (5 of 8); 4.4 sessions A + B DONE (FederationLink + MoQ subscribe-loop + per-track re-publish + two-cluster E2E); 861 workspace tests (+2 whisper-gated inline), 28 crates; **origin/main synced (head `cde66b4`)**
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.4 COMPLETE (6 of 8 Tier 4 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.8); 875 workspace tests (+2 whisper-gated inline), 28 crates; local `main` is N+2 commits ahead of `origin/main` pending push
 
-**Last Updated**: 2026-04-21 (session 102 push event). Session 101's two commits (`91888a4` feat + `92891ff` close-doc) and session 102's two commits (`df5e9d8` feat + `cde66b4` close-doc) are all pushed to `origin/main`; `git log --oneline origin/main..main` is empty. crates.io is unchanged since the post-session-98 publish event; a future release cycle bumps `lvqr-cluster` + `lvqr-cli` + `lvqr-test-utils` and republishes through `/tmp/lvqr_publish.sh`. Session 103 entry point below is Tier 4 item 4.4 session C (admin route `/api/v1/cluster/federation` + exponential-backoff reconnect on link failure).
+**Last Updated**: 2026-04-21 (session 103 close). Session 103 C landed the admin route `GET /api/v1/cluster/federation` plus the per-link exponential-backoff reconnect loop with a `FederationStatusHandle` observability surface; Tier 4 item 4.4 closes here. Local `main` is two commits ahead of `origin/main` (feat + close-doc); `git log --oneline origin/main..main` shows both. crates.io is unchanged since the post-session-98 publish event; a future release cycle bumps `lvqr-cluster` + `lvqr-cli` + `lvqr-admin` + `lvqr-test-utils` and republishes via `/tmp/lvqr_publish.sh`. Session 104 entry point is Tier 4 item 4.6 session A (server-side transcoding; see `tracking/TIER_4_PLAN.md` section 4.6 row 104 A).
+
+## Session 103 close (2026-04-21)
+
+1. **Tier 4 item 4.4 session C: admin route `/api/v1/cluster/federation` + exponential-backoff reconnect** (feat commit).
+   * `crates/lvqr-cluster/src/federation.rs`: new `FederationConnectState` enum (serde-lowercase: `connecting` / `connected` / `failed`); new `FederationLinkStatus` struct carrying `remote_url`, `forwarded_broadcasts`, `state`, `last_connected_at_ms`, `last_error`, `connect_attempts`, `forwarded_broadcasts_seen`; new `FederationStatusHandle` wrapping `Arc<RwLock<Vec<FederationLinkStatus>>>` with cloneable `snapshot()` and internal mutators. `FederationRunner` now owns a status handle and exposes it via `status_handle()` for the admin layer. The private `run_link` is now an outer retry wrapper around a new `run_link_once`: each pass sets Connecting, runs the single connect + announcement-drain cycle, records Connected or Failed, and sleeps `next_delay(attempt)` (base 1 s, doubling to 60 s cap, ±10% symmetric jitter via `rand::thread_rng().gen_range`) with a cancel-arm. `run_link_once` grew a `session.closed()` arm in the main select so remote peer shutdown surfaces as a recoverable error (instead of pinning the loop in Connecting because the local sub-origin's `announced()` never naturally drains on remote close), and a `CONNECT_TIMEOUT = 10s` wrapping the client connect so a silently-dropped QUIC Initial cannot hold the link in Connecting forever. Backoff constants (`BACKOFF_INITIAL`, `BACKOFF_MAX`, `BACKOFF_JITTER_FRAC`) are module-private for now; a `FederationBackoffConfig` struct can land later if operators need tuning.
+   * `crates/lvqr-cluster/src/lib.rs`: re-exports widened to include `FederationConnectState`, `FederationLinkStatus`, `FederationStatusHandle`.
+   * `crates/lvqr-cluster/tests/federation_unit.rs`: 2 new integration tests -- `runner_status_handle_reports_failed_after_initial_connect_error` drives an unreachable TEST-NET-1 URL through the retry loop and asserts the handle flips to Failed with non-zero `connect_attempts` + non-empty `last_error`; `status_handle_clones_observe_updates` asserts cloned handles observe writes the runner's per-link task makes.
+   * `crates/lvqr-admin/src/routes.rs`: `AdminState` gains an optional `federation_status: Option<FederationStatusHandle>` field (feature-gated on `cluster`) plus `with_federation_status` builder + pub(crate) `federation_status()` accessor.
+   * `crates/lvqr-admin/src/cluster_routes.rs`: new `GET /api/v1/cluster/federation` route returning `{"links": [FederationLinkStatus..]}`; when no handle is wired (single-node, or the runner simply is not installed), the route answers 200 + `{"links":[]}` rather than 503 so unconditional polling from operator tooling works. 2 new inline tests cover wired + unwired cases.
+   * `crates/lvqr-admin/Cargo.toml`: added `lvqr-moq` + `tokio-util` as dev-deps for the new wired-state test.
+   * `crates/lvqr-cli/src/lib.rs`: `start()` threads `federation_runner.status_handle()` into `AdminState` alongside the existing cluster handle.
+   * `crates/lvqr-test-utils/src/test_server.rs`: `TestServerConfig` gained `relay_addr: Option<SocketAddr>` + `with_relay_addr(..)` builder so tests can reuse a pre-reserved relay port. Originally driven by the "restart A on the same port" integration-test shape that got abandoned; the builder stays because it's a natural fit for any future test that needs a deterministic relay port.
+   * `crates/lvqr-cli/tests/federation_reconnect.rs` (new, ~220 LOC): end-to-end observability contract test. Boots TestServer A + B (B with federation link to A + an admin token provider), waits for Connected, asserts the admin route surfaces `state: connected` + remote_url + forwarded_broadcasts + a non-zero `connect_attempts` + populated `last_connected_at_ms`, verifies the admin gate rejects unauthenticated requests, shuts A down, waits for Failed, asserts the admin route reports `state: failed` with a non-empty `last_error`, then waits ~2.5 s and asserts `connect_attempts` kept growing (the retry loop is actively re-entering `run_link_once` on its backoff schedule). Hand-rolled HTTP/1.1 client mirrors `auth_integration.rs`; no `reqwest` dev-dep added.
+
+2. **Session 103 close doc** (this commit).
+
+### Key 4.4 session C design decisions baked in (confirmed in-commit per the plan-vs-code rule)
+
+* **`session.closed()` monitoring is load-bearing**. Without it, after a remote peer tears down, moq-lite's local sub-origin does not surface the close through `announced()`; the per-link task blocks forever and the status handle stays pinned at Connected. The new arm in `run_link_once`'s select returns `Err(..)` on session termination so the retry wrapper transitions to Failed + schedules a reconnect.
+* **`CONNECT_TIMEOUT = 10s` on each attempt**. A silently-dropped QUIC Initial against an unreachable peer retransmits for tens of seconds on quinn's default timers; without a per-attempt bound the admin route's `state` would stay `connecting` forever on a dead peer and `connect_attempts` would never increment. 10 s is well above the loopback / LAN handshake p99 and still short enough for an operator watching the admin route to see retry progress.
+* **JWT refresh across reconnect is OUT of scope for v1**. If the `auth_token` expires mid-failure cycle, subsequent attempts reuse the same stale token and fail with 401 on the remote. The failure is observable via the admin route's `last_error` field; operators rotate the config and restart. A future session can add a `FederationLink::refresh_token_url` hook; none of today's code blocks that.
+* **Status store is `Arc<RwLock<Vec<FederationLinkStatus>>>` in stdlib**. `std::sync::RwLock` because every critical section is sub-microsecond (tiny struct clone + scalar writes) and never awaits; `parking_lot::RwLock` or a lock-free cell would be over-engineering. Clone-shares-state semantics are asserted end-to-end in the unit tests.
+* **Admin route returns `{"links":[]}` rather than 503 when no handle is wired**. Single-node builds and cluster builds with empty `federation_links` are legitimate configurations; poll-unconditionally tooling should not have to special-case them. The cluster-miswired 500 convention on the other `/api/v1/cluster/*` routes only applies when a `Cluster` handle is *expected* and missing; the federation route has no such expectation.
+* **Empty Vec vs missing handle is deliberately collapsed on the wire**. An operator cannot distinguish "federation off" from "federation on but no links configured"; both present as `{"links":[]}`. If that distinction matters later, we'd add a top-level `enabled: bool` to the view without breaking the `links` field.
+* **No Prometheus metrics in 103 C.** The briefing's decision (d) listed `lvqr_federation_link_state` / `_connect_attempts_total` / `_forwarded_broadcasts_total` as desired metrics, but the 103 C row in the plan explicitly scopes to "admin route + reconnect". The HTTP surface already exposes every counter; a future session can add Prometheus fan-out without any federation.rs change beyond a metrics-recorder call on state transitions.
+* **Same-port reconnect integration test abandoned; observability contract tested instead**. The originally-planned `A -> shutdown -> restart A on same port -> reconnected` integration test hit a cross-process UDP port contention on macOS: while B's federation client is actively retrying against A's now-closed port, the UDP socket stays wedged (quinn Endpoint teardown does not release it fast enough for a fresh bind, even over 30 s of retry). A solo-restart probe (no B) rebinds the same port inside 50 ms, so the quirk is specific to the in-process two-server topology. The reconnect retry loop is still proven at the unit level (`federation_unit` tests); the integration test now focuses on the observability contract: Connected on handshake, Failed on peer shutdown, `connect_attempts` growing while the peer stays down, all visible through the HTTP admin route.
+* **`TestServerConfig::with_relay_addr` stays in the test-utils API even though the same-port test did not ship**. It's a small, natural builder; a future test that wants deterministic ports for a different reason will pick it up.
+
+### Ground truth (session 103 close)
+
+* **Head**: feat commit + this close-doc commit (two new commits on `main`). Local is N+2 above `origin/main` (push pending; `cde66b4` is still the `origin/main` head per session 102's push event).
+* **Tests**: **875** passed, 0 failed, 1 ignored on macOS (default features). (The 1 ignored is the pre-existing `moq_sink` doctest.)
+* **CI gates locally clean**:
+  * `cargo fmt --all --check`
+  * `cargo clippy --workspace --all-targets --benches -- -D warnings`
+  * `cargo test -p lvqr-cluster --lib` 51 passed (+9 new inline: `next_delay` jitter window at attempt 0, doubling, clamped at 6/10/20; `FederationLinkStatus` JSON round-trip + lowercase serde; `FederationStatusHandle` init snapshot, mutators, clone-shares-state, out-of-bounds-noop)
+  * `cargo test -p lvqr-cluster --test federation_unit` 11 passed (+2 new)
+  * `cargo test -p lvqr-admin` 17 passed (+2 new)
+  * `cargo test -p lvqr-cli --test federation_two_cluster` 1 passed (unchanged; no regression)
+  * `cargo test -p lvqr-cli --test federation_reconnect` 1 passed (new)
+  * `cargo test --workspace` 875 / 0 / 1 (+14 over session 102's 861)
+* **Workspace**: **28 crates**, unchanged.
+* **crates.io**: unchanged. Session 103 C adds non-breaking public API to `lvqr-cluster` (`FederationConnectState`, `FederationLinkStatus`, `FederationStatusHandle`, `FederationRunner::status_handle`) and `lvqr-admin` (`AdminState::with_federation_status`, `FederationStatusView` pub(crate)->pub move is not yet made), plus a dev-only builder on `lvqr-test-utils`. A future release bump needs `lvqr-cluster` + `lvqr-admin` + `lvqr-cli` + `lvqr-test-utils` republished; 101 A + 102 B + 103 C compose into one semver-minor bump.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 / 89 / 90 |
+| 4.3 | C2PA signed media | **COMPLETE** | 91-94 |
+| 4.8 | One-token-all-protocols | **COMPLETE** | 95 / 96 |
+| 4.5 | In-process AI agents | **COMPLETE** | 97 / 98 / 99 / 100 |
+| 4.4 | Cross-cluster federation | **COMPLETE** | 101 / 102 / 103 |
+| 4.6 | Server-side transcoding | PLANNED | 104-106 |
+| 4.7 | Latency SLO scheduling | PLANNED | 107-108 |
+
+6 of 8 Tier 4 items COMPLETE. Remaining: 4.6 transcoding (next), 4.7 latency SLO.
+
+### Session 104 entry point
+
+**Tier 4 item 4.6 session A: server-side transcoding scaffold.**
+
+Scope per `tracking/TIER_4_PLAN.md` section 4.6 row 104 A. New crate `crates/lvqr-transcode/` subscribes to a broadcast's fragment stream, pushes samples through a `gstreamer-rs` pipeline, and publishes the output as a new broadcast (`live/foo/720p`). Hardware encoders (NVENC, VAAPI, QSV, VideoToolbox) feature-gated. Session 104 A is the scaffold + one software-pipeline rendition; ABR ladder generation + HW encoder feature gates land in 105 / 106.
+
+### Pre-session checklist for session 104 A
+
+1. Decide: does `lvqr-transcode` publish back into the same `OriginProducer` (federation-style injection, local only) or into the shared `FragmentBroadcasterRegistry` (HLS / DASH / archive pick it up automatically)? Lean: registry, mirroring every ingest crate.
+2. Decide: gstreamer on CI. Not every runner ships gstreamer plugins. Options: make the crate optional-dep behind a `transcode` feature, gate integration tests on `LVQR_GSTREAMER_AVAILABLE`, or bundle a Docker-based CI job.
+3. Carry-forward: the federation runner + admin-route pattern from 4.4 is the reference shape for any new runtime surface with a status handle. Follow the same `StatusHandle` + admin route convention if transcoding jobs need observability.
 
 ## Session 102 close (2026-04-21)
 
