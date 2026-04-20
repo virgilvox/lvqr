@@ -678,7 +678,7 @@ change.
   priority order). Each link's `auth_token` is a JWT
   minted for the remote cluster's audience.
 
-## 4.6 -- Server-side transcoding (2 weeks, 3 sessions, 104-106)
+## 4.6 -- Server-side transcoding (2 weeks, 3 sessions, 104-106; A DONE, B-C pending)
 
 ### Scope (what lands)
 
@@ -710,7 +710,7 @@ change.
 
 | # | Session | Deliverable | Verification |
 |---|---|---|---|
-| 104 | A | Scaffold `lvqr-transcode`; gstreamer-rs pipeline for one 720p rendition. | `cargo test -p lvqr-transcode --test basic_720p` |
+| 104 | A | Scaffold `lvqr-transcode` crate: `Transcoder` trait + `TranscoderContext` + `TranscoderFactory` + `TranscodeRunner` + `TranscodeRunnerHandle` (`(transcoder, rendition, broadcast, track)` stats key + per-key `fragments_seen` / `panics` counters) + `RenditionSpec` (width / height / video-bitrate-kbps / audio-bitrate-kbps + `preset_720p` / `preset_480p` / `preset_240p` / `default_ladder()`). Pattern-matches `lvqr-agent` one-for-one: `on_entry_created` callback subscribes synchronously, spawns one drain task per `(factory, rendition)` pair that opts into `(broadcast, track)`, panic-isolates `on_start` / `on_fragment` / `on_stop` via `catch_unwind(AssertUnwindSafe(..))`, fans out Prometheus metrics `lvqr_transcode_fragments_total{transcoder, rendition}` + `lvqr_transcode_panics_total{transcoder, rendition, phase}`. Concrete `PassthroughTranscoder` + `PassthroughTranscoderFactory` ship for wiring verification; observe-only (logs + counts fragments; NO real encode, NO output republish). Scope-adjusted from the plan's one-liner per CLAUDE.md's plan-vs-code rule: the plan promised "gstreamer-rs pipeline for one 720p rendition" but the pass-through scaffold lets 104 A land with zero new heavy C deps and no CI gstreamer install story, while still proving the end-to-end registry callback + drain + panic-isolation path the real 105 B encoder slots into. gstreamer-rs + the real encoder land in 105 B behind a default-OFF `transcode` feature. No `lvqr-cli` wiring; session 106 C owns the composition root. | `cargo fmt --all` clean; `cargo clippy -p lvqr-transcode --all-targets -- -D warnings` clean; `cargo test -p lvqr-transcode` 16 passed (+ 1 doctest); `cargo test --workspace` 892 passed / 0 failed / 1 ignored (up from 875; +17, including the new `lvqr_transcode` doctest). | **DONE (session 104)** |
 | 105 | B | Ladder generation; multi-rendition publish. | `cargo test -p lvqr-cli --test transcode_ladder` |
 | 106 | C | Hardware encoder feature flags; benchmark NVENC vs x264. | Documented in `docs/deployment.md`. |
 

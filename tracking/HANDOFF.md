@@ -1,8 +1,87 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.4 COMPLETE (6 of 8 Tier 4 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.8); 875 workspace tests (+2 whisper-gated inline), 28 crates; **origin/main synced (head `5efbf86`)**
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.4 COMPLETE + 4.6 session A DONE (6 of 8 Tier 4 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.8; 4.6 one-third done); 892 workspace tests (+2 whisper-gated inline), 29 crates; local `main` is N+2 commits ahead of `origin/main` pending push
 
-**Last Updated**: 2026-04-21 (session 103 push event). Session 103's two commits (`d6bb42b` feat + `5efbf86` close-doc) are pushed to `origin/main`; `git log --oneline origin/main..main` is empty. crates.io is unchanged since the post-session-98 publish event; a future release cycle bumps `lvqr-cluster` + `lvqr-cli` + `lvqr-admin` + `lvqr-test-utils` and republishes via `/tmp/lvqr_publish.sh`. Tier 4 item 4.4 is CLOSED as of `5efbf86`. Session 104 entry point is Tier 4 item 4.6 session A (server-side transcoding; see `tracking/TIER_4_PLAN.md` section 4.6 row 104 A).
+**Last Updated**: 2026-04-21 (session 104 close). Session 104 A landed the `lvqr-transcode` scaffold crate (Tier 4 item 4.6 session A): `Transcoder` trait + `TranscoderFactory` + `TranscoderContext` + `TranscodeRunner` + `RenditionSpec` (720p / 480p / 240p presets + default ladder) + `PassthroughTranscoder` for wiring verification. Mirrors the `lvqr-agent` shape one-for-one, adds Prometheus metrics, panic-isolates per `AgentRunner` convention. Real gstreamer pipelines land in 105 B. Local `main` is two commits ahead of `origin/main` (feat + close-doc). crates.io is unchanged since the post-session-98 publish event; a future release cycle bumps `lvqr-cluster` + `lvqr-cli` + `lvqr-admin` + `lvqr-test-utils` (for the 4.4 chain) and newly publishes `lvqr-transcode` 0.4.0 alongside. Session 105 entry point is Tier 4 item 4.6 session B (ABR ladder generation + multi-rendition publish via real gstreamer-rs pipelines behind a `transcode` Cargo feature; see `tracking/TIER_4_PLAN.md` section 4.6 row 105 B).
+
+## Session 104 close (2026-04-21)
+
+1. **Tier 4 item 4.6 session A: `lvqr-transcode` scaffold** (feat commit).
+   * `crates/lvqr-transcode/Cargo.toml` (new): workspace-inherited package metadata, `lvqr-fragment` + `dashmap` + `metrics` + `parking_lot` + `serde` + `tokio` + `tracing` as deps (same shape as `lvqr-agent` plus `serde` for `RenditionSpec` serialization); `bytes` + `serde_json` + extra `tokio` features as dev-deps. No gstreamer.
+   * `crates/lvqr-transcode/src/lib.rs` (new): crate-level docs with session roll-up, consumer-family table (6 registry consumers total), anti-scope list, re-exports.
+   * `crates/lvqr-transcode/src/rendition.rs` (new, ~130 LOC): `RenditionSpec { name, width, height, video_bitrate_kbps, audio_bitrate_kbps }` with `serde::{Serialize, Deserialize}`. Presets match the section 4.6 defaults: 720p = 1280x720 @ 2.5Mb/s + 128kb/s; 480p = 854x480 @ 1.2Mb/s + 96kb/s; 240p = 426x240 @ 400kb/s + 64kb/s. `default_ladder()` returns the three in highest-to-lowest order.
+   * `crates/lvqr-transcode/src/transcoder.rs` (new, ~100 LOC): `Transcoder` trait (sync, Send; `on_start` / `on_fragment` / `on_stop` with no-op defaults) + `TranscoderContext { broadcast, track, meta, rendition }` + `TranscoderFactory` (`Send + Sync + 'static`; `name() + rendition() + build()`). Docstrings reference the `lvqr-agent` parallel throughout.
+   * `crates/lvqr-transcode/src/passthrough.rs` (new, ~200 LOC): `PassthroughTranscoder` + `PassthroughTranscoderFactory`. Default source track filter `"0.mp4"` (video only). Observes + counts fragments; NO real encode, NO output republish. Exists to prove the registry callback + drain + panic isolation wiring end-to-end without a gstreamer dep. 5 inline tests.
+   * `crates/lvqr-transcode/src/runner.rs` (new, ~360 LOC): `TranscodeRunner` + `TranscodeRunnerHandle` + `TranscoderStats`. Stats key is the 4-tuple `(transcoder_name, rendition_name, broadcast, track)` so two factories of the same name targeting different renditions live under separate metrics. `with_ladder(Vec<RenditionSpec>, |spec| F)` convenience builder for the typical ABR case. Panic isolation via `catch_unwind(AssertUnwindSafe(..))` on `on_start` / `on_fragment` / `on_stop` with per-phase panic counters. Prometheus metrics: `lvqr_transcode_fragments_total{transcoder, rendition}` + `lvqr_transcode_panics_total{transcoder, rendition, phase}`. 8 inline tests + 1 doctest covering fragment drain, default-ladder spawn-per-rendition, factory opt-out on non-video tracks, `on_fragment` panic-isolation with counter verification, `on_start` panic skips drain, empty runner no-op, `Default` empty, downstream-subscriber-unaffected fan-out.
+   * `Cargo.toml` (workspace root): added `crates/lvqr-transcode` to `members`; added `lvqr-transcode = { version = "0.4.0", path = "crates/lvqr-transcode" }` to `workspace.dependencies`.
+   * `tracking/TIER_4_PLAN.md`: section 4.6 header flipped to "A DONE, B-C pending"; row 104 A scoped up from one-line to the full deliverable + verification record; section 4.6 anti-scope unchanged.
+
+2. **Session 104 close doc** (this commit).
+
+### Key 4.6 session A design decisions baked in (confirmed in-commit per the plan-vs-code rule)
+
+* **Scaffold-only, no gstreamer in 104 A.** The plan row promised "gstreamer-rs pipeline for one 720p rendition" but the pass-through ships the full registry-side wiring with zero new heavy C deps and no CI gstreamer install story. 105 B adds gstreamer behind a default-OFF `transcode` Cargo feature. Rationale: 4.4 session C's experience showed that landing wire + observability first, real codec second, keeps rollback blast radius small. Every other subsystem in LVQR followed this order (WASM filter tap, agent runner, federation runner).
+* **Mirror `lvqr-agent` one-for-one.** The trait shape (`on_start` / `on_fragment` / `on_stop` sync, panic-isolated), the factory shape (name + build returning Option), the runner shape (builder + install returning a cheaply-cloneable handle that holds tasks alive), the stats shape (DashMap of AtomicU64 counters), the drain-on-broadcaster-close lifecycle -- all bit-for-bit match the Tier 4 item 4.5 session A scaffold. Operators reading a future transcoder integration see the same idiom they already saw for WASM filters, cluster claims, and AI agents. No new abstractions invented. Only the stats key is extended to a 4-tuple (adds `rendition_name`) so two factories of the same name at different ladder rungs stay metric-distinct.
+* **Factory carries its own `RenditionSpec`.** ABR ladders are expressed as N factory instances, one per rung, each constructed with its own `RenditionSpec`. The runner builds the `TranscoderContext` per-factory, inserting `factory.rendition().clone()` as the context's rendition field. Alternative designs (one factory building N transcoders, or one transcoder handling all renditions) coupled renditions in ways that would block the per-rendition pipeline tuning 105 B wants. The `with_ladder(ladder, |spec| build)` convenience builder unrolls this idiom in one call.
+* **Pass-through defaults to video-only (`track == "0.mp4"`).** Audio / captions / catalog tracks have no transcoder use case on the 4.6 ABR ladder (audio passthrough is a 105 B decision, captions + catalog are not transcode targets). `PassthroughTranscoderFactory::build` returns `None` for any other track. Operators wanting audio observation can write their own factory with a wider filter; the trait is a natural extension point.
+* **No output re-publish in 104 A.** Passthrough transcoders are observers only. The "output as a new broadcast" side lands in 105 B when there is a real encoder producing output bytes. This keeps the 104 A surface minimal and avoids prematurely committing to the output-naming convention (`<source>/<rendition>`); 105 B locks that in.
+* **No `lvqr-cli` wiring.** Session 106 C owns the composition root (`ServeConfig.transcode_renditions`, `--transcode-rendition` flag, `ServerHandle.transcode_runner` accessor). 104 A ships the library in isolation -- consumers wire it themselves if they need to before 106 C.
+* **Metric name convention locked.** `lvqr_transcode_fragments_total{transcoder, rendition}` + `lvqr_transcode_panics_total{transcoder, rendition, phase}`. Mirrors `lvqr_agent_fragments_total{agent}` + `lvqr_agent_panics_total{agent, phase}` with the rendition label added. Sets the shape for the 105 B output-side metrics (`lvqr_transcode_output_fragments_total`, etc.).
+* **`serde` on `RenditionSpec` for forward compatibility.** Operators writing 105 B / 106 C configs need to serialize ladder specs to / from TOML + JSON. Landing `Serialize + Deserialize` in 104 A closes the door on a backwards-incompatible serde addition in 105 B. One inline round-trip test locks the JSON shape.
+
+### Ground truth (session 104 close)
+
+* **Head**: feat commit + this close-doc commit (two new commits on `main`). Local is N+2 above `origin/main` (head `154b7b9` from session 103 push event).
+* **Tests**: **892** passed, 0 failed, 1 ignored on macOS (default features). (The 1 ignored is the pre-existing `moq_sink` doctest.)
+* **CI gates locally clean**:
+  * `cargo fmt --all --check`
+  * `cargo clippy --workspace --all-targets --benches -- -D warnings`
+  * `cargo test -p lvqr-transcode` 16 passed + 1 doctest (5 passthrough inline + 3 rendition inline + 8 runner inline + the `with_ladder` quickstart doctest)
+  * `cargo test --workspace` 892 / 0 / 1 (+17 over session 103's 875; the extra +1 over the in-crate count is the `lvqr_transcode` doctest tallied into the workspace total)
+* **Workspace**: **29 crates** (+1: `lvqr-transcode`).
+* **crates.io**: unchanged since session 98's publish event. The next release cycle needs to first-time publish `lvqr-transcode 0.4.0` alongside re-publishing `lvqr-cluster` / `lvqr-cli` / `lvqr-admin` / `lvqr-test-utils` with the 4.4 additive changes already in origin/main. Publish order: `lvqr-transcode` slots into Tier 3 (depends on `lvqr-fragment` + workspace deps only; no LVQR internal surface depends on it in 104 A, so it can ship anywhere after Tier 1).
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 / 89 / 90 |
+| 4.3 | C2PA signed media | **COMPLETE** | 91-94 |
+| 4.8 | One-token-all-protocols | **COMPLETE** | 95 / 96 |
+| 4.5 | In-process AI agents | **COMPLETE** | 97 / 98 / 99 / 100 |
+| 4.4 | Cross-cluster federation | **COMPLETE** | 101 / 102 / 103 |
+| 4.6 | Server-side transcoding | **A DONE**, B-C pending | 104 / 105 / 106 |
+| 4.7 | Latency SLO scheduling | PLANNED | 107-108 |
+
+6 of 8 Tier 4 items COMPLETE; 4.6 one-third done. Remaining: 4.6 B + C, 4.7 latency SLO.
+
+### Session 105 entry point
+
+**Tier 4 item 4.6 session B: ABR ladder generation + multi-rendition publish via real gstreamer-rs pipelines.**
+
+Scope per `tracking/TIER_4_PLAN.md` section 4.6 row 105 B. Concrete work items:
+
+1. Add a `transcode` Cargo feature on `lvqr-transcode` (default OFF) that pulls `gstreamer-rs` + `gstreamer-app` + `gstreamer-video` + `gstreamer-rtp` (or the subset 4.6 actually needs).
+2. New module `src/software.rs` (feature-gated) with `SoftwareTranscoder` + `SoftwareTranscoderFactory`. Pipeline shape: `appsrc -> qtdemux -> h264parse -> avdec_h264 -> videoscale -> videoconvert -> x264enc ! bitrate=<from RenditionSpec> -> h264parse -> mp4mux -> appsink`. Input: source fMP4 fragment bytes. Output: fMP4 fragment bytes published into a new broadcast named `<source>/<rendition>` on the `FragmentBroadcasterRegistry`.
+3. Output injection: `TranscodeRunner` gains a config option pointing at an `FragmentBroadcasterRegistry` for publishing (can be the same one it subscribes from; the registry's consumer side doesn't care). Output fragments are published via `get_or_create(<source>/<rendition>, track, meta)`.
+4. Integration test `crates/lvqr-transcode/tests/software_ladder.rs` (feature-gated on `transcode`): boots a `FragmentBroadcasterRegistry`, emits synthetic fMP4 fragments onto one broadcaster, wires a `TranscodeRunner` with `default_ladder()` + `SoftwareTranscoderFactory`, asserts three new `<source>/<rendition>` broadcasters appear on the registry with fragment counts matching the source.
+5. CI: document `LVQR_GSTREAMER_AVAILABLE` env gate or skip-with-log pattern. gstreamer plugins to assume: `gst-plugins-base`, `gst-plugins-good`, `gst-plugins-bad` (for mp4mux + qtdemux + videoscale), `gst-plugins-ugly` (x264enc). Developer install: `brew install gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly` on macOS.
+
+**Pre-session decisions to lock in-commit**:
+* **Output broadcast naming**: `<source>/<rendition>` exactly (`live/cam1/720p`), matching the section 4.6 plan text. HLS master-playlist composition in 106 C then learns to match `<source>` plus any `<source>/<rendition>` broadcasts into one master with per-rendition variants.
+* **Output init segment**: `mp4mux` emits a fresh moov on each GOP; the first output fragment carries the init segment. Downstream consumers cache init like they already do for ingest-produced broadcasts.
+* **Audio passthrough**: the 105 B pipeline is video-only. AAC passthrough (copying `<source>/<track="1.mp4">` to `<source>/<rendition>/<track="1.mp4">`) is a separate task inside 105 B or can wait for 106 C. Lean: include audio passthrough in 105 B so the rendition is self-contained for LL-HLS composition in 106 C.
+* **Panic on missing gstreamer plugins**: at factory construction, detect required plugins + `panic!` with a helpful message if absent. Prevents confusing drain-time errors on systems with a partial gstreamer install.
+
+**Biggest risks for 105 B**:
+* gstreamer-rs's `appsrc` back-pressure semantics: pushing bytes faster than the pipeline drains can leak memory. Mitigation: bounded `gst::Buffer` pushes, back-pressure signal propagated through the drain loop.
+* fMP4 fragment -> `qtdemux` hand-off: each fragment is one `moof + mdat`; we may need to prepend the init segment on the first buffer. Figure out the canonical feed shape from a gstreamer test rig before committing to an architecture.
+* `x264enc` keyframe alignment with source GOP boundaries: the output ladder should preserve the source's GOP structure so LL-HLS segmentation stays consistent across renditions. `keyint-max` + `keyint-min` tuned to source.
+
+### Session 104 push event carry-over
+
+If the user instructs a push after session 104 closes, follow up with a `docs: session 104 push event` commit that refreshes the HANDOFF status header to `origin/main synced (head <new_head>)` as the sessions 99 / 100 / 102 / 103 push-event commits did.
 
 ## Session 103 close (2026-04-21)
 
