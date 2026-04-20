@@ -305,6 +305,16 @@ impl TestServer {
         self.handle.rtmp_url(app, stream_key)
     }
 
+    /// Cloneable handle to the shared `FragmentBroadcasterRegistry`.
+    /// Useful in tests that want to publish synthetic fragments
+    /// directly onto a track (e.g. caption cues for the captions
+    /// track) without driving a real ingest protocol. Tier 4
+    /// item 4.5 session C surfaced this for the captions HLS
+    /// E2E test.
+    pub fn fragment_registry(&self) -> &lvqr_fragment::FragmentBroadcasterRegistry {
+        self.handle.fragment_registry()
+    }
+
     /// Trigger graceful shutdown and wait for every subsystem to drain.
     pub async fn shutdown(self) -> Result<()> {
         self.handle.shutdown().await

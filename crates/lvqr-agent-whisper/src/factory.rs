@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use lvqr_agent::{Agent, AgentContext, AgentFactory};
+use lvqr_fragment::FragmentBroadcasterRegistry;
 
 use crate::agent::WhisperCaptionsAgent;
 use crate::caption::CaptionStream;
@@ -18,6 +19,13 @@ use crate::caption::CaptionStream;
 /// `(broadcast, track)` pair the ingest emits. Matches
 /// `lvqr_ingest::bridge`'s `audio_track` constant.
 const AUDIO_TRACK_ID: &str = "1.mp4";
+
+/// Track-id LVQR uses for the captions track on the shared
+/// `FragmentBroadcasterRegistry`. Tier 4 item 4.5 session C
+/// adopts this so the same `(broadcast, track)` keying that
+/// powers HLS / archive / WASM consumers also fans out to the
+/// LL-HLS subtitle rendition.
+pub const CAPTIONS_TRACK_ID: &str = "captions";
 
 /// Static config for the whisper agent.
 ///
@@ -70,6 +78,14 @@ impl WhisperConfig {
 pub struct WhisperCaptionsFactory {
     config: Arc<WhisperConfig>,
     captions: CaptionStream,
+    /// Optional shared registry the agent will additionally
+    /// publish each `TranscribedCaption` into under track id
+    /// [`CAPTIONS_TRACK_ID`]. Tier 4 item 4.5 session C wires
+    /// this so the LL-HLS subtitle rendition can drain the
+    /// captions through the same `on_entry_created` callback
+    /// pattern every other LVQR consumer uses. Without it the
+    /// agent only feeds the in-process [`CaptionStream`].
+    caption_registry: Option<FragmentBroadcasterRegistry>,
 }
 
 impl WhisperCaptionsFactory {
@@ -81,6 +97,7 @@ impl WhisperCaptionsFactory {
         Self {
             config: Arc::new(config),
             captions: CaptionStream::new(),
+            caption_registry: None,
         }
     }
 
@@ -92,7 +109,25 @@ impl WhisperCaptionsFactory {
         Self {
             config: Arc::new(config),
             captions,
+            caption_registry: None,
         }
+    }
+
+    /// Wire a shared [`FragmentBroadcasterRegistry`] so the
+    /// agent additionally publishes each
+    /// [`crate::TranscribedCaption`] into the registry under
+    /// track id [`CAPTIONS_TRACK_ID`]. Returns `self` for
+    /// chaining. Tier 4 item 4.5 session C: pair this with
+    /// `lvqr_cli::captions::BroadcasterCaptionsBridge` so the
+    /// LL-HLS subtitle rendition is fed by the same registry
+    /// callback the audio + video renditions drink from.
+    ///
+    /// Without this builder the factory still works -- it
+    /// fans out captions only to the in-process
+    /// [`CaptionStream`].
+    pub fn with_caption_registry(mut self, registry: FragmentBroadcasterRegistry) -> Self {
+        self.caption_registry = Some(registry);
+        self
     }
 
     /// Cloneable handle to the captions output channel. Subscribe
@@ -100,6 +135,12 @@ impl WhisperCaptionsFactory {
     /// emit.
     pub fn captions(&self) -> CaptionStream {
         self.captions.clone()
+    }
+
+    /// Cloneable handle to the optional captions registry, when
+    /// installed via [`Self::with_caption_registry`].
+    pub fn caption_registry(&self) -> Option<&FragmentBroadcasterRegistry> {
+        self.caption_registry.as_ref()
     }
 
     /// Read access to the shared config.
@@ -120,6 +161,7 @@ impl AgentFactory for WhisperCaptionsFactory {
         Some(Box::new(WhisperCaptionsAgent::new(
             Arc::clone(&self.config),
             self.captions.clone(),
+            self.caption_registry.clone(),
         )))
     }
 }

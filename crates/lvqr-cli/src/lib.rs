@@ -12,6 +12,7 @@
 //! integration tests.
 
 mod archive;
+mod captions;
 #[cfg(feature = "cluster")]
 pub mod cluster_claim;
 mod hls;
@@ -286,6 +287,15 @@ pub struct ServerHandle {
     /// directly; held for its `Drop` side effect of stopping
     /// the watcher thread on shutdown.
     _wasm_reloader: Option<lvqr_wasm::WasmFilterReloader>,
+    /// Shared `(broadcast, track)`-keyed registry every
+    /// ingest crate publishes into and every consumer
+    /// (HLS / DASH / archive / WASM filter / captions
+    /// bridge) subscribes through. Exposed on the handle so
+    /// integration tests can publish synthetic fragments
+    /// (e.g. caption cues for the captions track) without
+    /// driving a real ingest protocol. Tier 4 item 4.5
+    /// session C added this accessor.
+    fragment_registry: FragmentBroadcasterRegistry,
 }
 
 impl ServerHandle {
@@ -332,6 +342,19 @@ impl ServerHandle {
     /// Bound SRT ingest UDP address, when SRT ingest is enabled.
     pub fn srt_addr(&self) -> Option<SocketAddr> {
         self.srt_addr
+    }
+
+    /// Cloneable handle to the shared
+    /// [`FragmentBroadcasterRegistry`] every ingest crate
+    /// publishes into and every consumer (HLS, DASH, archive,
+    /// WASM filter, captions bridge) subscribes through.
+    /// Useful in integration tests that want to publish
+    /// synthetic fragments onto a track (e.g. captions cues
+    /// for the captions track) without driving a real
+    /// ingest protocol. Tier 4 item 4.5 session C exposed
+    /// this for the captions HLS E2E test.
+    pub fn fragment_registry(&self) -> &FragmentBroadcasterRegistry {
+        &self.fragment_registry
     }
 
     /// Cluster handle backing this server, when
@@ -711,6 +734,12 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             config.hls_part_target_ms,
             &shared_registry,
         );
+        // Tier 4 item 4.5 session C: feed the captions
+        // sub-track into the per-broadcast subtitles
+        // rendition. The bridge no-ops on every track that
+        // is not `"captions"`, so it composes safely with
+        // the LL-HLS bridge above.
+        captions::BroadcasterCaptionsBridge::install(hls.clone(), &shared_registry);
     }
 
     // Install the broadcaster-based DASH composition bridge. Same
@@ -1258,6 +1287,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         cluster,
         wasm_filter: wasm_filter_handle,
         _wasm_reloader: wasm_reloader_handle,
+        fragment_registry: shared_registry,
     })
 }
 

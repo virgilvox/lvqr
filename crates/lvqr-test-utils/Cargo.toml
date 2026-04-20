@@ -21,6 +21,7 @@ lvqr-core = { workspace = true }
 lvqr-cli = { workspace = true }
 lvqr-archive = { workspace = true }
 lvqr-auth = { workspace = true }
+lvqr-fragment = { workspace = true }
 lvqr-wasm = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "net"] }
 tokio-util = { workspace = true }

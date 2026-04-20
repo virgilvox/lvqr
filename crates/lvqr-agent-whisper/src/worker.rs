@@ -17,6 +17,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
 use bytes::Bytes;
+use lvqr_fragment::{Fragment, FragmentBroadcaster, FragmentFlags};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
@@ -90,6 +91,7 @@ impl WorkerHandle {
 pub(crate) fn spawn(
     config: Arc<WhisperConfig>,
     captions: CaptionStream,
+    caption_broadcaster: Option<Arc<FragmentBroadcaster>>,
     broadcast: String,
     source_sample_rate: u32,
     asc: Bytes,
@@ -122,6 +124,7 @@ pub(crate) fn spawn(
                 context,
                 &mut decoder,
                 captions,
+                caption_broadcaster,
                 broadcast_for_thread,
                 source_sample_rate,
                 window_samples,
@@ -144,6 +147,7 @@ fn run(
     context: WhisperContext,
     decoder: &mut AacToMonoF32,
     captions: CaptionStream,
+    caption_broadcaster: Option<Arc<FragmentBroadcaster>>,
     broadcast: String,
     source_sample_rate: u32,
     window_samples: usize,
@@ -179,8 +183,15 @@ fn run(
                 if pcm.len() >= window_samples
                     && let Some(start_dts) = window_start_dts.take()
                 {
-                    let segments_emitted =
-                        run_inference(&mut state, &captions, &broadcast, source_sample_rate, start_dts, &pcm);
+                    let segments_emitted = run_inference(
+                        &mut state,
+                        &captions,
+                        caption_broadcaster.as_ref(),
+                        &broadcast,
+                        source_sample_rate,
+                        start_dts,
+                        &pcm,
+                    );
                     total_inferences += 1;
                     total_captions += segments_emitted as u64;
                     pcm.clear();
@@ -194,8 +205,15 @@ fn run(
                 if let Some(start_dts) = window_start_dts.take()
                     && !pcm.is_empty()
                 {
-                    let segments_emitted =
-                        run_inference(&mut state, &captions, &broadcast, source_sample_rate, start_dts, &pcm);
+                    let segments_emitted = run_inference(
+                        &mut state,
+                        &captions,
+                        caption_broadcaster.as_ref(),
+                        &broadcast,
+                        source_sample_rate,
+                        start_dts,
+                        &pcm,
+                    );
                     total_inferences += 1;
                     total_captions += segments_emitted as u64;
                 }
@@ -213,11 +231,13 @@ fn run(
 }
 
 /// Run one inference pass on the buffered PCM and publish
-/// resulting segments to the captions channel. Returns the
-/// segment count published.
+/// resulting segments to the captions channel and (when
+/// installed) the shared captions broadcaster on the
+/// fragment registry. Returns the segment count published.
 fn run_inference(
     state: &mut whisper_rs::WhisperState,
     captions: &CaptionStream,
+    caption_broadcaster: Option<&Arc<FragmentBroadcaster>>,
     broadcast: &str,
     source_sample_rate: u32,
     window_start_dts: u64,
@@ -267,6 +287,33 @@ fn run_inference(
             end_ts,
             text: trimmed.to_string(),
         });
+        if let Some(bc) = caption_broadcaster {
+            // Convert source-track ticks to wall-clock UNIX ms
+            // for the captions Fragment so the HLS bridge can
+            // place cues on the PROGRAM-DATE-TIME axis without
+            // re-deriving the broadcast anchor. `now()` at
+            // publish time is a reasonable proxy for the cue's
+            // wall-clock; cues lag inference by at most one
+            // window, which the HLS bridge documents as a v1
+            // limitation.
+            let duration_ms = end_ts.saturating_sub(start_ts) * 1000 / source_sample_rate.max(1) as u64;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let frag = Fragment::new(
+                "captions",
+                emitted as u64,
+                0,
+                0,
+                now_ms,
+                now_ms,
+                duration_ms,
+                FragmentFlags::KEYFRAME,
+                Bytes::from(trimmed.to_string()),
+            );
+            bc.emit(frag);
+        }
         emitted += 1;
     }
     emitted

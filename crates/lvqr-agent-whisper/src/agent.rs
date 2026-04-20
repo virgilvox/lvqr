@@ -11,12 +11,29 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lvqr_agent::{Agent, AgentContext};
-use lvqr_fragment::Fragment;
+use lvqr_fragment::{Fragment, FragmentBroadcaster, FragmentBroadcasterRegistry};
+#[cfg(feature = "whisper")]
+use lvqr_fragment::FragmentMeta;
 use tracing::{debug, warn};
 
 use crate::caption::CaptionStream;
-use crate::factory::WhisperConfig;
+use crate::factory::{CAPTIONS_TRACK_ID, WhisperConfig};
 use crate::mdat::extract_first_mdat;
+
+/// Timescale used for the `captions` registry track. Cue
+/// timestamps stored on the published `Fragment` are in
+/// milliseconds, which gives the HLS subtitle bridge enough
+/// precision for browser playback (cue boundaries below 1 ms
+/// are not perceptually meaningful for English speech).
+#[cfg(feature = "whisper")]
+pub(crate) const CAPTIONS_TIMESCALE_MS: u32 = 1_000;
+
+/// Codec string the captions track advertises on its
+/// `FragmentMeta`. `wvtt` mirrors the IANA `text/vtt`
+/// MIME-type's MPEG-4 box-name convention used by HLS
+/// subtitle renditions.
+#[cfg(feature = "whisper")]
+pub(crate) const CAPTIONS_CODEC: &str = "wvtt";
 
 /// Bounded depth of the agent -> worker mpsc channel. Sized
 /// for ~1 second of AAC frames at 48 kHz (1024 samples per
@@ -34,6 +51,19 @@ const WORKER_QUEUE_DEPTH: usize = 64;
 pub struct WhisperCaptionsAgent {
     config: Arc<WhisperConfig>,
     captions: CaptionStream,
+    /// Optional shared registry the agent additionally
+    /// publishes captions into under track id
+    /// [`CAPTIONS_TRACK_ID`]. When `None`, the agent's
+    /// captions are visible only via the in-process
+    /// `CaptionStream`. Set via
+    /// `WhisperCaptionsFactory::with_caption_registry`.
+    caption_registry: Option<FragmentBroadcasterRegistry>,
+    /// Producer-side handle to the captions broadcaster on
+    /// `caption_registry`. Lazily created at on_start time so
+    /// agents that fail to enter the inference path (no ASC,
+    /// model load failure) do not leak a captions broadcaster
+    /// into the registry.
+    caption_broadcaster: Option<Arc<FragmentBroadcaster>>,
     #[cfg(feature = "whisper")]
     worker: Option<crate::worker::WorkerHandle>,
     /// Asc + broadcast name captured at on_start so the worker
@@ -55,11 +85,21 @@ struct AgentState {
 
 impl WhisperCaptionsAgent {
     /// Build a fresh agent. Called from
-    /// [`crate::WhisperCaptionsFactory::build`].
-    pub fn new(config: Arc<WhisperConfig>, captions: CaptionStream) -> Self {
+    /// [`crate::WhisperCaptionsFactory::build`]. `caption_registry`
+    /// is `Some` when the factory was wired with
+    /// `with_caption_registry`; the agent then additionally
+    /// publishes each `TranscribedCaption` into the registry's
+    /// `(broadcast, "captions")` track.
+    pub fn new(
+        config: Arc<WhisperConfig>,
+        captions: CaptionStream,
+        caption_registry: Option<FragmentBroadcasterRegistry>,
+    ) -> Self {
         Self {
             config,
             captions,
+            caption_registry,
+            caption_broadcaster: None,
             #[cfg(feature = "whisper")]
             worker: None,
             state: AgentState::default(),
@@ -92,9 +132,30 @@ impl Agent for WhisperCaptionsAgent {
                 );
                 return;
             };
+            // Lazily create the captions broadcaster on the
+            // shared registry IF the factory wired one in. Done
+            // here (not in `new`) so agents that fail before the
+            // worker spawns do not register an orphan captions
+            // track.
+            let captions_bc = self.caption_registry.as_ref().map(|registry| {
+                let bc = registry.get_or_create(
+                    &ctx.broadcast,
+                    CAPTIONS_TRACK_ID,
+                    FragmentMeta::new(CAPTIONS_CODEC, CAPTIONS_TIMESCALE_MS),
+                );
+                debug!(
+                    broadcast = %ctx.broadcast,
+                    track = %CAPTIONS_TRACK_ID,
+                    "WhisperCaptionsAgent: captions broadcaster registered",
+                );
+                bc
+            });
+            self.caption_broadcaster = captions_bc.clone();
+
             match crate::worker::spawn(
                 Arc::clone(&self.config),
                 self.captions.clone(),
+                captions_bc,
                 ctx.broadcast.clone(),
                 ctx.meta.timescale,
                 asc,
@@ -167,6 +228,19 @@ impl Agent for WhisperCaptionsAgent {
                 handle.shutdown();
             }
         }
+
+        // Drop the producer-side handle on the captions
+        // broadcaster, then ask the registry to remove the
+        // entry so the BroadcasterCaptionsBridge's drain task
+        // sees `Closed` and exits cleanly. Order matters: the
+        // registry.remove() callback fires synchronously; we
+        // drop our Arc first so the captions broadcast::Sender
+        // count drops to zero and downstream `recv` returns
+        // None instead of waiting for another producer.
+        self.caption_broadcaster = None;
+        if let Some(registry) = self.caption_registry.as_ref() {
+            let _ = registry.remove(&self.state.broadcast, CAPTIONS_TRACK_ID);
+        }
     }
 }
 
@@ -187,7 +261,7 @@ mod tests {
 
     fn agent() -> WhisperCaptionsAgent {
         let cfg = Arc::new(WhisperConfig::new(PathBuf::from("/nonexistent/ggml-tiny.en.bin")));
-        WhisperCaptionsAgent::new(cfg, CaptionStream::new())
+        WhisperCaptionsAgent::new(cfg, CaptionStream::new(), None)
     }
 
     fn fragment_with_mdat(payload: &[u8]) -> Fragment {
@@ -270,5 +344,15 @@ mod tests {
         let frag = fragment_with_mdat(&[0xAA, 0xBB]);
         a.on_fragment(&frag);
         a.on_stop();
+    }
+
+    #[test]
+    fn on_stop_without_caption_registry_is_a_no_op() {
+        let mut a = agent();
+        a.on_start(&ctx("1.mp4"));
+        // Without a caption_registry the agent never touches a
+        // shared registry; on_stop must not panic.
+        a.on_stop();
+        assert!(a.caption_broadcaster.is_none());
     }
 }

@@ -81,6 +81,7 @@ use lvqr_cmaf::{CmafChunk, detect_audio_codec_string, detect_video_codec_string}
 use tokio::sync::{Notify, RwLock};
 
 use crate::manifest::{HlsError, PlaylistBuilder, PlaylistBuilderConfig};
+use crate::subtitles::SubtitlesServer;
 
 /// Default base path used when mounting a [`MultiHlsServer`] router.
 const MULTI_HLS_PREFIX: &str = "/hls";
@@ -633,11 +634,17 @@ struct MultiHlsState {
 ///
 /// Video is always present (broadcasts are created on the first
 /// `ensure_video` call); audio is optional and appears once
-/// `ensure_audio` is called for the same broadcast name.
+/// `ensure_audio` is called for the same broadcast name. The
+/// optional `subtitles` field is populated on the first
+/// `ensure_subtitles` call (Tier 4 item 4.5 session C); when
+/// present, the master playlist gains an
+/// `EXT-X-MEDIA TYPE=SUBTITLES` rendition group and the variant
+/// stream gets a `SUBTITLES="subs"` attribute.
 #[derive(Debug, Clone)]
 struct BroadcastEntry {
     video: HlsServer,
     audio: Option<HlsServer>,
+    subtitles: Option<SubtitlesServer>,
 }
 
 impl MultiHlsServer {
@@ -699,6 +706,7 @@ impl MultiHlsServer {
         let entry = BroadcastEntry {
             video: HlsServer::new(cfg),
             audio: None,
+            subtitles: None,
         };
         let video = entry.video.clone();
         map.insert(broadcast.to_string(), entry);
@@ -733,6 +741,7 @@ impl MultiHlsServer {
             BroadcastEntry {
                 video: HlsServer::new(cfg),
                 audio: None,
+                subtitles: None,
             }
         });
         if entry.audio.is_none() {
@@ -766,20 +775,59 @@ impl MultiHlsServer {
             .and_then(|e| e.audio.clone())
     }
 
+    /// Producer-side entry point for the subtitles rendition of
+    /// `broadcast`. Returns a cheap clone of the per-broadcast
+    /// [`SubtitlesServer`], creating both the broadcast entry
+    /// and the subtitles state on first call. Tier 4 item 4.5
+    /// session C: the WhisperCaptionsAgent's captions feed the
+    /// returned server's `push_cue` via `BroadcasterCaptionsBridge`.
+    pub fn ensure_subtitles(&self, broadcast: &str) -> SubtitlesServer {
+        let mut map = self
+            .inner
+            .broadcasts
+            .lock()
+            .expect("multi hls broadcasts mutex poisoned");
+        let entry = map.entry(broadcast.to_string()).or_insert_with(|| {
+            let cfg = stamp_pdt_now(&self.inner.config);
+            BroadcastEntry {
+                video: HlsServer::new(cfg),
+                audio: None,
+                subtitles: None,
+            }
+        });
+        if entry.subtitles.is_none() {
+            entry.subtitles = Some(SubtitlesServer::new());
+        }
+        entry.subtitles.clone().expect("subtitles just assigned")
+    }
+
+    /// Consumer-side lookup for the subtitles rendition of
+    /// `broadcast`. Returns `None` when the broadcast has no
+    /// captions (either the broadcast is unknown or no
+    /// captions agent has been wired in).
+    pub fn subtitles(&self, broadcast: &str) -> Option<SubtitlesServer> {
+        self.inner
+            .broadcasts
+            .lock()
+            .expect("multi hls broadcasts mutex poisoned")
+            .get(broadcast)
+            .and_then(|e| e.subtitles.clone())
+    }
+
     /// Mark a broadcast as ended. Calls [`HlsServer::finalize`] on
     /// both the video and audio renditions (if present), which closes
     /// the pending segment, coalesces its bytes, appends
     /// `#EXT-X-ENDLIST`, and wakes any parked blocking-reload
     /// subscribers. No-op if the broadcast is unknown.
     pub async fn finalize_broadcast(&self, broadcast: &str) {
-        let (video, audio) = {
+        let (video, audio, subs) = {
             let map = self
                 .inner
                 .broadcasts
                 .lock()
                 .expect("multi hls broadcasts mutex poisoned");
             match map.get(broadcast) {
-                Some(entry) => (Some(entry.video.clone()), entry.audio.clone()),
+                Some(entry) => (Some(entry.video.clone()), entry.audio.clone(), entry.subtitles.clone()),
                 None => return,
             }
         };
@@ -788,6 +836,9 @@ impl MultiHlsServer {
         }
         if let Some(a) = audio {
             a.finalize().await;
+        }
+        if let Some(s) = subs {
+            s.finalize();
         }
     }
 
@@ -815,6 +866,13 @@ impl MultiHlsServer {
     /// * `/hls/{broadcast}/audio-<uri>` -- audio chunk (matched by
     ///   the `audio-` prefix that `audio_config_from` installs on
     ///   the audio [`PlaylistBuilderConfig`]).
+    /// * `/hls/{broadcast}/captions/playlist.m3u8` -- subtitles
+    ///   media playlist (Tier 4 item 4.5 session C). Plain HLS
+    ///   playlist with no LL-HLS partials and no `EXT-X-MAP`;
+    ///   each `#EXTINF` entry references a per-cue `.vtt` file.
+    /// * `/hls/{broadcast}/captions/seg-<msn>.vtt` -- the
+    ///   `.vtt` body for media-sequence `msn`. 404 when the cue
+    ///   has been evicted from the sliding window.
     /// * `/hls/{broadcast}/<uri>` -- video chunk (everything else).
     pub fn router(&self) -> Router {
         Router::new()
@@ -887,7 +945,7 @@ async fn handle_multi_get(
     // is wired (clustering enabled), try to redirect the subscriber
     // to the owning node's HLS surface before 404'ing. Resolver
     // misses fall through to the existing not-found paths.
-    if multi.video(broadcast).is_none() && multi.audio(broadcast).is_none() {
+    if multi.video(broadcast).is_none() && multi.audio(broadcast).is_none() && multi.subtitles(broadcast).is_none() {
         if let Some(base) = multi.resolve_redirect_base(broadcast).await {
             return redirect_to_owner(&base, &path);
         }
@@ -895,6 +953,15 @@ async fn handle_multi_get(
 
     if tail == "master.m3u8" {
         return handle_master_playlist(&multi, broadcast).await;
+    }
+    // Captions URIs are sub-pathed `<broadcast>/captions/<file>`.
+    // The split_broadcast_path helper splits at the last `/`, so
+    // for `live/cam1/captions/playlist.m3u8` it returns
+    // `("live/cam1/captions", "playlist.m3u8")`. Detect the
+    // captions tail by stripping the `/captions` suffix off the
+    // broadcast and re-routing.
+    if let Some(real_broadcast) = broadcast.strip_suffix("/captions") {
+        return handle_captions(&multi, real_broadcast, tail).await;
     }
     let video = multi.video(broadcast);
     let audio = multi.audio(broadcast);
@@ -973,6 +1040,30 @@ async fn build_sibling_reports(sibling: Option<&HlsServer>, sibling_uri: &str) -
     }]
 }
 
+/// Handle a `/hls/{broadcast}/captions/<file>` request. Routes:
+///
+/// * `playlist.m3u8` -- the captions media playlist.
+/// * `seg-<msn>.vtt` -- the per-cue WebVTT segment body.
+async fn handle_captions(multi: &MultiHlsServer, broadcast: &str, tail: &str) -> Response {
+    let Some(subs) = multi.subtitles(broadcast) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("unknown captions rendition for broadcast {broadcast}"),
+        )
+            .into_response();
+    };
+    if tail == "playlist.m3u8" {
+        let body = subs.render_playlist();
+        return ([(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")], body).into_response();
+    }
+    if let Some(seq) = SubtitlesServer::parse_segment_uri(tail)
+        && let Some(body) = subs.render_segment(seq)
+    {
+        return ([(header::CONTENT_TYPE, "text/vtt; charset=utf-8")], body).into_response();
+    }
+    (StatusCode::NOT_FOUND, format!("unknown captions URI {tail}")).into_response()
+}
+
 async fn handle_master_playlist(multi: &MultiHlsServer, broadcast: &str) -> Response {
     let Some(video) = multi.video(broadcast) else {
         return (StatusCode::NOT_FOUND, format!("unknown broadcast {broadcast}")).into_response();
@@ -990,6 +1081,19 @@ async fn handle_master_playlist(multi: &MultiHlsServer, broadcast: &str) -> Resp
             default: true,
             autoselect: true,
             language: None,
+        });
+    }
+    let subtitles_group_id = "subs";
+    let has_subtitles = multi.subtitles(broadcast).is_some();
+    if has_subtitles {
+        master.renditions.push(crate::master::MediaRendition {
+            rendition_type: crate::master::MediaRenditionType::Subtitles,
+            group_id: subtitles_group_id.into(),
+            name: "English".into(),
+            uri: "captions/playlist.m3u8".into(),
+            default: true,
+            autoselect: true,
+            language: Some("en".into()),
         });
     }
     // Video codec string comes from the init segment parsed at
@@ -1028,6 +1132,7 @@ async fn handle_master_playlist(multi: &MultiHlsServer, broadcast: &str) -> Resp
         codecs,
         resolution: None,
         audio_group: has_audio.then(|| audio_group_id.to_string()),
+        subtitles_group: has_subtitles.then(|| subtitles_group_id.to_string()),
         uri: "playlist.m3u8".into(),
     });
     let body = master.render();

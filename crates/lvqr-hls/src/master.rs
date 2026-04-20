@@ -95,6 +95,15 @@ pub struct VariantStream {
     /// track is combined with the referenced audio rendition at
     /// playback time.
     pub audio_group: Option<String>,
+    /// Optional `SUBTITLES="..."` attribute referencing a
+    /// [`MediaRendition`] group of `TYPE=SUBTITLES`. Browser
+    /// players (hls.js, native Safari) pick the rendition's
+    /// playlist URI off the master playlist's matching
+    /// `EXT-X-MEDIA` entry and request the per-segment .vtt
+    /// files in time-aligned with the variant's video / audio.
+    /// Tier 4 item 4.5 session C wires this for the
+    /// WhisperCaptionsAgent's English captions output.
+    pub subtitles_group: Option<String>,
     /// URI to the variant's media playlist, relative to the master
     /// playlist. Rendered on the line immediately after the
     /// `#EXT-X-STREAM-INF` tag.
@@ -172,6 +181,9 @@ fn render_variant(out: &mut String, variant: &VariantStream) {
     if let Some(audio_group) = &variant.audio_group {
         let _ = write!(out, ",AUDIO=\"{audio_group}\"");
     }
+    if let Some(subtitles_group) = &variant.subtitles_group {
+        let _ = write!(out, ",SUBTITLES=\"{subtitles_group}\"");
+    }
     out.push('\n');
     let _ = writeln!(out, "{}", variant.uri);
 }
@@ -198,6 +210,7 @@ mod tests {
             codecs: "avc1.640020,mp4a.40.2".into(),
             resolution: Some((1280, 720)),
             audio_group: Some("audio".into()),
+            subtitles_group: None,
             uri: "playlist.m3u8".into(),
         }
     }
@@ -297,5 +310,37 @@ mod tests {
         };
         let body = m.render();
         assert!(!body.contains("RESOLUTION="));
+    }
+
+    #[test]
+    fn subtitles_rendition_renders_with_language_and_subtitles_group_on_variant() {
+        let subs = MediaRendition {
+            rendition_type: MediaRenditionType::Subtitles,
+            group_id: "subs".into(),
+            name: "English".into(),
+            uri: "captions/playlist.m3u8".into(),
+            default: true,
+            autoselect: true,
+            language: Some("en".into()),
+        };
+        let mut variant = sample_variant_with_audio();
+        variant.subtitles_group = Some("subs".into());
+        let m = MasterPlaylist {
+            version: 9,
+            renditions: vec![sample_audio_rendition(), subs],
+            variants: vec![variant],
+        };
+        let body = m.render();
+        assert!(
+            body.contains(
+                "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",DEFAULT=YES,\
+                 AUTOSELECT=YES,LANGUAGE=\"en\",URI=\"captions/playlist.m3u8\""
+            ),
+            "subtitles media line missing: {body}"
+        );
+        assert!(
+            body.contains("AUDIO=\"audio\",SUBTITLES=\"subs\""),
+            "variant should reference both audio + subtitles groups: {body}"
+        );
     }
 }
