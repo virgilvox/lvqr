@@ -1,8 +1,164 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 COMPLETE; 4.5 session A DONE (lvqr-agent scaffold landed); 796 tests, 27 crates
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 COMPLETE; 4.5 session A DONE (lvqr-agent scaffold landed); 796 tests, 27 crates; **v0.4.0 published to crates.io + pushed to origin/main**
 
-**Last Updated**: 2026-04-19 (session 97 close). Tier 4 item 4.5 session A landed the in-process AI agents framework scaffold under a new `crates/lvqr-agent`. Surface: `Agent` sync trait (`on_start(&AgentContext)` + `on_fragment(&Fragment)` + `on_stop()` lifecycle, all default-no-op except `on_fragment`); `AgentContext { broadcast, track, meta: FragmentMeta }`; `AgentFactory { name, build(&AgentContext) -> Option<Box<dyn Agent>> }` (per-stream opt-in via `None`); `AgentRunner` builder + `install(&FragmentBroadcasterRegistry) -> AgentRunnerHandle` that wires one `on_entry_created` callback, subscribes synchronously inside the callback, and spawns one tokio drain task per agent factory opts in for. The natural `BroadcasterStream::Closed` termination IS the broadcast-stop signal; no separate `on_entry_removed` wiring (would race the drain loop and double-fire `on_stop`). Every `on_start`/`on_fragment`/`on_stop` call wrapped in `std::panic::catch_unwind(AssertUnwindSafe(..))`; panics in `on_fragment` are logged + counted but do NOT terminate the drain (one bad frame must not kill the agent), panics in `on_start` DO skip the drain entirely. `AgentRunnerHandle` exposes per-`(agent, broadcast, track)` `fragments_seen` + `panics` counters mirror of `WasmFilterBridgeHandle`. Pattern-matches the four existing `FragmentBroadcasterRegistry` consumers (HLS bridge, archive indexer, WASM filter tap, cluster claim) so session 98 drops a `WhisperCaptionsFactory` in without re-deriving the callback / spawn / drain boilerplate. No CLI wiring (session 100 D). No concrete agent (session 98 B). Workspace tests: **796** passing (up from 786; +8 lib runner tests, +1 integration, +1 doctest). Workspace count now **27 crates** (was 26). Session 98 entry point is Tier 4 item 4.5 session B (`WhisperCaptionsAgent` reading AAC audio + feeding whisper-rs -- read `tracking/TIER_4_PLAN.md` section 4.5 row 98 B).
+**Last Updated**: 2026-04-20 (v0.4.0 release event). Post-session-97-close release activity: GitHub `origin/main` synced (head `6e98553`); README + docs refreshed for 4-of-8 Tier 4 status (commit `bdb5420`); workspace `Cargo.toml` patched to declare `lvqr-conformance` / `lvqr-test-utils` / `lvqr-soak` as path-only workspace deps (commit `6e98553`) so consumer dev-dep manifests are strippable on `cargo publish` (was the blocker on first publish attempt; cargo's package step rejects dev-deps that have a version field but cannot be resolved on the registry); 24 publishable workspace crates published to crates.io at v0.4.0 (8 version-bumps from 0.3.1 + 16 first-time publishes). Notable name re-use: `lvqr-wasm` 0.3.1 was "browser playback bindings" and 0.4.0 is "server-side WASM filter host" -- different content, same name (deliberate per session-44 refactor). The crates.io rate limit (5-burst then 1 new crate per 10 min) was the long pole: chain ran ~90 min wall-clock. `lvqr-cli 0.4.0` is the consumer-facing entry point (`cargo install lvqr-cli` after the chain settles).
+
+## v0.4.0 release event (2026-04-20)
+
+### What landed
+
+1. **GitHub `origin/main` synced**. Commits since
+   `ebb8668` (session 95 close):
+
+   * `d0e2ea6` test(auth): Tier 4 item 4.8 session B
+     -- cross-protocol auth E2E (one JWT, four
+     protocols)
+   * `d38d3c5` docs: session 96 close
+   * `b8631fa` feat(agent): Tier 4 item 4.5 session A
+     -- lvqr-agent scaffold
+   * `80ec948` docs: session 97 close
+   * `bdb5420` docs: refresh README + architecture +
+     quickstart for 4-of-8 Tier 4 status
+   * `6e98553` build: drop version field on
+     publish=false workspace deps so cargo publish
+     strips dev-deps
+
+   Six commits, all pushed. Local main is at
+   `origin/main`; verify via
+   `git log --oneline origin/main..main` (should be
+   empty).
+
+2. **Workspace manifest fix** (`6e98553`).
+   `cargo publish` package-step rejects dev-deps
+   with a `version` field that cannot be resolved on
+   crates.io. Fix: make the workspace.dependencies
+   entries for the three publish=false helper crates
+   path-only:
+
+   ```toml
+   lvqr-conformance = { path = "crates/lvqr-conformance" }
+   lvqr-test-utils  = { path = "crates/lvqr-test-utils" }
+   lvqr-soak        = { path = "crates/lvqr-soak" }
+   ```
+
+   Path-only dev-deps without a version are stripped
+   from the published Cargo.toml -- which is exactly
+   what publish requires. Local workspace builds
+   continue to resolve via the path field. Surfaced
+   when publishing `lvqr-codec` (dev-dep on
+   `lvqr-conformance` blocked the package step).
+   Affects ~9 publishable crates that dev-dep on the
+   helpers.
+
+3. **24 publishable crates pushed to crates.io at
+   v0.4.0**. The three publish=false helpers
+   (`lvqr-conformance`, `lvqr-test-utils`,
+   `lvqr-soak`) stayed local.
+
+   **Version bumps from 0.3.1** (existed on
+   crates.io previously):
+   `lvqr-core`, `lvqr-relay`, `lvqr-mesh`,
+   `lvqr-ingest`, `lvqr-signal`, `lvqr-admin`,
+   `lvqr-cli`, `lvqr-wasm`.
+
+   **First-time publishes** (16 crates):
+   `lvqr-moq`, `lvqr-archive`, `lvqr-auth`,
+   `lvqr-observability`, `lvqr-codec`,
+   `lvqr-fragment`, `lvqr-cluster`, `lvqr-cmaf`,
+   `lvqr-agent`, `lvqr-dash`, `lvqr-hls`,
+   `lvqr-record`, `lvqr-rtsp`, `lvqr-srt`,
+   `lvqr-whip`, `lvqr-whep`.
+
+   **Notable name re-use**: `lvqr-wasm 0.3.1` on
+   crates.io was a browser-playback binding crate
+   (deleted in the session-44 refactor); `lvqr-wasm
+   0.4.0` is the server-side WASM filter host
+   (Tier 4 item 4.2). Same name, different content.
+   Pinning to `lvqr-wasm = "0.3"` keeps the old
+   crate; bumping to `"0.4"` switches to the new
+   one.
+
+4. **README + docs refresh** (`bdb5420`). Reflects
+   ground truth: 27 crates, 796 tests, 4-of-8 Tier
+   4 items COMPLETE plus the 4.5 scaffold. Crate
+   map gains `lvqr-agent` and a "Programmable data
+   plane (Tier 4)" subsection. The "What's NOT
+   shipped yet" list pruned: 4.1 / 4.3 / 4.8 are
+   no longer in it; 4.5's WhisperCaptionsAgent
+   (sessions 98-100) is still called out
+   explicitly. `docs/architecture.md` +
+   `docs/quickstart.md` bumped 25 -> 27 crates.
+
+### Mechanics + gotchas
+
+* **Rate limits**. crates.io enforces 5-burst then
+  1 new crate per 10 minutes for first-time
+  publishes. With 16 first-time publishes in this
+  release, the chain ran ~90 min wall-clock just on
+  rate-limit waits. Version-bump publishes are not
+  rate-limited the same way -- they were
+  interleaved between new-crate slots to fill the
+  wait time. `/tmp/lvqr_publish.sh` (not
+  committed) is a retry-aware publish script that
+  detects 429 and sleeps 70s before retrying;
+  preserve it locally if you ever need to cut
+  another release.
+* **Dependency order**. Built from
+  `cargo metadata --no-deps` filtered to regular
+  (kind=null) internal deps. Tiers:
+    * Tier 0 (no internal deps): lvqr-core,
+      lvqr-moq, lvqr-archive, lvqr-auth,
+      lvqr-observability, lvqr-codec.
+    * Tier 1: lvqr-fragment (lvqr-moq),
+      lvqr-cluster (lvqr-core), lvqr-signal
+      (lvqr-core).
+    * Tier 2: lvqr-cmaf, lvqr-agent, lvqr-wasm,
+      lvqr-mesh, lvqr-admin, lvqr-relay,
+      lvqr-record.
+    * Tier 3: lvqr-dash, lvqr-hls, lvqr-ingest.
+    * Tier 4: lvqr-rtsp, lvqr-srt, lvqr-whip,
+      lvqr-whep.
+    * Tier 5: lvqr-cli (depends on everything).
+
+  cargo publish's wait-for-index-to-update step
+  (post 1.66) handled within-tier ordering for free
+  -- subsequent dependent publishes saw their deps
+  in the registry without explicit sleeps.
+* **`--no-verify` was NOT used**. Every published
+  crate compiled cleanly from its packaged tarball
+  via the standard verify step. The path-only
+  manifest fix made `--no-verify` unnecessary.
+* **Consumer-facing UX**. `cargo install lvqr-cli`
+  works for v0.4.0; the binary boots with the same
+  zero-config defaults `cargo run -p lvqr-cli`
+  produces locally.
+
+### Tier 4 execution status (unchanged from session 97)
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 / 89 / 90 |
+| 4.3 | C2PA signed media | **COMPLETE** | 91 (A) / 92 (B1) / 93 (B2) / 94 (B3) |
+| 4.8 | One-token-all-protocols | **COMPLETE** | 95 (A) / 96 (B) |
+| 4.5 | In-process AI agents | **A DONE**, B-D pending | 97 (A) / 98 (B) / 99 (C) / 100 (D) |
+| 4.4 | Cross-cluster federation | PLANNED | 101-103 |
+| 4.6 | Server-side transcoding | PLANNED | 104-106 |
+| 4.7 | Latency SLO scheduling | PLANNED | 107-108 |
+
+### Session 98 entry point (still: Tier 4 item 4.5 session B)
+
+WhisperCaptionsAgent reading AAC audio, feeding
+whisper-rs. The session-97-A `Agent` /
+`AgentFactory` / `AgentRunner` surface in
+`crates/lvqr-agent` is now live on crates.io; the
+new agent registers against an existing
+`AgentRunner` instance. See `tracking/TIER_4_PLAN.md`
+section 4.5 row 98 B + the session 97 close block
+below for the design notes that carry forward.
+
+ Tier 4 item 4.5 session A landed the in-process AI agents framework scaffold under a new `crates/lvqr-agent`. Surface: `Agent` sync trait (`on_start(&AgentContext)` + `on_fragment(&Fragment)` + `on_stop()` lifecycle, all default-no-op except `on_fragment`); `AgentContext { broadcast, track, meta: FragmentMeta }`; `AgentFactory { name, build(&AgentContext) -> Option<Box<dyn Agent>> }` (per-stream opt-in via `None`); `AgentRunner` builder + `install(&FragmentBroadcasterRegistry) -> AgentRunnerHandle` that wires one `on_entry_created` callback, subscribes synchronously inside the callback, and spawns one tokio drain task per agent factory opts in for. The natural `BroadcasterStream::Closed` termination IS the broadcast-stop signal; no separate `on_entry_removed` wiring (would race the drain loop and double-fire `on_stop`). Every `on_start`/`on_fragment`/`on_stop` call wrapped in `std::panic::catch_unwind(AssertUnwindSafe(..))`; panics in `on_fragment` are logged + counted but do NOT terminate the drain (one bad frame must not kill the agent), panics in `on_start` DO skip the drain entirely. `AgentRunnerHandle` exposes per-`(agent, broadcast, track)` `fragments_seen` + `panics` counters mirror of `WasmFilterBridgeHandle`. Pattern-matches the four existing `FragmentBroadcasterRegistry` consumers (HLS bridge, archive indexer, WASM filter tap, cluster claim) so session 98 drops a `WhisperCaptionsFactory` in without re-deriving the callback / spawn / drain boilerplate. No CLI wiring (session 100 D). No concrete agent (session 98 B). Workspace tests: **796** passing (up from 786; +8 lib runner tests, +1 integration, +1 doctest). Workspace count now **27 crates** (was 26). Session 98 entry point is Tier 4 item 4.5 session B (`WhisperCaptionsAgent` reading AAC audio + feeding whisper-rs -- read `tracking/TIER_4_PLAN.md` section 4.5 row 98 B).
 
 ## Session 97 close (2026-04-19)
 
