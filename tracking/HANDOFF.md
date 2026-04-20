@@ -1,8 +1,8 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.4 COMPLETE (6 of 8 Tier 4 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.8); 875 workspace tests (+2 whisper-gated inline), 28 crates; local `main` is N+2 commits ahead of `origin/main` pending push
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.4 COMPLETE (6 of 8 Tier 4 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.8); 875 workspace tests (+2 whisper-gated inline), 28 crates; **origin/main synced (head `5efbf86`)**
 
-**Last Updated**: 2026-04-21 (session 103 close). Session 103 C landed the admin route `GET /api/v1/cluster/federation` plus the per-link exponential-backoff reconnect loop with a `FederationStatusHandle` observability surface; Tier 4 item 4.4 closes here. Local `main` is two commits ahead of `origin/main` (feat + close-doc); `git log --oneline origin/main..main` shows both. crates.io is unchanged since the post-session-98 publish event; a future release cycle bumps `lvqr-cluster` + `lvqr-cli` + `lvqr-admin` + `lvqr-test-utils` and republishes via `/tmp/lvqr_publish.sh`. Session 104 entry point is Tier 4 item 4.6 session A (server-side transcoding; see `tracking/TIER_4_PLAN.md` section 4.6 row 104 A).
+**Last Updated**: 2026-04-21 (session 103 push event). Session 103's two commits (`d6bb42b` feat + `5efbf86` close-doc) are pushed to `origin/main`; `git log --oneline origin/main..main` is empty. crates.io is unchanged since the post-session-98 publish event; a future release cycle bumps `lvqr-cluster` + `lvqr-cli` + `lvqr-admin` + `lvqr-test-utils` and republishes via `/tmp/lvqr_publish.sh`. Tier 4 item 4.4 is CLOSED as of `5efbf86`. Session 104 entry point is Tier 4 item 4.6 session A (server-side transcoding; see `tracking/TIER_4_PLAN.md` section 4.6 row 104 A).
 
 ## Session 103 close (2026-04-21)
 
