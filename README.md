@@ -62,10 +62,13 @@ AI agents, cross-cluster federation) as Tier 4 on the roadmap.
   `metrics-util::FanoutBuilder` composition alongside Prometheus
 - Chitchat cluster plane: broadcast ownership KV with lease
   renewal, per-node capacity advertisement, LWW config, HLS/DASH/
-  RTSP redirect-to-owner, `/api/v1/cluster/{nodes,broadcasts,config}`
+  RTSP redirect-to-owner,
+  `/api/v1/cluster/{nodes,broadcasts,config,federation}`, and
+  one-way cross-cluster federation pulls with
+  exponential-backoff reconnect (item 4.4)
 
-**Programmable data plane (Tier 4 -- 4 of 8 items
-landed, 1 scaffolded):**
+**Programmable data plane (Tier 4 -- 6 of 8 items
+landed + 1 scaffolded):**
 
 - **WASM per-fragment filter runtime** (item 4.2,
   COMPLETE) via `wasmtime 25` (`--wasm-filter <path>` /
@@ -109,18 +112,66 @@ landed, 1 scaffolded):**
   at auth time. End-to-end matrix locked into
   `crates/lvqr-cli/tests/one_token_all_protocols.rs`.
   See [`docs/auth.md`](docs/auth.md).
-- **In-process AI agents framework scaffold**
-  (item 4.5 session A, DONE; B-D pending): `lvqr-agent`
-  ships the `Agent` trait + `AgentContext` + factory +
-  `AgentRunner` lifecycle wiring. One drain task per
+- **In-process AI agents framework + whisper
+  captions** (item 4.5, COMPLETE). `lvqr-agent` ships
+  the `Agent` trait + `AgentContext` + factory +
+  `AgentRunner` lifecycle wiring: one drain task per
   agent per `(broadcast, track)`, panic-isolated via
-  `catch_unwind`, per-`(agent, broadcast, track)` stats
-  + `lvqr_agent_fragments_total{agent}` metric. Session
-  98 will drop in `WhisperCaptionsAgent` against this
-  surface without re-deriving the registry-wiring
-  boilerplate.
+  `catch_unwind`, per-`(agent, broadcast, track)`
+  stats + `lvqr_agent_fragments_total{agent}` metric.
+  `lvqr-agent-whisper` (default-OFF `whisper` feature)
+  is the concrete agent: decodes AAC via symphonia,
+  feeds PCM to whisper.cpp via `whisper-rs` on a
+  dedicated worker thread, emits captions onto both
+  the in-process `CaptionStream` AND the
+  `FragmentBroadcasterRegistry`'s per-broadcast
+  `"captions"` track. `lvqr-hls`'s new
+  `SubtitlesServer` publishes a standard HLS
+  subtitle rendition on the master playlist
+  (`EXT-X-MEDIA TYPE=SUBTITLES`); the cues appear as
+  WebVTT at `/hls/{broadcast}/captions/playlist.m3u8`.
+  `lvqr-cli` drives the whole chain via
+  `--whisper-model <PATH>` / `LVQR_WHISPER_MODEL`
+  when built with `--features whisper`.
+- **Cross-cluster federation** (item 4.4, COMPLETE).
+  `lvqr-cluster::FederationLink { remote_url,
+  auth_token, forwarded_broadcasts, disable_tls_verify }`
+  configures one-way pulls from a peer cluster's MoQ
+  relay; `FederationRunner` spawns one task per link
+  that opens an authenticated MoQ session, subscribes
+  to the remote origin's announcement stream, and
+  re-publishes matched broadcasts into the local
+  origin on LVQR's convention tracks (`0.mp4`,
+  `1.mp4`, `catalog`). Session 103 C added an
+  exponential-backoff reconnect loop (base 1 s,
+  doubling to 60 s cap, +/-10% jitter) with a
+  `FederationStatusHandle` observability surface read
+  by the admin route
+  `GET /api/v1/cluster/federation`. Per-link status
+  exposes `state` (connecting / connected / failed),
+  `last_connected_at_ms`, `last_error`, and
+  `connect_attempts` for operator dashboards.
+- **Server-side transcoding scaffold** (item 4.6
+  session A, DONE; B-C pending). `lvqr-transcode`
+  ships the `Transcoder` trait + `TranscoderFactory` +
+  `TranscoderContext` + `TranscodeRunner` lifecycle
+  wiring, exactly mirroring `lvqr-agent`. `RenditionSpec`
+  carries `name` + `width` + `height` +
+  `video_bitrate_kbps` + `audio_bitrate_kbps` with
+  `preset_720p` / `preset_480p` / `preset_240p` +
+  `default_ladder()`. Panic-isolated drain via
+  `catch_unwind`, 4-tuple `(transcoder, rendition,
+  broadcast, track)` stats key,
+  `lvqr_transcode_fragments_total{transcoder, rendition}`
+  + `lvqr_transcode_panics_total{transcoder,
+  rendition, phase}` metrics. A
+  `PassthroughTranscoder` proves the end-to-end wiring
+  (observe + count) without pulling heavy C deps; real
+  gstreamer-rs software + hardware pipelines land in
+  sessions 105 B + 106 C behind a default-OFF
+  `transcode` Cargo feature.
 
-**Stability signal:** 796 workspace tests, 0 failures,
+**Stability signal:** 892 workspace tests, 0 failures,
 1 ignored (the pre-existing `moq_sink` doctest).
 `cargo fmt --all --check`, `cargo clippy --workspace
 --all-targets --benches -- -D warnings`, and
@@ -135,21 +186,19 @@ current crate-by-crate scorecard.
 faced docs easily miss):** webhook-based auth
 providers, OAuth2 / JWKS dynamic key discovery, HMAC
 signed URLs, hot config reload, a dedicated DVR
-scrub web UI, WebVTT caption segmenter + SCTE-35
-passthrough, stream-key CRUD admin API, WHEP audio
-(AAC to Opus transcoder required; unblocks with the
-Tier 4 transcoding item), server-side transcoding /
-ABR ladders (item 4.6, planned 104-106),
-cross-cluster federation (item 4.4, planned
-101-103), latency SLO scheduling (item 4.7, planned
-107-108), stream-modifying WASM filter pipelines (v1
-WASM runtime is a read-only tap), concrete
-`WhisperCaptionsAgent` (item 4.5 sessions B-D ship
-the model + CLI + HLS subtitle rendition wiring).
-Every one of these is either explicitly on
-[`tracking/ROADMAP.md`](tracking/ROADMAP.md) Tier 3 /
-Tier 4 or documented as out-of-scope for v1. None is
-a silent gap.
+scrub web UI, SCTE-35 passthrough (WebVTT captions
+now ship through the whisper-captions HLS rendition),
+stream-key CRUD admin API, WHEP audio (AAC to Opus
+transcoder required; unblocks with the Tier 4
+transcoding item currently mid-scaffold), real
+gstreamer ABR ladder publish + hardware encoders
+(item 4.6 sessions 105-106), latency SLO scheduling
+(item 4.7, planned 107-108), stream-modifying WASM
+filter pipelines (v1 WASM runtime is a read-only
+tap). Every one of these is either explicitly on
+[`tracking/ROADMAP.md`](tracking/ROADMAP.md) Tier 3
+/ Tier 4 or documented as out-of-scope for v1.
+None is a silent gap.
 
 ## Quickstart
 
@@ -297,6 +346,15 @@ lvqr serve [OPTIONS]
                             reloaded on file change. Env:
                             LVQR_WASM_FILTER.
 
+  Captions (requires `--features whisper` at build):
+  --whisper-model <PATH>    Path to a whisper.cpp ggml model file
+                            (e.g. ggml-tiny.en.bin). Turns on the
+                            in-process WhisperCaptionsAgent
+                            against every ingested AAC track and
+                            publishes WebVTT cues at
+                            /hls/<broadcast>/captions/playlist.m3u8.
+                            Env: LVQR_WHISPER_MODEL.
+
   Cluster:
   --cluster-listen <ADDR>   Gossip bind (enables cluster plane)
   --cluster-seeds <LIST>    Comma-separated peer ip:port seeds
@@ -356,7 +414,7 @@ cargo build --release
 
 ## Crate map
 
-The workspace is 27 crates organised along the Tier-2 unified
+The workspace is 29 crates organised along the Tier-2 unified
 data plane: one segmenter, every protocol is a projection.
 
 ```
@@ -377,7 +435,7 @@ Ingest protocols
 
 Egress protocols
   lvqr-relay         -- MoQ/QUIC relay over moq-lite
-  lvqr-hls           -- LL-HLS + MultiHlsServer + DVR sliding window
+  lvqr-hls           -- LL-HLS + MultiHlsServer + DVR + SubtitlesServer
   lvqr-dash          -- MPEG-DASH + MultiDashServer
   lvqr-whep          -- WebRTC egress via str0m
   lvqr-mesh          -- peer mesh topology planner (Tier 4 media)
@@ -385,17 +443,19 @@ Egress protocols
 Auth, storage, admin
   lvqr-auth          -- noop / static / HS256 JWT providers
   lvqr-record        -- fMP4 recorder subscribed to EventBus
-  lvqr-archive       -- redb segment index for DVR scrub
+  lvqr-archive       -- redb segment index + C2PA finalize / verify
   lvqr-signal        -- WebRTC signaling (mesh assignments)
-  lvqr-admin         -- /api/v1/*, /metrics, /healthz, /readyz
+  lvqr-admin         -- /api/v1/*, /metrics, /healthz, /readyz, /api/v1/cluster/federation
 
 Cluster + observability
-  lvqr-cluster       -- chitchat plane (ownership, capacity, config)
+  lvqr-cluster       -- chitchat plane + FederationRunner (ownership, capacity, config, cross-cluster pulls)
   lvqr-observability -- OTLP span + metric export, metrics-crate bridge
 
 Programmable data plane
   lvqr-wasm          -- wasmtime fragment-filter runtime + notify hot-reload
   lvqr-agent         -- in-process AI agents framework (trait + runner + lifecycle)
+  lvqr-agent-whisper -- WhisperCaptionsAgent (AAC -> PCM -> whisper.cpp -> captions track)
+  lvqr-transcode     -- server-side transcoder framework (scaffold; gstreamer pipelines in 105 B)
 
 Infrastructure
   lvqr-cli           -- single-binary composition root
