@@ -1,8 +1,77 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 + 4.5 COMPLETE (5 of 8 Tier 4 items done); 843 workspace tests (+2 whisper-gated inline), 28 crates; **origin/main synced (head `e4522a1`)**
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 + 4.5 COMPLETE (5 of 8); 4.4 session A DONE (FederationLink + MoQ subscribe-loop scaffold); 858 workspace tests (+2 whisper-gated inline), 28 crates; local main N+3 commits ahead of `origin/main` pending push
 
-**Last Updated**: 2026-04-21 (session 100 push event). Session 100's three commits (`519afda` feat + `0ba0169` close-doc + `e4522a1` audit-follow-up polish that warns when `--whisper-model` is set without an HLS surface) are pushed to `origin/main`; `git log --oneline origin/main..main` is empty. crates.io is unchanged since the post-session-98 `lvqr-agent-whisper 0.4.0` publish event; a future release cycle needs a version bump on `lvqr-cli` + `lvqr-test-utils` (and `lvqr-agent-whisper` as a drive-by) before re-publishing via `/tmp/lvqr_publish.sh`. The session 100 post-close audit surfaced one operational footgun (whisper factory runs even when HLS is disabled, in which case the caption fragments are silently dropped by tokio broadcast semantics); the `e4522a1` polish commit adds a `tracing::warn!` at `start()` time so misconfigured deployments surface early. Session 101 entry point below is Tier 4 item 4.4 session A (cross-cluster federation: `FederationLink` config + MoQ subscribe loop).
+**Last Updated**: 2026-04-21 (session 101 close). Session 101 landed Tier 4 item 4.4 session A: `lvqr-cluster` gained `FederationLink` (serde struct; TOML + JSON ready) and `FederationRunner` (one tokio task per link; opens outbound MoQ session via `moq_native::Client` against `subscription_url()` which appends `?token=<jwt>` matching the `lvqr_relay::server::parse_url_token` convention). Per-link task drains the remote origin's announcement stream and filters against `link.forwards(name)`; matched announcements log a structured event. Per-track re-publish into the local origin is deferred to session 102 B (where the two-cluster integration test can exercise the full wire path; scope rescoped in-commit per the plan-vs-code rule). `FederationRunner::shutdown()` bounds each per-link task wait to a 1 s grace then aborts, so an unreachable peer does not hang cluster teardown; `Drop` aborts the same way. New `lvqr-cluster` deps: `lvqr-moq`, `moq-lite`, `moq-native`, `url` (plus `toml` as a dev-dep for the TOML round-trip test). 15 new tests (6 inline in `src/federation.rs` + 9 in `tests/federation_unit.rs`) exercise config shape, URL token append, exact-match forwarding, runner lifecycle (empty link list, unreachable remote with bounded shutdown, Drop path). Workspace totals: **858 passed / 0 failed / 1 ignored** (up from 843; +15). Crate count unchanged at **28**. Session 101 is a fresh session continuing immediately after session 100's push event (commit chain: `519afda` feat + `0ba0169` close-doc + `e4522a1` audit polish + `b1bc4f5` push event are on `origin/main`; session 101's commits sit above them on local `main` pending this session's push).
+
+### Session 101 close (2026-04-21)
+
+1. **Tier 4 item 4.4 session A: FederationLink + FederationRunner scaffold** (feat commit).
+   * `crates/lvqr-cluster/src/federation.rs` (new, ~340 LOC): `FederationLink` with `subscription_url()` + `forwards()` helpers; `FederationRunner` with `start` / `configured_links` / `active_links` / `shutdown` / `Drop`; `run_link` private async fn; `SHUTDOWN_GRACE: Duration = 1 s`.
+   * `crates/lvqr-cluster/tests/federation_unit.rs` (new, ~150 LOC): 9 unit tests.
+   * `crates/lvqr-cluster/src/lib.rs`: `mod federation;` + `pub use federation::{FederationLink, FederationRunner};`.
+   * `crates/lvqr-cluster/Cargo.toml`: added `lvqr-moq`, `moq-lite`, `moq-native`, `url` regular deps + `toml` dev-dep.
+   * `tracking/TIER_4_PLAN.md`: 4.4 header flipped to "A DONE, B-C pending"; row 101 A scoped up to the full deliverable + verification record; row 102 B scoped up to include the per-track re-publish implementation (previously the plan split it across 101 A "subscribe loop" + 102 B "integration test"; reality is the two only compose as one atomic piece of code).
+
+2. **Session 101 close doc** (this commit).
+
+### Key 4.4 design decisions baked in
+
+* **URL shape**: `link.remote_url` must be a valid URL; `subscription_url()` appends `token=<auth_token>` via `url::Url::query_pairs_mut().append_pair`. Existing query params (e.g. `?region=us-west` for operator telemetry) are preserved. Matches the `lvqr_relay::server::parse_url_token` extractor exactly.
+* **Forward matching = exact match only for v1**. Glob / prefix patterns are explicit anti-scope (section 4.4 anti-scope forbids auto-discovery; explicit curation keeps operator intent unambiguous). A future session can add glob support behind a feature flag if demand materializes.
+* **No wildcard / regex patterns in `forwarded_broadcasts`**. Empty list is a valid no-op link (session opens, nothing is forwarded); useful as a cluster-reachability probe.
+* **Shutdown budget**: 1 s grace per per-link task, then abort. moq-native connect futures can stall on TLS / DNS work that is not cancellation-responsive; the bounded wait keeps cluster teardown O(links) x 1 s worst case. The `federation_unit.rs` test with a TEST-NET-1 remote URL (RFC 5737 `192.0.2.1`) verifies this bound holds.
+* **JWT minting out of scope**: session 101 A accepts an opaque `auth_token` string. Tier 4 item 4.8 already shipped the JWT minting path (shared secret + audience claim); operators mint per-link tokens externally. A future session can add a convenience helper (`FederationLink::with_jwt(secret, audience, broadcasts)`) but it is not blocking.
+* **Announcement stream is the subscribe surface**. We do NOT catalog-subscribe or track-enumerate; we drain the remote origin's announcement events and react to each matching broadcast as it appears. This matches the `crates/lvqr-relay/tests/relay_integration.rs` client pattern and avoids a round-trip through the catalog track's per-broadcast frame messages for discovery.
+* **Session 102 B integration-test scope**. The meaningful verification for the per-track re-publish requires two real MoQ relays; attempting to shove that into `federation_unit.rs` would require a second `RelayServer` + client round-trip + trait-object work just to avoid a live network. Instead, `federation_unit.rs` is network-free; `federation_two_cluster.rs` (session 102 B) gets its own TestServer harness spinning up two full LVQR instances, wiring a federation link between them, publishing on A, and asserting B's HLS surface serves the same broadcast.
+
+### Ground truth (session 101 close)
+
+* **Head**: feat commit + this close-doc commit (two new commits on `main`). Local is N+2 above `origin/main` pending push. (Previous push event `b1bc4f5` is on `origin/main`.)
+* **Tests**: **858** passed, 0 failed, 1 ignored on macOS (default features).
+* **CI gates locally clean**:
+  * `cargo fmt --all`
+  * `cargo clippy --workspace --all-targets --benches -- -D warnings`
+  * `cargo test -p lvqr-cluster --lib` 40 passed (+6 inline)
+  * `cargo test -p lvqr-cluster --test federation_unit` 9 passed
+  * `cargo test --workspace` 858 / 0 / 1 (+15 over session 100's 843)
+* **Workspace**: **28 crates**, unchanged.
+* **crates.io**: unchanged. Session 101 A adds non-breaking public API (`FederationLink`, `FederationRunner`) to `lvqr-cluster`; a future release bump (0.4.0 -> 0.5.0 or 0.4.1) republishes `lvqr-cluster` + re-runs the existing publish chain.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 / 89 / 90 |
+| 4.3 | C2PA signed media | **COMPLETE** | 91-94 |
+| 4.8 | One-token-all-protocols | **COMPLETE** | 95 / 96 |
+| 4.5 | In-process AI agents | **COMPLETE** | 97 / 98 / 99 / 100 |
+| 4.4 | Cross-cluster federation | **A DONE**, B-C pending | 101 / 102 / 103 |
+| 4.6 | Server-side transcoding | PLANNED | 104-106 |
+| 4.7 | Latency SLO scheduling | PLANNED | 107-108 |
+
+5 of 8 Tier 4 items COMPLETE; 4.4 one-third done.
+
+### Session 102 entry point
+
+**Tier 4 item 4.4 session B: two-cluster integration test + per-track re-publish implementation.**
+
+The session-101 A runner opens the outbound MoQ session + drains announcements. Session 102 B owns:
+1. Extending `run_link` (or a sibling helper) so a matched announcement triggers `remote_bc.subscribe_track(Track::new("0.mp4" / "1.mp4" / "catalog"))` against the LVQR track-name convention; the resulting `TrackConsumer` pipes groups + frames into a `TrackProducer` created on the local origin's `BroadcastProducer`.
+2. New integration test `crates/lvqr-cli/tests/federation_two_cluster.rs`: boots two `TestServer` instances (A + B), wires a `FederationLink` on B pointing at A, publishes an RTMP broadcast on A, asserts B's HLS surface serves the same broadcast. The `TestServer` harness may need a new builder `with_federation_link(..)` analogous to `with_whisper_model`.
+3. Decide: does the federation link's local origin injection go directly into `lvqr_relay::RelayServer::origin()` or through the shared `FragmentBroadcasterRegistry`? The former is faster (one less fanout) but the latter lets federated broadcasts flow through all the same consumers (HLS / DASH / archive / WASM filter / whisper captions). Default choice: registry, for consistency with every other ingest crate.
+
+**Prerequisites already in place**:
+* `FederationLink` + `FederationRunner` (session 101 A).
+* `lvqr_relay::RelayServer::origin()` accessor returns `&OriginProducer`.
+* `TestServer` fixture (lvqr-test-utils) can be driven twice in one test for a two-cluster topology.
+
+### Session 103 entry point (after 102 B)
+
+Admin route `GET /api/v1/cluster/federation` exposing link status + reconnect-on-failure (exponential backoff). Plan row 103 C unchanged.
+
+ Session 100's three commits (`519afda` feat + `0ba0169` close-doc + `e4522a1` audit-follow-up polish that warns when `--whisper-model` is set without an HLS surface) are pushed to `origin/main`; `git log --oneline origin/main..main` is empty. crates.io is unchanged since the post-session-98 `lvqr-agent-whisper 0.4.0` publish event; a future release cycle needs a version bump on `lvqr-cli` + `lvqr-test-utils` (and `lvqr-agent-whisper` as a drive-by) before re-publishing via `/tmp/lvqr_publish.sh`. The session 100 post-close audit surfaced one operational footgun (whisper factory runs even when HLS is disabled, in which case the caption fragments are silently dropped by tokio broadcast semantics); the `e4522a1` polish commit adds a `tracing::warn!` at `start()` time so misconfigured deployments surface early. Session 101 entry point below is Tier 4 item 4.4 session A (cross-cluster federation: `FederationLink` config + MoQ subscribe loop).
 
 ## Session 100 close (2026-04-21)
 
