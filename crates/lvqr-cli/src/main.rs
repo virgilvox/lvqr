@@ -157,6 +157,25 @@ struct ServeArgs {
     #[arg(long, env = "LVQR_WASM_FILTER")]
     wasm_filter: Option<PathBuf>,
 
+    /// Path to a whisper.cpp `ggml-*.bin` model file. When set,
+    /// `serve` installs a `WhisperCaptionsFactory` on the shared
+    /// fragment registry so every new broadcast's audio track
+    /// (`1.mp4`) spawns a WhisperCaptionsAgent that transcribes
+    /// speech into WebVTT cues and republishes them onto the
+    /// `captions` track; the LL-HLS subtitle rendition drains
+    /// those cues automatically. Fetch a v1 model via
+    /// `curl -L -o ggml-tiny.en.bin
+    /// https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin`.
+    /// v1 limitations: English only (no `--whisper-language`
+    /// flag); captions are not historical -- HLS subscribers who
+    /// join an ongoing broadcast see only cues emitted from the
+    /// moment they joined onwards. Requires the `whisper` Cargo
+    /// feature; the flag is absent from the CLI without it.
+    /// Tier 4 item 4.5 session D.
+    #[cfg(feature = "whisper")]
+    #[arg(long, env = "LVQR_WHISPER_MODEL")]
+    whisper_model: Option<PathBuf>,
+
     /// HS256 shared secret enabling JWT authentication. When set, the JWT
     /// provider replaces the static-token provider and all auth surfaces
     /// validate bearer tokens as signed JWTs.
@@ -337,6 +356,8 @@ async fn serve_from_args(
         archive_dir: args.archive_dir,
         #[cfg(feature = "c2pa")]
         c2pa: None,
+        #[cfg(feature = "whisper")]
+        whisper_model: args.whisper_model,
         wasm_filter: args.wasm_filter,
         install_prometheus: true,
         otel_metrics_recorder,

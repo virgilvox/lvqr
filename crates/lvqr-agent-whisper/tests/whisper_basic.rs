@@ -128,7 +128,7 @@ fn make_box(ty: &[u8; 4], body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn fragment(seq: u64, sample_rate: u32) -> Fragment {
+fn fragment(seq: u64, _sample_rate: u32) -> Fragment {
     let dts = seq * 1024;
     let payload = moof_then_mdat(synthetic_aac_frame().as_ref());
     Fragment::new("1.mp4", seq, 0, 0, dts, dts, 1024, FragmentFlags::KEYFRAME, payload)

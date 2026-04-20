@@ -143,6 +143,7 @@ pub(crate) fn spawn(
 /// Worker main loop. Owns the `WhisperContext`, the decoder,
 /// and the PCM ring. Runs inference whenever the ring crosses
 /// `window_samples`; runs a final pass on channel close.
+#[allow(clippy::too_many_arguments)]
 fn run(
     context: WhisperContext,
     decoder: &mut AacToMonoF32,

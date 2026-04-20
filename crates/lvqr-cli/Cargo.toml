@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [features]
 default = ["rtmp", "quinn-transport", "cluster"]
-full = ["rtmp", "quinn-transport", "cluster", "c2pa"]
+full = ["rtmp", "quinn-transport", "cluster", "c2pa", "whisper"]
 rtmp = ["lvqr-ingest/rtmp"]
 quinn-transport = ["lvqr-relay/quinn-transport"]
 # Enables cluster-mode CLI flags + bootstrap in `start()`. Disabled
@@ -32,6 +32,18 @@ cluster = ["dep:lvqr-cluster"]
 # task termination path. Default off so operators without a provenance
 # requirement do not link the c2pa-rs transitive closure.
 c2pa = ["lvqr-archive/c2pa", "dep:c2pa"]
+# Tier 4 item 4.5 session D: enables the `--whisper-model <PATH>` CLI
+# flag, plumbs the model path through `ServeConfig`, and installs a
+# `WhisperCaptionsFactory` + `AgentRunner` on the shared fragment
+# registry inside `start()`. Default off so `cargo install lvqr-cli`
+# does not pull `whisper-rs` (bindgen + cmake against whisper.cpp) or
+# `symphonia` into the default build path.
+whisper = [
+    "dep:lvqr-agent",
+    "dep:lvqr-agent-whisper",
+    "lvqr-agent-whisper/whisper",
+    "lvqr-test-utils/whisper",
+]
 
 [dependencies]
 lvqr-core = { workspace = true }
@@ -60,6 +72,13 @@ lvqr-wasm = { workspace = true }
 # route. Inherited from the workspace so the lockfile-level pin tracks
 # lvqr-archive's.
 c2pa = { workspace = true, optional = true }
+# Feature-gated on `whisper`; `start()` builds a
+# `WhisperCaptionsFactory` + `AgentRunner` on the shared fragment
+# registry so the captions track the HLS subtitle rendition consumes
+# has a live producer. Without the feature neither dep links at all
+# and the `--whisper-model` flag is absent from the CLI.
+lvqr-agent = { workspace = true, optional = true }
+lvqr-agent-whisper = { workspace = true, optional = true }
 
 axum = { workspace = true }
 bytes = { workspace = true }

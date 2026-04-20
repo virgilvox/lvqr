@@ -15,6 +15,12 @@ publish = false
 # can flip the config field on. Default off so the test-utils crate
 # tracks `lvqr-cli`'s default feature set.
 c2pa = ["lvqr-cli/c2pa", "lvqr-archive/c2pa"]
+# Surface the `lvqr-cli/whisper` feature through TestServer so the
+# `whisper_cli_e2e.rs` integration test can install a
+# `WhisperCaptionsFactory` via `ServeConfig.whisper_model`. Default
+# off; the `whisper-rs` bindgen + cmake closure stays out of the
+# default test-utils build. Tier 4 item 4.5 session D.
+whisper = ["lvqr-cli/whisper", "dep:lvqr-agent"]
 
 [dependencies]
 lvqr-core = { workspace = true }
@@ -23,6 +29,10 @@ lvqr-archive = { workspace = true }
 lvqr-auth = { workspace = true }
 lvqr-fragment = { workspace = true }
 lvqr-wasm = { workspace = true }
+# Gated on the `whisper` feature: the test-utils `agent_runner()`
+# accessor returns an `&lvqr_agent::AgentRunnerHandle`, so the
+# dep must resolve when the feature is on.
+lvqr-agent = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "macros", "net"] }
 tokio-util = { workspace = true }
 bytes = { workspace = true }

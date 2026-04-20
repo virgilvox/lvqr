@@ -136,6 +136,23 @@ pub struct ServeConfig {
     /// Tier 4 item 4.3 session B3.
     #[cfg(feature = "c2pa")]
     pub c2pa: Option<lvqr_archive::provenance::C2paConfig>,
+    /// Optional path to a whisper.cpp `ggml-*.bin` model. When
+    /// set, `start()` constructs a
+    /// `lvqr_agent_whisper::WhisperCaptionsFactory` wired against
+    /// the shared `FragmentBroadcasterRegistry` (so the generated
+    /// caption cues flow through the same
+    /// `(broadcast, "captions")` track the LL-HLS subtitle
+    /// rendition drains) and installs it on a throwaway
+    /// `lvqr_agent::AgentRunner`; the returned
+    /// `AgentRunnerHandle` is held on `ServerHandle` for the
+    /// server lifetime. Without a value the factory is skipped
+    /// entirely and no AI-adjacent state is constructed.
+    /// Feature-gated: accessible only when `lvqr-cli` is built
+    /// with `--features whisper` so the whisper.cpp + symphonia
+    /// transitive closure stays out of deployments that do not
+    /// want captions. Tier 4 item 4.5 session D.
+    #[cfg(feature = "whisper")]
+    pub whisper_model: Option<PathBuf>,
     /// Optional path to a WASM fragment filter module. When set,
     /// `start()` loads + compiles the module via
     /// `lvqr_wasm::WasmFilter::load` and installs a filter tap
@@ -233,6 +250,8 @@ impl ServeConfig {
             archive_dir: None,
             #[cfg(feature = "c2pa")]
             c2pa: None,
+            #[cfg(feature = "whisper")]
+            whisper_model: None,
             wasm_filter: None,
             install_prometheus: false,
             otel_metrics_recorder: None,
@@ -278,6 +297,15 @@ pub struct ServerHandle {
     /// Tests read fragment counters off this handle to assert
     /// the filter actually saw the ingested broadcasts.
     wasm_filter: Option<lvqr_wasm::WasmFilterBridgeHandle>,
+    /// `AgentRunner` handle kept alive for the server's
+    /// lifetime when `--whisper-model` is configured. Dropping
+    /// the handle aborts every per-broadcast drain task the
+    /// runner spawned; holding it on `ServerHandle` mirrors the
+    /// `wasm_filter` pattern so the lifetime semantics are
+    /// identical. Tier 4 item 4.5 session D. Feature-gated
+    /// `#[cfg(feature = "whisper")]`.
+    #[cfg(feature = "whisper")]
+    agent_runner: Option<lvqr_agent::AgentRunnerHandle>,
     /// WASM filter hot-reload watcher kept alive for the
     /// server's lifetime when `--wasm-filter` is configured.
     /// On every debounced change to the module path, the
@@ -420,6 +448,17 @@ impl ServerHandle {
     /// the filter actually observed the broadcast.
     pub fn wasm_filter(&self) -> Option<&lvqr_wasm::WasmFilterBridgeHandle> {
         self.wasm_filter.as_ref()
+    }
+
+    /// `AgentRunner` handle backing this server, when
+    /// [`ServeConfig::whisper_model`] was `Some` at `start()`
+    /// time. Returns `None` when captions are not wired. Tests
+    /// read per-`(agent, broadcast, track)` fragment counters
+    /// off this handle to assert the whisper agent actually
+    /// observed the broadcast. Feature-gated on `whisper`.
+    #[cfg(feature = "whisper")]
+    pub fn agent_runner(&self) -> Option<&lvqr_agent::AgentRunnerHandle> {
+        self.agent_runner.as_ref()
     }
 
     /// Trigger graceful shutdown and wait for every subsystem to drain.
@@ -741,6 +780,31 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         // the LL-HLS bridge above.
         captions::BroadcasterCaptionsBridge::install(hls.clone(), &shared_registry);
     }
+
+    // Tier 4 item 4.5 session D: if the operator passed
+    // `--whisper-model <PATH>`, build the
+    // `WhisperCaptionsFactory` + `AgentRunner` and install it
+    // onto the shared registry so every new
+    // `(broadcast, "1.mp4")` triggers a WhisperCaptionsAgent.
+    // The agent republishes each caption cue onto
+    // `(broadcast, "captions")` where the
+    // `BroadcasterCaptionsBridge` above picks it up and feeds
+    // the HLS subtitle rendition. Without the flag (or without
+    // the `whisper` feature at all) no AI state is constructed.
+    #[cfg(feature = "whisper")]
+    let agent_runner_handle = if let Some(ref path) = config.whisper_model {
+        let factory =
+            lvqr_agent_whisper::WhisperCaptionsFactory::new(lvqr_agent_whisper::WhisperConfig::new(path.clone()))
+                .with_caption_registry(shared_registry.clone());
+        tracing::info!(path = %path.display(), "whisper captions agent enabled");
+        Some(
+            lvqr_agent::AgentRunner::new()
+                .with_factory(factory)
+                .install(&shared_registry),
+        )
+    } else {
+        None
+    };
 
     // Install the broadcaster-based DASH composition bridge. Same
     // pattern as LL-HLS: the callback spawns a drain task per
@@ -1287,6 +1351,8 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         cluster,
         wasm_filter: wasm_filter_handle,
         _wasm_reloader: wasm_reloader_handle,
+        #[cfg(feature = "whisper")]
+        agent_runner: agent_runner_handle,
         fragment_registry: shared_registry,
     })
 }
@@ -1757,4 +1823,26 @@ fn parse_avcc_record(data: &[u8]) -> Option<lvqr_ingest::remux::VideoConfig> {
         level,
         nalu_length_size,
     })
+}
+
+#[cfg(all(test, feature = "whisper"))]
+mod whisper_serve_config_tests {
+    use super::ServeConfig;
+    use std::path::PathBuf;
+
+    #[test]
+    fn loopback_ephemeral_defaults_whisper_model_to_none() {
+        let cfg = ServeConfig::loopback_ephemeral();
+        assert!(cfg.whisper_model.is_none());
+    }
+
+    #[test]
+    fn whisper_model_round_trips_through_serve_config() {
+        let path = PathBuf::from("/nonexistent/ggml-tiny.en.bin");
+        let cfg = ServeConfig {
+            whisper_model: Some(path.clone()),
+            ..ServeConfig::loopback_ephemeral()
+        };
+        assert_eq!(cfg.whisper_model.as_deref(), Some(path.as_path()));
+    }
 }

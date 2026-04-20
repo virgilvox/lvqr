@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lvqr_agent::{Agent, AgentContext};
-use lvqr_fragment::{Fragment, FragmentBroadcaster, FragmentBroadcasterRegistry};
 #[cfg(feature = "whisper")]
 use lvqr_fragment::FragmentMeta;
+use lvqr_fragment::{Fragment, FragmentBroadcaster, FragmentBroadcasterRegistry};
 use tracing::{debug, warn};
 
 use crate::caption::CaptionStream;

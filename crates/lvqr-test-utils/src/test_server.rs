@@ -53,6 +53,8 @@ pub struct TestServerConfig {
     whip_enabled: bool,
     #[cfg(feature = "c2pa")]
     c2pa: Option<lvqr_archive::provenance::C2paConfig>,
+    #[cfg(feature = "whisper")]
+    whisper_model: Option<PathBuf>,
 }
 
 impl TestServerConfig {
@@ -101,6 +103,17 @@ impl TestServerConfig {
     #[cfg(feature = "c2pa")]
     pub fn with_c2pa(mut self, c2pa: lvqr_archive::provenance::C2paConfig) -> Self {
         self.c2pa = Some(c2pa);
+        self
+    }
+
+    /// Install a whisper.cpp model path on the `ServeConfig` so the
+    /// TestServer's `start()` path constructs a
+    /// `WhisperCaptionsFactory` + `AgentRunner` against the shared
+    /// fragment registry. Gated on `feature = "whisper"` on
+    /// `lvqr-test-utils`. Tier 4 item 4.5 session D.
+    #[cfg(feature = "whisper")]
+    pub fn with_whisper_model(mut self, path: impl Into<PathBuf>) -> Self {
+        self.whisper_model = Some(path.into());
         self
     }
 
@@ -189,6 +202,8 @@ impl TestServer {
             archive_dir: config.archive_dir,
             #[cfg(feature = "c2pa")]
             c2pa: config.c2pa,
+            #[cfg(feature = "whisper")]
+            whisper_model: config.whisper_model,
             wasm_filter: config.wasm_filter,
             // Prometheus install is process-wide and panics on second
             // call, so tests always disable it. Metrics macros still
@@ -267,6 +282,17 @@ impl TestServer {
     /// `with_wasm_filter` was not used on this TestServer.
     pub fn wasm_filter(&self) -> Option<&lvqr_wasm::WasmFilterBridgeHandle> {
         self.handle.wasm_filter()
+    }
+
+    /// AgentRunner handle (read-only). Returns `None` when
+    /// [`TestServerConfig::with_whisper_model`] was not used.
+    /// Tests read per-`(agent, broadcast, track)` fragment
+    /// counters off this handle to assert the whisper agent
+    /// actually observed the RTMP audio. Gated on
+    /// `feature = "whisper"`. Tier 4 item 4.5 session D.
+    #[cfg(feature = "whisper")]
+    pub fn agent_runner(&self) -> Option<&lvqr_agent::AgentRunnerHandle> {
+        self.handle.agent_runner()
     }
 
     /// Bound SRT ingest UDP address. Panics if SRT was not enabled.

@@ -2904,6 +2904,8 @@ dependencies = [
  "http",
  "jsonwebtoken",
  "lvqr-admin",
+ "lvqr-agent",
+ "lvqr-agent-whisper",
  "lvqr-archive",
  "lvqr-auth",
  "lvqr-cluster",
@@ -3262,6 +3264,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "lvqr-agent",
  "lvqr-archive",
  "lvqr-auth",
  "lvqr-cli",
