@@ -1,0 +1,42 @@
+[package]
+name = "lvqr-agent-whisper"
+description = "WhisperCaptionsAgent for LVQR (Tier 4 item 4.5 session B). AAC fragment audio -> whisper.cpp captions, plugged into lvqr-agent."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+keywords = ["lvqr", "streaming", "whisper", "captions", "agent"]
+categories = ["multimedia"]
+
+# Default feature set is intentionally empty so `cargo build --workspace`
+# stays fast: enabling the `whisper` feature pulls in whisper-rs (which runs
+# bindgen + cmake against whisper.cpp) and symphonia (which adds the AAC
+# decoder + format demuxers). Without the feature the crate ships its
+# always-available surface (TranscribedCaption, WhisperCaptionsFactory,
+# mdat / ASC parsers, panic-isolated agent stub) so callers can wire the
+# factory into an `lvqr_agent::AgentRunner` and get a deterministic no-op
+# behaviour. Concrete inference is gated to the `whisper` feature.
+[features]
+default = []
+whisper = ["dep:whisper-rs", "dep:symphonia"]
+
+[dependencies]
+lvqr-agent = { workspace = true }
+lvqr-fragment = { workspace = true }
+
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+# Heavy deps gated behind the `whisper` feature. whisper-rs builds against
+# whisper.cpp via bindgen + cmake; symphonia 0.6.0-alpha.2 with the `aac`
+# feature is the pure-Rust AAC-LC decoder. Both are pinned exact-major so a
+# minor bump gets its own session per `tracking/TIER_4_PLAN.md`'s pin policy.
+whisper-rs = { version = "0.16", optional = true, default-features = false }
+symphonia = { version = "0.6.0-alpha.2", optional = true, default-features = false, features = ["aac"] }
+
+[dev-dependencies]

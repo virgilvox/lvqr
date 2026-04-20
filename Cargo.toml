@@ -41,6 +41,7 @@ members = [
     "crates/lvqr-test-utils",
     "crates/lvqr-wasm",
     "crates/lvqr-agent",
+    "crates/lvqr-agent-whisper",
 ]
 
 [workspace.package]
@@ -197,6 +198,7 @@ lvqr-observability = { version = "0.4.0", path = "crates/lvqr-observability" }
 lvqr-soak = { path = "crates/lvqr-soak" }
 lvqr-wasm = { version = "0.4.0", path = "crates/lvqr-wasm" }
 lvqr-agent = { version = "0.4.0", path = "crates/lvqr-agent" }
+lvqr-agent-whisper = { version = "0.4.0", path = "crates/lvqr-agent-whisper" }
 
 [profile.release]
 lto = true
