@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::{Json, Router, routing::get};
-use lvqr_cluster::{BroadcastSummary, Cluster, ConfigEntry, NodeCapacity, NodeId};
+use lvqr_cluster::{BroadcastSummary, Cluster, ConfigEntry, FederationLinkStatus, NodeCapacity, NodeId};
 use serde::{Deserialize, Serialize};
 
 use crate::routes::{AdminError, AdminState};
@@ -86,14 +86,46 @@ pub(crate) async fn list_config(State(state): State<AdminState>) -> Result<Json<
     Ok(Json(cluster.list_config().await))
 }
 
-/// Router fragment that builds the three cluster endpoints on a
-/// shared [`AdminState`]. Consumers merge this into the top-level
-/// admin router via `Router::merge`.
+/// JSON body for `GET /api/v1/cluster/federation` (Tier 4 item 4.4
+/// session C). Wraps the per-link status vector in a `links`
+/// object so the shape can gain sibling fields in the future
+/// (e.g. `generated_at_ms`, aggregate counters) without a
+/// breaking schema change.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FederationStatusView {
+    pub links: Vec<FederationLinkStatus>,
+}
+
+/// `GET /api/v1/cluster/federation`. Returns one
+/// [`FederationLinkStatus`] entry per configured federation link,
+/// in the same order the operator declared them in config. When
+/// the CLI did not install a
+/// [`lvqr_cluster::FederationStatusHandle`] on [`AdminState`]
+/// (no `federation_links` configured, or the cluster feature is
+/// off in the current build), the response body is
+/// `{"links": []}` with status 200. The empty-vs-missing
+/// distinction is deliberately collapsed: operator tooling can
+/// poll this route unconditionally and treat an empty list as
+/// "federation disabled or no links".
+pub(crate) async fn federation_status(
+    State(state): State<AdminState>,
+) -> Result<Json<FederationStatusView>, AdminError> {
+    let links = match state.federation_status() {
+        Some(handle) => handle.snapshot(),
+        None => Vec::new(),
+    };
+    Ok(Json(FederationStatusView { links }))
+}
+
+/// Router fragment that builds the cluster endpoints on a shared
+/// [`AdminState`]. Consumers merge this into the top-level admin
+/// router via `Router::merge`.
 pub(crate) fn cluster_router() -> Router<AdminState> {
     Router::new()
         .route("/api/v1/cluster/nodes", get(list_nodes))
         .route("/api/v1/cluster/broadcasts", get(list_broadcasts))
         .route("/api/v1/cluster/config", get(list_config))
+        .route("/api/v1/cluster/federation", get(federation_status))
 }
 
 #[cfg(test)]
@@ -210,6 +242,73 @@ mod tests {
         assert_eq!(entries[0].key, "hls.low-latency.enabled");
         assert_eq!(entries[0].value, "true");
 
+        if let Ok(c) = Arc::try_unwrap(cluster) {
+            c.shutdown().await.expect("shutdown");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn federation_route_returns_empty_list_when_not_wired() {
+        // No FederationStatusHandle installed on AdminState (no
+        // `federation_links` configured, or clustering off). Route
+        // returns 200 + empty list per the session 103 C contract.
+        let (cluster, _transport) = boot_cluster(20404).await;
+        let app = build_router(minimal_state(cluster.clone()));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/cluster/federation")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let view: FederationStatusView = serde_json::from_slice(&body).expect("json");
+        assert!(view.links.is_empty());
+        if let Ok(c) = Arc::try_unwrap(cluster) {
+            c.shutdown().await.expect("shutdown");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn federation_route_reports_configured_link_status() {
+        // FederationStatusHandle installed with two links. Route
+        // returns both in declared order.
+        let (cluster, _transport) = boot_cluster(20405).await;
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let origin = lvqr_moq::OriginProducer::new();
+        let links = vec![
+            lvqr_cluster::FederationLink::new("https://192.0.2.10:4443/", "t", vec!["live/a".into()]),
+            lvqr_cluster::FederationLink::new("https://192.0.2.11:4443/", "t", vec!["live/b".into()]),
+        ];
+        let runner = lvqr_cluster::FederationRunner::start(links, origin, shutdown.clone());
+        let status_handle = runner.status_handle();
+        let state = minimal_state(cluster.clone()).with_federation_status(status_handle);
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/cluster/federation")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let view: FederationStatusView = serde_json::from_slice(&body).expect("json");
+        assert_eq!(view.links.len(), 2);
+        assert_eq!(view.links[0].remote_url, "https://192.0.2.10:4443/");
+        assert_eq!(view.links[0].forwarded_broadcasts, vec!["live/a".to_string()]);
+        assert_eq!(view.links[1].remote_url, "https://192.0.2.11:4443/");
+
+        let shutdown_fut = runner.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), shutdown_fut)
+            .await
+            .expect("runner shutdown bounded");
         if let Ok(c) = Arc::try_unwrap(cluster) {
             c.shutdown().await.expect("shutdown");
         }

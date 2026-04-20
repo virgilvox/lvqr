@@ -56,6 +56,7 @@ pub struct TestServerConfig {
     #[cfg(feature = "whisper")]
     whisper_model: Option<PathBuf>,
     federation_links: Vec<lvqr_cluster::FederationLink>,
+    relay_addr: Option<SocketAddr>,
 }
 
 impl TestServerConfig {
@@ -127,6 +128,19 @@ impl TestServerConfig {
         self
     }
 
+    /// Override the MoQ relay bind address. Defaults to
+    /// `127.0.0.1:0` (ephemeral). Tier 4 item 4.4 session C's
+    /// reconnect integration test uses this to restart a
+    /// shutdown peer on the exact same QUIC/UDP port so the
+    /// reconnect path sees a recovered peer rather than picking
+    /// up a fresh cluster. UDP (unlike TCP) has no TIME_WAIT so
+    /// port reuse across a shutdown / restart works without
+    /// SO_REUSEADDR gymnastics.
+    pub fn with_relay_addr(mut self, addr: SocketAddr) -> Self {
+        self.relay_addr = Some(addr);
+        self
+    }
+
     /// Turn off the LL-HLS HTTP surface. Tests that do not exercise
     /// HLS can opt out to skip the extra TCP listener.
     pub fn without_hls(mut self) -> Self {
@@ -193,7 +207,7 @@ impl TestServer {
         let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
         let ephemeral: SocketAddr = (loopback, 0).into();
         let serve_config = ServeConfig {
-            relay_addr: ephemeral,
+            relay_addr: config.relay_addr.unwrap_or(ephemeral),
             rtmp_addr: ephemeral,
             admin_addr: ephemeral,
             hls_addr: if config.hls_disabled { None } else { Some(ephemeral) },

@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use lvqr_cluster::{FederationLink, FederationRunner};
+use lvqr_cluster::{FederationConnectState, FederationLink, FederationRunner};
 use tokio_util::sync::CancellationToken;
 
 #[test]
@@ -122,6 +122,91 @@ async fn runner_exits_cleanly_on_shutdown_even_with_unreachable_remote() {
     tokio::time::timeout(Duration::from_secs(2), shutdown_fut)
         .await
         .expect("runner must shut down within 2 s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_status_handle_reports_failed_after_initial_connect_error() {
+    // Session 103 C: after the outer retry loop catches the first
+    // failed connect against an unreachable peer, the per-link
+    // status must flip to Failed with connect_attempts > 0 and a
+    // non-empty last_error. This is the core observability claim
+    // of the admin route so we assert it end-to-end.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("lvqr=debug")
+        .with_test_writer()
+        .try_init();
+
+    let origin = lvqr_moq::OriginProducer::new();
+    let shutdown = CancellationToken::new();
+    // TEST-NET-1 (RFC 5737) -- guaranteed unroutable.
+    let link = FederationLink::new("https://192.0.2.3:4443/", "t", vec!["live/x".into()]);
+    let runner = FederationRunner::start(vec![link], origin, shutdown);
+    let status = runner.status_handle();
+
+    // The first attempt's connect future has to error out before the
+    // retry wrapper records the Failed state. With the 10 s
+    // per-attempt CONNECT_TIMEOUT inside run_link_once, Failed
+    // appears within ~11 s on an unroutable address; allow up to
+    // 15 s to soak slow CI jitter.
+    let mut observed_failed = false;
+    for _ in 0..150 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        if snapshot[0].state == FederationConnectState::Failed {
+            assert!(
+                snapshot[0].connect_attempts >= 1,
+                "Failed state must carry connect_attempts >= 1"
+            );
+            assert!(
+                snapshot[0].last_error.is_some(),
+                "Failed state must carry a last_error string"
+            );
+            observed_failed = true;
+            break;
+        }
+    }
+    assert!(observed_failed, "link never flipped to Failed within 15 s");
+
+    // Shutdown the runner bounded: the retry loop is currently sleeping
+    // on the backoff, which must unblock via the select-on-cancel arm.
+    let shutdown_fut = runner.shutdown();
+    tokio::time::timeout(Duration::from_secs(2), shutdown_fut)
+        .await
+        .expect("runner must shut down within 2 s even while the retry loop is sleeping");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_handle_clones_observe_updates() {
+    // Admin route will hold a clone of the handle; assert that
+    // snapshots taken through the clone reflect state the runner's
+    // per-link task writes.
+    let origin = lvqr_moq::OriginProducer::new();
+    let shutdown = CancellationToken::new();
+    let link = FederationLink::new("https://192.0.2.4:4443/", "t", vec![]);
+    let runner = FederationRunner::start(vec![link], origin, shutdown);
+    let handle_a = runner.status_handle();
+    let handle_b = handle_a.clone();
+
+    // Wait for the first connect_attempts bump; 500 ms is plenty on
+    // loopback (the connect fails near-instantly for an unroutable
+    // address).
+    let mut saw_bump = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snap = handle_b.snapshot();
+        if snap[0].connect_attempts >= 1 {
+            assert_eq!(snap[0].remote_url, "https://192.0.2.4:4443/");
+            saw_bump = true;
+            break;
+        }
+    }
+    assert!(saw_bump, "clone handle never observed connect_attempts bump");
+
+    let shutdown_fut = runner.shutdown();
+    tokio::time::timeout(Duration::from_secs(2), shutdown_fut)
+        .await
+        .expect("shutdown bounded");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

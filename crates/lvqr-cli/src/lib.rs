@@ -1139,6 +1139,15 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         Some(c) => admin_state.with_cluster(c.clone()),
         None => admin_state,
     };
+    // Wire the federation status handle into
+    // `/api/v1/cluster/federation`. Tier 4 item 4.4 session C.
+    // When no federation links are configured (handle is None),
+    // the route serves an empty list.
+    #[cfg(feature = "cluster")]
+    let admin_state = match federation_runner_handle.as_ref() {
+        Some(runner) => admin_state.with_federation_status(runner.status_handle()),
+        None => admin_state,
+    };
 
     // WebSocket fMP4 relay + WebSocket ingest state.
     let ws_state = WsRelayState {

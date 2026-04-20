@@ -45,6 +45,15 @@ pub struct AdminState {
     /// not run clustering pay no cost for the dep.
     #[cfg(feature = "cluster")]
     cluster: Option<Arc<lvqr_cluster::Cluster>>,
+    /// Optional federation status handle. Populated by
+    /// [`AdminState::with_federation_status`]; consumed by the
+    /// `GET /api/v1/cluster/federation` route in
+    /// [`crate::cluster_routes`]. `None` means the caller did not
+    /// start a [`lvqr_cluster::FederationRunner`] (no
+    /// `federation_links` configured); the route then returns an
+    /// empty link list.
+    #[cfg(feature = "cluster")]
+    federation_status: Option<lvqr_cluster::FederationStatusHandle>,
 }
 
 impl AdminState {
@@ -64,6 +73,8 @@ impl AdminState {
             metrics_render: None,
             #[cfg(feature = "cluster")]
             cluster: None,
+            #[cfg(feature = "cluster")]
+            federation_status: None,
         }
     }
 
@@ -99,6 +110,24 @@ impl AdminState {
     #[cfg(feature = "cluster")]
     pub(crate) fn cluster(&self) -> Option<&Arc<lvqr_cluster::Cluster>> {
         self.cluster.as_ref()
+    }
+
+    /// Wire a [`lvqr_cluster::FederationStatusHandle`] so the
+    /// `GET /api/v1/cluster/federation` route can expose per-link
+    /// state (connecting / connected / failed) to operators.
+    /// Without this call the route returns an empty link list.
+    /// Tier 4 item 4.4 session C.
+    #[cfg(feature = "cluster")]
+    pub fn with_federation_status(mut self, status: lvqr_cluster::FederationStatusHandle) -> Self {
+        self.federation_status = Some(status);
+        self
+    }
+
+    /// Borrow the configured federation status handle, if any.
+    /// Used by the `cluster_routes` module.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn federation_status(&self) -> Option<&lvqr_cluster::FederationStatusHandle> {
+        self.federation_status.as_ref()
     }
 }
 

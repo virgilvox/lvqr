@@ -82,7 +82,9 @@ pub use broadcast::{BROADCAST_KEY_PREFIX, BroadcastSummary, Claim, MIN_LEASE};
 pub use capacity::{CAPACITY_KEY, CapacityGauge, NodeCapacity};
 pub use config::{CONFIG_KEY_PREFIX, ConfigEntry};
 pub use endpoints::{ENDPOINTS_KEY, NodeEndpoints};
-pub use federation::{FederationLink, FederationRunner};
+pub use federation::{
+    FederationConnectState, FederationLink, FederationLinkStatus, FederationRunner, FederationStatusHandle,
+};
 
 /// Default UDP port for the chitchat gossip transport. Matches the
 /// upstream chitchat example's convention. No LVQR listener today

@@ -39,3 +39,8 @@ cluster = ["dep:lvqr-cluster"]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json = { workspace = true }
 chitchat = { workspace = true }
+# Session 103 C: cluster_routes tests construct a FederationRunner
+# directly to exercise the /api/v1/cluster/federation route with a
+# real FederationStatusHandle wired through AdminState.
+lvqr-moq = { workspace = true }
+tokio-util = { workspace = true }
