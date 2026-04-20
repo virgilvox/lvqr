@@ -3292,6 +3292,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lvqr-transcode"
+version = "0.4.0"
+dependencies = [
+ "bytes",
+ "dashmap",
+ "lvqr-fragment",
+ "metrics",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lvqr-wasm"
 version = "0.4.0"
 dependencies = [

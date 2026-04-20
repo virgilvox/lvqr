@@ -42,6 +42,7 @@ members = [
     "crates/lvqr-wasm",
     "crates/lvqr-agent",
     "crates/lvqr-agent-whisper",
+    "crates/lvqr-transcode",
 ]
 
 [workspace.package]
@@ -199,6 +200,7 @@ lvqr-soak = { path = "crates/lvqr-soak" }
 lvqr-wasm = { version = "0.4.0", path = "crates/lvqr-wasm" }
 lvqr-agent = { version = "0.4.0", path = "crates/lvqr-agent" }
 lvqr-agent-whisper = { version = "0.4.0", path = "crates/lvqr-agent-whisper" }
+lvqr-transcode = { version = "0.4.0", path = "crates/lvqr-transcode" }
 
 [profile.release]
 lto = true
