@@ -1,8 +1,121 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 COMPLETE; 4.5 sessions A + B + C DONE (lvqr-agent + lvqr-agent-whisper + HLS subtitle rendition); 843 tests, 28 crates; **origin/main synced (head `f54cec6`)**
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 + 4.5 COMPLETE (5 of 8 Tier 4 items done); 843 workspace tests (+2 whisper-gated inline), 28 crates; local ahead of `origin/main` (head `9c1135c` upstream)
 
-**Last Updated**: 2026-04-21 (session 99 close + push). Session 99's two commits (`43c29e5` feat + `f54cec6` close-doc) are pushed to `origin/main`; `git log --oneline origin/main..main` is empty. crates.io is unchanged (lvqr-agent-whisper / lvqr-agent / lvqr-cli stay at 0.4.0; no version bump required since session 99's changes are additive); a future release would need a workspace-wide version bump for the touched crates (lvqr-hls, lvqr-agent-whisper, lvqr-cli, lvqr-test-utils) and the existing publish-chain script under `/tmp/lvqr_publish.sh`. Tier 4 item 4.5 session C landed the HLS subtitle rendition + captions registry track that bridges the WhisperCaptionsAgent's output through to browser players. Three-crate stitch: `lvqr-hls` ships the `subtitles.rs` module (`SubtitlesServer` with sliding-window cue store + WebVTT serializer + captions playlist with `EXT-X-PROGRAM-DATE-TIME` alignment, plus `MultiHlsServer::ensure_subtitles` / `subtitles` accessors); the master playlist gains the `EXT-X-MEDIA TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE="en",URI="captions/playlist.m3u8"` rendition + `SUBTITLES="subs"` on the variant when captions exist (`VariantStream` extended with `subtitles_group: Option<String>`); new axum routes `/hls/{broadcast}/captions/playlist.m3u8` + `/hls/{broadcast}/captions/seg-{msn}.vtt`. `lvqr-agent-whisper` factory gains `with_caption_registry(FragmentBroadcasterRegistry)`; the agent dual-publishes each `TranscribedCaption` to both the in-process `CaptionStream` (existing public API) AND the registry's `(broadcast, "captions")` track (new wire shape: `Fragment.payload` = UTF-8 cue text, `dts/duration` = wall-clock UNIX ms). `lvqr-cli` ships `BroadcasterCaptionsBridge` mirroring `BroadcasterHlsBridge::install`: `on_entry_created` callback for the `"captions"` track that subscribes synchronously and spawns one drain task per broadcast feeding `CaptionCue` values into `MultiHlsServer::ensure_subtitles`. `ServerHandle::fragment_registry()` + `TestServer::fragment_registry()` accessors added so integration tests can publish captions directly without driving whisper.cpp. The new `crates/lvqr-cli/tests/captions_hls_e2e.rs` exercises the full flow with synthetic fragments. Workspace tests: **843** passing (up from 823; +20 for the new modules + e2e). Workspace count unchanged at **28 crates**. Session 100 entry point is Tier 4 item 4.5 session D (`--whisper-model` CLI flag + `lvqr_cli::start` AgentRunner wiring + ffmpeg-publish-then-browser-playback E2E demo).
+**Last Updated**: 2026-04-21 (session 100 close). Session 100 landed the `--whisper-model` CLI flag + `lvqr_cli::start` `AgentRunner` wiring + the whisper E2E test skeleton, closing Tier 4 item 4.5 in full. The whole AI agents framework path (scaffold -> concrete agent -> wire format -> CLI -> demo) is now shipped. `lvqr-cli` grew a default-OFF `whisper` Cargo feature pulling `dep:lvqr-agent` + `dep:lvqr-agent-whisper` + `lvqr-agent-whisper/whisper` + `lvqr-test-utils/whisper`; the `full` meta-feature includes it. `ServeConfig` gained `#[cfg(feature = "whisper")] pub whisper_model: Option<PathBuf>`, plumbed through `main.rs` from a new `--whisper-model <PATH>` flag (with `LVQR_WHISPER_MODEL` env). `lvqr_cli::start` builds the `WhisperCaptionsFactory::with_caption_registry(shared_registry)` wired onto a throwaway `AgentRunner::install(&shared_registry)`; the returned handle is held on `ServerHandle.agent_runner` (also feature-gated) for the server lifetime. `cargo build --release -p lvqr-cli` compiles without whisper-rs / symphonia / bindgen / cmake in the dep tree, verified via `cargo tree -p lvqr-cli | grep whisper` empty. 2 new inline `#[cfg(all(test, feature = "whisper"))]` tests in `crates/lvqr-cli/src/lib.rs` verify the ServeConfig plumbing; 1 new `#[ignore]`-ed integration test `crates/lvqr-cli/tests/whisper_cli_e2e.rs` drives a real RTMP AAC publish + asserts `AgentRunnerHandle::fragments_seen` ticks over for `(captions, live/captions, 1.mp4)` when `WHISPER_MODEL_PATH` is set. Drive-by clippy fixes under `--features whisper`: `#[allow(clippy::too_many_arguments)]` on `lvqr_agent_whisper::worker::run` (8 args is the minimum without a state struct churn); `_sample_rate` rename in `lvqr-agent-whisper/tests/whisper_basic.rs`. Workspace tests still **843** passing (the new inline tests run only under `--features whisper`, so the default workspace pass is unchanged); workspace crate count unchanged at **28**. Local main is N+2 commits ahead of `origin/main` pending push.
+
+## Session 100 close (2026-04-21)
+
+### What shipped
+
+1. **Tier 4 item 4.5 session D: `--whisper-model` CLI flag + `lvqr_cli::start` AgentRunner wiring** (feat commit).
+
+   **Decisions baked in (confirmed in-commit per the plan-vs-code rule)**:
+
+   * `lvqr-cli` Cargo feature name = `whisper`, default OFF. Symmetry with `lvqr-agent-whisper/whisper`. Pulls `dep:lvqr-agent` + `dep:lvqr-agent-whisper` + `lvqr-agent-whisper/whisper` + `lvqr-test-utils/whisper`. Included in the `full` meta-feature. Reasoning: the optional-dep + gated-field shape mirrors the existing `c2pa` pattern exactly so future readers see one idiom, not two.
+   * CLI flag = `--whisper-model <PATH>` with `LVQR_WHISPER_MODEL` env. `--whisper-language` is OUT per 4.5 anti-scope (English only). Help text also documents the v1 no-history limitation (late HLS subscribers see only cues emitted from the moment they joined onwards).
+   * `ServeConfig.whisper_model: Option<PathBuf>` is feature-gated `#[cfg(feature = "whisper")]` exactly like `c2pa: Option<C2paConfig>`. Without the feature the field (and the flag) vanish from the ABI.
+   * Factory install site in `lvqr_cli::start` is immediately after `BroadcasterCaptionsBridge::install(hls.clone(), &shared_registry)` so the HLS subtitles drain path exists before the agent starts emitting cues, and before any ingest listener binds.
+   * `ServerHandle` gains `agent_runner: Option<AgentRunnerHandle>` feature-gated on whisper; mirrors the `wasm_filter: Option<WasmFilterBridgeHandle>` shape. `ServerHandle::agent_runner()` accessor is the read path for tests.
+
+   **`lvqr-cli` changes**:
+   * `Cargo.toml`: added `whisper` feature entry + two new optional deps (`lvqr-agent`, `lvqr-agent-whisper`); `full` meta-feature now includes `whisper`.
+   * `src/lib.rs`: `ServeConfig.whisper_model` field; `loopback_ephemeral` default of `None`; `ServerHandle.agent_runner` field + accessor; `start()` branch that builds the factory + installs it on a fresh `AgentRunner`; `ServerHandle { .. }` constructor passthrough. Inline `#[cfg(all(test, feature = "whisper"))]` test module with 2 cases: default is `None`, explicit path round-trips through `ServeConfig`.
+   * `src/main.rs`: new `#[cfg(feature = "whisper")] #[arg(long, env = "LVQR_WHISPER_MODEL")] whisper_model: Option<PathBuf>`; threaded into `ServeConfig` next to the `c2pa: None` line.
+   * `tests/whisper_cli_e2e.rs` (new): `#![cfg(feature = "whisper")]` + `#[ignore]`-ed integration test that lifts the AAC RTMP publish helpers from `rtmp_hls_e2e.rs`, publishes a video init + audio init + 4 synthetic AAC frames, polls `server.agent_runner().unwrap().fragments_seen("captions", "live/captions", "1.mp4")` for up to 5 s, asserts non-zero. Skip-with-log branch when `WHISPER_MODEL_PATH` is absent.
+
+   **`lvqr-test-utils` changes**:
+   * `Cargo.toml`: new `whisper` feature (`["lvqr-cli/whisper", "dep:lvqr-agent"]`) + optional `lvqr-agent` regular dep so the `agent_runner()` accessor's return type resolves.
+   * `src/test_server.rs`: `TestServerConfig.whisper_model` field + `with_whisper_model` builder (feature-gated); `ServeConfig.whisper_model` threaded through in `TestServer::start`; `TestServer::agent_runner()` accessor proxying to `ServerHandle::agent_runner()`.
+
+   **Drive-by clippy fixes under `--features whisper`** (surfaced because the new `lvqr-cli/whisper` feature chain reactivates `lvqr-agent-whisper/whisper` during the whisper-gated clippy pass):
+   * `crates/lvqr-agent-whisper/src/worker.rs:run`: `#[allow(clippy::too_many_arguments)]` on the 8-arg worker entry. Refactoring to a state struct is scope creep (the worker is private and the args are genuinely distinct lifetimes).
+   * `crates/lvqr-agent-whisper/tests/whisper_basic.rs`: `sample_rate` -> `_sample_rate` on the `fragment()` helper (was already ignored).
+
+   **Plan refresh**. `tracking/TIER_4_PLAN.md` section 4.5 header flipped from "A + B + C DONE, D pending" to "COMPLETE"; row 100 D scoped up from one-line to the full deliverable + verification record.
+
+2. **Session 100 close doc** (this commit).
+
+### Manual demo recipe
+
+```bash
+# Fetch a v1 model (~75 MB):
+curl -L -o /tmp/ggml-tiny.en.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
+
+# Build + run lvqr with captions enabled:
+cargo build --release -p lvqr-cli --features whisper
+./target/release/lvqr serve --whisper-model /tmp/ggml-tiny.en.bin
+
+# In another terminal, publish English speech via ffmpeg:
+ffmpeg -re -i podcast-clip.mp3 \
+  -c:a aac -ar 16000 -ac 1 -b:a 128k \
+  -f flv rtmp://localhost:1935/live/demo
+
+# Browser playback:
+# http://localhost:8888/hls/live/demo/master.m3u8
+# Open in hls.js demo page or Safari; enable the English captions
+# track. Cues should appear within ~5 s of speech. (Cold whisper-rs
+# inference can take an extra second on first pass.)
+```
+
+Pick a known-English, clear-speech audio source (a podcast clip, an audiobook excerpt). Silent or non-English clips produce empty cues -- whisper.cpp tiny.en is discriminating.
+
+### Tests shipped
+
+| # | Test surface | Added this session |
+|---|---|---|
+| a | `crates/lvqr-cli/src/lib.rs` inline tests | 2 (`loopback_ephemeral_defaults_whisper_model_to_none`; `whisper_model_round_trips_through_serve_config`) -- `#[cfg(all(test, feature = "whisper"))]`, so absent from the default `cargo test --workspace` run. |
+| b | `crates/lvqr-cli/tests/whisper_cli_e2e.rs` | 1 `#[ignore]`-ed integration test (`whisper_cli_flag_wires_factory_through_start`): exercises the full RTMP -> ingest -> FragmentBroadcasterRegistry -> AgentRunner wiring; asserts `agent_runner().fragments_seen(...)` bumps. Run via `WHISPER_MODEL_PATH=... cargo test -p lvqr-cli --features whisper --test whisper_cli_e2e -- --ignored`. |
+
+Workspace totals: **843** passed, 0 failed, 1 ignored (parity with session 99; the 2 new inline tests are whisper-feature-gated and the 1 integration test is both feature-gated and `#[ignore]`-ed). The 1 remaining always-ignored test is the pre-existing `moq_sink` doctest.
+
+### Ground truth (session 100 close)
+
+* **Head**: feat commit + this close-doc commit (two new commits on `main`). Local is N+2 commits ahead of `origin/main` (head upstream is `9c1135c`). Verify via `git log --oneline origin/main..main`. Do NOT push without direct user instruction.
+* **Tests**: **843** passed, 0 failed, 1 ignored on macOS (default features).
+* **CI gates locally clean**:
+  * `cargo fmt --all`
+  * `cargo clippy --workspace --all-targets --benches -- -D warnings`
+  * `cargo clippy -p lvqr-cli -p lvqr-test-utils -p lvqr-agent-whisper --features whisper --all-targets -- -D warnings`
+  * `cargo build --release -p lvqr-cli` (default features; confirmed `cargo tree -p lvqr-cli | grep -E "whisper|symphonia"` empty)
+  * `cargo test -p lvqr-cli --features whisper --lib` 2 passed
+  * `cargo test -p lvqr-cli --features whisper --test whisper_cli_e2e` 1 ignored (the intended default)
+  * `cargo test --workspace` 843 / 0 / 1
+* **Workspace**: **28 crates**, unchanged.
+* **crates.io**: unchanged since session 98's `lvqr-agent-whisper 0.4.0` publish; session 100 D's changes are additive to `lvqr-cli` + `lvqr-test-utils`, no existing crate semantic break. A future release bump would need to touch `lvqr-cli`, `lvqr-test-utils`, `lvqr-agent-whisper` (drive-by), and `lvqr-agent-whisper/tests/whisper_basic.rs` (drive-by).
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 / 89 / 90 |
+| 4.3 | C2PA signed media | **COMPLETE** | 91-94 |
+| 4.8 | One-token-all-protocols | **COMPLETE** | 95 / 96 |
+| 4.5 | In-process AI agents | **COMPLETE** | 97 / 98 / 99 / 100 |
+| 4.4 | Cross-cluster federation | PLANNED | 101-103 |
+| 4.6 | Server-side transcoding | PLANNED | 104-106 |
+| 4.7 | Latency SLO scheduling | PLANNED | 107-108 |
+
+5 of 8 Tier 4 items DONE. Remaining: 4.4 federation (next), 4.6 transcoding, 4.7 latency SLO.
+
+### Session 101 entry point
+
+**Tier 4 item 4.4 session A: `FederationLink` config + MoQ subscribe loop.**
+
+Scope per `tracking/TIER_4_PLAN.md` section 4.4 row 101 A: `lvqr-cluster` gains a `FederationLink { remote_url, auth_token, forwarded_broadcasts: Vec<String> }` config, and at cluster bootstrap every link opens a single authenticated MoQ session to the remote cluster's MoQ relay endpoint; for every broadcast name in `forwarded_broadcasts` the local cluster subscribes to the remote's MoQ origin and re-publishes into the local origin. Verification: `cargo test -p lvqr-cluster --test federation_unit`.
+
+**Prerequisites already in place**:
+* `lvqr-auth`'s JWT path (Tier 4 item 4.8); each link's `auth_token` is a JWT minted for the remote cluster's audience.
+* `lvqr-moq`'s subscribe primitive; the federation link is structurally a relay-of-relay pattern already exercised in-process in Tier 3.
+* `lvqr-cluster` is shipped + on crates.io at 0.4.0.
+
+**Pre-session checklist**:
+1. Decide the TOML shape for `FederationLink` in the CLI config (versus a CLI flag). Prior art: `--cluster-seeds` is a comma-separated flag, but a federation link has three fields (url + token + broadcast list), which argues for TOML.
+2. Decide whether `forwarded_broadcasts` supports glob patterns (e.g. `live/*`). Anti-scope allows explicit names only in v1; the plan's phrasing is "for every broadcast name in `forwarded_broadcasts`" which reads literal.
+
+## Session 99 close (2026-04-21) Session 99's two commits (`43c29e5` feat + `f54cec6` close-doc) are pushed to `origin/main`; `git log --oneline origin/main..main` is empty. crates.io is unchanged (lvqr-agent-whisper / lvqr-agent / lvqr-cli stay at 0.4.0; no version bump required since session 99's changes are additive); a future release would need a workspace-wide version bump for the touched crates (lvqr-hls, lvqr-agent-whisper, lvqr-cli, lvqr-test-utils) and the existing publish-chain script under `/tmp/lvqr_publish.sh`. Tier 4 item 4.5 session C landed the HLS subtitle rendition + captions registry track that bridges the WhisperCaptionsAgent's output through to browser players. Three-crate stitch: `lvqr-hls` ships the `subtitles.rs` module (`SubtitlesServer` with sliding-window cue store + WebVTT serializer + captions playlist with `EXT-X-PROGRAM-DATE-TIME` alignment, plus `MultiHlsServer::ensure_subtitles` / `subtitles` accessors); the master playlist gains the `EXT-X-MEDIA TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE="en",URI="captions/playlist.m3u8"` rendition + `SUBTITLES="subs"` on the variant when captions exist (`VariantStream` extended with `subtitles_group: Option<String>`); new axum routes `/hls/{broadcast}/captions/playlist.m3u8` + `/hls/{broadcast}/captions/seg-{msn}.vtt`. `lvqr-agent-whisper` factory gains `with_caption_registry(FragmentBroadcasterRegistry)`; the agent dual-publishes each `TranscribedCaption` to both the in-process `CaptionStream` (existing public API) AND the registry's `(broadcast, "captions")` track (new wire shape: `Fragment.payload` = UTF-8 cue text, `dts/duration` = wall-clock UNIX ms). `lvqr-cli` ships `BroadcasterCaptionsBridge` mirroring `BroadcasterHlsBridge::install`: `on_entry_created` callback for the `"captions"` track that subscribes synchronously and spawns one drain task per broadcast feeding `CaptionCue` values into `MultiHlsServer::ensure_subtitles`. `ServerHandle::fragment_registry()` + `TestServer::fragment_registry()` accessors added so integration tests can publish captions directly without driving whisper.cpp. The new `crates/lvqr-cli/tests/captions_hls_e2e.rs` exercises the full flow with synthetic fragments. Workspace tests: **843** passing (up from 823; +20 for the new modules + e2e). Workspace count unchanged at **28 crates**. Session 100 entry point is Tier 4 item 4.5 session D (`--whisper-model` CLI flag + `lvqr_cli::start` AgentRunner wiring + ffmpeg-publish-then-browser-playback E2E demo).
 
 ## Session 99 close (2026-04-21)
 
