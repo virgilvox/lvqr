@@ -1,8 +1,29 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 COMPLETE; 4.5 sessions A + B DONE (lvqr-agent scaffold + lvqr-agent-whisper concrete agent); 823 tests, 28 crates; v0.4.0 already on crates.io + origin/main
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.2 + 4.1 + 4.3 + 4.8 COMPLETE; 4.5 sessions A + B DONE (lvqr-agent scaffold + lvqr-agent-whisper concrete agent); 823 tests, 28 crates; **all 25 publishable workspace crates live on crates.io at v0.4.0** + origin/main synced (head `c1632c4`)
 
-**Last Updated**: 2026-04-20 (session 98 close). Tier 4 item 4.5 session B landed `crates/lvqr-agent-whisper`, the first concrete `lvqr_agent::Agent` implementation: a `WhisperCaptionsFactory` that opts in only for the audio track (`track_id == "1.mp4"`) and a `WhisperCaptionsAgent` that subscribes to the broadcast's audio stream, extracts raw AAC frames from each fragment's `moof + mdat` payload, decodes via symphonia (using the `AudioSpecificConfig` parsed out of the init segment), buffers PCM up to a configurable window (default 5 s), and runs whisper.cpp inference on a dedicated OS worker thread to emit `TranscribedCaption` values onto a public `tokio::sync::broadcast`-backed `CaptionStream`. Heavy deps (`whisper-rs 0.16` + `symphonia 0.6.0-alpha.2 [aac]`) gated behind a default-OFF `whisper` Cargo feature so `cargo build --workspace` stays fast. Always-available surface (`TranscribedCaption`, `CaptionStream`, factory, agent stub, mdat parser, ASC parser) compiles without the feature so consumers can wire the factory into an `AgentRunner` and the agent contract holds (no-op `on_fragment` with a single debug-log line). With the feature enabled, the worker uses `std::sync::mpsc::sync_channel(64)` for back-pressure-free frame intake and runs `WhisperContext::full` with English-only `Greedy { best_of: 1 }` sampling. Workspace tests: **823** passing (up from 796; +27 new lib tests for agent / asc / caption / factory / decode / mdat). Workspace count now **28 crates** (was 27). Session 99 entry point is Tier 4 item 4.5 session C (captions track publish via `lvqr-moq` + HLS subtitle rendition wiring in `lvqr-hls`).
+**Last Updated**: 2026-04-21 (post-session-98 publish event). Pushed session 98 commits to `origin/main` (head `c1632c4`); published `lvqr-agent-whisper 0.4.0` to crates.io as a first-time publish (the v0.4.0 release event 16+ hours earlier had drained the rate-limit bucket, but enough refill time had passed that this single publish went through on the first try). Total publishable workspace crates now at **25** (was 24 after the 2026-04-20 release event); the three publish=false helpers (`lvqr-conformance`, `lvqr-test-utils`, `lvqr-soak`) stay local. `cargo install lvqr-cli` still installs the same v0.4.0 binary; the new `lvqr-agent-whisper` is opt-in (consumers add it to their own Cargo.toml + flip the `whisper` feature). No code changes between session 98 close and this publish event.
+
+## Post-session-98 publish event (2026-04-21)
+
+* `lvqr-agent-whisper 0.4.0` published to crates.io
+  on the first attempt at 02:32 UTC. The v0.4.0
+  release event burst had drained the new-crate
+  rate-limit bucket ~16 hours earlier; cargo
+  metrics' refill rate of 1 per 10 minutes had
+  fully restored the burst by then.
+* No version-bump churn for any other workspace
+  crate (the new crate is additive; no other
+  crate's content changed since session 98).
+* `lvqr-cli` is unchanged on crates.io; the
+  WhisperCaptionsAgent is NOT yet wired into
+  `lvqr_cli::start` (that lands in session 100 D).
+  Today, consumers wanting to use the agent add it
+  to their own binary as a `cargo add
+  lvqr-agent-whisper --features whisper` dep and
+  install the factory on an `AgentRunner` they own.
+
+## Session 98 close (2026-04-20) Tier 4 item 4.5 session B landed `crates/lvqr-agent-whisper`, the first concrete `lvqr_agent::Agent` implementation: a `WhisperCaptionsFactory` that opts in only for the audio track (`track_id == "1.mp4"`) and a `WhisperCaptionsAgent` that subscribes to the broadcast's audio stream, extracts raw AAC frames from each fragment's `moof + mdat` payload, decodes via symphonia (using the `AudioSpecificConfig` parsed out of the init segment), buffers PCM up to a configurable window (default 5 s), and runs whisper.cpp inference on a dedicated OS worker thread to emit `TranscribedCaption` values onto a public `tokio::sync::broadcast`-backed `CaptionStream`. Heavy deps (`whisper-rs 0.16` + `symphonia 0.6.0-alpha.2 [aac]`) gated behind a default-OFF `whisper` Cargo feature so `cargo build --workspace` stays fast. Always-available surface (`TranscribedCaption`, `CaptionStream`, factory, agent stub, mdat parser, ASC parser) compiles without the feature so consumers can wire the factory into an `AgentRunner` and the agent contract holds (no-op `on_fragment` with a single debug-log line). With the feature enabled, the worker uses `std::sync::mpsc::sync_channel(64)` for back-pressure-free frame intake and runs `WhisperContext::full` with English-only `Greedy { best_of: 1 }` sampling. Workspace tests: **823** passing (up from 796; +27 new lib tests for agent / asc / caption / factory / decode / mdat). Workspace count now **28 crates** (was 27). Session 99 entry point is Tier 4 item 4.5 session C (captions track publish via `lvqr-moq` + HLS subtitle rendition wiring in `lvqr-hls`).
 
 ## Session 98 close (2026-04-20)
 
