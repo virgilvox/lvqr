@@ -793,6 +793,19 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // the `whisper` feature at all) no AI state is constructed.
     #[cfg(feature = "whisper")]
     let agent_runner_handle = if let Some(ref path) = config.whisper_model {
+        if hls_server.is_none() {
+            // The captions track reaches browser players only via
+            // the HLS subtitle rendition that `BroadcasterCaptionsBridge`
+            // wires above. With HLS disabled the WhisperCaptionsAgent
+            // still runs and publishes cues onto the registry and the
+            // in-process `CaptionStream`, but browser subscribers see
+            // nothing. Warn so misconfigured deployments surface early
+            // rather than through silent captions loss.
+            tracing::warn!(
+                path = %path.display(),
+                "whisper captions agent enabled without HLS surface; browser clients will not receive captions"
+            );
+        }
         let factory =
             lvqr_agent_whisper::WhisperCaptionsFactory::new(lvqr_agent_whisper::WhisperConfig::new(path.clone()))
                 .with_caption_registry(shared_registry.clone());
