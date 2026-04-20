@@ -1,8 +1,8 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.4 COMPLETE + 4.6 session A DONE (6 of 8 Tier 4 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.8; 4.6 one-third done); 892 workspace tests (+2 whisper-gated inline), 29 crates; **origin/main synced (head `adfee65`)**
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.4 COMPLETE + 4.6 session A DONE (6 of 8 Tier 4 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.8; 4.6 one-third done); 892 workspace tests (+2 whisper-gated inline), 29 crates; **origin/main synced (head `8bc76a9`)**
 
-**Last Updated**: 2026-04-21 (session 104 push event). Session 104's two commits (`1cf7631` feat + `adfee65` close-doc) are pushed to `origin/main`; `git log --oneline origin/main..main` is empty. crates.io is unchanged since the post-session-98 publish event; a future release cycle bumps `lvqr-cluster` + `lvqr-cli` + `lvqr-admin` + `lvqr-test-utils` (for the 4.4 chain) and newly publishes `lvqr-transcode` 0.4.0 alongside. Session 105 entry point is Tier 4 item 4.6 session B (ABR ladder generation + multi-rendition publish via real gstreamer-rs pipelines behind a `transcode` Cargo feature; see `tracking/TIER_4_PLAN.md` section 4.6 row 105 B).
+**Last Updated**: 2026-04-21 (session 104 push event + README refresh `8bc76a9`). Session 104's two commits (`1cf7631` feat + `adfee65` close-doc) are pushed to `origin/main`, followed by the session 104 push-event doc (`0ac6281`) and a README refresh (`8bc76a9`) aligning `README.md`'s Tier 4 status + crate map + CLI reference with the shipped 4.4 / 4.5 / 4.6 A surface. `git log --oneline origin/main..main` is empty. crates.io is unchanged since the post-session-98 publish event; a future release cycle bumps `lvqr-cluster` + `lvqr-cli` + `lvqr-admin` + `lvqr-test-utils` (for the 4.4 chain) and newly publishes `lvqr-transcode` 0.4.0 alongside. Session 105 entry point is Tier 4 item 4.6 session B (ABR ladder generation + multi-rendition publish via real gstreamer-rs pipelines behind a `transcode` Cargo feature; see `tracking/TIER_4_PLAN.md` section 4.6 row 105 B).
 
 ## Session 104 close (2026-04-21)
 
