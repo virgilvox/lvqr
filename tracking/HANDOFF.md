@@ -1,16 +1,65 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 912 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **origin/main synced (head `4fcc172`)**
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 913 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **local `main` N+2 ahead of `origin/main` (pre-commit head `eab59fa`)**
 
-**Last Updated**: 2026-04-21 (session 108 B push event). Tier 4 is closed and live on `origin/main`. Session 108 B's two commits (`0b9e173` feat + `4fcc172` close-doc) are pushed. `git log --oneline origin/main..main` is empty. crates.io is unchanged.
+**Last Updated**: 2026-04-21 (session 109 A close). Session 109 A lands v1.1-A MPEG-DASH egress SLO instrumentation (one `LatencyTracker::record` sample per fragment delivered under `transport="dash"`). Two commits pending push (feat + close-doc). `git log --oneline origin/main..main` shows the two. crates.io is unchanged.
 
-## Session 109 entry point -- v1.1-A: broaden egress SLO instrumentation
+## Session 110 entry point -- maintainer's choice, v1.1-B
 
-**Full kick-off prompt:** [`tracking/SESSION_109_BRIEFING.md`](SESSION_109_BRIEFING.md). Copy its contents into a fresh Claude conversation.
+**Full kick-off briefing:** there is no 110 briefing yet. The session 109 A close block below documents what shipped; pick one of the post-Tier-4 follow-up candidates to start the 110 session. The most likely next picks:
 
-**One-line summary:** the 4.7 A tracker + 4.7 B alert pack + Grafana dashboard already label-match generically on `(broadcast, transport)`, but only the LL-HLS drain loop currently calls `LatencyTracker::record`. Session 109 A broadens instrumentation to the WebSocket fMP4 relay (`transport="ws"`) and the MPEG-DASH bridge drain (`transport="dash"`) by threading the shared tracker through `WsRelayState` + `BroadcasterDashBridge::install` and recording one sample per subscriber-delivered fragment. The Grafana dashboard + rule pack light up automatically; no alert-pack edits. MoQ + WHEP egress instrumentation stay deferred to a 109 B / 109 C follow-up because their subscriber-delivery shape is not a `Fragment` + `BroadcasterStream` pair today.
+* **109 B / 110 A: MoQ frame-carried ingest-time propagation**. The design lever that unblocks WS / MoQ / WHEP SLO instrumentation all at once. Scope: add a per-frame header field (or a sidecar metadata frame) carrying the ingest wall-clock stamp through `moq_lite`'s `TrackConsumer` / `group.read_frame()` surface. 1-2 sessions; design-heavy; medium risk because it touches the MoQ wire format LVQR + foreign clients depend on. Once landed, WS relay / MoQ subscribers / WHEP packetizer can each light up their drain-point `tracker.record(..., "<transport>", delta)` call in a ~1-session follow-up per transport.
+* **110 A: `examples/tier4-demos/` first public demo script**. The Tier 4 exit-criterion gap. Ship one end-to-end script (ffmpeg publish + browser subscribe + live SLO dashboard screenshot) that a reader can run in 60 seconds. 1 session; polish-heavy; low risk.
 
-After 109 A the SLO tracker sees samples from three of five egress surfaces. The remaining two (MoQ, WHEP) + other v1.1 items (hardware encoders, stream-modifying WASM filters, WHEP audio transcoder, at least one public demo under `examples/tier4-demos/`, and Tier 5 client SDK work) stay on the maintainer's choice queue; see the "Post-Tier-4 follow-up candidates" section of the briefing for the prioritized list.
+Other candidates in the prioritized queue (all documented in `tracking/SESSION_109_BRIEFING.md`'s "Post-Tier-4 follow-up candidates" table): hardware-encoder backends (NVENC / VAAPI / VideoToolbox / QSV), stream-modifying WASM filter pipelines, WHEP audio transcoder (AAC -> Opus), Tier 5 client SDK.
+
+## Session 109 A close (2026-04-21)
+
+1. **v1.1 item A: MPEG-DASH egress SLO instrumentation** (feat commit).
+   * `crates/lvqr-dash/Cargo.toml`: new regular dep `lvqr-admin = { workspace = true }`. Confirmed with `cargo tree -p lvqr-dash`: no cycle, no new crate pulled into the tree beyond `lvqr-admin`'s own existing subtree (`lvqr-auth` + `lvqr-cluster` + `lvqr-core` + `lvqr-moq`), none of which depend on `lvqr-dash`. `default-features = false` override was attempted first but cargo rejects it on inherited workspace deps that do not pre-declare `default-features`; accepting the cluster feature brings no additional crates into `lvqr-dash`'s tree because `lvqr-cluster` was already reachable via `lvqr-admin`.
+   * `crates/lvqr-dash/src/bridge.rs`: `BroadcasterDashBridge::install` signature grows a third argument `slo: Option<lvqr_admin::LatencyTracker>`; `drain` grows a matching parameter and records one sample per delivered fragment via `tracker.record(&broadcast, "dash", now_ms - fragment.ingest_time_ms)`. Skips samples where `ingest_time_ms == 0` (federation replays, synthetic fragments, backfill paths) and skips entirely when no tracker was wired. New `TRANSPORT_LABEL = "dash"` constant (matches the HLS helper's `TRANSPORT_LABEL = "hls"` shape) + new private `unix_wall_ms()` helper byte-identical to the HLS + dispatch helpers (three copies now; a `lvqr-core::now_unix_ms()` consolidation is a legitimate 15-minute tidy candidate for a future session).
+   * `crates/lvqr-dash/src/bridge.rs` tests: four in-crate `#[tokio::test]` call sites (`video_fragments_get_monotonic_sequence_numbers`, `audio_and_video_sequences_are_independent`, `reinit_resets_the_counter`, `unknown_track_ids_are_ignored`) grow the trailing `None` arg. No other call sites of `BroadcasterDashBridge::install` in the workspace outside the CLI composition root.
+   * `crates/lvqr-cli/src/lib.rs` line 948: `BroadcasterDashBridge::install(dash.clone(), &shared_registry, Some(slo_tracker.clone()))`. The shared tracker built in `start()` since 107 A threads into the DASH bridge exactly the way it already threads into the HLS bridge one block earlier.
+
+2. **`crates/lvqr-cli/tests/slo_latency_e2e.rs`** (extended, +90 LOC). New second test function `slo_route_reports_dash_latency_samples_after_publish` mirrors 107 A's HLS test: enables DASH on the TestServer via `TestServerConfig::default().with_dash()`, publishes 8 synthetic `moof + mdat` fragments backdated 200 ms through the shared `FragmentBroadcasterRegistry`, polls `/api/v1/slo` for up to 5 s until the `(live/demo, dash)` entry reports 8 samples, then asserts p50 >= 150 ms + p99 >= p50 + max >= p99 and that both `hls` and `dash` entries co-exist on `ServerHandle::slo().snapshot()` (HLS stays enabled on the TestServer so the cross-transport surfacing story is exercised end-to-end). Shared helpers (`minimal_init_segment`, `moof_mdat_fragment`, `http_get`, `unix_now_ms`) are unchanged. Total test time locally ~0.16 s for the file.
+
+3. **`docs/slo.md`** (two small prose edits): (a) the "Egress emit" bullet spells out the DASH per-Fragment-vs-per-segment sample cadence so operators reading the sample rate panel know the DASH drain ticks once per incoming fragment, not once per finalized `$Number$` segment; (b) the "v1 limitations" bullet flips from "HLS-only egress instrumentation ships in 107 A" to "LL-HLS (107 A) + MPEG-DASH (109 A) egress instrumentation is live" and names MoQ frame-carried ingest-time propagation as the design lever blocking WS / MoQ / WHEP instrumentation. Threshold tuning table is already label-generic; no YAML / JSON asset edits needed.
+
+4. **Session 109 A close doc** (this commit).
+
+### Key v1.1-A design decisions baked in (confirmed in-commit per the plan-vs-code rule)
+
+* **Transport label is `"dash"`**. Matches the existing `"hls"` convention and the rule pack's decision table header. No alert-pack edits needed because every rule in `deploy/grafana/alerts/lvqr-slo.rules.yaml` is scoped on `(broadcast, transport)` generically; the first DASH sample flowing into the histogram surfaces automatically in Grafana alongside any existing HLS series.
+* **Bridge signature added an `Option<LatencyTracker>` trailing arg, not a separate `install_with_slo` constructor**. Option keeps the public surface backward-compatible for downstream crates that do not wire the tracker (the in-crate test module is the in-tree example); adding a second constructor would double the install surface for zero benefit. The four in-crate tests each pass a literal `None`.
+* **Zero `ingest_time_ms` is still "unset"**. The `if fragment.ingest_time_ms > 0` guard mirrors the HLS drain byte-for-byte so synthetic test fragments and federation replays that preserve the `0` sentinel flow through without contaminating the histogram. Zero-latency valid deliveries (same-tick synthetic stamp) still record correctly because the caller stamps a non-zero `ingest_time_ms`.
+* **DASH samples are per-Fragment, not per-finalized-`$Number$`-segment**. DASH's `SegmentTemplate` live-profile addresses full segments via `$Number$` URIs; a typical DASH segment is 2-6 s and may aggregate several incoming `Fragment` values before the segmenter finalizes it. The SLO tracker intentionally records at the `push_video_segment` / `push_audio_segment` call site, so operators get one sample per fragment arrival (the finest-grained latency signal available on the drain) rather than one sample per finalized segment (which would undersample the histogram during warm-up). This matches the HLS drain's per-`push_chunk_bytes` sample cadence.
+* **`default-features = false` on the new `lvqr-admin` dep in `lvqr-dash/Cargo.toml` was rejected by cargo**. The workspace root's `[workspace.dependencies]` entry for `lvqr-admin` does not pre-declare `default-features`, and cargo's rule is that inherited workspace deps cannot toggle default-features without a workspace-level override. Dropping the override is harmless: `lvqr-admin`'s default `cluster` feature pulls in `lvqr-cluster` + `lvqr-moq`, both of which were already reachable from `lvqr-dash`'s transitive graph via `lvqr-cmaf` / workspace siblings, so no new crate is introduced into `lvqr-dash`'s build.
+* **Only DASH in this session; WS / MoQ / WHEP deferred**. DASH's `BroadcasterDashBridge` drains `Fragment` values from the shared `FragmentBroadcasterRegistry`, so `Fragment::ingest_time_ms` is available for free at the drain point. WS relay (`lvqr-cli::ws_relay_session`), MoQ subscribers (`OriginProducer`), and WHEP (`str0m` RTP packetizer) each consume `moq_lite` `Bytes` frames that do not carry the ingest wall-clock stamp on the MoQ wire today. Instrumenting them requires either a MoQ frame-header design change or a sidecar sampling heuristic; both are v1.1 design sessions rather than one-line wiring changes and are deferred to the 110 A entry point.
+* **Three copies of `unix_wall_ms()` now exist** (`lvqr-ingest::dispatch`, `lvqr-cli::hls`, `lvqr-dash::bridge`). Three is the tipping point for a shared helper; moving it to `lvqr-core` as a `pub fn now_unix_ms() -> u64` is a legitimate 15-minute cleanup candidate, deferred to a future tidy session because it has zero behavior change and would add noise to the 109 A feat diff.
+
+### Ground truth (session 109 A close)
+
+* **Head**: feat commit (pending) + this close-doc commit (pending). Local `main` will be N+2 ahead of `origin/main`; no push event in this block. Pre-commit head on `origin/main`: `eab59fa`.
+* **Tests (default features gate)**: **913** passed, 0 failed, 1 ignored on macOS. +1 over session 108 B's 912 (the new `slo_route_reports_dash_latency_samples_after_publish` integration test in `crates/lvqr-cli/tests/slo_latency_e2e.rs`). The 1 ignored is the pre-existing `moq_sink` doctest.
+* **Tier 4 execution status**: **COMPLETE** (unchanged). This session lands a v1.1 follow-up; it does not reopen the Tier 4 close.
+* **CI gates locally clean**:
+  * `cargo fmt --all --check`.
+  * `cargo clippy --workspace --all-targets --benches -- -D warnings`.
+  * `cargo test -p lvqr-dash` 29 + 3 + 4 + 5 passed (lib + proptest + router + proptest_mpd targets unchanged from 108 B counts; the new slo wiring does not add bridge-scope tests).
+  * `cargo test -p lvqr-admin` 25 + 3 passed (unchanged from 108 B; the new `lvqr-admin` dep edge from `lvqr-dash` does not touch any admin-crate tests).
+  * `cargo test -p lvqr-cli --test slo_latency_e2e` 2 passed (both HLS and new DASH test functions).
+  * `cargo test --workspace` 913 / 0 / 1.
+* **Workspace**: **29 crates**, unchanged.
+* **crates.io**: unchanged. Session 109 A additively extends `BroadcasterDashBridge::install`'s public API (trailing `Option<LatencyTracker>`), so the pending re-publish chain from session 105 still lands cleanly on the next release. Downstream callers of `lvqr-dash::BroadcasterDashBridge` outside this workspace (none known) would need to pass a trailing `None`; a semver-major bump is not required because `lvqr-dash` is pre-1.0 but operators should treat this as a source-incompatible change.
+
+### Known limitations / documented v1 shape (after 109 A close)
+
+* **WS / MoQ / WHEP egress instrumentation still deferred**: drain points consume `moq_lite` `Bytes` frames rather than `Fragment` values, so `ingest_time_ms` is not on the wire. Unblocked by a 110 A-scope design session on MoQ frame-carried ingest-time propagation.
+* **DASH sample cadence is per-Fragment, not per-finalized-`$Number$`-segment**: documented in `docs/slo.md`; operators expecting one sample per DASH segment should read one-sample-per-fragment-arrival instead.
+* **Server-side measurement only** (unchanged from 107 A).
+* **No admission control** (unchanged from 108 B).
+* **No time-windowed retention on the admin snapshot** (unchanged from 107 A).
+* **Three copies of `unix_wall_ms()`** across `lvqr-ingest::dispatch`, `lvqr-cli::hls`, and `lvqr-dash::bridge`; ripe for a `lvqr-core::now_unix_ms()` consolidation.
 
 ## Session 108 B close (2026-04-21)
 
