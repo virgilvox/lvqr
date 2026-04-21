@@ -1,8 +1,8 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 915 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **local `main` is ahead of `origin/main` (pre-commit head `eab59fa`); see `git log --oneline origin/main..main` for the current count**
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 915 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **origin/main synced (head `ea3bbae`)**
 
-**Last Updated**: 2026-04-21 (session 109 A close + follow-up tidy + README drift fix + session 110 briefing). Session 109 A landed v1.1-A MPEG-DASH egress SLO instrumentation plus the `lvqr_core::now_unix_ms()` consolidation plus a README refresh that drops stale "HLS-only" SLO drift. A session 110 briefing document was authored on top of the 109 A chain, scoping the next session as WS + WHEP egress SLO instrumentation with the MoQ wire explicitly kept pure. All commits pending push. crates.io is unchanged.
+**Last Updated**: 2026-04-21 (session 109 A push event). Session 109 A's full chain is pushed to `origin/main`: `4b44f9b` feat(slo) v1.1-A DASH egress instrumentation, `eeb49ef` close-doc, `2c78967` refactor(core) `unix_wall_ms` consolidation into `lvqr_core::now_unix_ms`, `79a18dc` README drift fix, `9fe41b1` HANDOFF bookkeeping, `ea3bbae` session 110 briefing. `git log --oneline origin/main..main` is empty after this commit. crates.io is unchanged -- the 109 A feat additively extends `BroadcasterDashBridge::install`'s public API + adds `lvqr_core::now_unix_ms()` but does not bump any crate versions; the pending re-publish chain from session 105 still lands cleanly on the next release cycle.
 
 ## Session 110 entry point -- v1.1-B: WS + WHEP egress SLO instrumentation
 
