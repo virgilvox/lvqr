@@ -945,7 +945,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // onto every observed fragment and pushes it into the per-broadcast
     // `DashServer`. Session 60: completes the consumer-side switchover.
     if let Some(ref dash) = dash_server {
-        BroadcasterDashBridge::install(dash.clone(), &shared_registry);
+        BroadcasterDashBridge::install(dash.clone(), &shared_registry, Some(slo_tracker.clone()));
     }
 
     // Tier 4 item 4.6 session 106 C: if the operator passed

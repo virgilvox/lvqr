@@ -1,17 +1,23 @@
-//! End-to-end integration test for the Tier 4 item 4.7 latency SLO
+//! End-to-end integration tests for the Tier 4 item 4.7 latency SLO
 //! tracker + `/api/v1/slo` admin route.
 //!
 //! Boots a full `TestServer`, publishes synthetic fragments directly
 //! onto the shared `FragmentBroadcasterRegistry` (stamping each with
 //! a wall-clock ingest time via `Fragment::with_ingest_time_ms`), and
-//! waits for the HLS drain loop to record samples on the tracker.
-//! Then fetches `/api/v1/slo` over HTTP and asserts the JSON body
-//! surfaces the per-broadcast p50 / p95 / p99 shape.
+//! waits for the egress drain loops (HLS + DASH) to record samples
+//! on the tracker. Then fetches `/api/v1/slo` over HTTP and asserts
+//! the JSON body surfaces the per-`(broadcast, transport)` p50 / p95
+//! / p99 shape.
 //!
-//! Real HLS drain path (no mocks), real axum HTTP round-trip, real
-//! bytes on the wire. The synthetic fragments bypass RTMP to keep
-//! the test hermetic + fast; the broadcaster wiring is identical to
-//! what every ingest protocol drives.
+//! Real egress drain path (no mocks), real axum HTTP round-trip,
+//! real bytes on the wire. The synthetic fragments bypass RTMP to
+//! keep the tests hermetic + fast; the broadcaster wiring is
+//! identical to what every ingest protocol drives.
+//!
+//! * `slo_route_reports_hls_latency_samples_after_publish` -- 107 A
+//!   original, LL-HLS drain side.
+//! * `slo_route_reports_dash_latency_samples_after_publish` -- 109 A
+//!   addition, MPEG-DASH drain side.
 
 use bytes::Bytes;
 use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta};
@@ -162,6 +168,89 @@ async fn slo_route_reports_hls_latency_samples_after_publish() {
         snapshot
             .iter()
             .any(|e| e.broadcast == "live/demo" && e.transport == "hls")
+    );
+
+    server.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slo_route_reports_dash_latency_samples_after_publish() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("lvqr=info")
+        .with_test_writer()
+        .try_init();
+
+    // Turn the DASH surface on so `BroadcasterDashBridge` installs its
+    // drain callback on the shared registry. Leaving HLS enabled is
+    // fine: both drains see the same fragments and each records its
+    // own transport label, which is exactly the cross-transport
+    // dashboard story we want to assert is live end-to-end.
+    let server = TestServer::start(TestServerConfig::default().with_dash())
+        .await
+        .expect("start TestServer");
+    let admin_addr = server.admin_addr();
+    let registry: &FragmentBroadcasterRegistry = server.fragment_registry();
+
+    // Same synthetic publish as the HLS case: init + 8 backdated
+    // fragments so the DASH drain records a positive, reproducible
+    // delta per `push_video_segment`.
+    let ingest_time = unix_now_ms().saturating_sub(200);
+    let mut meta = FragmentMeta::new("avc1.640020", 90_000);
+    meta.init_segment = Some(minimal_init_segment());
+    let bc = registry.get_or_create("live/demo", "0.mp4", meta);
+
+    for seq in 0..8u64 {
+        bc.emit(moof_mdat_fragment(seq, ingest_time + seq * 5));
+    }
+
+    // Poll /api/v1/slo until the DASH drain reports 8 samples for
+    // live/demo. 5 s budget matches the HLS test; DASH drain is a
+    // sibling tokio task spawned on the same runtime and registers
+    // within a few hundred ms of the first fragment emit.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let body = loop {
+        if Instant::now() > deadline {
+            panic!("slo route never reported a live/demo dash sample");
+        }
+        let (status, bytes) = http_get(admin_addr, "/api/v1/slo").await;
+        assert_eq!(status, 200, "status {status}");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let broadcasts = parsed
+            .get("broadcasts")
+            .and_then(|v| v.as_array())
+            .expect("broadcasts array");
+        let matched = broadcasts.iter().find(|b| {
+            b["broadcast"] == "live/demo" && b["transport"] == "dash" && b["sample_count"].as_u64() == Some(8)
+        });
+        if let Some(entry) = matched {
+            break entry.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    assert_eq!(body["sample_count"], 8);
+    assert_eq!(body["total_observed"], 8);
+    let p50 = body["p50_ms"].as_u64().expect("p50 u64");
+    let p99 = body["p99_ms"].as_u64().expect("p99 u64");
+    let max = body["max_ms"].as_u64().expect("max u64");
+    assert!(p50 >= 150, "p50 should be at least 150 ms, got {p50}");
+    assert!(p99 >= p50, "p99 ({p99}) >= p50 ({p50})");
+    assert!(max >= p99, "max ({max}) >= p99 ({p99})");
+
+    // Both transports should show up since HLS stayed enabled; the
+    // snapshot accessor surfaces them side by side.
+    let snapshot = server.slo().snapshot();
+    assert!(
+        snapshot
+            .iter()
+            .any(|e| e.broadcast == "live/demo" && e.transport == "dash"),
+        "expected live/demo dash entry in snapshot, got {snapshot:?}",
+    );
+    assert!(
+        snapshot
+            .iter()
+            .any(|e| e.broadcast == "live/demo" && e.transport == "hls"),
+        "expected live/demo hls entry in snapshot alongside dash, got {snapshot:?}",
     );
 
     server.shutdown().await.expect("shutdown");

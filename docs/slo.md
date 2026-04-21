@@ -23,8 +23,14 @@ delta between two wall-clock timestamps:
    for live publishes.
 2. **Egress emit**: the moment the egress surface delivered the
    fragment to subscribers. For LL-HLS, this is the `push_chunk_bytes`
-   call inside `BroadcasterHlsBridge::drain`. WS / DASH / MoQ / WHEP
-   instrumentation is a small additive follow-up.
+   call inside `BroadcasterHlsBridge::drain` (107 A). For MPEG-DASH,
+   this is the `push_video_segment` / `push_audio_segment` call inside
+   `BroadcasterDashBridge::drain` (109 A); samples are per-Fragment,
+   not per-finalized-DASH-segment, so operators reading the
+   "sample rate" panel see one tick per incoming fragment even though
+   DASH `$Number$` URIs address full segments. WS / MoQ / WHEP
+   instrumentation is a small additive follow-up, blocked on MoQ
+   frame-carried ingest-time propagation.
 
 The histogram labels are:
 
@@ -221,12 +227,16 @@ histogram_quantile(
 
 ## v1 limitations
 
-* **HLS-only egress instrumentation ships in 107 A**. WS / DASH /
-  MoQ / WHEP need a one-line `tracker.record(broadcast, transport,
-  delta_ms)` at their subscriber-delivery point. Each is a small
-  additive change; the alert pack + dashboard are label-generic so
-  they light up automatically the moment a new transport starts
-  recording samples.
+* **LL-HLS (107 A) + MPEG-DASH (109 A) egress instrumentation is
+  live**. WS / MoQ / WHEP still need a one-line
+  `tracker.record(broadcast, transport, delta_ms)` at their
+  subscriber-delivery point; those drains consume `moq_lite` frames
+  rather than `Fragment` values, so the `ingest_time_ms` stamp is
+  not on the wire today and wiring them up is a small design session
+  (`carry ingest_time_ms on the MoQ frame header` is the canonical
+  approach). The alert pack + dashboard already label-match
+  generically on `transport`, so they light up automatically the
+  moment a new transport starts recording samples.
 * **No time-windowed retention on the admin snapshot**. The ring
   buffer is size-bounded (1024 samples per key); a quiet broadcast
   keeps stale samples until new traffic arrives. Operators who need

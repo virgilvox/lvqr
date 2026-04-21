@@ -28,6 +28,7 @@
 //! dropped.
 
 use bytes::Bytes;
+use lvqr_admin::LatencyTracker;
 use lvqr_fragment::{BroadcasterStream, FragmentBroadcasterRegistry, FragmentStream};
 use tokio::runtime::Handle;
 
@@ -39,6 +40,9 @@ use crate::server::{DashServer, MultiDashServer};
 const VIDEO_TRACK: &str = "0.mp4";
 /// Audio track id counterpart to [`VIDEO_TRACK`].
 const AUDIO_TRACK: &str = "1.mp4";
+/// Transport label reported to the shared [`LatencyTracker`]. Matches
+/// the `"dash"` row in the operator runbook's threshold table.
+const TRANSPORT_LABEL: &str = "dash";
 
 /// Broadcaster-native DASH composition helper. Stateless: the struct
 /// itself carries nothing; [`install`](Self::install) wires an
@@ -53,7 +57,12 @@ impl BroadcasterDashBridge {
     /// the shared [`MultiDashServer`].
     ///
     /// Callers must invoke this from inside a tokio runtime.
-    pub fn install(multi: MultiDashServer, registry: &FragmentBroadcasterRegistry) {
+    /// `slo` is an optional latency tracker that receives one sample
+    /// per fragment delivered to the DASH server under
+    /// `transport="dash"`; Tier 4 item 4.7 session 109 A mirrors the
+    /// HLS drain's wiring so DASH subscribers surface on the shared
+    /// `/api/v1/slo` admin route and Prometheus alert pack.
+    pub fn install(multi: MultiDashServer, registry: &FragmentBroadcasterRegistry, slo: Option<LatencyTracker>) {
         registry.on_entry_created(move |broadcast, track, bc| {
             let broadcast = broadcast.to_string();
             let track = track.to_string();
@@ -82,13 +91,20 @@ impl BroadcasterDashBridge {
                 }
             };
             let server = multi.ensure(&broadcast);
-            handle.spawn(Self::drain(server, broadcast, track, is_video, sub));
+            handle.spawn(Self::drain(server, broadcast, track, is_video, sub, slo.clone()));
         });
     }
 
     /// Per-broadcaster drain task. Runs until every producer-side
     /// clone of the broadcaster drops.
-    async fn drain(server: DashServer, broadcast: String, track: String, is_video: bool, mut sub: BroadcasterStream) {
+    async fn drain(
+        server: DashServer,
+        broadcast: String,
+        track: String,
+        is_video: bool,
+        mut sub: BroadcasterStream,
+        slo: Option<LatencyTracker>,
+    ) {
         let mut last_init: Option<Bytes> = None;
         let mut seq: u64 = 0;
         while let Some(fragment) = sub.next_fragment().await {
@@ -122,6 +138,22 @@ impl BroadcasterDashBridge {
             } else {
                 server.push_audio_segment(seq, fragment.payload.clone());
             }
+            // Tier 4 item 4.7 session 109 A: one SLO sample per
+            // fragment delivered to the DASH server. Mirrors the HLS
+            // drain: skip federation replays + test synthetics that
+            // leave `ingest_time_ms` at its `0` sentinel, and skip
+            // entirely when no tracker was wired at startup. Samples
+            // are per-Fragment, not per-finalized-segment, so
+            // operators reading the "sample rate" panel see one tick
+            // per incoming fragment even though DASH `$Number$` URIs
+            // address full segments.
+            if let Some(tracker) = slo.as_ref()
+                && fragment.ingest_time_ms > 0
+            {
+                let now_ms = unix_wall_ms();
+                let latency = now_ms.saturating_sub(fragment.ingest_time_ms);
+                tracker.record(&broadcast, TRANSPORT_LABEL, latency);
+            }
         }
         tracing::info!(
             broadcast = %broadcast,
@@ -129,6 +161,17 @@ impl BroadcasterDashBridge {
             "BroadcasterDashBridge: drain terminated (producers closed)",
         );
     }
+}
+
+/// UNIX wall-clock milliseconds. Falls back to `0` when the system
+/// clock is set before the UNIX epoch; callers should treat `0` as
+/// an unset stamp (mirrors `lvqr_ingest::dispatch::unix_wall_ms` and
+/// the HLS bridge's helper).
+fn unix_wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -166,7 +209,7 @@ mod tests {
     async fn video_fragments_get_monotonic_sequence_numbers() {
         let multi = MultiDashServer::new(DashConfig::default());
         let registry = FragmentBroadcasterRegistry::new();
-        BroadcasterDashBridge::install(multi.clone(), &registry);
+        BroadcasterDashBridge::install(multi.clone(), &registry, None);
 
         let bc = registry.get_or_create("live/test", VIDEO_TRACK, FragmentMeta::new("avc1.640028", 90_000));
         bc.set_init_segment(Bytes::from_static(b"\x00init"));
@@ -187,7 +230,7 @@ mod tests {
     async fn audio_and_video_sequences_are_independent() {
         let multi = MultiDashServer::new(DashConfig::default());
         let registry = FragmentBroadcasterRegistry::new();
-        BroadcasterDashBridge::install(multi.clone(), &registry);
+        BroadcasterDashBridge::install(multi.clone(), &registry, None);
 
         let video_bc = registry.get_or_create("live/av", VIDEO_TRACK, FragmentMeta::new("avc1.640028", 90_000));
         let audio_bc = registry.get_or_create("live/av", AUDIO_TRACK, FragmentMeta::new("mp4a.40.2", 48_000));
@@ -211,7 +254,7 @@ mod tests {
     async fn reinit_resets_the_counter() {
         let multi = MultiDashServer::new(DashConfig::default());
         let registry = FragmentBroadcasterRegistry::new();
-        BroadcasterDashBridge::install(multi.clone(), &registry);
+        BroadcasterDashBridge::install(multi.clone(), &registry, None);
 
         let bc = registry.get_or_create("live/rc", VIDEO_TRACK, FragmentMeta::new("avc1.640028", 90_000));
         bc.set_init_segment(Bytes::from_static(b"\x00init-a"));
@@ -236,7 +279,7 @@ mod tests {
     async fn unknown_track_ids_are_ignored() {
         let multi = MultiDashServer::new(DashConfig::default());
         let registry = FragmentBroadcasterRegistry::new();
-        BroadcasterDashBridge::install(multi.clone(), &registry);
+        BroadcasterDashBridge::install(multi.clone(), &registry, None);
 
         let bc = registry.get_or_create("live/odd", "captions", FragmentMeta::new("wvtt", 1000));
         bc.set_init_segment(Bytes::from_static(b"\x00cap"));

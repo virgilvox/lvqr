@@ -13,6 +13,11 @@ categories = ["multimedia", "web-programming"]
 [dependencies]
 lvqr-cmaf = { workspace = true }
 lvqr-fragment = { workspace = true }
+# Tier 4 item 4.7 session 109 A: the DASH drain task records one
+# `LatencyTracker::record("dash")` sample per delivered fragment so
+# DASH subscribers surface on the shared `/api/v1/slo` route and the
+# Grafana alert pack alongside LL-HLS.
+lvqr-admin = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
