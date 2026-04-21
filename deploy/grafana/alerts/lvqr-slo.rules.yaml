@@ -1,0 +1,157 @@
+# LVQR latency SLO alert rule pack.
+#
+# Tier 4 item 4.7 session B. Import into Prometheus via
+# `rule_files:` in `prometheus.yml` or into Grafana Cloud's
+# managed alert rules as a Prometheus-format upload. Alerts are
+# keyed by `broadcast` + `transport` so operators can wire routing
+# policies (Slack channel per broadcast, PagerDuty per transport)
+# without touching the rule expressions.
+#
+# Metric source (fired by `lvqr-admin::slo::LatencyTracker::record`,
+# invoked from every instrumented egress surface):
+#
+#   lvqr_subscriber_glass_to_glass_ms_bucket{broadcast, transport, le}
+#   lvqr_subscriber_glass_to_glass_ms_count{broadcast, transport}
+#   lvqr_subscriber_glass_to_glass_ms_sum{broadcast, transport}
+#
+# The metric captures server-side latency: the delta between the
+# ingest protocol handler stamping `Fragment::ingest_time_ms` and
+# the egress surface delivering the fragment to subscribers.
+# Client-side render latency is NOT in scope for these rules; pair
+# these alerts with browser SDK telemetry (Tier 5) for a full
+# glass-to-glass picture.
+#
+# Thresholds are tuned for the default LL-HLS shape (target
+# 2-second segment, 200 ms partial). Operators on WebRTC (target
+# <500 ms) or MoQ (target <200 ms) should clone this file, add a
+# per-transport label matcher to the `expr:`, and tighten the
+# breach thresholds. See `docs/slo.md` for the decision table.
+
+groups:
+  - name: lvqr.slo.latency
+    interval: 30s
+    rules:
+      - alert: LvqrSloLatencyP99VeryHigh
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (broadcast, transport, le) (
+              rate(lvqr_subscriber_glass_to_glass_ms_bucket[5m])
+            )
+          ) > 4000
+        for: 2m
+        labels:
+          severity: critical
+          subsystem: lvqr-egress
+          slo: latency
+        annotations:
+          summary: "LVQR p99 latency above 4s on {{ $labels.broadcast }} / {{ $labels.transport }}"
+          description: |
+            Server-side p99 glass-to-glass latency exceeded 4000 ms for 2 minutes on broadcast
+            `{{ $labels.broadcast }}` transport `{{ $labels.transport }}`. Current value:
+            `{{ $value }} ms`. Subscribers on that transport are almost certainly stalling or
+            disconnecting. Check: (a) the `/api/v1/slo` admin snapshot for per-sample counts,
+            (b) `lvqr_fragment_broadcast_lagged_skips_total` for subscriber back-pressure,
+            (c) host CPU + network on the egress machine.
+          runbook_url: https://github.com/virgilvox/lvqr/blob/main/docs/slo.md#critical-p99-above-4s
+
+      - alert: LvqrSloLatencyP99High
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (broadcast, transport, le) (
+              rate(lvqr_subscriber_glass_to_glass_ms_bucket[5m])
+            )
+          ) > 2000
+        for: 5m
+        labels:
+          severity: warning
+          subsystem: lvqr-egress
+          slo: latency
+        annotations:
+          summary: "LVQR p99 latency above 2s on {{ $labels.broadcast }} / {{ $labels.transport }}"
+          description: |
+            Server-side p99 glass-to-glass latency exceeded 2000 ms for 5 minutes on broadcast
+            `{{ $labels.broadcast }}` transport `{{ $labels.transport }}`. Current value:
+            `{{ $value }} ms`. This is the standard SLO burn warning for LL-HLS; operators on
+            low-latency transports should clone this rule with a tighter threshold.
+          runbook_url: https://github.com/virgilvox/lvqr/blob/main/docs/slo.md#warning-p99-above-2s
+
+      - alert: LvqrSloLatencyP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (broadcast, transport, le) (
+              rate(lvqr_subscriber_glass_to_glass_ms_bucket[5m])
+            )
+          ) > 1500
+        for: 5m
+        labels:
+          severity: warning
+          subsystem: lvqr-egress
+          slo: latency
+        annotations:
+          summary: "LVQR p95 latency above 1.5s on {{ $labels.broadcast }} / {{ $labels.transport }}"
+          description: |
+            Typical-subscriber latency (p95) exceeded 1500 ms for 5 minutes on broadcast
+            `{{ $labels.broadcast }}` transport `{{ $labels.transport }}`. Current value:
+            `{{ $value }} ms`. p95 catches the middle-majority of subscribers; if p95 is up
+            while p99 is calm, suspect a broad ingest-side slowdown rather than tail-latency
+            on a few subscribers.
+          runbook_url: https://github.com/virgilvox/lvqr/blob/main/docs/slo.md#warning-p95-above-1.5s
+
+      - alert: LvqrSloLatencyP50High
+        expr: |
+          histogram_quantile(
+            0.50,
+            sum by (broadcast, transport, le) (
+              rate(lvqr_subscriber_glass_to_glass_ms_bucket[5m])
+            )
+          ) > 500
+        for: 10m
+        labels:
+          severity: info
+          subsystem: lvqr-egress
+          slo: latency
+        annotations:
+          summary: "LVQR p50 latency above 500ms on {{ $labels.broadcast }} / {{ $labels.transport }}"
+          description: |
+            Median latency exceeded 500 ms for 10 minutes on broadcast
+            `{{ $labels.broadcast }}` transport `{{ $labels.transport }}`. Current value:
+            `{{ $value }} ms`. Typically indicates a sustained ingest delay (slow encoder,
+            network jitter between publisher and server); not urgent on LL-HLS but is a
+            warning for WebRTC / MoQ deployments.
+          runbook_url: https://github.com/virgilvox/lvqr/blob/main/docs/slo.md#info-p50-above-500ms
+
+      - alert: LvqrSloNoRecentSamples
+        # Fires when a broadcast that had samples 30 min ago has seen
+        # no samples in the last 5 min. Common causes: publisher
+        # disconnected, egress drain task crashed, subscriber
+        # back-pressure stalled the broadcaster.
+        expr: |
+          (
+            sum by (broadcast, transport) (
+              rate(lvqr_subscriber_glass_to_glass_ms_count[5m])
+            ) == 0
+          )
+          and
+          (
+            sum by (broadcast, transport) (
+              rate(lvqr_subscriber_glass_to_glass_ms_count[30m])
+            ) > 0
+          )
+        for: 5m
+        labels:
+          severity: warning
+          subsystem: lvqr-egress
+          slo: availability
+        annotations:
+          summary: "LVQR egress stopped producing latency samples on {{ $labels.broadcast }} / {{ $labels.transport }}"
+          description: |
+            Broadcast `{{ $labels.broadcast }}` transport `{{ $labels.transport }}` recorded
+            latency samples within the last 30 minutes but none in the last 5 minutes.
+            Typical causes: publisher disconnected and the broadcast has no egress subscribers,
+            ingest bridge errored, or the egress drain task crashed / aborted.
+            Check `/api/v1/streams` for active publishers and the process logs for
+            `BroadcasterHlsBridge: drain terminated` messages.
+          runbook_url: https://github.com/virgilvox/lvqr/blob/main/docs/slo.md#no-recent-samples

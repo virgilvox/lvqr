@@ -264,6 +264,37 @@ A starter `grafana/dashboards/lvqr.json` is tracked in
 - Cluster node count (derived from `/api/v1/cluster/nodes`
   via a blackbox exporter or a custom scrape).
 
+## Latency SLO (Tier 4 item 4.7)
+
+`lvqr_subscriber_glass_to_glass_ms` is a Prometheus histogram
+recorded by every instrumented egress surface on each
+subscriber-side fragment delivery. Labels: `broadcast` +
+`transport`. Fired from `lvqr_admin::slo::LatencyTracker`'s
+`record()` method and simultaneously written into a
+per-`(broadcast, transport)` ring buffer that powers the
+read-only admin route:
+
+```bash
+curl -H "Authorization: Bearer $LVQR_ADMIN_TOKEN" \
+  http://localhost:8080/api/v1/slo
+```
+
+The route returns
+`{ broadcasts: [{ broadcast, transport, p50_ms, p95_ms, p99_ms,
+max_ms, sample_count, total_observed } ] }` sorted by
+`(broadcast, transport)`.
+
+The rule pack
+[`deploy/grafana/alerts/lvqr-slo.rules.yaml`](../deploy/grafana/alerts/lvqr-slo.rules.yaml)
+ships five Prometheus alerts (critical p99 > 4s, warning p99 > 2s,
+warning p95 > 1.5s, info p50 > 500ms, warning no-recent-samples)
+tuned for the default LL-HLS shape. The companion dashboard
+[`deploy/grafana/dashboards/lvqr-slo.json`](../deploy/grafana/dashboards/lvqr-slo.json)
+panels the same percentiles plus the raw sample rate.
+
+Full runbook, per-transport threshold table, and troubleshooting
+checklist: [`docs/slo.md`](slo.md).
+
 ## Load-bearing invariant (LBD #4)
 
 Lifecycle events (publisher up / down, viewer join / leave)
