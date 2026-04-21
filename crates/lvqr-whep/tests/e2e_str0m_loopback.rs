@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use lvqr_cmaf::RawSample;
 use lvqr_ingest::MediaCodec;
-use lvqr_whep::{SdpAnswerer, SessionHandle, Str0mAnswerer, Str0mConfig};
+use lvqr_whep::{LatencyTracker, SdpAnswerer, SessionHandle, Str0mAnswerer, Str0mConfig};
 use str0m::change::SdpAnswer;
 use str0m::media::{Direction, MediaKind};
 use str0m::net::{Protocol, Receive};
@@ -82,7 +82,14 @@ async fn client_receives_video_from_str0m_answerer() {
     let offer_sdp = offer.to_sdp_string();
 
     // --- Server side: hand the offer to Str0mAnswerer. ---
-    let answerer = Str0mAnswerer::new(Str0mConfig::default());
+    // Session 110 B attach: wire a fresh LatencyTracker so the
+    // poll loop records one sample under `transport="whep"` for
+    // every successful `Writer::write`. Asserted at the bottom
+    // of the test; proves the positive-path SLO wiring end-to-end
+    // alongside the `slo_tracker_skips_pre_connected_writes` inline
+    // negative-path test.
+    let tracker = LatencyTracker::new();
+    let answerer = Str0mAnswerer::new(Str0mConfig::default()).with_slo_tracker(tracker.clone());
     let (handle, answer_bytes) = answerer
         .create_session("test/e2e", offer_sdp.as_bytes())
         .expect("Str0mAnswerer accepted the offer");
@@ -196,6 +203,25 @@ async fn client_receives_video_from_str0m_answerer() {
     );
     eprintln!("[e2e] got {media_frames} media frames");
     assert!(media_frames >= 1, "expected at least one media frame");
+
+    // Session 110 B: the spam loop stamps each `SessionMsg::Video`
+    // with a monotonically-increasing `ingest_time_ms` that is
+    // bounded above by `now_unix_ms()` at sample-build time, so
+    // every successful `Writer::write` records a sample under
+    // `transport="whep"`. We got >=1 client-side MediaData above,
+    // which means the server side did >=1 successful write. Assert
+    // the tracker saw at least one `whep` sample for the broadcast.
+    let snap = tracker.snapshot();
+    let whep_entry = snap.iter().find(|e| e.broadcast == "test/e2e" && e.transport == "whep");
+    assert!(
+        whep_entry.is_some(),
+        "expected a test/e2e whep tracker entry after the client received media; got {snap:?}",
+    );
+    let entry = whep_entry.unwrap();
+    assert!(
+        entry.sample_count >= 1,
+        "expected >=1 whep sample after media received; entry={entry:?}",
+    );
 }
 
 fn absorb_client_event(event: Event, connected: &mut bool, got_media: &mut bool, frames: &mut usize) {
@@ -237,7 +263,16 @@ async fn spam_video_samples(handle: Arc<dyn SessionHandle>) {
     tokio::time::sleep(Duration::from_millis(100)).await;
     loop {
         let sample = build_fake_h264_sample(dts);
-        handle.on_raw_sample("0.mp4", MediaCodec::H264, &sample, 0);
+        // Session 110 B: stamp each sample with the current UNIX
+        // wall-clock so the WHEP poll loop records a non-zero
+        // latency on every successful `Writer::write`. Zero would
+        // be treated as "unset" by the guard (matching HLS + DASH)
+        // and no SLO sample would be recorded.
+        let ingest_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        handle.on_raw_sample("0.mp4", MediaCodec::H264, &sample, ingest_ms);
         dts += frame_ticks;
         // Tight cadence: 20ms instead of 33ms so the test does not
         // sit idle while DTLS finishes. The server's Writer absorbs

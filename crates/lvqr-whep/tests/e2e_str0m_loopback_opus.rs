@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use lvqr_cmaf::RawSample;
 use lvqr_ingest::MediaCodec;
-use lvqr_whep::{SdpAnswerer, SessionHandle, Str0mAnswerer, Str0mConfig};
+use lvqr_whep::{LatencyTracker, SdpAnswerer, SessionHandle, Str0mAnswerer, Str0mConfig};
 use str0m::change::SdpAnswer;
 use str0m::media::{Direction, MediaKind};
 use str0m::net::{Protocol, Receive};
@@ -59,7 +59,11 @@ async fn client_receives_opus_audio_from_str0m_answerer() {
     let (offer, pending) = changes.apply().expect("client sdp_api().apply() produced an offer");
     let offer_sdp = offer.to_sdp_string();
 
-    let answerer = Str0mAnswerer::new(Str0mConfig::default());
+    // Session 110 B: attach a LatencyTracker so each successful
+    // writer.write on the server-side poll loop records a sample
+    // under `transport="whep"`. Asserted at the end of the test.
+    let tracker = LatencyTracker::new();
+    let answerer = Str0mAnswerer::new(Str0mConfig::default()).with_slo_tracker(tracker.clone());
     let (handle, answer_bytes) = answerer
         .create_session("test/e2e-opus", offer_sdp.as_bytes())
         .expect("Str0mAnswerer accepted the Opus-only offer");
@@ -182,6 +186,24 @@ async fn client_receives_opus_audio_from_str0m_answerer() {
     );
     eprintln!("[whep-e2e-opus] got {media_frames} media frames");
     assert!(media_frames >= 1, "expected at least one Opus media frame");
+
+    // Session 110 B positive-path assertion: if the client saw an
+    // Opus MediaData event, the server-side poll loop did at least
+    // one successful `Writer::write` on the Opus mid, which the
+    // SLO record arm observed under `transport="whep"`.
+    let snap = tracker.snapshot();
+    let whep_entry = snap
+        .iter()
+        .find(|e| e.broadcast == "test/e2e-opus" && e.transport == "whep");
+    assert!(
+        whep_entry.is_some(),
+        "expected a test/e2e-opus whep tracker entry after the client received Opus; got {snap:?}",
+    );
+    let entry = whep_entry.unwrap();
+    assert!(
+        entry.sample_count >= 1,
+        "expected >=1 whep sample after Opus received; entry={entry:?}",
+    );
 }
 
 async fn spam_opus_samples(handle: Arc<dyn SessionHandle>) {
@@ -200,7 +222,11 @@ async fn spam_opus_samples(handle: Arc<dyn SessionHandle>) {
             payload: Bytes::from(opus),
             keyframe: true,
         };
-        handle.on_raw_sample("1.mp4", MediaCodec::Opus, &sample, 0);
+        let ingest_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        handle.on_raw_sample("1.mp4", MediaCodec::Opus, &sample, ingest_ms);
         dts += frame_ticks;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

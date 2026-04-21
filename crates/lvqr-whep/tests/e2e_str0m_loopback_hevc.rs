@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use lvqr_cmaf::RawSample;
 use lvqr_ingest::MediaCodec;
-use lvqr_whep::{SdpAnswerer, SessionHandle, Str0mAnswerer, Str0mConfig};
+use lvqr_whep::{LatencyTracker, SdpAnswerer, SessionHandle, Str0mAnswerer, Str0mConfig};
 use str0m::change::SdpAnswer;
 use str0m::media::{Direction, MediaKind};
 use str0m::net::{Protocol, Receive};
@@ -79,7 +79,12 @@ async fn client_receives_hevc_video_from_str0m_answerer() {
     let (offer, pending) = changes.apply().expect("client sdp_api().apply() produced an offer");
     let offer_sdp = offer.to_sdp_string();
 
-    let answerer = Str0mAnswerer::new(Str0mConfig::default());
+    // Session 110 B: attach a LatencyTracker. Asserted at the
+    // end of the test: a successful HEVC MediaData on the client
+    // implies the server-side poll loop did a writer.write, which
+    // the SLO record arm observed under `transport="whep"`.
+    let tracker = LatencyTracker::new();
+    let answerer = Str0mAnswerer::new(Str0mConfig::default()).with_slo_tracker(tracker.clone());
     let (handle, answer_bytes) = answerer
         .create_session("test/e2e-hevc", offer_sdp.as_bytes())
         .expect("Str0mAnswerer accepted the HEVC offer");
@@ -177,6 +182,21 @@ async fn client_receives_hevc_video_from_str0m_answerer() {
     );
     eprintln!("[whep-e2e-hevc] got {media_frames} media frames");
     assert!(media_frames >= 1, "expected at least one HEVC media frame");
+
+    // Session 110 B positive-path assertion on the HEVC route.
+    let snap = tracker.snapshot();
+    let whep_entry = snap
+        .iter()
+        .find(|e| e.broadcast == "test/e2e-hevc" && e.transport == "whep");
+    assert!(
+        whep_entry.is_some(),
+        "expected a test/e2e-hevc whep tracker entry after the client received HEVC; got {snap:?}",
+    );
+    let entry = whep_entry.unwrap();
+    assert!(
+        entry.sample_count >= 1,
+        "expected >=1 whep sample after HEVC received; entry={entry:?}",
+    );
 }
 
 fn absorb_client_event(event: Event, connected: &mut bool, got_media: &mut bool, frames: &mut usize) {
@@ -217,7 +237,11 @@ async fn spam_hevc_samples(handle: Arc<dyn SessionHandle>) {
     tokio::time::sleep(Duration::from_millis(100)).await;
     loop {
         let sample = build_fake_hevc_sample(dts);
-        handle.on_raw_sample("0.mp4", MediaCodec::H265, &sample, 0);
+        let ingest_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        handle.on_raw_sample("0.mp4", MediaCodec::H265, &sample, ingest_ms);
         dts += frame_ticks;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

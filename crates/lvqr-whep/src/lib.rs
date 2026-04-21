@@ -26,3 +26,9 @@ pub use router::router as router_for;
 pub use rtp::{H264Packetizer, H264RtpPayload};
 pub use server::{SdpAnswerer, SessionHandle, SessionId, WhepError, WhepServer};
 pub use str0m_backend::{Str0mAnswerer, Str0mConfig, Str0mSessionHandle};
+
+// Tier 4 item 4.7 session 110 B: re-export the shared latency
+// tracker type so callers of `Str0mAnswerer::with_slo_tracker` do
+// not need a direct `lvqr-admin` dep just to name the argument
+// type. The re-export mirrors the `lvqr-cli` pattern from 107 A.
+pub use lvqr_admin::LatencyTracker;
