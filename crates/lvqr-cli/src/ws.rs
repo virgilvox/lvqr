@@ -31,7 +31,15 @@ use lvqr_core::{EventBus, RelayEvent};
 use lvqr_moq::Track;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_util::sync::CancellationToken;
+
+/// Monotonic counter backing the per-session mesh peer_id that
+/// `ws_relay_session` generates when the mesh coordinator is
+/// wired. Format: `ws-{counter}`. Safe across all active
+/// sessions because the counter is process-global and
+/// `AtomicU64` increments are race-free. Session 111-B2.
+static MESH_PEER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Shared state for WebSocket relay and ingest handlers.
 #[derive(Clone)]
@@ -54,6 +62,35 @@ pub(crate) struct WsRelayState {
     /// Optional shared latency tracker. `None` disables WS SLO sampling
     /// for compat with tests that boot a bare `WsRelayState`.
     pub(crate) slo: Option<lvqr_admin::LatencyTracker>,
+    /// Optional mesh coordinator. `Some` when
+    /// [`ServeConfig::mesh_enabled`] was `true` at `start()`,
+    /// `None` otherwise. When present, every `ws_relay_session`
+    /// generates a server-side peer_id via `MESH_PEER_COUNTER`,
+    /// calls `add_peer` at connect time, sends the resulting
+    /// [`MeshAssignment`] as a leading text frame on the WS so
+    /// the client knows its tree position, and calls
+    /// `remove_peer` when the session ends. Session 111-B2.
+    pub(crate) mesh: Option<Arc<lvqr_mesh::MeshCoordinator>>,
+}
+
+/// Leading-frame shape sent by `ws_relay_session` to every new
+/// subscriber when the mesh coordinator is wired. Encodes the
+/// server-generated `peer_id`, the peer's tree `role` (Root or
+/// Relay), the `parent_id` assigned (`null` for root peers), and
+/// the `depth` from the server. Clients that want to participate
+/// in the WebRTC DataChannel data plane use the `peer_id` to
+/// open `/signal` with the same identity and negotiate SDP with
+/// their assigned parent. Clients that do not care about mesh
+/// can ignore the leading text frame and continue reading
+/// binary MoQ frames as usual. Session 111-B2.
+#[derive(serde::Serialize)]
+pub(crate) struct MeshAssignment {
+    #[serde(rename = "type")]
+    pub(crate) kind: &'static str,
+    pub(crate) peer_id: String,
+    pub(crate) role: String,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) depth: u32,
 }
 
 pub(crate) async fn ws_relay_handler(
@@ -97,6 +134,45 @@ async fn ws_relay_session(mut socket: WebSocket, state: WsRelayState, broadcast:
     };
 
     tracing::info!(broadcast = %broadcast, "WS relay session started");
+
+    // Session 111-B2: register this subscriber with the mesh
+    // coordinator (when mesh is enabled) and send the resulting
+    // assignment as a leading text frame so the client can open
+    // `/signal` later with the same server-generated peer_id.
+    // `mesh_peer_id` is `Some` only when the registration
+    // succeeded; on failure we log and proceed without mesh
+    // state so the subscriber still gets served MoQ frames.
+    let mesh_peer_id = if let Some(mesh) = state.mesh.as_ref() {
+        let peer_id = format!("ws-{}", MESH_PEER_COUNTER.fetch_add(1, Ordering::Relaxed));
+        match mesh.add_peer(peer_id.clone(), broadcast.clone()) {
+            Ok(assignment) => {
+                let payload = MeshAssignment {
+                    kind: "peer_assignment",
+                    peer_id: peer_id.clone(),
+                    role: format!("{:?}", assignment.role),
+                    parent_id: assignment.parent.clone(),
+                    depth: assignment.depth,
+                };
+                match serde_json::to_string(&payload) {
+                    Ok(json) => {
+                        if let Err(e) = socket.send(Message::Text(json.into())).await {
+                            tracing::debug!(error = ?e, "WS send of mesh assignment failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "serializing MeshAssignment failed");
+                    }
+                }
+                Some(peer_id)
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, peer = %peer_id, "mesh add_peer failed for WS subscriber");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let video_track = bc.subscribe_track(&Track::new("0.mp4")).ok();
     let audio_track = bc.subscribe_track(&Track::new("1.mp4")).ok();
@@ -161,20 +237,66 @@ async fn ws_relay_session(mut socket: WebSocket, state: WsRelayState, broadcast:
         }
     }
 
-    while let Some((track_id, payload)) = rx.recv().await {
-        let mut framed = Vec::with_capacity(1 + payload.len());
-        framed.push(track_id);
-        framed.extend_from_slice(&payload);
-        let len = framed.len() as u64;
-        if let Err(e) = socket.send(Message::Binary(framed.into())).await {
-            tracing::debug!(error = ?e, "WS send error");
-            break;
+    // Session 111-B2: watch both the MoQ-side rx and the
+    // client-side socket so idle subscribers (no frames flowing)
+    // still exit promptly when the client closes the WS.
+    // Pre-111-B2 the loop only polled rx.recv(), which meant a
+    // subscriber that never saw a frame never got cleaned up;
+    // that pinned the mesh peer entry forever when mesh was
+    // enabled, and held the relay-side state otherwise.
+    loop {
+        tokio::select! {
+            recv = rx.recv() => {
+                match recv {
+                    Some((track_id, payload)) => {
+                        let mut framed = Vec::with_capacity(1 + payload.len());
+                        framed.push(track_id);
+                        framed.extend_from_slice(&payload);
+                        let len = framed.len() as u64;
+                        if let Err(e) = socket.send(Message::Binary(framed.into())).await {
+                            tracing::debug!(error = ?e, "WS send error");
+                            break;
+                        }
+                        metrics::counter!("lvqr_frames_relayed_total", "transport" => "ws").increment(1);
+                        metrics::counter!("lvqr_bytes_relayed_total", "transport" => "ws").increment(len);
+                    }
+                    None => break,
+                }
+            }
+            inbound = socket.recv() => {
+                match inbound {
+                    None => break,
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Err(e)) => {
+                        tracing::debug!(error = ?e, "WS recv error");
+                        break;
+                    }
+                    Some(Ok(_)) => {
+                        // Subscribers may send Ping or small Text frames
+                        // over the life of the session; we do not
+                        // interpret them today, so ignore and keep
+                        // polling.
+                    }
+                }
+            }
         }
-        metrics::counter!("lvqr_frames_relayed_total", "transport" => "ws").increment(1);
-        metrics::counter!("lvqr_bytes_relayed_total", "transport" => "ws").increment(len);
     }
 
     cancel.cancel();
+
+    // Session 111-B2: release the mesh peer_id when the
+    // subscriber disconnects. `remove_peer` returns the list of
+    // orphaned children (peers that had this peer as parent);
+    // each is reassigned immediately so the tree does not leak
+    // orphans. Symmetric to the `add_peer` call at session
+    // start.
+    if let (Some(peer_id), Some(mesh)) = (mesh_peer_id, state.mesh.as_ref()) {
+        let orphans = mesh.remove_peer(&peer_id);
+        for orphan in orphans {
+            let _ = mesh.reassign_peer(&orphan);
+        }
+    }
+
     tracing::info!(broadcast = %broadcast, "WS relay session ended");
 }
 

@@ -747,20 +747,6 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // p50 / p95 / p99 / max samples.
     let admin_state = admin_state.with_slo(slo_tracker.clone());
 
-    // WebSocket fMP4 relay + WebSocket ingest state.
-    let ws_state = WsRelayState {
-        origin: relay.origin().clone(),
-        init_segments: Arc::new(dashmap::DashMap::new()),
-        auth: auth.clone(),
-        events: events.clone(),
-        registry: shared_registry.clone(),
-        slo: Some(slo_tracker.clone()),
-    };
-    let ws_router = axum::Router::new()
-        .route("/ws/{*broadcast}", get(ws_relay_handler))
-        .route("/ingest/{*broadcast}", get(ws_ingest_handler))
-        .with_state(ws_state);
-
     // Session 111-B1: hoist `MeshCoordinator` construction out of
     // the admin-router block so it can be stored on `ServerHandle`
     // and accessed by integration tests + the session 111-B2
@@ -777,6 +763,25 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     } else {
         None
     };
+
+    // WebSocket fMP4 relay + WebSocket ingest state. Built AFTER
+    // `mesh_coordinator` so the mesh field can be wired through
+    // to `ws_relay_session` for session-111-B2 subscriber
+    // registration; when mesh is disabled the field stays `None`
+    // and the relay session behaves exactly as pre-111-B2.
+    let ws_state = WsRelayState {
+        origin: relay.origin().clone(),
+        init_segments: Arc::new(dashmap::DashMap::new()),
+        auth: auth.clone(),
+        events: events.clone(),
+        registry: shared_registry.clone(),
+        slo: Some(slo_tracker.clone()),
+        mesh: mesh_coordinator.clone(),
+    };
+    let ws_router = axum::Router::new()
+        .route("/ws/{*broadcast}", get(ws_relay_handler))
+        .route("/ingest/{*broadcast}", get(ws_ingest_handler))
+        .with_state(ws_state);
 
     let combined_router = {
         let admin_router = if let Some(mesh) = mesh_coordinator.clone() {
@@ -826,8 +831,32 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
 
             let mesh_for_signal = mesh.clone();
             let mut signal = lvqr_signal::SignalServer::new();
+            // Session 111-B2: the callback is idempotent on
+            // Register. A client that already opened `/ws/*`
+            // (and therefore already holds a `ws-{n}` peer_id
+            // assigned by `ws_relay_session`) can reuse that
+            // peer_id on `/signal` without getting a second
+            // tree entry: the callback looks the peer up first
+            // and returns its existing assignment. Clients
+            // that open `/signal` without first opening `/ws`
+            // fall through to the pre-111-B2 path of
+            // `add_peer` + fresh assignment.
             signal.set_peer_callback(Arc::new(move |peer_id, track, connected| {
                 if connected {
+                    if let Some(existing) = mesh_for_signal.get_peer(peer_id) {
+                        tracing::debug!(
+                            peer = %peer_id,
+                            role = ?existing.role,
+                            depth = existing.depth,
+                            "mesh: signal reusing existing peer entry from WS relay"
+                        );
+                        return Some(lvqr_signal::SignalMessage::AssignParent {
+                            peer_id: peer_id.to_string(),
+                            role: format!("{:?}", existing.role),
+                            parent_id: existing.parent.clone(),
+                            depth: existing.depth,
+                        });
+                    }
                     match mesh_for_signal.add_peer(peer_id.to_string(), track.to_string()) {
                         Ok(a) => {
                             tracing::info!(peer = %peer_id, role = ?a.role, depth = a.depth, "mesh: signal peer assigned");
