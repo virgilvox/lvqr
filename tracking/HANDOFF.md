@@ -1,8 +1,52 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.6 COMPLETE (7 of 8 Tier 4 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.8); 900 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **origin/main synced (head `99411a4`)**
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.8 COMPLETE + 4.7 session A DONE (7.5 of 8 Tier 4 items done; only 4.7 session B Grafana alert pack remains); 909 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; local `main` N+3 ahead of `origin/main` (pre-commit head `bde70ce`)
 
-**Last Updated**: 2026-04-21 (session 106 push event). Session 106's two commits (`047445e` feat + `99411a4` close-doc) are pushed to `origin/main`. `git log --oneline origin/main..main` is empty. crates.io is unchanged since the post-session-98 publish event; the next release cycle first-time-publishes `lvqr-transcode 0.4.0` alongside the pending 4.4-chain re-publishes of `lvqr-cluster` / `lvqr-cli` / `lvqr-admin` / `lvqr-test-utils`. Session 107 entry point is Tier 4 item 4.7 session A (latency SLO histogram wiring + `/api/v1/slo` admin route).
+**Last Updated**: 2026-04-21 (session 107 A close). Session 107 A is Tier 4 item 4.7 session A: the per-subscriber glass-to-glass latency histogram + `/api/v1/slo` admin route. Session 108 B is the Grafana alert pack + documentation layer on top. After 108 B lands, Tier 4 is COMPLETE.
+
+## Session 107 A close (2026-04-21)
+
+1. **Tier 4 item 4.7 session A: latency SLO histogram + `/api/v1/slo` admin route** (feat commit).
+   * `crates/lvqr-fragment/src/fragment.rs`: new field `Fragment::ingest_time_ms: u64` (`0` = unset) + `Fragment::with_ingest_time_ms(mut self, ms: u64) -> Self` builder. Every existing `Fragment::new` call site stays unchanged because `new()` defaults the field to `0`.
+   * `crates/lvqr-ingest/src/dispatch.rs`: `publish_fragment` now stamps the fragment's `ingest_time_ms` with `SystemTime::now()` UNIX ms when unset, so every ingest protocol (RTMP, SRT, RTSP, WHIP, WS) automatically carries the server-side ingest wall-clock without per-protocol wiring. Callers that pre-stamp via `with_ingest_time_ms` (federation relays preserving upstream timing) keep their value.
+   * `crates/lvqr-admin/src/slo.rs` (new, ~260 LOC): `LatencyTracker` + `SloEntry`. Per-`(broadcast, transport)` ring buffer capped at 1024 samples with sort-on-query p50 / p95 / p99 / max computation. `record(broadcast, transport, latency_ms)` both updates the internal buffer AND fires `metrics::histogram!("lvqr_subscriber_glass_to_glass_ms", "broadcast", "transport").record(ms)` so long-term observability reaches the Prometheus / OTLP fan-out. `snapshot()` returns the per-key Vec sorted lexicographically by `(broadcast, transport)`. 5 inline tests: percentile math, ring-buffer eviction, multi-key separation, empty snapshot, clear.
+   * `crates/lvqr-admin/src/routes.rs`: `AdminState::with_slo(LatencyTracker)` + `GET /api/v1/slo` handler returning `{ broadcasts: [SloEntry..] }`. Returns an empty list when no tracker is wired so dashboards can pre-bake the response structure. 3 new route tests: empty-without-tracker, populated-snapshot, auth-gating.
+   * `crates/lvqr-admin/Cargo.toml`: added `parking_lot` regular dep (used by `LatencyTracker`'s internal `RwLock`).
+   * `crates/lvqr-admin/src/lib.rs`: re-exports `LatencyTracker` + `SloEntry`.
+   * `crates/lvqr-cli/src/lib.rs`: `start()` builds one shared `LatencyTracker`, threads it into `BroadcasterHlsBridge::install(..., Some(tracker.clone()))` and `AdminState::with_slo(tracker.clone())`, and stashes it on `ServerHandle.slo`. `ServerHandle::slo() -> &LatencyTracker` accessor + top-level re-exports `pub use lvqr_admin::{LatencyTracker, SloEntry};` so downstream crates do not pull `lvqr-admin` in as a direct dep.
+   * `crates/lvqr-cli/src/hls.rs`: `BroadcasterHlsBridge::install` / `drain` gained an `Option<LatencyTracker>` parameter. The drain loop records one sample per `push_chunk_bytes` delivery, skipping zero `ingest_time_ms` values (federation / backfill paths that do not stamp). Transport label: `"hls"`. Internal `unix_wall_ms()` helper mirrors the dispatch crate's equivalent.
+   * `crates/lvqr-test-utils/src/test_server.rs`: new `TestServer::slo() -> &lvqr_cli::LatencyTracker` accessor exposing the server's shared tracker for integration tests.
+   * **`crates/lvqr-cli/tests/slo_latency_e2e.rs`** (new, ~170 LOC): boots a `TestServer`, publishes synthetic init + fragment bytes directly onto the shared `FragmentBroadcasterRegistry` (stamping each fragment with a 200 ms backdated `ingest_time_ms`), polls `GET /api/v1/slo` until the HLS drain reports 8 samples for `live/demo` / `hls`, and asserts p50 >= 150 ms + max >= p99 >= p50. Also exercises the `ServerHandle::slo()` accessor on the same snapshot.
+
+2. **Session 107 A close doc** (this commit).
+
+### Key 4.7 session A design decisions baked in (confirmed in-commit per the plan-vs-code rule)
+
+* **Server-side measurement, not true glass-to-glass**. The tracker measures the UNIX-wall-clock delta between `Fragment::ingest_time_ms` (stamped by the ingest protocol handler) and the moment an egress surface delivers the fragment to subscribers. This captures server-internal latency; client-render latency requires browser SDK telemetry and is explicitly a Tier 5 SDK item per the 4.7 risk block. Metric name (`lvqr_subscriber_glass_to_glass_ms`) matches the plan's forward-looking label even though 107 A only covers the server-side leg.
+* **Ring buffer + sort-on-query instead of streaming quantiles**. Avoids a new dep (`hdrhistogram` / `quantiles`) and keeps the snapshot path O(n log n) over n=1024, which is ~10 us on a modern host. The `/api/v1/slo` route is low-QPS; operators hit it seconds-apart from a dashboard. A streaming quantile estimator would be preferable for very high sample rates but 1024 samples per `(broadcast, transport)` is plenty for the expected cardinality.
+* **Per-`(broadcast, transport)` keying, not per-subscriber**. An admin snapshot of 10 000 subscribers would blow the admin JSON body; the aggregated view per egress surface is what operators actually consult when triaging SLO burn. Per-subscriber drilldown can come from the Prometheus histogram's high-cardinality samples in Grafana later.
+* **Transport label is a string, not an enum**. Strings keep the API open to protocols the CLI adds later without a codec-style enum explosion. The HLS drain uses `"hls"`; WS / DASH / MoQ / WHEP are future instrumentation passes.
+* **Dispatch-path stamping, not per-protocol stamping**. Every ingest protocol goes through `lvqr_ingest::dispatch::publish_fragment`, so stamping there covers RTMP + SRT + RTSP + WHIP + WS in one call site. Federation relays that want to preserve upstream timing pre-stamp the fragment before calling `publish_fragment`; the helper skips the overwrite when `ingest_time_ms != 0`.
+* **Zero ingest-time is "unset", not "zero-latency"**. The HLS drain's `if fragment.ingest_time_ms > 0` skip lets synthetic test fragments, federation replays, and anything else without a meaningful stamp flow through without contaminating the histogram. Zero-latency deliveries (same-tick synthetic tests) are still handled correctly on the tracker side: the sample is recorded as `0` when the caller explicitly stamps + we observe a same-tick delivery.
+* **Re-export `LatencyTracker` + `SloEntry` from `lvqr-cli`**: downstream test utilities and integration tests should not need to take a direct `lvqr-admin` dep just to name the tracker type. The re-export is a one-liner and keeps the ABI surface tight.
+* **Dispatch-path stamp chosen over a bridge-level stamp**: the ingest bridges that compose `Fragment` values (RTMP, SRT, RTSP, WHIP) already route through `publish_fragment`, so stamping there avoids touching every bridge. An alternative (stamp inside `FragmentBroadcaster::emit`) would also work but widens the surface of `lvqr-fragment`.
+
+### Ground truth (session 107 A close)
+
+* **Head**: feat commit (pending) + this close-doc commit (pending). Local `main` will be N+2 ahead of `origin/main`; no push event in this block. Pre-commit head on `origin/main`: `bde70ce`.
+* **Tests (default features gate)**: **909** passed, 0 failed, 1 ignored on macOS. +9 over session 106's 900: 5 new inline tests on `lvqr-admin::slo` + 3 new inline tests on the admin route + 1 new integration test `slo_latency_e2e.rs`.
+* **CI gates locally clean**:
+  * `cargo fmt --all --check`.
+  * `cargo clippy --workspace --all-targets --benches -- -D warnings`.
+  * `cargo test --workspace` 909 / 0 / 1.
+* **Workspace**: **29 crates**, unchanged. No crate added or removed.
+* **crates.io**: unchanged. Session 107 A is additive: new `Fragment` field, new `lvqr-admin` module, new admin route. The pending re-publish chain from session 105 still lands cleanly on the next release cycle.
+
+### Known limitations / documented v1 shape
+
+* **HLS-only egress instrumentation**: session 107 A records samples only from the LL-HLS drain loop. WS relay, DASH drain, MoQ forward, WHEP RTP emit -- all pending. Each is a small additive patch (subscribe + read `fragment.ingest_time_ms` + call `tracker.record`); deferred to a future follow-up so 107 A stays focused on the framework + admin route.
+* **Source variant resolution still absent from LL-HLS master playlist**: unchanged from session 106 close. Tracked as a 107+ follow-up.
+* **No time-windowed retention**: the ring buffer is size-bounded, not time-bounded. A quiet broadcast keeps stale samples until new traffic arrives. Live dashboards read the Prometheus histogram instead for time-aligned views; the admin snapshot is a point-in-time aggregate.
 
 ## Session 106 close (2026-04-21)
 

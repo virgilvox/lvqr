@@ -724,7 +724,7 @@ change.
   deadlock under backpressure. Mitigation: bounded queue
   with drop-oldest policy on the fragment-in side.
 
-## 4.7 -- Latency SLO scheduling (1 week, 2 sessions, 107-108)
+## 4.7 -- Latency SLO scheduling (1 week, 2 sessions, 107-108; A DONE, B pending)
 
 ### Scope (what lands)
 
@@ -749,7 +749,7 @@ change.
 
 | # | Session | Deliverable | Verification |
 |---|---|---|---|
-| 107 | A | Histogram wiring + `/api/v1/slo` route. | `cargo test -p lvqr-admin --test slo_route` |
+| 107 | A | New `lvqr-admin::slo` module: `LatencyTracker` + `SloEntry` + per-(broadcast, transport) ring-buffer percentile estimator (1024-sample cap, sort-on-query) + `metrics::histogram!("lvqr_subscriber_glass_to_glass_ms", "broadcast", "transport")` fan-out on every `record()` call. `AdminState::with_slo(tracker)` + `GET /api/v1/slo` route returning `{ broadcasts: [SloEntry..] }` sorted by `(broadcast, transport)`. `lvqr-fragment::Fragment` gained `ingest_time_ms: u64` field + `Fragment::with_ingest_time_ms(ms)` builder (0 = unset). `lvqr-ingest::dispatch::publish_fragment` stamps `ingest_time_ms` with `SystemTime::now().as_millis()` when unset, so every ingest protocol (RTMP, SRT, RTSP, WHIP, WS) automatically gets the ingest stamp without per-protocol wiring. `lvqr-cli::start` builds one `LatencyTracker`, threads it into `BroadcasterHlsBridge::install(..., Some(tracker.clone()))` + `AdminState::with_slo(tracker.clone())`, and exposes it on `ServerHandle::slo()` + `TestServer::slo()`. The HLS drain loop records one sample per fragment delivered to the `HlsServer`, skipping zero ingest stamps. `lvqr-cli` re-exports `LatencyTracker` + `SloEntry` so test-utils does not pull `lvqr-admin` in as a direct dep. New inline tests: 5 on `lvqr-admin::slo` (percentile math, ring-buffer eviction, multi-key separation, empty snapshot, clear); 3 on the admin route (empty without tracker, populated with samples, auth-gated). New integration test `crates/lvqr-cli/tests/slo_latency_e2e.rs` boots a `TestServer`, publishes synthetic init + fragment bytes onto the registry with a deliberate 200 ms backdated `ingest_time_ms`, polls `GET /api/v1/slo` until the HLS drain reports 8 samples, and asserts p50 >= 150 ms + max >= p99 >= p50. | `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets --benches -- -D warnings` clean; `cargo test -p lvqr-admin` 25 passed (+3 over session 103 C's 22: the route + tracker + auth-gating integration tests); `cargo test -p lvqr-cli --test slo_latency_e2e` 1 passed; `cargo test --workspace` 909 / 0 / 1 (up from 900; +9 on the default gate from the SLO module + admin route + e2e tests). | **DONE (session 107)** |
 | 108 | B | Grafana alert pack + documentation. | Manual: Grafana imports the JSON. |
 
 ### Risks + mitigations
