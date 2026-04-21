@@ -22,15 +22,31 @@ delta between two wall-clock timestamps:
    through the same dispatch helper, so the field is always present
    for live publishes.
 2. **Egress emit**: the moment the egress surface delivered the
-   fragment to subscribers. For LL-HLS, this is the `push_chunk_bytes`
-   call inside `BroadcasterHlsBridge::drain` (107 A). For MPEG-DASH,
-   this is the `push_video_segment` / `push_audio_segment` call inside
-   `BroadcasterDashBridge::drain` (109 A); samples are per-Fragment,
-   not per-finalized-DASH-segment, so operators reading the
-   "sample rate" panel see one tick per incoming fragment even though
-   DASH `$Number$` URIs address full segments. WS / MoQ / WHEP
-   instrumentation is a small additive follow-up, blocked on MoQ
-   frame-carried ingest-time propagation.
+   fragment to subscribers. Four drain points are live:
+   * LL-HLS -- `push_chunk_bytes` inside
+     `BroadcasterHlsBridge::drain` (107 A). One sample per
+     partial / segment delivery.
+   * MPEG-DASH -- `push_video_segment` / `push_audio_segment`
+     inside `BroadcasterDashBridge::drain` (109 A). Samples are
+     per-Fragment, not per-finalized-DASH-segment, so operators
+     reading the "sample rate" panel see one tick per incoming
+     fragment even though DASH `$Number$` URIs address full
+     segments.
+   * WebSocket fMP4 relay -- an auxiliary
+     `FragmentBroadcasterRegistry` subscription spawned inside
+     `ws_relay_session` (110 A). The MoQ-side drain that feeds
+     the wire is unchanged; the aux subscription samples
+     `Fragment::ingest_time_ms` per-session so a disconnected
+     subscriber does not record ghost samples.
+   * WHEP RTP packetizer -- the `Str0mSessionHandle::on_raw_sample`
+     -> `SessionMsg::Video` -> `write_sample` path in
+     `lvqr-whep::str0m_backend` (110 B). Samples are recorded
+     after `writer.write` returns `Ok(true)`; pre-Connected,
+     codec-mismatch, and AAC-to-Opus drops are excluded so the
+     histogram only sees real RTP packets.
+   Pure MoQ subscribers drinking directly from `OriginProducer`
+   stay out of scope for server-side measurement; their latency is
+   a Tier 5 client-SDK telemetry item.
 
 The histogram labels are:
 
@@ -227,16 +243,20 @@ histogram_quantile(
 
 ## v1 limitations
 
-* **LL-HLS (107 A) + MPEG-DASH (109 A) egress instrumentation is
-  live**. WS / MoQ / WHEP still need a one-line
-  `tracker.record(broadcast, transport, delta_ms)` at their
-  subscriber-delivery point; those drains consume `moq_lite` frames
-  rather than `Fragment` values, so the `ingest_time_ms` stamp is
-  not on the wire today and wiring them up is a small design session
-  (`carry ingest_time_ms on the MoQ frame header` is the canonical
-  approach). The alert pack + dashboard already label-match
-  generically on `transport`, so they light up automatically the
-  moment a new transport starts recording samples.
+* **LL-HLS (107 A) + MPEG-DASH (109 A) + WS (110 A) + WHEP (110 B)
+  egress instrumentation is live**. The fifth egress surface --
+  pure MoQ subscribers drinking directly from `OriginProducer` --
+  has no server-side drain task to hook, so its latency is a
+  Tier 5 client-SDK telemetry item rather than a server-side
+  metric. The alert pack + dashboard label-match generically on
+  `transport`, so adding `transport="moq"` samples later (via a
+  client-SDK push endpoint, for example) lights up the existing
+  panels automatically. The 110 scoping decision explicitly
+  rejected the alternative of prefixing every MoQ frame payload
+  with an 8-byte `ingest_time_ms` header, because `moq_lite` 0.15
+  frames are bare `Bytes` with no extension slot and a payload
+  prefix would break every foreign MoQ client that decodes
+  frames as raw CMAF bytes.
 * **No time-windowed retention on the admin snapshot**. The ring
   buffer is size-bounded (1024 samples per key); a quiet broadcast
   keeps stale samples until new traffic arrives. Operators who need

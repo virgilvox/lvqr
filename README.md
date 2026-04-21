@@ -196,7 +196,9 @@ items COMPLETE):**
   post-4.6 follow-ups; the software ladder is the
   feature-complete v1 encode path.
 - **Latency SLO tracker + Prometheus / Grafana alert
-  pack** (item 4.7, COMPLETE sessions 107-108).
+  pack** (item 4.7, COMPLETE sessions 107-108; v1.1
+  follow-ups 109 A + 110 A/B broadened the drain
+  coverage to four of five egress surfaces).
   `Fragment::ingest_time_ms` is auto-stamped at
   `lvqr_ingest::dispatch::publish_fragment` time, so
   every ingest protocol (RTMP / SRT / RTSP / WHIP /
@@ -206,16 +208,19 @@ items COMPLETE):**
   buffer (1024-sample cap, sort-on-query
   p50 / p95 / p99 / max) and fires the
   `lvqr_subscriber_glass_to_glass_ms` Prometheus
-  histogram on every `record()` call. The LL-HLS
-  drain contributes samples under `transport="hls"`
-  and the MPEG-DASH drain under `transport="dash"`;
-  WS / MoQ / WHEP egress instrumentation remains a
-  small additive v1.1 follow-up, blocked on
-  MoQ frame-carried ingest-time propagation (the
-  alert pack + dashboard already label-match
-  generically so new transports light up
-  automatically once they start recording samples).
-  Query
+  histogram on every `record()` call. LL-HLS
+  contributes samples under `transport="hls"`,
+  MPEG-DASH under `"dash"`, the WebSocket fMP4 relay
+  under `"ws"` (per-session aux
+  `FragmentBroadcasterRegistry` subscription so a
+  disconnected subscriber records no ghost samples),
+  and the WHEP RTP packetizer under `"whep"`
+  (recorded after `writer.write` returns `Ok(true)`
+  so pre-Connected + codec-mismatch drops are
+  excluded from the histogram). The fifth egress
+  surface -- pure MoQ subscribers drinking directly
+  from `OriginProducer` -- has no server-side drain
+  task and stays Tier 5 client-SDK scope. Query
   `GET /api/v1/slo` for
   `{ broadcasts: [{ broadcast, transport, p50_ms,
   p95_ms, p99_ms, max_ms, sample_count,
@@ -254,10 +259,12 @@ stream-key CRUD admin API, WHEP audio (AAC to Opus
 transcoder required; a future follow-up atop the 4.6
 software transcoder), hardware-encoder feature flags
 (NVENC / VAAPI / VideoToolbox -- deferred post-4.6),
-WS / MoQ / WHEP egress latency SLO instrumentation
-(additive v1.1 follow-up; 4.7 A + B ship LL-HLS +
-MPEG-DASH today, with the remaining three transports
-blocked on MoQ frame-carried ingest-time propagation),
+pure MoQ subscriber egress latency SLO (the
+remaining v1 SLO gap after the 110 WS + WHEP drain
+additions; server-side measurement would require a
+MoQ wire change that 110's scoping decision
+explicitly rejected, so pure MoQ subscriber latency
+is a Tier 5 client-SDK telemetry item instead),
 stream-modifying WASM filter pipelines (v1 WASM
 runtime is a read-only tap). Every one of these is
 either explicitly on
@@ -267,18 +274,19 @@ None is a silent gap.
 
 ## What's next (post-Tier-4, v1.1)
 
-Tier 4 closed at session 108 B; session 109 A landed
-the first v1.1 follow-up (MPEG-DASH egress SLO
-instrumentation). The next session is the maintainer's
-pick between two candidates documented in
-[`tracking/SESSION_109_BRIEFING.md`](tracking/SESSION_109_BRIEFING.md#post-tier-4-follow-up-candidates):
-MoQ frame-carried ingest-time propagation (unblocks
-WS / MoQ / WHEP SLO instrumentation at once) or the
-first `examples/tier4-demos/` public demo script
-(Tier 4 exit-criterion gap). Longer follow-ups --
-hardware encoders, stream-modifying WASM filters,
-WHEP audio, Tier 5 client SDKs -- are sized in that
-same briefing's prioritization table.
+Tier 4 closed at session 108 B; sessions 109 A + 110
+landed the first two v1.1 follow-ups (MPEG-DASH +
+WS + WHEP egress SLO instrumentation), bringing the
+tracker's transport coverage to four of five egress
+surfaces (the fifth, pure MoQ subscribers, remains
+Tier 5 client-SDK scope). The next session is the
+maintainer's pick from the prioritization table in
+[`tracking/SESSION_110_BRIEFING.md`](tracking/SESSION_110_BRIEFING.md#post-tier-4-follow-up-candidates-refreshed-prioritization):
+the first `examples/tier4-demos/` public demo script
+(Tier 4 exit-criterion gap), hardware encoders
+(NVENC / VideoToolbox / VAAPI / QSV), stream-
+modifying WASM filter pipelines, WHEP audio (AAC
+to Opus), or the Tier 5 client SDK.
 
 ## Quickstart
 
