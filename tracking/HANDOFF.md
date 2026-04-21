@@ -1,17 +1,18 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 915 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **local `main` N+4 ahead of `origin/main` (pre-commit head `eab59fa`)**
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 915 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **local `main` is ahead of `origin/main` (pre-commit head `eab59fa`); see `git log --oneline origin/main..main` for the current count**
 
-**Last Updated**: 2026-04-21 (session 109 A close + follow-up tidy + README drift fix). Session 109 A lands v1.1-A MPEG-DASH egress SLO instrumentation (one `LatencyTracker::record` sample per fragment delivered under `transport="dash"`) plus a small follow-up refactor that consolidates the three private `unix_wall_ms()` copies into a shared `lvqr_core::now_unix_ms()`, plus a README refresh that drops stale "HLS-only" SLO drift. Four commits pending push (feat + close-doc + refactor + README). `git log --oneline origin/main..main` shows the four. crates.io is unchanged.
+**Last Updated**: 2026-04-21 (session 109 A close + follow-up tidy + README drift fix + session 110 briefing). Session 109 A landed v1.1-A MPEG-DASH egress SLO instrumentation plus the `lvqr_core::now_unix_ms()` consolidation plus a README refresh that drops stale "HLS-only" SLO drift. A session 110 briefing document was authored on top of the 109 A chain, scoping the next session as WS + WHEP egress SLO instrumentation with the MoQ wire explicitly kept pure. All commits pending push. crates.io is unchanged.
 
-## Session 110 entry point -- maintainer's choice, v1.1-B
+## Session 110 entry point -- v1.1-B: WS + WHEP egress SLO instrumentation
 
-**Full kick-off briefing:** there is no 110 briefing yet. The session 109 A close block below documents what shipped; pick one of the post-Tier-4 follow-up candidates to start the 110 session. The most likely next picks:
+**Full kick-off briefing:** [`tracking/SESSION_110_BRIEFING.md`](SESSION_110_BRIEFING.md). Copy its contents into a fresh Claude conversation.
 
-* **109 B / 110 A: MoQ frame-carried ingest-time propagation**. The design lever that unblocks WS / MoQ / WHEP SLO instrumentation all at once. Scope: add a per-frame header field (or a sidecar metadata frame) carrying the ingest wall-clock stamp through `moq_lite`'s `TrackConsumer` / `group.read_frame()` surface. 1-2 sessions; design-heavy; medium risk because it touches the MoQ wire format LVQR + foreign clients depend on. Once landed, WS relay / MoQ subscribers / WHEP packetizer can each light up their drain-point `tracker.record(..., "<transport>", delta)` call in a ~1-session follow-up per transport.
-* **110 A: `examples/tier4-demos/` first public demo script**. The Tier 4 exit-criterion gap. Ship one end-to-end script (ffmpeg publish + browser subscribe + live SLO dashboard screenshot) that a reader can run in 60 seconds. 1 session; polish-heavy; low risk.
+**One-line summary:** session 110 lands WS (`transport="ws"`) and WHEP (`transport="whep"`) egress latency SLO instrumentation by threading the shared `LatencyTracker` into the WS relay drain + the WHEP str0m backend. The scoping decision baked into the briefing is **keep the MoQ wire pure**: the WS relay acquires `Fragment::ingest_time_ms` via an auxiliary `FragmentBroadcasterRegistry` subscription alongside its MoQ-side `TrackConsumer` drain (the same pattern HLS + DASH already use), and WHEP grows an `ingest_time_ms: u64` field on its internal `SessionMsg::Video` channel. `MoqTrackSink::push` stays byte-identical so foreign MoQ clients + federation forward paths keep working.
 
-Other candidates in the prioritized queue (all documented in `tracking/SESSION_109_BRIEFING.md`'s "Post-Tier-4 follow-up candidates" table): hardware-encoder backends (NVENC / VAAPI / VideoToolbox / QSV), stream-modifying WASM filter pipelines, WHEP audio transcoder (AAC -> Opus), Tier 5 client SDK.
+After 110 the SLO tracker sees samples from four of five egress surfaces. The fifth (pure MoQ subscribers drinking directly from `OriginProducer`) stays out of server-side measurement scope -- their latency is Tier 5 client-SDK telemetry, matching the "server-side measurement only" limitation already documented in `docs/slo.md`.
+
+**Alternative if the maintainer prefers a different pick:** the briefing's post-Tier-4 follow-up table (at the bottom of `tracking/SESSION_110_BRIEFING.md`) ranks `examples/tier4-demos/` first demo script as row 2, hardware-encoder backends (NVENC / VAAPI / VideoToolbox / QSV) as row 3, stream-modifying WASM filter pipelines as row 4, WHEP audio transcoder (AAC -> Opus) as row 5, Tier 5 client SDK as row 6, and the explicitly-rejected MoQ frame-carried ingest-time propagation as row 7.
 
 ## Session 109 A close (2026-04-21)
 
