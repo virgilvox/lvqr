@@ -41,6 +41,11 @@ lvqr-wasm = { workspace = true }
 # a regular dep (its transitive surface is already present via
 # `lvqr-cli`'s default `cluster` feature).
 lvqr-cluster = { workspace = true }
+# Session 111-B1: TestServer surfaces the mesh coordinator via a
+# `mesh_coordinator()` accessor whose return type names
+# `lvqr_mesh::MeshCoordinator` directly; the dep must resolve at
+# compile time.
+lvqr-mesh = { workspace = true }
 # For the MoQ-client-side federation integration test: constructing a
 # broadcast on one server and subscribing from another requires naming
 # moq-lite types directly. lvqr-moq is the facade.

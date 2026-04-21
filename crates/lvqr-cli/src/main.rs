@@ -155,6 +155,16 @@ struct ServeArgs {
     #[arg(long, env = "LVQR_NO_AUTH_LIVE_PLAYBACK")]
     no_auth_live_playback: bool,
 
+    /// Disable the subscribe-auth gate on the mesh `/signal`
+    /// WebSocket. When unset (default, and `--mesh-enabled` is
+    /// set), the `/signal` upgrade requires the subscribe token
+    /// via a `?token=<token>` query parameter. Noop provider
+    /// deployments see no behavior change because the provider
+    /// always allows. Only meaningful when `--mesh-enabled`.
+    /// Session 111-B1.
+    #[arg(long, env = "LVQR_NO_AUTH_SIGNAL")]
+    no_auth_signal: bool,
+
     /// Directory to record broadcasts into. Omit to disable recording.
     #[arg(long, env = "LVQR_RECORD_DIR")]
     record_dir: Option<PathBuf>,
@@ -435,6 +445,8 @@ async fn serve_from_args(
         #[cfg(feature = "cluster")]
         federation_links: Vec::new(),
         no_auth_live_playback: args.no_auth_live_playback,
+        no_auth_signal: args.no_auth_signal,
+        mesh_root_peer_count: None,
     };
 
     let handle = start(config).await?;

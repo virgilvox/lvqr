@@ -115,3 +115,74 @@ Peers connect to the `/signal` WebSocket endpoint and exchange:
 {"type": "AssignParent", "parent_id": "def456", "depth": 1}
 {"type": "PeerLeft", "peer_id": "abc123"}
 ```
+
+### Authentication
+
+`/signal` participates in the shared subscribe-auth pipeline as
+of session 111-B1. Clients pass the bearer via
+`?token=<subscribe-token>` on the upgrade URL. The token is
+checked against the configured `SubscribeAuth` provider before
+the WebSocket upgrade completes. Noop-provider deployments see
+no behavior change. Configured deployments (static subscribe
+token or JWT) short-circuit with a 401 on any upgrade without
+a valid bearer.
+
+The `--no-auth-signal` CLI flag (and the
+`TestServerConfig::without_signal_auth()` builder) disables the
+gate for deployments that want open signaling with auth scoped
+elsewhere. `Sec-WebSocket-Protocol: lvqr.bearer.<token>` is
+intentionally not yet supported because the upstream
+`lvqr-signal` handler does not echo subprotocols; the feature
+is tracked as a follow-up after the subprotocol-echo lands.
+
+## MoQ-over-DataChannel wire format (v1)
+
+Once the data plane lands (session 111-B2 and later), media
+frames forwarded between peers over WebRTC DataChannels use
+the following framing:
+
+```
+[ 8-byte big-endian object_id ][ raw MoQ frame bytes ]
+```
+
+Each DataChannel message carries exactly one MoQ frame. The
+8-byte big-endian `object_id` prefix is the MoQ track-scoped
+object identifier the sender's producer emitted; receivers
+strip the prefix, use the `object_id` for gap detection and
+skip/reconnect reconciliation, and forward the raw bytes to
+their MSE pipeline.
+
+Design rationale:
+
+- **Server-authoritative ordering.** The `object_id` comes
+  from the server's MoQ producer, not a peer-side counter, so
+  reconnecting children can align with the parent without a
+  sync handshake.
+- **MoQ wire stays pure on the QUIC side.** The prefix only
+  exists on the DataChannel leg; the MoQ-over-QUIC leg
+  continues to ship bare frames, matching the 110 scoping
+  decision (no MoQ wire changes to preserve foreign-client
+  compatibility).
+- **Single message per frame.** One DataChannel send = one
+  MoQ frame. DataChannel already fragments large messages
+  across SCTP chunks; no application-layer fragmentation is
+  needed. Future iterations can pack multiple small frames
+  per message if bandwidth measurements warrant.
+
+## Admin route
+
+`GET /api/v1/mesh` returns the current tree-shape snapshot
+(also reachable in-process via
+`ServerHandle::mesh_coordinator()` in integration tests as of
+session 111-B1):
+
+```json
+{
+  "enabled": true,
+  "peer_count": 42,
+  "offload_percentage": 0.0
+}
+```
+
+`offload_percentage` is intended offload based on tree shape,
+not measured traffic, until the data plane ships.

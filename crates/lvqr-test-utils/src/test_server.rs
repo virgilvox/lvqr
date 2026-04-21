@@ -62,6 +62,8 @@ pub struct TestServerConfig {
     federation_links: Vec<lvqr_cluster::FederationLink>,
     relay_addr: Option<SocketAddr>,
     no_auth_live_playback: bool,
+    no_auth_signal: bool,
+    mesh_root_peer_count: Option<usize>,
 }
 
 impl TestServerConfig {
@@ -227,6 +229,28 @@ impl TestServerConfig {
         self.no_auth_live_playback = true;
         self
     }
+
+    /// Disable the subscribe-auth gate on the mesh `/signal`
+    /// WebSocket. Mirrors the CLI's `--no-auth-signal` flag.
+    /// When unset (default, and `with_mesh` is also set), the
+    /// TestServer requires a valid subscribe token via the
+    /// `?token=<token>` query parameter on every `/signal`
+    /// upgrade. Session 111-B1.
+    pub fn without_signal_auth(mut self) -> Self {
+        self.no_auth_signal = true;
+        self
+    }
+
+    /// Override the mesh `root_peer_count` so tests can exercise
+    /// the `AssignParent` path with a small number of peers.
+    /// Defaults to the `lvqr_mesh::MeshConfig::default()` value
+    /// of 30; tests that want the second peer to become a child
+    /// of the first set this to 1. Only meaningful when
+    /// `with_mesh` is set. Session 111-B1.
+    pub fn with_mesh_root_peer_count(mut self, count: usize) -> Self {
+        self.mesh_root_peer_count = Some(count);
+        self
+    }
 }
 
 /// A running LVQR server bound to ephemeral loopback ports.
@@ -293,6 +317,8 @@ impl TestServer {
             cluster_advertise_rtsp: None,
             federation_links: config.federation_links,
             no_auth_live_playback: config.no_auth_live_playback,
+            no_auth_signal: config.no_auth_signal,
+            mesh_root_peer_count: config.mesh_root_peer_count,
         };
         let handle = start(serve_config).await?;
         Ok(Self { handle })
@@ -427,6 +453,22 @@ impl TestServer {
     /// WebSocket subscribe URL for a broadcast (e.g. `"live/test"`).
     pub fn ws_url(&self, broadcast: &str) -> String {
         self.handle.ws_url(broadcast)
+    }
+
+    /// Mesh `/signal` WebSocket URL. The underlying `ServerHandle`
+    /// mounts `/signal` on the admin port when `mesh_enabled` is
+    /// set. Integration tests append a `?token=<token>` query
+    /// parameter to carry the subscribe bearer. Session 111-B1.
+    pub fn signal_url(&self) -> String {
+        self.handle.signal_url()
+    }
+
+    /// Mesh coordinator handle. `None` when the TestServer was
+    /// started without `with_mesh(..)`. Tests inspect
+    /// `peer_count()` + `offload_percentage()` directly on the
+    /// coordinator to assert on tree state. Session 111-B1.
+    pub fn mesh_coordinator(&self) -> Option<&std::sync::Arc<lvqr_mesh::MeshCoordinator>> {
+        self.handle.mesh_coordinator()
     }
 
     /// WebSocket ingest URL for a broadcast.

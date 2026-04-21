@@ -3491,6 +3491,7 @@ dependencies = [
  "lvqr-cluster",
  "lvqr-core",
  "lvqr-fragment",
+ "lvqr-mesh",
  "lvqr-moq",
  "lvqr-transcode",
  "lvqr-wasm",

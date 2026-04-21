@@ -270,6 +270,27 @@ pub struct ServeConfig {
     /// (Noop provider) see no behavior change either way
     /// because the provider always allows. Session 112.
     pub no_auth_live_playback: bool,
+    /// Escape hatch for deployments that want an unauthenticated
+    /// mesh `/signal` WebSocket. When `false` (default), the
+    /// composition root wraps `/signal` with the same
+    /// `SubscribeAuth` gate pattern that protects other
+    /// subscribe-side surfaces: `Sec-WebSocket-Protocol:
+    /// lvqr.bearer.<token>` preferred, `?token=<token>` query
+    /// fallback. Noop provider deployments see no behavior
+    /// change because the provider always allows. Configured
+    /// deployments (static token, JWT) now require a bearer
+    /// on every `/signal` upgrade. Only meaningful when
+    /// `mesh_enabled` is `true`. Session 111-B1.
+    pub no_auth_signal: bool,
+    /// Override the mesh `root_peer_count` (number of peers
+    /// that connect directly to the origin before the tree
+    /// starts assigning parents). `None` uses the
+    /// `lvqr_mesh::MeshConfig::default()` value of 30. Tests
+    /// that want to exercise the `AssignParent` path with a
+    /// small number of peers set this to 1 so the second peer
+    /// becomes a child of the first. Only meaningful when
+    /// `mesh_enabled` is `true`. Session 111-B1.
+    pub mesh_root_peer_count: Option<usize>,
 }
 
 impl ServeConfig {
@@ -318,6 +339,8 @@ impl ServeConfig {
             #[cfg(feature = "transcode")]
             source_bandwidth_kbps: None,
             no_auth_live_playback: false,
+            no_auth_signal: false,
+            mesh_root_peer_count: None,
         }
     }
 }
@@ -374,6 +397,14 @@ pub struct ServerHandle {
     /// start() so the route sees per-(broadcast, transport) samples
     /// drawn from the whole server. Tier 4 item 4.7 session A.
     slo: lvqr_admin::LatencyTracker,
+    /// Mesh coordinator backing the `/api/v1/mesh` admin route
+    /// and the `/signal` WebSocket. `Some` when
+    /// [`ServeConfig::mesh_enabled`] was `true` at `start()`,
+    /// `None` otherwise. Integration tests use
+    /// [`ServerHandle::mesh_coordinator`] to assert on tree
+    /// state after driving WS subscribers through the relay.
+    /// Session 111-B1.
+    mesh_coordinator: Option<Arc<lvqr_mesh::MeshCoordinator>>,
     /// WASM filter hot-reload watcher kept alive for the
     /// server's lifetime when `--wasm-filter` is configured.
     /// On every debounced change to the module path, the
@@ -583,6 +614,26 @@ impl ServerHandle {
     /// samples. Tier 4 item 4.7 session A.
     pub fn slo(&self) -> &lvqr_admin::LatencyTracker {
         &self.slo
+    }
+
+    /// Mesh coordinator backing the `/api/v1/mesh` admin route
+    /// and the `/signal` WebSocket. Returns `None` when the
+    /// server was started with `mesh_enabled = false`. Tests
+    /// call `peer_count()` + `offload_percentage()` directly on
+    /// the coordinator to assert on tree state without going
+    /// through the admin HTTP surface. Session 111-B1.
+    pub fn mesh_coordinator(&self) -> Option<&Arc<lvqr_mesh::MeshCoordinator>> {
+        self.mesh_coordinator.as_ref()
+    }
+
+    /// Construct the WebSocket `/signal` URL. The returned URL
+    /// points at the admin port (the same axum service that
+    /// mounts `/signal`). Tests add a
+    /// `Sec-WebSocket-Protocol: lvqr.bearer.<token>` header or a
+    /// `?token=<token>` query parameter for the subscribe-auth
+    /// gate. Session 111-B1.
+    pub fn signal_url(&self) -> String {
+        format!("ws://{}/signal", self.admin_addr)
     }
 
     /// Trigger graceful shutdown and wait for every subsystem to drain.
@@ -1320,14 +1371,25 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         .route("/ingest/{*broadcast}", get(ws_ingest_handler))
         .with_state(ws_state);
 
-    let combined_router = {
-        let admin_router = if config.mesh_enabled {
-            let mesh_config = lvqr_mesh::MeshConfig {
-                max_children: config.max_peers,
-                ..Default::default()
-            };
-            let mesh = Arc::new(lvqr_mesh::MeshCoordinator::new(mesh_config));
+    // Session 111-B1: hoist `MeshCoordinator` construction out of
+    // the admin-router block so it can be stored on `ServerHandle`
+    // and accessed by integration tests + the session 111-B2
+    // `ws_relay_session` subscriber-registration wiring. `None`
+    // when `mesh_enabled = false`; `Some(Arc::new(..))` otherwise.
+    let mesh_coordinator: Option<Arc<lvqr_mesh::MeshCoordinator>> = if config.mesh_enabled {
+        let default_mesh = lvqr_mesh::MeshConfig::default();
+        let mesh_config = lvqr_mesh::MeshConfig {
+            max_children: config.max_peers,
+            root_peer_count: config.mesh_root_peer_count.unwrap_or(default_mesh.root_peer_count),
+            ..default_mesh
+        };
+        Some(Arc::new(lvqr_mesh::MeshCoordinator::new(mesh_config)))
+    } else {
+        None
+    };
 
+    let combined_router = {
+        let admin_router = if let Some(mesh) = mesh_coordinator.clone() {
             let mesh_for_cb = mesh.clone();
             relay.set_connection_callback(Arc::new(move |conn_id, connected| {
                 let peer_id = format!("conn-{conn_id}");
@@ -1409,11 +1471,25 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
 
             tracing::info!(
                 max_children = config.max_peers,
+                auth_gate = !config.no_auth_signal,
                 "peer mesh enabled (/signal endpoint active)"
             );
 
+            // Session 111-B1: gate /signal with SubscribeAuth
+            // unless `--no-auth-signal` was set. `?token=<token>`
+            // query parameter carries the bearer; Sec-WebSocket-
+            // Protocol support is deferred to 111-B2 pending a
+            // subprotocol-echo upstream in `lvqr-signal`.
+            let mut signal_router = signal.router();
+            if !config.no_auth_signal {
+                signal_router = signal_router.layer(from_fn_with_state(
+                    SignalAuthState { auth: auth.clone() },
+                    signal_auth_middleware,
+                ));
+            }
+
             let router = lvqr_admin::build_router(admin_with_mesh);
-            router.merge(signal.router())
+            router.merge(signal_router)
         } else {
             lvqr_admin::build_router(admin_state)
         };
@@ -1634,6 +1710,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         #[cfg(feature = "transcode")]
         transcode_runner: transcode_runner_handle,
         slo: slo_tracker,
+        mesh_coordinator,
         fragment_registry: shared_registry,
         origin: relay_origin,
         #[cfg(feature = "cluster")]
@@ -1740,6 +1817,67 @@ fn extract_live_playback_token(headers: &HeaderMap, query: &str) -> Option<Strin
     {
         return Some(tok.to_string());
     }
+    for kv in query.split('&') {
+        if let Some((k, v)) = kv.split_once('=')
+            && k == "token"
+            && !v.is_empty()
+        {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+// =====================================================================
+// Mesh /signal subscribe-auth middleware (session 111-B1)
+// =====================================================================
+
+/// State for the `/signal` auth middleware. Mirrors
+/// [`LivePlaybackAuthState`] but without a transport label
+/// since `/signal` is not per-broadcast at the HTTP layer
+/// (clients send `Register { broadcast }` over the WS after
+/// the handshake).
+#[derive(Clone)]
+struct SignalAuthState {
+    auth: SharedAuth,
+}
+
+/// Tower middleware that applies the subscribe-auth gate to
+/// the mesh `/signal` WebSocket. Accepts the bearer via the
+/// `?token=<token>` query parameter. The WS subprotocol path
+/// is intentionally unused for 111-B1: the underlying
+/// `lvqr_signal::SignalServer` handler does not echo
+/// `Sec-WebSocket-Protocol` back to the client, so relying on
+/// subprotocol-carried bearer would break the RFC 6455
+/// handshake for strict clients. Future work in 111-B2+ can
+/// add subprotocol echo and re-enable the header path for
+/// consistency with `/ws/*`.
+///
+/// `NoopAuthProvider` deployments see no behavior change
+/// because the provider always returns `Allow`. Configured
+/// deployments (static token, JWT) get an automatic 401 on
+/// any `/signal` upgrade without a valid bearer.
+async fn signal_auth_middleware(State(state): State<SignalAuthState>, request: Request, next: Next) -> Response {
+    let token = extract_signal_token(request.uri().query().unwrap_or(""));
+    let decision = state.auth.check(&AuthContext::Subscribe {
+        token,
+        broadcast: String::new(),
+    });
+    match decision {
+        AuthDecision::Allow => next.run(request).await,
+        AuthDecision::Deny { reason } => {
+            metrics::counter!("lvqr_auth_failures_total", "entry" => "signal").increment(1);
+            tracing::warn!(reason = %reason, "signal upgrade denied");
+            (StatusCode::UNAUTHORIZED, reason).into_response()
+        }
+    }
+}
+
+/// Extract a bearer token from a `?token=<token>` query string
+/// for the `/signal` auth gate. Kept separate from
+/// [`extract_live_playback_token`] to make the design decision
+/// (no subprotocol support for 111-B1) grep-able per-surface.
+fn extract_signal_token(query: &str) -> Option<String> {
     for kv in query.split('&') {
         if let Some((k, v)) = kv.split_once('=')
             && k == "token"
