@@ -58,12 +58,26 @@ pub struct Fragment {
 
     /// Wire-ready payload bytes.
     pub payload: Bytes,
+
+    /// Server-side wall-clock (UNIX milliseconds) at which the fragment
+    /// was first observed by the ingest path. `0` means the field is
+    /// unset -- typical for fragments constructed in tests or in
+    /// backfill paths that have no real ingest wall-clock. Used by the
+    /// Tier 4 item 4.7 latency SLO tracker to compute server-side
+    /// glass-to-glass delta on each subscriber-side delivery; zero
+    /// values are skipped by the histogram recorder. Never negative,
+    /// so `u64` is a fine fit.
+    pub ingest_time_ms: u64,
 }
 
 impl Fragment {
     /// Construct a new fragment. All fields are required; prefer this over
     /// `Fragment { .. }` so future field additions force an explicit choice
     /// at every construction site.
+    ///
+    /// `ingest_time_ms` defaults to `0` (unset); callers that want the Tier
+    /// 4 item 4.7 latency SLO tracker to observe this fragment should chain
+    /// [`Fragment::with_ingest_time_ms`] directly after `new()`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         track_id: impl Into<String>,
@@ -86,7 +100,17 @@ impl Fragment {
             duration,
             flags,
             payload,
+            ingest_time_ms: 0,
         }
+    }
+
+    /// Stamp the fragment with a UNIX-wall-clock milliseconds ingest time.
+    /// Typical call site: `Fragment::new(...).with_ingest_time_ms(now_ms)`
+    /// inside an ingest protocol's fragment dispatch path. Tier 4 item 4.7
+    /// session A.
+    pub fn with_ingest_time_ms(mut self, ms: u64) -> Self {
+        self.ingest_time_ms = ms;
+        self
     }
 
     /// Size of the payload in bytes. Convenience for metrics reporting.

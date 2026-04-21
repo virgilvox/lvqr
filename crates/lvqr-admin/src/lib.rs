@@ -1,9 +1,11 @@
 pub mod routes;
+pub mod slo;
 
 #[cfg(feature = "cluster")]
 pub mod cluster_routes;
 
 pub use routes::{AdminError, AdminState, MeshState, MetricsRender, StreamInfo, build_router};
+pub use slo::{LatencyTracker, SloEntry};
 
 /// Configuration for the admin HTTP server.
 #[derive(Debug, Clone)]

@@ -54,6 +54,12 @@ pub struct AdminState {
     /// empty link list.
     #[cfg(feature = "cluster")]
     federation_status: Option<lvqr_cluster::FederationStatusHandle>,
+    /// Optional latency SLO tracker. Populated by
+    /// [`AdminState::with_slo`]; consumed by the
+    /// `GET /api/v1/slo` route. `None` means the caller did not
+    /// wire the tracker into any egress surface; the route then
+    /// returns an empty broadcast list. Tier 4 item 4.7 session A.
+    slo: Option<crate::slo::LatencyTracker>,
 }
 
 impl AdminState {
@@ -75,6 +81,7 @@ impl AdminState {
             cluster: None,
             #[cfg(feature = "cluster")]
             federation_status: None,
+            slo: None,
         }
     }
 
@@ -129,6 +136,16 @@ impl AdminState {
     pub(crate) fn federation_status(&self) -> Option<&lvqr_cluster::FederationStatusHandle> {
         self.federation_status.as_ref()
     }
+
+    /// Wire a [`crate::slo::LatencyTracker`] so the
+    /// `GET /api/v1/slo` route can expose per-(broadcast, transport)
+    /// p50 / p95 / p99 / max latency drawn from the tracker's
+    /// rolling sample window. Without this call the route returns
+    /// an empty broadcast list. Tier 4 item 4.7 session A.
+    pub fn with_slo(mut self, tracker: crate::slo::LatencyTracker) -> Self {
+        self.slo = Some(tracker);
+        self
+    }
 }
 
 /// Structured error responses for the admin API.
@@ -156,7 +173,8 @@ pub fn build_router(state: AdminState) -> Router {
     let mut api_routes: Router<AdminState> = Router::new()
         .route("/api/v1/stats", get(get_stats))
         .route("/api/v1/streams", get(list_streams))
-        .route("/api/v1/mesh", get(get_mesh));
+        .route("/api/v1/mesh", get(get_mesh))
+        .route("/api/v1/slo", get(get_slo));
 
     #[cfg(feature = "cluster")]
     {
@@ -201,6 +219,20 @@ async fn list_streams(State(state): State<AdminState>) -> Result<Json<Vec<Stream
 
 async fn get_mesh(State(state): State<AdminState>) -> Result<Json<MeshState>, AdminError> {
     Ok(Json((state.get_mesh)()))
+}
+
+/// `GET /api/v1/slo` handler. Returns `{ "broadcasts": [SloEntry..] }`
+/// drawn from the [`crate::slo::LatencyTracker`] wired via
+/// [`AdminState::with_slo`]. When no tracker is configured the
+/// route returns an empty broadcast list (shape stable for
+/// dashboards that pre-bake the response structure). Tier 4 item
+/// 4.7 session A.
+async fn get_slo(State(state): State<AdminState>) -> Result<Json<serde_json::Value>, AdminError> {
+    let broadcasts = match state.slo.as_ref() {
+        Some(tracker) => tracker.snapshot(),
+        None => Vec::new(),
+    };
+    Ok(Json(json!({ "broadcasts": broadcasts })))
 }
 
 /// Middleware that validates the `Authorization: Bearer` header against the
@@ -443,5 +475,62 @@ mod tests {
             .unwrap();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("lvqr_test 1"));
+    }
+
+    #[tokio::test]
+    async fn slo_route_empty_without_tracker() {
+        let state = test_state(vec![]);
+        let app = build_router(state);
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/slo").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let broadcasts = v.get("broadcasts").expect("broadcasts field present");
+        assert!(broadcasts.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn slo_route_exposes_tracker_snapshot() {
+        let tracker = crate::slo::LatencyTracker::new();
+        for ms in 1..=50u64 {
+            tracker.record("live/demo", "hls", ms * 2);
+        }
+        let state = test_state(vec![]).with_slo(tracker);
+        let app = build_router(state);
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/slo").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let broadcasts = v.get("broadcasts").unwrap().as_array().unwrap();
+        assert_eq!(broadcasts.len(), 1);
+        let first = &broadcasts[0];
+        assert_eq!(first["broadcast"], "live/demo");
+        assert_eq!(first["transport"], "hls");
+        assert_eq!(first["sample_count"], 50);
+        assert_eq!(first["total_observed"], 50);
+        assert!(first["p50_ms"].as_u64().unwrap() > 0);
+        assert!(first["max_ms"].as_u64().unwrap() >= first["p99_ms"].as_u64().unwrap());
+    }
+
+    #[tokio::test]
+    async fn slo_route_respects_admin_auth() {
+        let auth: SharedAuth = Arc::new(StaticAuthProvider::new(StaticAuthConfig {
+            admin_token: Some("secret".into()),
+            ..Default::default()
+        }));
+        let tracker = crate::slo::LatencyTracker::new();
+        let state = test_state(vec![]).with_auth(auth).with_slo(tracker);
+        let app = build_router(state);
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/slo").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

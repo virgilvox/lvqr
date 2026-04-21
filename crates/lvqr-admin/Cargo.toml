@@ -24,6 +24,10 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 metrics = { workspace = true }
+# Tier 4 item 4.7 session A: the `LatencyTracker` in `slo.rs` stores
+# per-broadcast sample ring buffers behind a parking_lot RwLock so the
+# hot-path `record` call and the cold-path admin snapshot do not contend.
+parking_lot = { workspace = true }
 
 [features]
 default = ["cluster"]

@@ -51,16 +51,38 @@ pub fn publish_init(
 }
 
 /// Publish a fragment to the broadcaster-registry path.
+///
+/// The fragment's [`Fragment::ingest_time_ms`] is stamped with the
+/// current UNIX wall-clock milliseconds if unset, so the Tier 4 item
+/// 4.7 latency SLO tracker can compute server-side glass-to-glass
+/// delta on each subscriber-side delivery. Callers that already have
+/// a meaningful ingest stamp (for example a federation relay
+/// preserving the upstream stamp) may pre-stamp the fragment via
+/// [`Fragment::with_ingest_time_ms`]; the helper only overwrites an
+/// unset (`0`) field.
 pub fn publish_fragment(
     registry: &FragmentBroadcasterRegistry,
     broadcast: &str,
     track: &str,
     codec: &str,
     timescale: u32,
-    frag: Fragment,
+    mut frag: Fragment,
 ) {
+    if frag.ingest_time_ms == 0 {
+        frag.ingest_time_ms = unix_wall_ms();
+    }
     let bc = registry.get_or_create(broadcast, track, FragmentMeta::new(codec, timescale));
     bc.emit(frag);
+}
+
+/// UNIX wall-clock milliseconds. Falls back to `0` when the system
+/// clock is set before the UNIX epoch; callers should treat `0` as
+/// "ingest time unset".
+fn unix_wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

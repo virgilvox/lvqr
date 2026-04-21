@@ -35,6 +35,7 @@
 //!   own [`CmafPolicyState`]; there is no cross-broadcast map to lock.
 
 use bytes::Bytes;
+use lvqr_admin::LatencyTracker;
 use lvqr_cmaf::{CmafChunk, CmafPolicy, CmafPolicyState};
 use lvqr_fragment::{BroadcasterStream, FragmentBroadcasterRegistry, FragmentStream};
 use lvqr_hls::{HlsServer, MultiHlsServer};
@@ -42,6 +43,7 @@ use tokio::runtime::Handle;
 
 const VIDEO_TRACK: &str = "0.mp4";
 const AUDIO_TRACK: &str = "1.mp4";
+const TRANSPORT_LABEL: &str = "hls";
 
 /// Broadcaster-native HLS composition helper. Stateless: the struct
 /// itself carries nothing -- `install` wires a registry callback that
@@ -57,12 +59,15 @@ impl BroadcasterHlsBridge {
     /// Callers must invoke this from inside a tokio runtime.
     /// `segment_duration_ms` and `part_duration_ms` configure the
     /// [`CmafPolicy`] each drain task constructs at its track's
-    /// native timescale.
+    /// native timescale. `slo` is an optional latency tracker that
+    /// receives one sample per fragment delivered onto the HLS
+    /// server (Tier 4 item 4.7 session A).
     pub fn install(
         multi: MultiHlsServer,
         segment_duration_ms: u32,
         part_duration_ms: u32,
         registry: &FragmentBroadcasterRegistry,
+        slo: Option<LatencyTracker>,
     ) {
         registry.on_entry_created(move |broadcast, track, bc| {
             let broadcast = broadcast.to_string();
@@ -104,12 +109,14 @@ impl BroadcasterHlsBridge {
                 segment_duration_ms,
                 part_duration_ms,
                 sub,
+                slo.clone(),
             ));
         });
     }
 
     /// Per-broadcaster drain task. Runs until every producer-side
     /// clone of the broadcaster drops.
+    #[allow(clippy::too_many_arguments)]
     async fn drain(
         server: HlsServer,
         broadcast: String,
@@ -118,6 +125,7 @@ impl BroadcasterHlsBridge {
         segment_duration_ms: u32,
         part_duration_ms: u32,
         mut sub: BroadcasterStream,
+        slo: Option<LatencyTracker>,
     ) {
         let mut state = CmafPolicyState::new(CmafPolicy::with_durations(
             timescale,
@@ -170,6 +178,19 @@ impl BroadcasterHlsBridge {
             if let Err(e) = server.push_chunk_bytes(&chunk, payload).await {
                 tracing::debug!(error = ?e, "hls push_chunk_bytes rejected");
             }
+            // Tier 4 item 4.7 session A: record one sample per
+            // fragment delivered to the HLS server. Skipped when the
+            // ingest path did not stamp an `ingest_time_ms` (older
+            // callers, test fixtures, federation relays that
+            // deliberately preserve zero) or when no tracker was
+            // wired in at server startup.
+            if let Some(tracker) = slo.as_ref()
+                && fragment.ingest_time_ms > 0
+            {
+                let now_ms = unix_wall_ms();
+                let latency = now_ms.saturating_sub(fragment.ingest_time_ms);
+                tracker.record(&broadcast, TRANSPORT_LABEL, latency);
+            }
         }
         tracing::info!(
             broadcast = %broadcast,
@@ -177,4 +198,14 @@ impl BroadcasterHlsBridge {
             "BroadcasterHlsBridge: drain terminated (producers closed)",
         );
     }
+}
+
+/// UNIX wall-clock milliseconds. Falls back to `0` when the system
+/// clock is set before the UNIX epoch; callers should treat `0` as
+/// an unset stamp (mirrors `lvqr_ingest::dispatch::unix_wall_ms`).
+fn unix_wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

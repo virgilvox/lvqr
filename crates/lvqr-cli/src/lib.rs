@@ -17,6 +17,11 @@ mod captions;
 pub mod cluster_claim;
 mod hls;
 
+/// Re-export of [`lvqr_admin::LatencyTracker`] so downstream callers
+/// (`lvqr-test-utils`, integration tests) do not need to pull
+/// `lvqr-admin` in as a direct dep. Tier 4 item 4.7 session A.
+pub use lvqr_admin::{LatencyTracker, SloEntry};
+
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
@@ -351,6 +356,11 @@ pub struct ServerHandle {
     /// session 106 C. Feature-gated `#[cfg(feature = "transcode")]`.
     #[cfg(feature = "transcode")]
     transcode_runner: Option<lvqr_transcode::TranscodeRunnerHandle>,
+    /// Shared latency SLO tracker backing the `/api/v1/slo` admin
+    /// route. Cloned into every instrumented egress surface at
+    /// start() so the route sees per-(broadcast, transport) samples
+    /// drawn from the whole server. Tier 4 item 4.7 session A.
+    slo: lvqr_admin::LatencyTracker,
     /// WASM filter hot-reload watcher kept alive for the
     /// server's lifetime when `--wasm-filter` is configured.
     /// On every debounced change to the module path, the
@@ -551,6 +561,15 @@ impl ServerHandle {
     #[cfg(feature = "transcode")]
     pub fn transcode_runner(&self) -> Option<&lvqr_transcode::TranscodeRunnerHandle> {
         self.transcode_runner.as_ref()
+    }
+
+    /// Cloneable handle to the shared
+    /// [`lvqr_admin::LatencyTracker`] that powers the
+    /// `/api/v1/slo` admin route. Tests snapshot this directly
+    /// to assert the instrumented egress surfaces are recording
+    /// samples. Tier 4 item 4.7 session A.
+    pub fn slo(&self) -> &lvqr_admin::LatencyTracker {
+        &self.slo
     }
 
     /// Trigger graceful shutdown and wait for every subsystem to drain.
@@ -787,6 +806,14 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // callback against it.
     let shared_registry = FragmentBroadcasterRegistry::new();
 
+    // Tier 4 item 4.7 session A: one shared `LatencyTracker` per
+    // server feeds samples from every instrumented egress surface
+    // (currently LL-HLS drain + WS relay) and powers the
+    // `/api/v1/slo` admin route + the
+    // `lvqr_subscriber_glass_to_glass_ms` Prometheus histogram.
+    // Tests read the snapshot directly off `ServerHandle::slo()`.
+    let slo_tracker = lvqr_admin::LatencyTracker::new();
+
     // Auto-claim every new broadcast against the cluster so peers
     // redirect correctly without the operator having to call
     // `Cluster::claim_broadcast` by hand. The bridge holds the
@@ -864,6 +891,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             config.hls_target_duration_secs * 1000,
             config.hls_part_target_ms,
             &shared_registry,
+            Some(slo_tracker.clone()),
         );
         // Tier 4 item 4.5 session C: feed the captions
         // sub-track into the per-broadcast subtitles
@@ -1255,6 +1283,10 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         Some(runner) => admin_state.with_federation_status(runner.status_handle()),
         None => admin_state,
     };
+    // Tier 4 item 4.7 session A: expose the shared latency tracker
+    // so `GET /api/v1/slo` returns per-(broadcast, transport)
+    // p50 / p95 / p99 / max samples.
+    let admin_state = admin_state.with_slo(slo_tracker.clone());
 
     // WebSocket fMP4 relay + WebSocket ingest state.
     let ws_state = WsRelayState {
@@ -1554,6 +1586,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         agent_runner: agent_runner_handle,
         #[cfg(feature = "transcode")]
         transcode_runner: transcode_runner_handle,
+        slo: slo_tracker,
         fragment_registry: shared_registry,
         origin: relay_origin,
         #[cfg(feature = "cluster")]

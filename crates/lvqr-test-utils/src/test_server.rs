@@ -365,6 +365,14 @@ impl TestServer {
         self.handle.transcode_runner()
     }
 
+    /// Shared latency SLO tracker (read-only). Tests snapshot
+    /// this to assert the server's egress surfaces are recording
+    /// per-(broadcast, transport) latency samples. Tier 4 item
+    /// 4.7 session A.
+    pub fn slo(&self) -> &lvqr_cli::LatencyTracker {
+        self.handle.slo()
+    }
+
     /// Cloneable handle to the server's relay-backing
     /// [`lvqr_moq::OriginProducer`]. Tier 4 item 4.4 session B
     /// federation tests use this to inject synthetic MoQ
