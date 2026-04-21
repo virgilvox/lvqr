@@ -1,8 +1,51 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.8 COMPLETE + 4.7 session A DONE (7.5 of 8 Tier 4 items done; only 4.7 session B Grafana alert pack remains); 909 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **origin/main synced (head `d10e003`)**
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 912 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; local `main` N+2 ahead of `origin/main` (pre-commit head `88d712b`)
 
-**Last Updated**: 2026-04-21 (session 107 A push event). Session 107 A's two commits (`4201eee` feat + `d10e003` close-doc) are pushed to `origin/main`. `git log --oneline origin/main..main` is empty. crates.io is unchanged. Session 108 B is the Grafana alert pack + documentation layer on top. After 108 B lands, Tier 4 is COMPLETE.
+**Last Updated**: 2026-04-21 (session 108 B close). Tier 4 is closed. Session 108 B shipped the Prometheus / Grafana alert pack + operator runbook on top of the 4.7 A tracker wiring. Next sessions are whatever the maintainer picks up: v1.1 follow-ups (WS / DASH / MoQ / WHEP SLO instrumentation, stream-modifying WASM filters, hardware-encoder feature flags, WHEP audio transcoder), Tier 5 client SDK work, or the M4 marketing milestone demo.
+
+## Session 108 B close (2026-04-21)
+
+1. **Tier 4 item 4.7 session B: Grafana / Prometheus alert pack + operator runbook** (feat commit).
+   * `deploy/grafana/alerts/lvqr-slo.rules.yaml` (new): Prometheus-format rule pack with five rules keyed by `(broadcast, transport)`: `LvqrSloLatencyP99VeryHigh` (critical, p99 > 4 s for 2 min), `LvqrSloLatencyP99High` (warning, p99 > 2 s for 5 min), `LvqrSloLatencyP95High` (warning, p95 > 1.5 s for 5 min), `LvqrSloLatencyP50High` (info, p50 > 500 ms for 10 min), `LvqrSloNoRecentSamples` (warning, catches drain-stall without firing on clean publisher disconnect via the 30-min lookback). Every rule's `runbook_url` annotation points at the matching named section in `docs/slo.md`.
+   * `deploy/grafana/dashboards/lvqr-slo.json` (new): Grafana schema-38 dashboard (`uid: "lvqr-slo"`, title "LVQR Latency SLO") with four panels -- p99 timeseries (heat thresholds at 2 s warning / 4 s critical), p95 timeseries, p50 timeseries, and the per-`(broadcast, transport)` sample rate feeding the histogram. `${DS_PROMETHEUS}` datasource variable so any Prometheus-shaped backend wires in.
+   * `deploy/grafana/README.md` (new): import-path documentation covering Prometheus `rule_files:`, Grafana Cloud managed alert rules, Grafana UI import, and provisioning YAML. Links back to `docs/slo.md` for threshold tuning.
+   * `docs/slo.md` (new): operator runbook. Five named sections (`Critical p99 above 4s`, `Warning p99 above 2s`, `Warning p95 above 1.5s`, `Info p50 above 500ms`, `No recent samples`) matching every alert's `runbook_url` anchor, plus `Threshold tuning by transport` with the HLS / DASH / WHEP / MoQ / WS threshold decision table. Covers metric shape (what's measured + what's explicitly NOT measured), `/api/v1/slo` response shape, and troubleshooting checklists.
+   * `docs/observability.md`: new "Latency SLO (Tier 4 item 4.7)" section linking the rule pack, dashboard, and runbook.
+   * **`crates/lvqr-admin/tests/slo_assets.rs`** (new): three asset-hygiene tests that read each file off disk and assert the expected contents. Guards against silent drift (renaming an alert in code without updating the rule pack, or vice versa). String-based checks rather than full YAML/JSON deserialization so we do not pull `serde_yaml` in for asset hygiene -- the authoritative YAML validation runs via `promtool check rules` in CI / operator tooling.
+
+2. **Session 108 B close doc** (this commit).
+
+### Key 4.7 session B design decisions baked in (confirmed in-commit per the plan-vs-code rule)
+
+* **Rule pack in Prometheus format, not Grafana-managed alert format**. Prometheus YAML is the most portable: consumed by Prometheus directly, Grafana Cloud's alert rule import, Alertmanager, Thanos Ruler, Cortex / Mimir. A Grafana-managed alert JSON export would lock operators into Grafana's alert engine, which many LVQR deployments avoid in favour of the Prometheus-native stack.
+* **Dashboard ships as schema-38 Grafana JSON, not a Terraform / Helm resource**. Same portability argument: JSON import works in every Grafana 10+ deployment without a provisioning layer. Operators who want GitOps add it to their `/etc/grafana/provisioning/dashboards/` path; the README documents both routes.
+* **Thresholds tuned for LL-HLS defaults, with a documented tuning decision table for other transports**. Shipping one rule pack that claims to work for every egress surface would be dishonest -- WebRTC's p99 budget is ~500 ms, LL-HLS's is ~2 s. The table in `docs/slo.md` tells operators exactly how to clone + scope the rules for their deployment.
+* **Asset-hygiene test uses string matching, not YAML deserialization**. The `serde_yaml` dep is heavy (depends on `unsafe-libyaml`) and we only need to catch drift, not validate against the Prometheus schema. Test failures surface with clear "rule pack missing `alert: X`" messages; the authoritative YAML validation is `promtool check rules` which CI runs separately.
+* **Every alert's `runbook_url` points at a named section in `docs/slo.md`**. On-call engineers land on a specific diagnostic checklist, not the repo root. The asset-hygiene test enforces that every alert has a runbook URL and every docs anchor exists so links never rot silently.
+* **Dashboard uid locked to `"lvqr-slo"`**. External runbooks, the rule pack's `runbook_url`, and integration tests all reference this uid; a rename would break every link. The asset-hygiene test guards it.
+* **Rule pack separates p99 into two tiers (4 s critical + 2 s warning) rather than a single threshold with routing labels**. Keeps the fire-delay and severity decisions in the rule file itself rather than pushing complexity into Alertmanager routing. Operators can still override severity via labels on the alert rule consumer.
+
+### Ground truth (session 108 B close; Tier 4 COMPLETE)
+
+* **Head**: feat commit (pending) + this close-doc commit (pending). Local `main` will be N+2 ahead of `origin/main`; no push event in this block. Pre-commit head on `origin/main`: `88d712b`.
+* **Tests (default features gate)**: **912** passed, 0 failed, 1 ignored on macOS. +3 over session 107 A's 909 (three asset-hygiene tests in the new `crates/lvqr-admin/tests/slo_assets.rs`). The 1 ignored is the pre-existing `moq_sink` doctest.
+* **Tier 4 execution status**: **COMPLETE**. 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8 all DONE. The last open items are v1.1 follow-ups explicitly documented as post-Tier-4 scope (WS / DASH / MoQ / WHEP egress SLO instrumentation on top of the 4.7 A wiring; hardware-encoder backends NVENC / VAAPI / VideoToolbox / QSV; stream-modifying WASM filter pipelines; WHEP audio transcoder; M4 marketing demo).
+* **CI gates locally clean**:
+  * `cargo fmt --all --check`.
+  * `cargo clippy --workspace --all-targets --benches -- -D warnings`.
+  * `cargo test -p lvqr-admin --test slo_assets` 3 passed.
+  * `cargo test --workspace` 912 / 0 / 1.
+* **Workspace**: **29 crates**, unchanged.
+* **crates.io**: unchanged. Session 108 B ships no Rust source outside the new test, so the pending re-publish chain from session 105 still lands cleanly on the next release.
+
+### Known limitations / documented v1 shape (after Tier 4 close)
+
+* **HLS-only egress SLO instrumentation**: WS / DASH / MoQ / WHEP subscribers need a one-line `tracker.record(broadcast, transport, delta_ms)` call at their subscriber-delivery point. Each is a small additive change; the alert pack + dashboard already label-match generically so they light up automatically when a new transport records samples.
+* **Server-side measurement only**: true glass-to-glass requires browser SDK telemetry (Tier 5 client SDK scope).
+* **Hardware encoders deferred post-4.6**: NVENC, VideoToolbox, VAAPI, QSV -- unchanged from the 4.6 close.
+* **Admission control deferred**: per 4.7 anti-scope, operators react via alerts; the server does not refuse subscribers preemptively.
+* **No admin-state `/api/v1/slo` authentication exemption**: the route is bearer-gated alongside the other `/api/v1/*` paths; dashboards scraping it need a token.
 
 ## Session 107 A close (2026-04-21)
 
