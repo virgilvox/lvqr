@@ -12,6 +12,10 @@ categories = ["multimedia", "web-programming"]
 
 [dependencies]
 lvqr-cmaf = { workspace = true }
+# Tier 4 item 4.7 session 109 A follow-up: direct dep on lvqr-core so
+# the DASH drain can call `lvqr_core::now_unix_ms()` rather than keep a
+# byte-identical private helper alongside the ingest + HLS copies.
+lvqr-core = { workspace = true }
 lvqr-fragment = { workspace = true }
 # Tier 4 item 4.7 session 109 A: the DASH drain task records one
 # `LatencyTracker::record("dash")` sample per delivered fragment so

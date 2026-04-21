@@ -35,6 +35,7 @@
 //! [`BroadcasterStream::refresh_meta`]: lvqr_fragment::BroadcasterStream::refresh_meta
 
 use bytes::Bytes;
+use lvqr_core::now_unix_ms;
 use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentMeta};
 
 /// Publish an init segment to the broadcaster-registry path.
@@ -69,20 +70,10 @@ pub fn publish_fragment(
     mut frag: Fragment,
 ) {
     if frag.ingest_time_ms == 0 {
-        frag.ingest_time_ms = unix_wall_ms();
+        frag.ingest_time_ms = now_unix_ms();
     }
     let bc = registry.get_or_create(broadcast, track, FragmentMeta::new(codec, timescale));
     bc.emit(frag);
-}
-
-/// UNIX wall-clock milliseconds. Falls back to `0` when the system
-/// clock is set before the UNIX epoch; callers should treat `0` as
-/// "ingest time unset".
-fn unix_wall_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

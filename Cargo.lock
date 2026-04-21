@@ -3246,6 +3246,7 @@ dependencies = [
  "http-body-util",
  "lvqr-admin",
  "lvqr-cmaf",
+ "lvqr-core",
  "lvqr-fragment",
  "proptest",
  "thiserror 2.0.18",

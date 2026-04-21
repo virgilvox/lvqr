@@ -1,8 +1,8 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 913 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **local `main` N+2 ahead of `origin/main` (pre-commit head `eab59fa`)**
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 915 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **local `main` N+3 ahead of `origin/main` (pre-commit head `eab59fa`)**
 
-**Last Updated**: 2026-04-21 (session 109 A close). Session 109 A lands v1.1-A MPEG-DASH egress SLO instrumentation (one `LatencyTracker::record` sample per fragment delivered under `transport="dash"`). Two commits pending push (feat + close-doc). `git log --oneline origin/main..main` shows the two. crates.io is unchanged.
+**Last Updated**: 2026-04-21 (session 109 A close + follow-up tidy). Session 109 A lands v1.1-A MPEG-DASH egress SLO instrumentation (one `LatencyTracker::record` sample per fragment delivered under `transport="dash"`) plus a small follow-up refactor that consolidates the three private `unix_wall_ms()` copies into a shared `lvqr_core::now_unix_ms()`. Three commits pending push (feat + close-doc + refactor). `git log --oneline origin/main..main` shows the three. crates.io is unchanged.
 
 ## Session 110 entry point -- maintainer's choice, v1.1-B
 
@@ -35,12 +35,12 @@ Other candidates in the prioritized queue (all documented in `tracking/SESSION_1
 * **DASH samples are per-Fragment, not per-finalized-`$Number$`-segment**. DASH's `SegmentTemplate` live-profile addresses full segments via `$Number$` URIs; a typical DASH segment is 2-6 s and may aggregate several incoming `Fragment` values before the segmenter finalizes it. The SLO tracker intentionally records at the `push_video_segment` / `push_audio_segment` call site, so operators get one sample per fragment arrival (the finest-grained latency signal available on the drain) rather than one sample per finalized segment (which would undersample the histogram during warm-up). This matches the HLS drain's per-`push_chunk_bytes` sample cadence.
 * **`default-features = false` on the new `lvqr-admin` dep in `lvqr-dash/Cargo.toml` was rejected by cargo**. The workspace root's `[workspace.dependencies]` entry for `lvqr-admin` does not pre-declare `default-features`, and cargo's rule is that inherited workspace deps cannot toggle default-features without a workspace-level override. Dropping the override is harmless: `lvqr-admin`'s default `cluster` feature pulls in `lvqr-cluster` + `lvqr-moq`, both of which were already reachable from `lvqr-dash`'s transitive graph via `lvqr-cmaf` / workspace siblings, so no new crate is introduced into `lvqr-dash`'s build.
 * **Only DASH in this session; WS / MoQ / WHEP deferred**. DASH's `BroadcasterDashBridge` drains `Fragment` values from the shared `FragmentBroadcasterRegistry`, so `Fragment::ingest_time_ms` is available for free at the drain point. WS relay (`lvqr-cli::ws_relay_session`), MoQ subscribers (`OriginProducer`), and WHEP (`str0m` RTP packetizer) each consume `moq_lite` `Bytes` frames that do not carry the ingest wall-clock stamp on the MoQ wire today. Instrumenting them requires either a MoQ frame-header design change or a sidecar sampling heuristic; both are v1.1 design sessions rather than one-line wiring changes and are deferred to the 110 A entry point.
-* **Three copies of `unix_wall_ms()` now exist** (`lvqr-ingest::dispatch`, `lvqr-cli::hls`, `lvqr-dash::bridge`). Three is the tipping point for a shared helper; moving it to `lvqr-core` as a `pub fn now_unix_ms() -> u64` is a legitimate 15-minute cleanup candidate, deferred to a future tidy session because it has zero behavior change and would add noise to the 109 A feat diff.
+* **Three copies of `unix_wall_ms()` previously existed** (`lvqr-ingest::dispatch`, `lvqr-cli::hls`, `lvqr-dash::bridge`) and were consolidated in a separate follow-up `refactor(core)` commit immediately after the 109 A close doc landed. New `lvqr_core::now_unix_ms()` is the single source of truth; `lvqr-dash` gained a direct `lvqr-core` dep (it was only reachable transitively via `lvqr-cmaf` before). Two inline smoke tests guard the helper against silent regressions. Zero behavior change; the refactor commit is independent of the feat so a reviewer can bisect either leg cleanly.
 
 ### Ground truth (session 109 A close)
 
-* **Head**: feat commit (pending) + this close-doc commit (pending). Local `main` will be N+2 ahead of `origin/main`; no push event in this block. Pre-commit head on `origin/main`: `eab59fa`.
-* **Tests (default features gate)**: **913** passed, 0 failed, 1 ignored on macOS. +1 over session 108 B's 912 (the new `slo_route_reports_dash_latency_samples_after_publish` integration test in `crates/lvqr-cli/tests/slo_latency_e2e.rs`). The 1 ignored is the pre-existing `moq_sink` doctest.
+* **Head**: feat commit `4b44f9b` + close-doc commit `eeb49ef` + refactor follow-up commit (pending). Local `main` will be N+3 ahead of `origin/main` once the refactor lands; no push event in this block. Pre-commit head on `origin/main`: `eab59fa`.
+* **Tests (default features gate)**: **915** passed, 0 failed, 1 ignored on macOS. +3 over session 108 B's 912: the new `slo_route_reports_dash_latency_samples_after_publish` integration test in `crates/lvqr-cli/tests/slo_latency_e2e.rs` (+1) plus the two inline smoke tests guarding `lvqr_core::now_unix_ms()` in `crates/lvqr-core/src/lib.rs` (+2). The 1 ignored is the pre-existing `moq_sink` doctest.
 * **Tier 4 execution status**: **COMPLETE** (unchanged). This session lands a v1.1 follow-up; it does not reopen the Tier 4 close.
 * **CI gates locally clean**:
   * `cargo fmt --all --check`.
@@ -48,7 +48,7 @@ Other candidates in the prioritized queue (all documented in `tracking/SESSION_1
   * `cargo test -p lvqr-dash` 29 + 3 + 4 + 5 passed (lib + proptest + router + proptest_mpd targets unchanged from 108 B counts; the new slo wiring does not add bridge-scope tests).
   * `cargo test -p lvqr-admin` 25 + 3 passed (unchanged from 108 B; the new `lvqr-admin` dep edge from `lvqr-dash` does not touch any admin-crate tests).
   * `cargo test -p lvqr-cli --test slo_latency_e2e` 2 passed (both HLS and new DASH test functions).
-  * `cargo test --workspace` 913 / 0 / 1.
+  * `cargo test --workspace` 915 / 0 / 1 (after the refactor follow-up adds the two `time_tests` smoke tests in `lvqr-core`).
 * **Workspace**: **29 crates**, unchanged.
 * **crates.io**: unchanged. Session 109 A additively extends `BroadcasterDashBridge::install`'s public API (trailing `Option<LatencyTracker>`), so the pending re-publish chain from session 105 still lands cleanly on the next release. Downstream callers of `lvqr-dash::BroadcasterDashBridge` outside this workspace (none known) would need to pass a trailing `None`; a semver-major bump is not required because `lvqr-dash` is pre-1.0 but operators should treat this as a source-incompatible change.
 
@@ -59,7 +59,7 @@ Other candidates in the prioritized queue (all documented in `tracking/SESSION_1
 * **Server-side measurement only** (unchanged from 107 A).
 * **No admission control** (unchanged from 108 B).
 * **No time-windowed retention on the admin snapshot** (unchanged from 107 A).
-* **Three copies of `unix_wall_ms()`** across `lvqr-ingest::dispatch`, `lvqr-cli::hls`, and `lvqr-dash::bridge`; ripe for a `lvqr-core::now_unix_ms()` consolidation.
+* ~~**Three copies of `unix_wall_ms()`** across `lvqr-ingest::dispatch`, `lvqr-cli::hls`, and `lvqr-dash::bridge`; ripe for a `lvqr-core::now_unix_ms()` consolidation.~~ Consolidated in the follow-up `refactor(core)` commit; `lvqr_core::now_unix_ms()` is now the single source of truth.
 
 ## Session 108 B close (2026-04-21)
 

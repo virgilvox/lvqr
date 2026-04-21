@@ -29,6 +29,7 @@
 
 use bytes::Bytes;
 use lvqr_admin::LatencyTracker;
+use lvqr_core::now_unix_ms;
 use lvqr_fragment::{BroadcasterStream, FragmentBroadcasterRegistry, FragmentStream};
 use tokio::runtime::Handle;
 
@@ -150,7 +151,7 @@ impl BroadcasterDashBridge {
             if let Some(tracker) = slo.as_ref()
                 && fragment.ingest_time_ms > 0
             {
-                let now_ms = unix_wall_ms();
+                let now_ms = now_unix_ms();
                 let latency = now_ms.saturating_sub(fragment.ingest_time_ms);
                 tracker.record(&broadcast, TRANSPORT_LABEL, latency);
             }
@@ -161,17 +162,6 @@ impl BroadcasterDashBridge {
             "BroadcasterDashBridge: drain terminated (producers closed)",
         );
     }
-}
-
-/// UNIX wall-clock milliseconds. Falls back to `0` when the system
-/// clock is set before the UNIX epoch; callers should treat `0` as
-/// an unset stamp (mirrors `lvqr_ingest::dispatch::unix_wall_ms` and
-/// the HLS bridge's helper).
-fn unix_wall_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
