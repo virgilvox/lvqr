@@ -522,17 +522,22 @@ fn attach_output_callback(appsink: &gst_app::AppSink, output_bc: &Arc<FragmentBr
                     bc_for_cb.set_init_segment(payload);
                 } else {
                     let group_id = group_counter.fetch_add(1, Ordering::Relaxed);
-                    let pts = buffer.pts().map(|t| t.nseconds()).unwrap_or(0);
-                    let dts = buffer.dts().map(|t| t.nseconds()).unwrap_or(pts);
-                    let dur = buffer.duration().map(|t| t.nseconds()).unwrap_or(0);
+                    // `gst::ClockTime` units are nanoseconds; the output
+                    // `FragmentMeta.timescale` is `OUTPUT_TIMESCALE` (90 kHz
+                    // for video per LVQR convention). Convert so downstream
+                    // consumers that read `dts` / `pts` / `duration` as
+                    // ticks-in-meta-timescale see the right axis.
+                    let pts_ns = buffer.pts().map(|t| t.nseconds()).unwrap_or(0);
+                    let dts_ns = buffer.dts().map(|t| t.nseconds()).unwrap_or(pts_ns);
+                    let dur_ns = buffer.duration().map(|t| t.nseconds()).unwrap_or(0);
                     let frag = Fragment::new(
                         OUTPUT_TRACK,
                         group_id,
                         0,
                         0,
-                        dts,
-                        pts,
-                        dur,
+                        ns_to_ticks(dts_ns, OUTPUT_TIMESCALE),
+                        ns_to_ticks(pts_ns, OUTPUT_TIMESCALE),
+                        ns_to_ticks(dur_ns, OUTPUT_TIMESCALE),
                         FragmentFlags::KEYFRAME,
                         payload.clone(),
                     );
@@ -669,6 +674,17 @@ fn missing_required_elements() -> Vec<&'static str> {
         .collect()
 }
 
+/// Convert a nanosecond duration into a tick count at `timescale` Hz,
+/// truncating on the divide.
+///
+/// `saturating_mul` avoids u64 overflow for pathological inputs;
+/// `timescale == 90_000` and `ns < 2^64 / 90_000` (~200 000 s of video,
+/// ~55 hours) is within the safe range for any realistic broadcast, but
+/// the saturate gives a well-defined fallback past that.
+fn ns_to_ticks(ns: u64, timescale: u32) -> u64 {
+    ns.saturating_mul(timescale as u64) / 1_000_000_000u64
+}
+
 /// `true` when `broadcast`'s trailing path component matches the
 /// conventional `<digits>p` rendition marker (`720p`, `480p`, `1080p`,
 /// `144p`, etc.).
@@ -780,6 +796,28 @@ mod tests {
         let registry = FragmentBroadcasterRegistry::new();
         let transcoder = SoftwareTranscoder::new(RenditionSpec::preset_240p(), "live/cam1".into(), registry, None);
         assert_eq!(transcoder.output_broadcast_name(), "live/cam1/240p");
+    }
+
+    #[test]
+    fn ns_to_ticks_converts_ns_into_90khz_ticks() {
+        // Exact: 1 s in nanoseconds at 90 kHz is 90 000 ticks.
+        assert_eq!(ns_to_ticks(1_000_000_000, 90_000), 90_000);
+        // 1 ms at 90 kHz = 90 ticks.
+        assert_eq!(ns_to_ticks(1_000_000, 90_000), 90);
+        // 0 in / 0 out.
+        assert_eq!(ns_to_ticks(0, 90_000), 0);
+        // Truncates sub-tick remainder rather than rounding -- the drift
+        // this picks up across many fragments is bounded by the number of
+        // fragments (<= 1 tick of error per fragment). Document that in
+        // the doc comment on ns_to_ticks.
+        assert_eq!(ns_to_ticks(11_111, 90_000), 0); // < 1 tick
+        assert_eq!(ns_to_ticks(11_112, 90_000), 1); // just past 1 tick
+        // Saturates instead of overflowing on pathological input.
+        assert_eq!(
+            ns_to_ticks(u64::MAX, 90_000),
+            u64::MAX / 1_000_000_000,
+            "saturating_mul clamps the product and the divide stays bounded",
+        );
     }
 
     #[test]
