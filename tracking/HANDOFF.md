@@ -1,8 +1,8 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 915 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **local `main` N+3 ahead of `origin/main` (pre-commit head `eab59fa`)**
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 915 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **local `main` N+4 ahead of `origin/main` (pre-commit head `eab59fa`)**
 
-**Last Updated**: 2026-04-21 (session 109 A close + follow-up tidy). Session 109 A lands v1.1-A MPEG-DASH egress SLO instrumentation (one `LatencyTracker::record` sample per fragment delivered under `transport="dash"`) plus a small follow-up refactor that consolidates the three private `unix_wall_ms()` copies into a shared `lvqr_core::now_unix_ms()`. Three commits pending push (feat + close-doc + refactor). `git log --oneline origin/main..main` shows the three. crates.io is unchanged.
+**Last Updated**: 2026-04-21 (session 109 A close + follow-up tidy + README drift fix). Session 109 A lands v1.1-A MPEG-DASH egress SLO instrumentation (one `LatencyTracker::record` sample per fragment delivered under `transport="dash"`) plus a small follow-up refactor that consolidates the three private `unix_wall_ms()` copies into a shared `lvqr_core::now_unix_ms()`, plus a README refresh that drops stale "HLS-only" SLO drift. Four commits pending push (feat + close-doc + refactor + README). `git log --oneline origin/main..main` shows the four. crates.io is unchanged.
 
 ## Session 110 entry point -- maintainer's choice, v1.1-B
 
