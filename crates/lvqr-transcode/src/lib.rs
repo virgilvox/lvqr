@@ -102,7 +102,13 @@ mod rendition;
 mod runner;
 mod transcoder;
 
+#[cfg(feature = "transcode")]
+mod software;
+
 pub use passthrough::{PassthroughTranscoder, PassthroughTranscoderFactory};
 pub use rendition::RenditionSpec;
 pub use runner::{TranscodeRunner, TranscodeRunnerHandle, TranscoderStats};
 pub use transcoder::{Transcoder, TranscoderContext, TranscoderFactory};
+
+#[cfg(feature = "transcode")]
+pub use software::{SoftwareTranscoder, SoftwareTranscoderFactory};

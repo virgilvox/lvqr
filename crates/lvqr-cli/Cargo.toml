@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [features]
 default = ["rtmp", "quinn-transport", "cluster"]
-full = ["rtmp", "quinn-transport", "cluster", "c2pa", "whisper"]
+full = ["rtmp", "quinn-transport", "cluster", "c2pa", "whisper", "transcode"]
 rtmp = ["lvqr-ingest/rtmp"]
 quinn-transport = ["lvqr-relay/quinn-transport"]
 # Enables cluster-mode CLI flags + bootstrap in `start()`. Disabled
@@ -44,6 +44,13 @@ whisper = [
     "lvqr-agent-whisper/whisper",
     "lvqr-test-utils/whisper",
 ]
+# Tier 4 item 4.6 session 105 B: pulls `lvqr-transcode/transcode` into the
+# build. `lvqr-cli` does not yet wire `SoftwareTranscoderFactory` into the
+# composition root (that lands in session 106 C together with the
+# `--transcode-rendition` flag and the LL-HLS master playlist composition);
+# the feature lives here in 105 B so `cargo build -p lvqr-cli --features full`
+# exercises the GStreamer dep graph on CI the moment an operator opts in.
+transcode = ["dep:lvqr-transcode", "lvqr-transcode/transcode"]
 
 [dependencies]
 lvqr-core = { workspace = true }
@@ -79,6 +86,10 @@ c2pa = { workspace = true, optional = true }
 # and the `--whisper-model` flag is absent from the CLI.
 lvqr-agent = { workspace = true, optional = true }
 lvqr-agent-whisper = { workspace = true, optional = true }
+# Feature-gated on `transcode`. Adding the dep here lets the `full`
+# meta-feature activate `lvqr-transcode/transcode` from a single flag;
+# `start()` does not yet install a `TranscodeRunner` (session 106 C).
+lvqr-transcode = { workspace = true, optional = true }
 
 axum = { workspace = true }
 bytes = { workspace = true }

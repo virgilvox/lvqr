@@ -157,6 +157,20 @@ notify = "6"
 # in `lvqr-archive` so macOS + Windows builds never see it in their dep graph.
 tokio-uring = "0.5"
 
+# gstreamer-rs 0.23 series (Tier 4 item 4.6 session 105 B). Pinned because
+# 0.24 bumped the MSRV beyond our 1.85 floor and shifted a handful of AppSrc
+# builder method names; any future upgrade gets its own session per the
+# "Dependencies to pin" table below. The optional dep set is pulled in only
+# by `lvqr-transcode` under `--features transcode`; default builds never link
+# any of it. Runtime requirement is GStreamer 1.22+ with `gst-plugins-base`,
+# `gst-plugins-good`, `gst-plugins-bad`, `gst-plugins-ugly`, plus `gst-libav`
+# (for `avdec_h264`); install recipes live in the 4.6 section of
+# `tracking/TIER_4_PLAN.md`.
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-video = "0.23"
+glib = "0.20"
+
 # C2PA provenance (Tier 4 item 4.3). Pinned to 0.80 because c2pa-rs is
 # pre-1.0 and the `Builder` / `Signer` API shape has moved between releases;
 # any upgrade gets its own session per TIER_4_PLAN.md's "Dependencies to

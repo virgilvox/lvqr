@@ -10,16 +10,38 @@ authors.workspace = true
 keywords = ["lvqr", "streaming", "transcode", "abr"]
 categories = ["multimedia"]
 
+[features]
+default = []
+# Tier 4 item 4.6 session 105 B: real gstreamer-rs software encoder pipeline.
+# Pulls gstreamer, gstreamer-app (appsrc / appsink), gstreamer-video (video
+# caps helpers), and glib (BoolError, ObjectExt). Host must have the
+# GStreamer 1.22+ runtime with `gst-plugins-base`, `gst-plugins-good`,
+# `gst-plugins-bad`, `gst-plugins-ugly`, and `gst-libav` installed; install
+# recipes live in `tracking/TIER_4_PLAN.md` section 4.6. Default OFF so CI
+# runners without GStreamer continue to build the scaffold + pass-through.
+transcode = [
+    "dep:gstreamer",
+    "dep:gstreamer-app",
+    "dep:gstreamer-video",
+    "dep:glib",
+]
+
 [dependencies]
+bytes = { workspace = true }
 dashmap = { workspace = true }
 lvqr-fragment = { workspace = true }
 metrics = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# Feature-gated on `transcode`; see the feature comment above.
+gstreamer = { workspace = true, optional = true }
+gstreamer-app = { workspace = true, optional = true }
+gstreamer-video = { workspace = true, optional = true }
+glib = { workspace = true, optional = true }
 
 [dev-dependencies]
-bytes = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
