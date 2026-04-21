@@ -67,8 +67,8 @@ AI agents, cross-cluster federation) as Tier 4 on the roadmap.
   one-way cross-cluster federation pulls with
   exponential-backoff reconnect (item 4.4)
 
-**Programmable data plane (Tier 4 -- 6 of 8 items
-landed; 4.6 two-thirds done):**
+**Programmable data plane (Tier 4 -- 7 of 8 items
+landed; only 4.7 latency SLO remains):**
 
 - **WASM per-fragment filter runtime** (item 4.2,
   COMPLETE) via `wasmtime 25` (`--wasm-filter <path>` /
@@ -151,45 +151,52 @@ landed; 4.6 two-thirds done):**
   exposes `state` (connecting / connected / failed),
   `last_connected_at_ms`, `last_error`, and
   `connect_attempts` for operator dashboards.
-- **Server-side transcoding: framework + software ABR
-  ladder** (item 4.6 sessions A + B DONE; C pending).
-  `lvqr-transcode` ships the `Transcoder` trait +
-  `TranscoderFactory` + `TranscoderContext` +
-  `TranscodeRunner` lifecycle wiring, exactly mirroring
-  `lvqr-agent` (panic-isolated drain via `catch_unwind`,
-  4-tuple `(transcoder, rendition, broadcast, track)`
-  stats key). `RenditionSpec` carries `name` + `width`
-  + `height` + `video_bitrate_kbps` +
-  `audio_bitrate_kbps` with `preset_720p` /
-  `preset_480p` / `preset_240p` + `default_ladder()`.
-  Session 105 B landed the real GStreamer software
-  pipeline behind a default-OFF `transcode` Cargo
-  feature: `appsrc ! qtdemux ! h264parse ! avdec_h264
+- **Server-side transcoding: software ABR ladder +
+  LL-HLS master playlist + AAC passthrough** (item 4.6,
+  COMPLETE sessions 104-106). `lvqr-transcode` ships
+  the `Transcoder` trait + `TranscoderFactory` +
+  `TranscoderContext` + `TranscodeRunner` lifecycle
+  wiring, mirroring `lvqr-agent` (panic-isolated
+  drain via `catch_unwind`, 4-tuple `(transcoder,
+  rendition, broadcast, track)` stats key).
+  `RenditionSpec` carries `name` + `width` + `height`
+  + `video_bitrate_kbps` + `audio_bitrate_kbps` with
+  `preset_720p` / `preset_480p` / `preset_240p` +
+  `default_ladder()`. The real GStreamer software
+  pipeline (`appsrc ! qtdemux ! h264parse ! avdec_h264
   ! videoscale ! videoconvert ! x264enc ! h264parse
-  ! mp4mux ! appsink` driven from a dedicated worker
-  thread (same bounded-mpsc pattern as
-  `lvqr-agent-whisper`), output renditions republished
-  under `<source>/<rendition>` broadcasts on the shared
-  `FragmentBroadcasterRegistry` for every existing
-  egress. `PassthroughTranscoder` stays as the
-  always-available reference for the feature-off
-  build. Metrics:
+  ! mp4mux ! appsink`) is behind a default-OFF
+  `transcode` Cargo feature and runs on a dedicated
+  worker thread (same bounded-mpsc pattern as
+  `lvqr-agent-whisper`); the always-available
+  `AudioPassthroughTranscoderFactory` copies the
+  source's AAC `1.mp4` fragments verbatim to
+  `<source>/<rendition>/1.mp4`, so each rendition
+  broadcaster is a self-contained mp4. `lvqr-cli`
+  drives the whole ladder via `--transcode-rendition
+  <NAME>` / `LVQR_TRANSCODE_RENDITION` (presets or
+  `.toml` custom specs) + `--source-bandwidth-kbps`
+  override; the LL-HLS master playlist composer scans
+  the registry for `<source>/<rendition>` siblings and
+  emits one `#EXT-X-STREAM-INF` per rendition, highest-
+  to-lowest `BANDWIDTH`, source variant first at
+  `highest_rung * 1.2`. Metrics:
   `lvqr_transcode_fragments_total{transcoder,
   rendition}` +
   `lvqr_transcode_output_fragments_total{...}` +
   `lvqr_transcode_output_bytes_total{...}` +
   `lvqr_transcode_dropped_fragments_total{...}` +
-  `lvqr_transcode_panics_total{...,phase}`. Session
-  106 C wires the composition root
-  (`--transcode-rendition` flag + LL-HLS master
-  playlist composition + AAC passthrough sibling
-  transcoder). Host requirement: GStreamer 1.22+
-  runtime + plugin set (base / good / bad / ugly /
-  libav) when building with `--features transcode`;
-  the feature is default-OFF so CI runners without the
-  install continue to build `lvqr-cli` green.
+  `lvqr_transcode_panics_total{...,phase}`. Host
+  requirement: GStreamer 1.22+ runtime + plugin set
+  (base / good / bad / ugly / libav) when building
+  with `--features transcode`; the feature is
+  default-OFF so CI runners without the install
+  continue to build `lvqr-cli` green. Hardware-encoder
+  backends (NVENC / VideoToolbox / VAAPI / QSV) are
+  post-4.6 follow-ups; the software ladder is the
+  feature-complete v1 encode path.
 
-**Stability signal:** 892 workspace tests, 0 failures,
+**Stability signal:** 900 workspace tests, 0 failures,
 1 ignored (the pre-existing `moq_sink` doctest).
 `cargo fmt --all --check`, `cargo clippy --workspace
 --all-targets --benches -- -D warnings`, and
@@ -207,16 +214,12 @@ signed URLs, hot config reload, a dedicated DVR
 scrub web UI, SCTE-35 passthrough (WebVTT captions
 now ship through the whisper-captions HLS rendition),
 stream-key CRUD admin API, WHEP audio (AAC to Opus
-transcoder required; unblocks with the Tier 4
-transcoding item once the session 106 C composition
-root lands), CLI surface for the ABR ladder
-(`--transcode-rendition` flag, LL-HLS master playlist
-composition, AAC passthrough sibling -- item 4.6
-session 106 C), hardware-encoder feature flags
-(NVENC / VAAPI / VideoToolbox -- deferred
-post-4.6), latency SLO scheduling (item 4.7, planned
-107-108), stream-modifying WASM filter pipelines
-(v1 WASM runtime is a read-only tap). Every one of
+transcoder required; a future follow-up atop the 4.6
+software transcoder), hardware-encoder feature flags
+(NVENC / VAAPI / VideoToolbox -- deferred post-4.6),
+latency SLO scheduling (item 4.7, planned 107-108),
+stream-modifying WASM filter pipelines (v1 WASM
+runtime is a read-only tap). Every one of
 these is either explicitly on
 [`tracking/ROADMAP.md`](tracking/ROADMAP.md) Tier 3
 / Tier 4 or documented as out-of-scope for v1.
@@ -378,12 +381,28 @@ lvqr serve [OPTIONS]
                             Env: LVQR_WHISPER_MODEL.
 
   Server-side transcoding (requires `--features transcode` at
-  build; the flag + LL-HLS master playlist composition land in
-  session 106 C):
-  (none yet; 105 B ships the framework only. Building with
-  `--features full` or `--features transcode` pulls `gstreamer`
-  0.23 + the plugin set base/good/bad/ugly + `gst-libav` from
-  the host.)
+  build; pulls `gstreamer` 0.23 + the plugin set
+  base/good/bad/ugly + `gst-libav` from the host):
+  --transcode-rendition <NAME>   Repeatable. Preset (`720p` /
+                                 `480p` / `240p`) OR a path
+                                 ending in `.toml` that
+                                 deserializes as a custom
+                                 RenditionSpec. Comma-separated
+                                 when read from
+                                 LVQR_TRANSCODE_RENDITION. Each
+                                 value installs one
+                                 SoftwareTranscoderFactory +
+                                 AudioPassthroughTranscoderFactory
+                                 pair on the shared registry, so
+                                 every source broadcast produces
+                                 `<source>/<rendition>/{0,1}.mp4`
+                                 siblings the LL-HLS master
+                                 playlist references as variants.
+  --source-bandwidth-kbps <N>    Override the master playlist's
+                                 source-variant BANDWIDTH
+                                 attribute. Defaults to
+                                 `highest_rung_kbps * 1.2`. Env:
+                                 LVQR_SOURCE_BANDWIDTH_KBPS.
 
   Cluster:
   --cluster-listen <ADDR>   Gossip bind (enables cluster plane)

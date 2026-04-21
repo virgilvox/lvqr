@@ -1,8 +1,8 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.6 COMPLETE (7 of 8 Tier 4 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.8); 900 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; local `main` N+2 ahead of `origin/main` (pre-commit head `cdbb854`)
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.6 COMPLETE (7 of 8 Tier 4 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.8); 900 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **origin/main synced (head `99411a4`)**
 
-**Last Updated**: 2026-04-21 (session 106 close). Session 106 is Tier 4 item 4.6 session C: the composition-root wiring + master-playlist composition + audio passthrough that flips section 4.6 from "A + B DONE" to **COMPLETE**. Remaining Tier 4: 4.7 (latency SLO scheduling). Session 107 entry point is Tier 4 item 4.7 session A (latency SLO histogram wiring + `/api/v1/slo` admin route).
+**Last Updated**: 2026-04-21 (session 106 push event). Session 106's two commits (`047445e` feat + `99411a4` close-doc) are pushed to `origin/main`. `git log --oneline origin/main..main` is empty. crates.io is unchanged since the post-session-98 publish event; the next release cycle first-time-publishes `lvqr-transcode 0.4.0` alongside the pending 4.4-chain re-publishes of `lvqr-cluster` / `lvqr-cli` / `lvqr-admin` / `lvqr-test-utils`. Session 107 entry point is Tier 4 item 4.7 session A (latency SLO histogram wiring + `/api/v1/slo` admin route).
 
 ## Session 106 close (2026-04-21)
 
