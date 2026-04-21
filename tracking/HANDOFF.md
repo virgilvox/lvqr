@@ -67,15 +67,22 @@
 * **No admission control** (unchanged from 108 B).
 * **No time-windowed retention on the admin snapshot** (unchanged from 107 A).
 
-## Session 110 entry point -- v1.1-B: WS + WHEP egress SLO instrumentation (SUPERSEDED by 110 close above)
+## Session 111 entry point -- maintainer's pick from post-Tier-4 follow-up candidates
 
-**Full kick-off briefing:** [`tracking/SESSION_110_BRIEFING.md`](SESSION_110_BRIEFING.md). Copy its contents into a fresh Claude conversation.
+Session 110 closed the v1.1-B WS + WHEP egress SLO work, bringing the Tier 4 item 4.7 latency tracker's coverage to four of five egress surfaces. The fifth surface (pure MoQ subscribers) stays out of server-side measurement scope per 110's scoping decision. No specific scope is locked in for session 111; the maintainer picks from the table below. Each row points at the design notes that would carry forward into a full kick-off briefing.
 
-**One-line summary:** session 110 lands WS (`transport="ws"`) and WHEP (`transport="whep"`) egress latency SLO instrumentation by threading the shared `LatencyTracker` into the WS relay drain + the WHEP str0m backend. The scoping decision baked into the briefing is **keep the MoQ wire pure**: the WS relay acquires `Fragment::ingest_time_ms` via an auxiliary `FragmentBroadcasterRegistry` subscription alongside its MoQ-side `TrackConsumer` drain (the same pattern HLS + DASH already use), and WHEP grows an `ingest_time_ms: u64` field on its internal `SessionMsg::Video` channel. `MoqTrackSink::push` stays byte-identical so foreign MoQ clients + federation forward paths keep working.
+| # | Candidate | Rough scope | Risk | Unblocks |
+|---|---|---|---|---|
+| 1 | `examples/tier4-demos/` first public demo script | 1 session, polish-heavy | low | Tier 4 exit criterion the plan enumerated as "M4 marketing demo" |
+| 2 | Hardware encoder feature flags (NVENC / VideoToolbox / VAAPI / QSV) | 3-5 sessions per backend | high (platform-specific CI) | ABR ladder on GPU; WHIP + RTMP with zero CPU cost on publish |
+| 3 | Stream-modifying WASM filter pipelines | 2-3 sessions, contract rewrite | high | v1.1 marquee feature; unblocks third-party filter marketplace |
+| 4 | WHEP audio transcoder (AAC -> Opus) | 2-3 sessions | medium | true WebRTC browser audio from RTMP publishers |
+| 5 | Tier 5 client SDK (browser, Rust, Python) | ~20 sessions, product decisions | high | distribution story + pure MoQ subscriber SLO (server-side measurement is blocked without a MoQ wire change, which 110 explicitly rejected) |
+| 6 | MoQ frame-carried ingest-time propagation (revisit) | 1-2 sessions, design-heavy | medium | pure MoQ subscriber SLO without Tier 5 SDK (but requires a wire-incompat change LVQR deliberately punted on) |
 
-After 110 the SLO tracker sees samples from four of five egress surfaces. The fifth (pure MoQ subscribers drinking directly from `OriginProducer`) stays out of server-side measurement scope -- their latency is Tier 5 client-SDK telemetry, matching the "server-side measurement only" limitation already documented in `docs/slo.md`.
+**How to kick off session 111:** pick a row, read the referenced briefing column (for row 1 the closest precedent is the 106 C `transcode_ladder_e2e.rs` integration-test polish commit; for rows 2-6 no full briefing exists yet and the first act of the session is to author one at `tracking/SESSION_111_BRIEFING.md` after the pick is locked). The 110 rules all still apply: no Claude attribution in commits, no emojis, no em-dashes, 120-col max, real ingest + egress in integration tests, only edit in-repo, no push without direct instruction, plan-vs-code refresh on any design deviation.
 
-**Alternative if the maintainer prefers a different pick:** the briefing's post-Tier-4 follow-up table (at the bottom of `tracking/SESSION_110_BRIEFING.md`) ranks `examples/tier4-demos/` first demo script as row 2, hardware-encoder backends (NVENC / VAAPI / VideoToolbox / QSV) as row 3, stream-modifying WASM filter pipelines as row 4, WHEP audio transcoder (AAC -> Opus) as row 5, Tier 5 client SDK as row 6, and the explicitly-rejected MoQ frame-carried ingest-time propagation as row 7.
+**Recommended lean:** row 1 (`examples/tier4-demos/`) is the lowest-risk polish-heavy session and closes a long-standing Tier 4 exit-criterion gap the plan enumerated as "M4 marketing demo". Row 4 (WHEP audio transcoder) is the highest-leverage single-codec-gap closer for browser WebRTC from RTMP publishers, building on 106's GStreamer software transcoder pipeline. Row 2 (hardware encoders) is a multi-session commitment and should wait until the maintainer has a concrete deployment target that needs a specific GPU backend.
 
 ## Session 109 A close (2026-04-21)
 
