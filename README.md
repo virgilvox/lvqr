@@ -67,8 +67,9 @@ AI agents, cross-cluster federation) as Tier 4 on the roadmap.
   one-way cross-cluster federation pulls with
   exponential-backoff reconnect (item 4.4)
 
-**Programmable data plane (Tier 4 -- 7 of 8 items
-landed; only 4.7 latency SLO remains):**
+**Programmable data plane (Tier 4 -- 7.5 of 8 items
+landed; only the 4.7 Grafana alert pack + docs
+remain):**
 
 - **WASM per-fragment filter runtime** (item 4.2,
   COMPLETE) via `wasmtime 25` (`--wasm-filter <path>` /
@@ -195,8 +196,28 @@ landed; only 4.7 latency SLO remains):**
   backends (NVENC / VideoToolbox / VAAPI / QSV) are
   post-4.6 follow-ups; the software ladder is the
   feature-complete v1 encode path.
+- **Latency SLO tracker + `/api/v1/slo` admin route**
+  (item 4.7 session A DONE; session B pending for the
+  Grafana alert pack). `Fragment::ingest_time_ms` is
+  auto-stamped at `lvqr_ingest::dispatch::publish_fragment`
+  time, so every ingest protocol (RTMP / SRT / RTSP /
+  WHIP / WS) carries the server-side ingest wall
+  clock. `lvqr-admin::slo::LatencyTracker` aggregates
+  per-`(broadcast, transport)` samples into a ring
+  buffer (1024-sample cap, sort-on-query
+  p50 / p95 / p99 / max) and fires the
+  `lvqr_subscriber_glass_to_glass_ms` Prometheus
+  histogram on every `record()` call. The LL-HLS drain
+  loop contributes samples under `transport="hls"`;
+  WS / DASH / MoQ / WHEP egress instrumentation is a
+  small additive follow-up. Query `GET /api/v1/slo`
+  for `{ broadcasts: [{ broadcast, transport, p50_ms,
+  p95_ms, p99_ms, max_ms, sample_count,
+  total_observed }] }` or read the tracker directly
+  off `ServerHandle::slo()` / `TestServer::slo()`
+  for integration tests.
 
-**Stability signal:** 900 workspace tests, 0 failures,
+**Stability signal:** 909 workspace tests, 0 failures,
 1 ignored (the pre-existing `moq_sink` doctest).
 `cargo fmt --all --check`, `cargo clippy --workspace
 --all-targets --benches -- -D warnings`, and
@@ -217,7 +238,8 @@ stream-key CRUD admin API, WHEP audio (AAC to Opus
 transcoder required; a future follow-up atop the 4.6
 software transcoder), hardware-encoder feature flags
 (NVENC / VAAPI / VideoToolbox -- deferred post-4.6),
-latency SLO scheduling (item 4.7, planned 107-108),
+the Grafana alert pack + operator docs on top of
+`/api/v1/slo` (item 4.7 session B, planned 108),
 stream-modifying WASM filter pipelines (v1 WASM
 runtime is a read-only tap). Every one of
 these is either explicitly on

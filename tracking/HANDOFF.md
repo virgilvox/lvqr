@@ -1,8 +1,8 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.8 COMPLETE + 4.7 session A DONE (7.5 of 8 Tier 4 items done; only 4.7 session B Grafana alert pack remains); 909 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; local `main` N+3 ahead of `origin/main` (pre-commit head `bde70ce`)
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 items 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.8 COMPLETE + 4.7 session A DONE (7.5 of 8 Tier 4 items done; only 4.7 session B Grafana alert pack remains); 909 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **origin/main synced (head `d10e003`)**
 
-**Last Updated**: 2026-04-21 (session 107 A close). Session 107 A is Tier 4 item 4.7 session A: the per-subscriber glass-to-glass latency histogram + `/api/v1/slo` admin route. Session 108 B is the Grafana alert pack + documentation layer on top. After 108 B lands, Tier 4 is COMPLETE.
+**Last Updated**: 2026-04-21 (session 107 A push event). Session 107 A's two commits (`4201eee` feat + `d10e003` close-doc) are pushed to `origin/main`. `git log --oneline origin/main..main` is empty. crates.io is unchanged. Session 108 B is the Grafana alert pack + documentation layer on top. After 108 B lands, Tier 4 is COMPLETE.
 
 ## Session 107 A close (2026-04-21)
 
