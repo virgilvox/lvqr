@@ -1035,7 +1035,12 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // fanout path.
     let whep_server = if let Some(addr) = config.whep_addr {
         let str0m_cfg = lvqr_whep::Str0mConfig { host_ip: addr.ip() };
-        let answerer = Arc::new(lvqr_whep::Str0mAnswerer::new(str0m_cfg)) as Arc<dyn lvqr_whep::SdpAnswerer>;
+        // Tier 4 item 4.7 session 110 B: thread the shared
+        // LatencyTracker into the str0m answerer so every spawned
+        // session's poll loop records one sample per successful
+        // `Writer::write` under transport="whep".
+        let answerer = Arc::new(lvqr_whep::Str0mAnswerer::new(str0m_cfg).with_slo_tracker(slo_tracker.clone()))
+            as Arc<dyn lvqr_whep::SdpAnswerer>;
         let server = lvqr_whep::WhepServer::new(answerer);
         let observer: lvqr_ingest::SharedRawSampleObserver = Arc::new(server.clone());
         bridge_builder = bridge_builder.with_raw_sample_observer(observer);
@@ -1294,6 +1299,8 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         init_segments: Arc::new(dashmap::DashMap::new()),
         auth: auth.clone(),
         events: events.clone(),
+        registry: shared_registry.clone(),
+        slo: Some(slo_tracker.clone()),
     };
     let ws_router = axum::Router::new()
         .route("/ws/{*broadcast}", get(ws_relay_handler))
@@ -1609,6 +1616,16 @@ struct WsRelayState {
     auth: SharedAuth,
     /// Lifecycle event bus.
     events: EventBus,
+    /// Shared `FragmentBroadcasterRegistry` handle used by the WS relay
+    /// session to open an auxiliary `BroadcasterStream` subscription per
+    /// `(broadcast, track)` for Tier 4 item 4.7 SLO sampling under the
+    /// `transport="ws"` label. The MoQ-side drain that feeds the wire is
+    /// unchanged; the aux stream exists purely to read
+    /// `Fragment::ingest_time_ms` without touching the MoQ wire.
+    registry: lvqr_fragment::FragmentBroadcasterRegistry,
+    /// Optional shared latency tracker. `None` disables WS SLO sampling
+    /// for compat with tests that boot a bare `WsRelayState`.
+    slo: Option<lvqr_admin::LatencyTracker>,
 }
 
 async fn ws_relay_handler(
@@ -1679,6 +1696,42 @@ async fn ws_relay_session(mut socket: WebSocket, state: WsRelayState, broadcast:
         });
     }
     drop(tx);
+
+    // Tier 4 item 4.7 session 110 A: auxiliary fragment-registry drain
+    // per (broadcast, track) so the WS relay records one SLO sample
+    // per fragment under `transport="ws"`. The MoQ-side drain above
+    // still feeds the wire byte-identically; this aux drain never
+    // touches the socket. Decision baked in-commit: stamp the sample
+    // at the point where the fragment becomes available on the
+    // fanout (essentially sub-ms before the WS socket.send) to keep
+    // the MoQ wire pure (no payload-prefix ingest-time propagation)
+    // and avoid a correlation channel with the MoQ-side drain's
+    // phantom init frames (which are written once per group by
+    // `MoqTrackSink::push` but have no matching Fragment).
+    if let Some(tracker) = state.slo.clone() {
+        for track_id in ["0.mp4", "1.mp4"] {
+            if let Some(mut sub) = state.registry.get(&broadcast, track_id).map(|bc| bc.subscribe()) {
+                let tracker = tracker.clone();
+                let broadcast = broadcast.clone();
+                let cancel_aux = cancel.clone();
+                tokio::spawn(async move {
+                    use lvqr_fragment::FragmentStream;
+                    loop {
+                        let frag = tokio::select! {
+                            res = sub.next_fragment() => res,
+                            _ = cancel_aux.cancelled() => return,
+                        };
+                        let Some(frag) = frag else { return };
+                        if frag.ingest_time_ms > 0 {
+                            let now_ms = lvqr_core::now_unix_ms();
+                            let latency = now_ms.saturating_sub(frag.ingest_time_ms);
+                            tracker.record(&broadcast, "ws", latency);
+                        }
+                    }
+                });
+            }
+        }
+    }
 
     while let Some((track_id, payload)) = rx.recv().await {
         let mut framed = Vec::with_capacity(1 + payload.len());

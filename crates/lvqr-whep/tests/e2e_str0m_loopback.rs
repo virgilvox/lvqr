@@ -237,7 +237,7 @@ async fn spam_video_samples(handle: Arc<dyn SessionHandle>) {
     tokio::time::sleep(Duration::from_millis(100)).await;
     loop {
         let sample = build_fake_h264_sample(dts);
-        handle.on_raw_sample("0.mp4", MediaCodec::H264, &sample);
+        handle.on_raw_sample("0.mp4", MediaCodec::H264, &sample, 0);
         dts += frame_ticks;
         // Tight cadence: 20ms instead of 33ms so the test does not
         // sit idle while DTLS finishes. The server's Writer absorbs

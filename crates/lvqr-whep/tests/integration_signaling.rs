@@ -85,7 +85,7 @@ impl SessionHandle for CountingHandle {
         Ok(())
     }
 
-    fn on_raw_sample(&self, _track: &str, _codec: MediaCodec, _sample: &RawSample) {
+    fn on_raw_sample(&self, _track: &str, _codec: MediaCodec, _sample: &RawSample, _ingest_time_ms: u64) {
         self.sample_count.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -432,10 +432,10 @@ async fn raw_sample_observer_routes_only_to_subscribed_sessions() {
         keyframe: true,
     };
 
-    server.on_raw_sample("live/one", "0.mp4", MediaCodec::H264, &sample);
-    server.on_raw_sample("live/one", "0.mp4", MediaCodec::H264, &sample);
-    server.on_raw_sample("live/two", "0.mp4", MediaCodec::H264, &sample);
-    server.on_raw_sample("live/three", "0.mp4", MediaCodec::H264, &sample); // unsubscribed
+    server.on_raw_sample("live/one", "0.mp4", MediaCodec::H264, &sample, 0);
+    server.on_raw_sample("live/one", "0.mp4", MediaCodec::H264, &sample, 0);
+    server.on_raw_sample("live/two", "0.mp4", MediaCodec::H264, &sample, 0);
+    server.on_raw_sample("live/three", "0.mp4", MediaCodec::H264, &sample, 0); // unsubscribed
 
     assert_eq!(hits_one.load(Ordering::SeqCst), 2);
     assert_eq!(hits_two.load(Ordering::SeqCst), 1);

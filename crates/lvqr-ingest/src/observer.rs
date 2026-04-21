@@ -82,12 +82,32 @@ pub trait RawSampleObserver: Send + Sync {
     /// matching `str0m::Pt` without having to sniff NAL headers.
     /// Audio samples carry the default value and the audio path
     /// must not branch on it.
-    fn on_raw_sample(&self, broadcast: &str, track: &str, codec: MediaCodec, sample: &RawSample);
+    ///
+    /// `ingest_time_ms` is the UNIX wall-clock milliseconds stamp
+    /// the producing bridge captured when it received the sample
+    /// (typically the same call to `now_unix_ms()` that seeds the
+    /// sibling [`lvqr_fragment::Fragment::ingest_time_ms`] on the
+    /// fragment path). Session 110 B added the field so the WHEP
+    /// egress can record one SLO sample per `rtc.writer.write`
+    /// call under the `transport="whep"` label without plumbing
+    /// [`lvqr_cmaf::RawSample`] itself with a telemetry field.
+    /// Producers that truly have no upstream stamp (synthetic test
+    /// harnesses) pass `0`; consumers treat `0` as unset and skip
+    /// the sample, matching the HLS + DASH drain guard.
+    fn on_raw_sample(&self, broadcast: &str, track: &str, codec: MediaCodec, sample: &RawSample, ingest_time_ms: u64);
 }
 
 /// Drop-in raw-sample observer that does nothing.
 pub struct NoopRawSampleObserver;
 
 impl RawSampleObserver for NoopRawSampleObserver {
-    fn on_raw_sample(&self, _broadcast: &str, _track: &str, _codec: MediaCodec, _sample: &RawSample) {}
+    fn on_raw_sample(
+        &self,
+        _broadcast: &str,
+        _track: &str,
+        _codec: MediaCodec,
+        _sample: &RawSample,
+        _ingest_time_ms: u64,
+    ) {
+    }
 }

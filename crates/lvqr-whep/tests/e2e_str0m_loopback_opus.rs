@@ -200,7 +200,7 @@ async fn spam_opus_samples(handle: Arc<dyn SessionHandle>) {
             payload: Bytes::from(opus),
             keyframe: true,
         };
-        handle.on_raw_sample("1.mp4", MediaCodec::Opus, &sample);
+        handle.on_raw_sample("1.mp4", MediaCodec::Opus, &sample, 0);
         dts += frame_ticks;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

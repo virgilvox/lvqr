@@ -55,7 +55,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use lvqr_admin::LatencyTracker;
 use lvqr_cmaf::RawSample;
+use lvqr_core::now_unix_ms;
 use lvqr_ingest::MediaCodec;
 use str0m::change::{SdpAnswer, SdpOffer};
 use str0m::format::Codec;
@@ -66,6 +68,11 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::server::{SdpAnswerer, SessionHandle, WhepError};
+
+/// Transport label the str0m backend reports to the shared
+/// [`LatencyTracker`]. Matches the `"whep"` row in the operator
+/// runbook's threshold decision table.
+const TRANSPORT_LABEL: &str = "whep";
 
 /// Shared configuration for the str0m-backed answerer.
 ///
@@ -94,8 +101,16 @@ impl Default for Str0mConfig {
 /// and clone into [`crate::WhepServer::new`]. The answerer installs
 /// the process-wide `str0m` crypto provider on first construction
 /// via a `OnceLock`; subsequent constructions are no-ops.
+///
+/// Tier 4 item 4.7 session 110 B: [`Str0mAnswerer::with_slo_tracker`]
+/// attaches an optional [`LatencyTracker`] so the per-session poll
+/// loop records one sample per `rtc.writer(mid).write` call under
+/// `transport="whep"`. The default `new` constructor leaves the
+/// tracker unset (compat with tests + deployments that have not
+/// wired the admin tracker yet).
 pub struct Str0mAnswerer {
     config: Str0mConfig,
+    slo: Option<LatencyTracker>,
 }
 
 impl Str0mAnswerer {
@@ -108,7 +123,17 @@ impl Str0mAnswerer {
         INIT.get_or_init(|| {
             str0m::crypto::from_feature_flags().install_process_default();
         });
-        Self { config }
+        Self { config, slo: None }
+    }
+
+    /// Attach a shared [`LatencyTracker`] to this answerer. Every
+    /// session the answerer creates clones the tracker into its
+    /// poll loop and records one sample per successful
+    /// `Writer::write` call under the `"whep"` transport label.
+    /// Tier 4 item 4.7 session 110 B.
+    pub fn with_slo_tracker(mut self, tracker: LatencyTracker) -> Self {
+        self.slo = Some(tracker);
+        self
     }
 }
 
@@ -172,6 +197,7 @@ impl SdpAnswerer for Str0mAnswerer {
             shutdown_rx,
             sample_rx,
             broadcast_owned,
+            self.slo.clone(),
         ));
 
         tracing::debug!(
@@ -199,11 +225,17 @@ enum SessionMsg {
     /// poll task converts to Annex B before calling str0m. `codec`
     /// picks which negotiated `Pt` the sample is routed through
     /// (session 28 added H265 alongside the existing H264 path).
+    /// `ingest_time_ms` is the upstream bridge's wall-clock stamp
+    /// (session 110 B); the poll loop records
+    /// `now_unix_ms - ingest_time_ms` under `transport="whep"`
+    /// after a successful `Writer::write`. Zero means "unset";
+    /// the egress guard skips it, matching the HLS + DASH drains.
     Video {
         payload: Bytes,
         dts: u64,
         keyframe: bool,
         codec: MediaCodec,
+        ingest_time_ms: u64,
     },
 }
 
@@ -273,6 +305,7 @@ async fn run_session_loop(
     mut shutdown: oneshot::Receiver<()>,
     mut samples: mpsc::UnboundedReceiver<SessionMsg>,
     broadcast: String,
+    slo: Option<LatencyTracker>,
 ) {
     let mut ctx = SessionCtx::default();
     let mut buf = vec![0u8; 2048];
@@ -356,9 +389,37 @@ async fn run_session_loop(
             }
             msg = samples.recv() => {
                 match msg {
-                    Some(SessionMsg::Video { payload, dts, keyframe, codec }) => {
-                        if let Err(()) = write_sample(&mut rtc, &mut ctx, &broadcast, payload, dts, keyframe, codec) {
-                            // `write_sample` logged already.
+                    Some(SessionMsg::Video { payload, dts, keyframe, codec, ingest_time_ms }) => {
+                        match write_sample(&mut rtc, &mut ctx, &broadcast, payload, dts, keyframe, codec) {
+                            Ok(true) => {
+                                // Tier 4 item 4.7 session 110 B: one
+                                // SLO sample per successful
+                                // `Writer::write`. Skip when no
+                                // tracker was wired at answerer
+                                // construction or when the producer
+                                // passed `0` (synthetic test, pre-
+                                // 110 caller). The recording point
+                                // is after str0m accepts the write
+                                // because the RTP packetization is
+                                // what hits the wire; pre-Connected
+                                // drops and codec-mismatch drops
+                                // both return `Ok(false)` and are
+                                // excluded from the histogram.
+                                if let Some(tracker) = slo.as_ref()
+                                    && ingest_time_ms > 0
+                                {
+                                    let latency = now_unix_ms().saturating_sub(ingest_time_ms);
+                                    tracker.record(&broadcast, TRANSPORT_LABEL, latency);
+                                }
+                            }
+                            Ok(false) => {
+                                // Pre-Connected, codec mismatch, or
+                                // AAC-on-Opus drop. Not a wire
+                                // event; no SLO sample recorded.
+                            }
+                            Err(()) => {
+                                // `write_sample` logged already.
+                            }
                         }
                     }
                     None => {
@@ -447,6 +508,15 @@ fn absorb_event(event: &Event, ctx: &mut SessionCtx, broadcast: &str) {
 /// emits one RTP packet per `Writer::write` call without framing
 /// inspection, so the AVCC buffer we received from the bridge
 /// passes through unchanged.
+///
+/// Session 110 B widened the return type: `Ok(true)` when str0m
+/// accepted the write and an RTP packet will go out the wire,
+/// `Ok(false)` when the sample was deliberately dropped
+/// (pre-Connected, codec mismatch, AAC into an Opus-only session,
+/// missing mid/pt, empty Annex B), `Err(())` when str0m surfaced
+/// a write error. Only the `Ok(true)` branch records an SLO
+/// sample; the rest are pre-wire drops and would bias the
+/// histogram toward zero-ish samples.
 fn write_sample(
     rtc: &mut Rtc,
     ctx: &mut SessionCtx,
@@ -455,9 +525,9 @@ fn write_sample(
     dts: u64,
     _keyframe: bool,
     codec: MediaCodec,
-) -> Result<(), ()> {
+) -> Result<bool, ()> {
     if !ctx.connected {
-        return Ok(());
+        return Ok(false);
     }
 
     // Route to the matching mid + pt + clock domain based on
@@ -483,11 +553,11 @@ fn write_sample(
                     "whep: AAC audio publisher -> Opus-only subscriber surface; dropping audio (no transcoder)",
                 );
             }
-            return Ok(());
+            return Ok(false);
         }
     };
     let Some(mid) = mid else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(pt) = pt else {
         if !ctx.unmatched_codec_logged {
@@ -498,7 +568,7 @@ fn write_sample(
                 "whep: publisher codec not present in subscriber offer; dropping samples"
             );
         }
-        return Ok(());
+        return Ok(false);
     };
 
     // Video codecs need AVCC -> Annex B. Audio codecs pass
@@ -508,7 +578,7 @@ fn write_sample(
             let annex_b = avcc_to_annex_b(&payload);
             if annex_b.is_empty() {
                 tracing::trace!(%broadcast, "avcc->annex_b produced empty output; dropping sample");
-                return Ok(());
+                return Ok(false);
             }
             annex_b
         }
@@ -517,7 +587,7 @@ fn write_sample(
     };
 
     let Some(writer) = rtc.writer(mid) else {
-        return Ok(());
+        return Ok(false);
     };
 
     let wallclock = Instant::now();
@@ -528,7 +598,7 @@ fn write_sample(
                 ctx.first_write_logged = true;
                 tracing::info!(%broadcast, ?codec, dts, "first sample written to str0m");
             }
-            Ok(())
+            Ok(true)
         }
         Err(e) => {
             if !ctx.write_error_logged {
@@ -614,7 +684,7 @@ impl SessionHandle for Str0mSessionHandle {
         Ok(())
     }
 
-    fn on_raw_sample(&self, track: &str, codec: MediaCodec, sample: &RawSample) {
+    fn on_raw_sample(&self, track: &str, codec: MediaCodec, sample: &RawSample, ingest_time_ms: u64) {
         // Track convention matches `lvqr-ingest::RawSampleObserver`:
         // `0.mp4` is video, `1.mp4` is audio. Anything else is a
         // future track slot we do not know how to write yet.
@@ -635,6 +705,7 @@ impl SessionHandle for Str0mSessionHandle {
             dts: sample.dts,
             keyframe: sample.keyframe,
             codec,
+            ingest_time_ms,
         };
         // Ignore send failure: the task has exited and we will be
         // dropped soon. Nothing useful for the caller to do.
@@ -824,6 +895,54 @@ mod tests {
 
     // ---- end-to-end: on_raw_sample pushes through the channel ----
 
+    // Tier 4 item 4.7 session 110 B: negative assertion that the
+    // WHEP SLO tracker does NOT record a sample when str0m has not
+    // yet reached `Event::Connected`. `write_sample` short-circuits
+    // on `!ctx.connected` with `Ok(false)` so the poll loop's
+    // recording arm is skipped; without this guard the histogram
+    // would see a burst of near-zero samples during every session's
+    // ICE + DTLS warm-up. The positive path (Connected -> successful
+    // writer.write -> record under `transport="whep"`) is covered
+    // by the `e2e_str0m_loopback*.rs` integration tests, which run
+    // against a real DTLS-completed peer via str0m's test harness.
+    #[tokio::test]
+    async fn slo_tracker_skips_pre_connected_writes() {
+        use bytes::Bytes as B;
+        let tracker = LatencyTracker::new();
+        let answerer = Str0mAnswerer::new(Str0mConfig::default()).with_slo_tracker(tracker.clone());
+        let (handle, _answer) = answerer
+            .create_session("live/test", CHROME_AUDIO_OFFER.as_bytes())
+            .expect("chrome offer accepted");
+
+        let avcc_video = avcc_buf(&[&[0x65, 0xAA, 0xBB, 0xCC][..]]);
+        let sample = RawSample {
+            track_id: 1,
+            dts: 1000,
+            cts_offset: 0,
+            duration: 3000,
+            payload: B::from(avcc_video),
+            keyframe: true,
+        };
+        let backdated = now_unix_ms().saturating_sub(200);
+        handle.on_raw_sample("0.mp4", MediaCodec::H264, &sample, backdated);
+        handle.on_raw_sample("0.mp4", MediaCodec::H264, &sample, backdated);
+        handle.on_raw_sample("0.mp4", MediaCodec::H264, &sample, backdated);
+
+        // The poll loop reads SessionMsg::Video off the mpsc, calls
+        // write_sample (returns Ok(false) because connected is
+        // never set without a real peer), and skips the record
+        // arm. No sample must land under `transport="whep"`.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        drop(handle);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let snap = tracker.snapshot();
+        assert!(
+            snap.iter().all(|e| e.transport != TRANSPORT_LABEL),
+            "pre-Connected writes must not record SLO samples: {snap:?}",
+        );
+    }
+
     #[tokio::test]
     async fn on_raw_sample_forwards_video_and_drops_audio() {
         use bytes::Bytes as B;
@@ -847,9 +966,9 @@ mod tests {
             payload: B::from(avcc_video),
             keyframe: true,
         };
-        handle.on_raw_sample("0.mp4", MediaCodec::H264, &sample); // video path
-        handle.on_raw_sample("1.mp4", MediaCodec::H264, &sample); // audio path, warn-once
-        handle.on_raw_sample("1.mp4", MediaCodec::H264, &sample); // audio path, already warned
+        handle.on_raw_sample("0.mp4", MediaCodec::H264, &sample, 0); // video path
+        handle.on_raw_sample("1.mp4", MediaCodec::H264, &sample, 0); // audio path, warn-once
+        handle.on_raw_sample("1.mp4", MediaCodec::H264, &sample, 0); // audio path, already warned
 
         // Give the poll task a beat to absorb the sample. No assert:
         // the point is that none of the above panic, and the

@@ -132,7 +132,15 @@ pub trait SessionHandle: Send + Sync + 'static {
     /// `str0m::Pt` for `Writer::write`. Audio samples carry the
     /// default variant and the implementation must not branch on
     /// it for audio tracks.
-    fn on_raw_sample(&self, track: &str, codec: MediaCodec, sample: &RawSample);
+    ///
+    /// `ingest_time_ms` is the UNIX wall-clock millisecond stamp
+    /// the producing bridge captured when it received the sample
+    /// (Tier 4 item 4.7 session 110 B). Implementations forward
+    /// the value onto their internal session channel so the WHEP
+    /// egress SLO can record `now - ingest_time_ms` under
+    /// `transport="whep"` at `writer.write` time. Zero means
+    /// "unset"; the egress guard skips it, same as HLS + DASH.
+    fn on_raw_sample(&self, track: &str, codec: MediaCodec, sample: &RawSample, ingest_time_ms: u64);
 }
 
 /// Concrete SDP answerer contract. Separating this from the
@@ -205,11 +213,11 @@ impl WhepServer {
 /// `broadcast -> Vec<SessionId>` index if the session fanout cost
 /// shows up in profiling.
 impl RawSampleObserver for WhepServer {
-    fn on_raw_sample(&self, broadcast: &str, track: &str, codec: MediaCodec, sample: &RawSample) {
+    fn on_raw_sample(&self, broadcast: &str, track: &str, codec: MediaCodec, sample: &RawSample, ingest_time_ms: u64) {
         for entry in self.state.sessions.iter() {
             let session = entry.value();
             if session.broadcast == broadcast {
-                session.handle.on_raw_sample(track, codec, sample);
+                session.handle.on_raw_sample(track, codec, sample, ingest_time_ms);
             }
         }
     }

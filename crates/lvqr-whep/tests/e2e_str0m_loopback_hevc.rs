@@ -217,7 +217,7 @@ async fn spam_hevc_samples(handle: Arc<dyn SessionHandle>) {
     tokio::time::sleep(Duration::from_millis(100)).await;
     loop {
         let sample = build_fake_hevc_sample(dts);
-        handle.on_raw_sample("0.mp4", MediaCodec::H265, &sample);
+        handle.on_raw_sample("0.mp4", MediaCodec::H265, &sample, 0);
         dts += frame_ticks;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

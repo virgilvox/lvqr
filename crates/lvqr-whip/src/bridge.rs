@@ -37,7 +37,7 @@ use lvqr_cmaf::{
     write_hevc_init_segment, write_opus_init_segment,
 };
 use lvqr_codec::hevc::{self as hevc_codec, HevcSps};
-use lvqr_core::{EventBus, RelayEvent};
+use lvqr_core::{EventBus, RelayEvent, now_unix_ms};
 use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta, MoqTrackSink};
 use lvqr_ingest::{MediaCodec, SharedRawSampleObserver, publish_fragment, publish_init};
 use lvqr_moq::{OriginProducer, Track};
@@ -377,9 +377,13 @@ impl WhipMoqBridge {
         // Raw-sample observer (WHEP). Session 28 lifted the
         // AVC-only guard: the observer signature now carries a
         // codec tag so the WHEP session backend can pick the
-        // matching `str0m::Pt` for the negotiated codec.
+        // matching `str0m::Pt` for the negotiated codec. Session
+        // 110 B added the `ingest_time_ms` trailing arg so the
+        // WHEP SLO sample lines up with the sibling `Fragment`'s
+        // `ingest_time_ms` stamped below.
+        let ingest_ms = now_unix_ms();
         if let Some(obs) = self.raw_observer.as_ref() {
-            obs.on_raw_sample(broadcast, "0.mp4", sample.codec, &raw);
+            obs.on_raw_sample(broadcast, "0.mp4", sample.codec, &raw, ingest_ms);
         }
 
         let Some(mut entry) = self.streams.get_mut(broadcast) else {
@@ -399,7 +403,8 @@ impl WhipMoqBridge {
         } else {
             FragmentFlags::DELTA
         };
-        let frag = Fragment::new("0.mp4", seq as u64, 0, 0, dts, dts, raw.duration as u64, flags, seg);
+        let frag = Fragment::new("0.mp4", seq as u64, 0, 0, dts, dts, raw.duration as u64, flags, seg)
+            .with_ingest_time_ms(ingest_ms);
         if let Err(e) = state.video_sink.push(&frag) {
             debug!(broadcast, error = ?e, "whip: moq sink push failed");
         }
@@ -491,6 +496,7 @@ impl WhipMoqBridge {
         let dur = raw.duration as u64;
         let seg = build_moof_mdat(seq, 2, dts, std::slice::from_ref(&raw));
 
+        let ingest_ms = now_unix_ms();
         let frag = Fragment::new(
             "1.mp4",
             seq as u64,
@@ -501,7 +507,8 @@ impl WhipMoqBridge {
             dur,
             FragmentFlags::KEYFRAME, // every opus frame is independently decodable
             seg,
-        );
+        )
+        .with_ingest_time_ms(ingest_ms);
         if let Err(e) = audio_sink.push(&frag) {
             debug!(broadcast, error = ?e, "whip: moq audio sink push failed");
         }
@@ -514,9 +521,12 @@ impl WhipMoqBridge {
         drop(entry);
         // Raw-sample observer (WHEP): forwards Opus frames to
         // subscribers that negotiated Opus on their side (same-
-        // codec passthrough, no transcode). Session 30.
+        // codec passthrough, no transcode). Session 30. The
+        // trailing `ingest_time_ms` arg was added in session 110 B
+        // so the WHEP egress SLO can compute `now - ingest_time_ms`
+        // at `rtc.writer.write` time under `transport="whep"`.
         if let Some(obs) = self.raw_observer.as_ref() {
-            obs.on_raw_sample(broadcast, "1.mp4", MediaCodec::Opus, &raw);
+            obs.on_raw_sample(broadcast, "1.mp4", MediaCodec::Opus, &raw, ingest_ms);
         }
         // Publish the Opus fragment onto the shared registry. The
         // LL-HLS audio rendition is codec-agnostic above the init

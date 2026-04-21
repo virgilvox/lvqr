@@ -14,7 +14,9 @@ categories = ["multimedia", "network-programming"]
 axum = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
+lvqr-admin = { workspace = true }
 lvqr-cmaf = { workspace = true }
+lvqr-core = { workspace = true }
 lvqr-ingest = { workspace = true }
 rand = { workspace = true }
 str0m = "0.18"

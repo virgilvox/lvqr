@@ -7,7 +7,7 @@
 use bytes::Bytes;
 use dashmap::DashMap;
 use lvqr_auth::{NoopAuthProvider, SharedAuth, extract};
-use lvqr_core::{EventBus, RelayEvent};
+use lvqr_core::{EventBus, RelayEvent, now_unix_ms};
 use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta, MoqTrackSink};
 use lvqr_moq::Track;
 use std::sync::Arc;
@@ -301,12 +301,20 @@ impl RtmpMoqBridge {
                         keyframe,
                     };
 
+                    let ingest_ms = now_unix_ms();
                     if let Some(obs) = raw_observer_video.as_ref() {
                         // RTMP / FLV ingest is AVC-only in LVQR today;
                         // HEVC-over-RTMP (enhanced-RTMP) lives in a
                         // later session. The codec tag is therefore
                         // constant here, unlike the WHIP bridge.
-                        obs.on_raw_sample(&stream_name, "0.mp4", crate::MediaCodec::H264, &sample);
+                        // Session 110 B: stamp the same wall-clock
+                        // `now_unix_ms()` onto the raw-sample
+                        // observer call and the sibling `Fragment`
+                        // below, so the WHEP egress SLO sample for
+                        // this sample lines up with the HLS + DASH
+                        // samples the downstream drains record from
+                        // `Fragment::ingest_time_ms`.
+                        obs.on_raw_sample(&stream_name, "0.mp4", crate::MediaCodec::H264, &sample, ingest_ms);
                     }
 
                     stream.video_seq += 1;
@@ -332,7 +340,8 @@ impl RtmpMoqBridge {
                         duration_ticks as u64,
                         flags,
                         seg,
-                    );
+                    )
+                    .with_ingest_time_ms(ingest_ms);
                     if let Err(e) = stream.video_sink.push(&frag) {
                         debug!(error = ?e, "failed to push video fragment through sink");
                     }
@@ -391,6 +400,7 @@ impl RtmpMoqBridge {
                     let duration: u32 = 1024;
                     let base_dts = (timestamp as u64) * (config.sample_rate as u64) / 1000;
 
+                    let ingest_ms = now_unix_ms();
                     if let Some(obs) = raw_observer_audio.as_ref() {
                         let sample = lvqr_cmaf::RawSample {
                             track_id: 2,
@@ -406,7 +416,7 @@ impl RtmpMoqBridge {
                         // needs a placeholder value; downstream
                         // consumers can correctly distinguish
                         // RTMP-sourced AAC from WHIP-sourced Opus.
-                        obs.on_raw_sample(&stream_name, "1.mp4", crate::MediaCodec::Aac, &sample);
+                        obs.on_raw_sample(&stream_name, "1.mp4", crate::MediaCodec::Aac, &sample, ingest_ms);
                     }
 
                     let seg = audio_segment(stream.audio_seq, base_dts, duration, &aac_data);
@@ -426,7 +436,8 @@ impl RtmpMoqBridge {
                         duration as u64,
                         FragmentFlags::KEYFRAME,
                         seg,
-                    );
+                    )
+                    .with_ingest_time_ms(ingest_ms);
                     if let Err(e) = stream.audio_sink.push(&frag) {
                         debug!(error = ?e, "failed to push audio fragment through sink");
                     }
