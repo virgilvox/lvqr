@@ -1,8 +1,136 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.4 COMPLETE + 4.6 session A DONE (6 of 8 Tier 4 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.8; 4.6 one-third done); 892 workspace tests (+2 whisper-gated inline), 29 crates; **origin/main synced (head `8bc76a9`)**
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.4 COMPLETE + 4.6 sessions A + B DONE (6 of 8 Tier 4 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.8; 4.6 two-thirds done); 892 workspace tests on the default gate (+6 transcode-gated inline + 1 transcode-gated integration), 29 crates; **local `main` ahead of origin/main by the session 105 feat + close-doc commits; push pending operator instruction**
 
-**Last Updated**: 2026-04-21 (session 104 push event + README refresh `8bc76a9`). Session 104's two commits (`1cf7631` feat + `adfee65` close-doc) are pushed to `origin/main`, followed by the session 104 push-event doc (`0ac6281`) and a README refresh (`8bc76a9`) aligning `README.md`'s Tier 4 status + crate map + CLI reference with the shipped 4.4 / 4.5 / 4.6 A surface. `git log --oneline origin/main..main` is empty. crates.io is unchanged since the post-session-98 publish event; a future release cycle bumps `lvqr-cluster` + `lvqr-cli` + `lvqr-admin` + `lvqr-test-utils` (for the 4.4 chain) and newly publishes `lvqr-transcode` 0.4.0 alongside. Session 105 entry point is Tier 4 item 4.6 session B (ABR ladder generation + multi-rendition publish via real gstreamer-rs pipelines behind a `transcode` Cargo feature; see `tracking/TIER_4_PLAN.md` section 4.6 row 105 B).
+**Last Updated**: 2026-04-21 (session 105 close). Session 105 B landed the first real GStreamer software-encoder pipeline on top of session 104 A's scaffold. `lvqr-transcode` gained a default-OFF `transcode` Cargo feature that pulls `gstreamer` 0.23 + `gstreamer-app` + `gstreamer-video` + `glib`; a new `SoftwareTranscoderFactory` + `SoftwareTranscoder` drive the default 720p / 480p / 240p ABR ladder into the shared `FragmentBroadcasterRegistry` as `<source>/<rendition>` broadcasts. `lvqr-cli` gained a sibling `transcode` feature folded into `full`; the composition-root wiring (`--transcode-rendition` flag + LL-HLS master playlist) lands in session 106 C. Local `main` is ahead of origin/main by two commits (feat + this close-doc) awaiting a push instruction; crates.io is unchanged since the post-session-98 publish event. The next release cycle adds `lvqr-transcode 0.4.0` as a first-time publish alongside the pending 4.4-chain re-publishes of `lvqr-cluster` / `lvqr-cli` / `lvqr-admin` / `lvqr-test-utils`.
+
+## Session 105 close (2026-04-21)
+
+1. **Tier 4 item 4.6 session B: real GStreamer software encoder ladder** (feat commit).
+   * `crates/lvqr-transcode/Cargo.toml`: new `transcode` Cargo feature (default OFF) gating four optional deps (`gstreamer`, `gstreamer-app`, `gstreamer-video`, `glib`). `bytes` + `thiserror` promoted from dev-deps / absent to regular deps -- `bytes` is used by the appsink callback to copy `gst::Buffer` payloads into `Fragment::payload`; `thiserror` powers the new `WorkerSpawnError` enum.
+   * `Cargo.toml` (workspace root): `gstreamer = "0.23"`, `gstreamer-app = "0.23"`, `gstreamer-video = "0.23"`, `glib = "0.20"` pinned in `[workspace.dependencies]` with a comment recording that any upgrade is a single-file change per the "Dependencies to pin" table in `tracking/TIER_4_PLAN.md`.
+   * `crates/lvqr-cli/Cargo.toml`: new `transcode` feature (`["dep:lvqr-transcode", "lvqr-transcode/transcode"]`); `full` meta-feature expanded from 5 to 6 entries; new optional `lvqr-transcode` dep. `start()` does NOT install a `TranscodeRunner` in 105 B -- that wiring is 106 C's composition-root job -- but the dep edge is in place so `cargo build -p lvqr-cli --features full` exercises the full GStreamer dep graph.
+   * `crates/lvqr-transcode/src/software.rs` (new, ~480 LOC, feature-gated on `transcode`): the heart of the session. `SoftwareTranscoderFactory` probes `REQUIRED_ELEMENTS` via `gst::ElementFactory::find` at construction; missing elements cause every subsequent `build(ctx)` to return `None` with one warn log, matching the `TranscoderFactory` opt-out idiom already used for non-video tracks. Pipeline shape built via `gst::parse::launch` for the body + downcast `AppSrc` / `AppSink` for the endpoints: `appsrc(video/quicktime) ! qtdemux ! h264parse ! avdec_h264 ! videoscale ! video/x-raw,width=W,height=H ! videoconvert ! x264enc bitrate=K threads=2 tune=zerolatency speed-preset=superfast key-int-max=60 ! h264parse ! mp4mux streamable=true fragment-duration=2000 ! appsink emit-signals=true sync=false`. `threads=2` caps the x264 worker pool so three parallel ladder rungs do not exhaust the host pthread ceiling (discovered empirically when the 720p rung silently produced zero output under the default `threads=ncores` on an M-series mac).
+   * Worker-thread pattern lifted from `crates/lvqr-agent-whisper/src/worker.rs`: `on_start` builds the pipeline on the spawning thread (so parse errors surface eagerly), spawns a named OS thread (`lvqr-transcode:<source>:<rendition>`), and optionally pushes `ctx.meta.init_segment` as a `BufferFlags::HEADER` buffer before draining. `on_fragment` forwards each `Fragment::payload` through a bounded `std::sync::mpsc::sync_channel(64)`; `TrySendError::Full` drops the fragment, bumps `lvqr_transcode_dropped_fragments_total{transcoder, rendition}`, and emits one `tracing::warn!`. `on_stop` drops the sender, at which point the worker's `rx.recv()` returns `Err` -> `appsrc.end_of_stream()` -> `bus.timed_pop_filtered(EOS|Error, 5 s)` -> `pipeline.set_state(Null)` -> exit. The same teardown runs from `Drop` so mid-stride `TranscodeRunnerHandle` aborts don't leak GStreamer streaming threads into the tokio runtime's drop path.
+   * Output side: each rendition lazily calls `output_registry.get_or_create("<source>/<rendition>", "0.mp4", FragmentMeta::new("avc1.640028", 90_000))` at worker spawn. The appsink `new-sample` callback checks `BufferFlags::HEADER` on each pulled `gst::Buffer`; header buffers update the output broadcaster's init via `FragmentBroadcaster::set_init_segment` (so late-joining HLS / MoQ subscribers can decode), non-header buffers emit as `Fragment` instances. New metrics: `lvqr_transcode_output_fragments_total{transcoder, rendition}` + `lvqr_transcode_output_bytes_total{transcoder, rendition}` alongside the existing `lvqr_transcode_fragments_total{transcoder, rendition}` (input) and `lvqr_transcode_panics_total{transcoder, rendition, phase}` from the runner.
+   * Recursion guard `looks_like_rendition_output(broadcast)`: treats any broadcast whose trailing path component matches `\d+p` (`720p`, `480p`, `1080p`, ...) as already-transcoded and skips it in `build()`. Without this guard the registry's `on_entry_created` callback re-fires for every `<source>/<rendition>` the transcoder publishes, spawning another round of ladder factories on those outputs and cascading to 25+ pipelines + thread-exhaustion on the host pthread pool. The heuristic has a documented v1 limitation: a source literally named `live/720p` would be skipped; 106 C adds an explicit `skip_source_suffixes` override knob for operators using non-conventional rendition names.
+   * `crates/lvqr-transcode/src/lib.rs`: feature-gated `mod software;` + `pub use software::{SoftwareTranscoder, SoftwareTranscoderFactory};` under `#[cfg(feature = "transcode")]`. Public API surface unchanged for the feature-off build.
+   * 6 new feature-gated inline tests on `software.rs`: pipeline string embeds rendition geometry + bitrate, factory opts out of non-video tracks (`"1.mp4"`), factory returns a transcoder for `"0.mp4"` when available, plugin-probe returns empty on a fully-installed host, `SoftwareTranscoder::output_broadcast_name()` concatenates source + rendition, `looks_like_rendition_output` heuristic accepts `\d+p` suffixes and rejects everything else.
+
+2. **`crates/lvqr-transcode/tests/software_ladder.rs`** (new, ~210 LOC, feature-gated on `transcode`): the end-to-end integration test. Boots a `FragmentBroadcasterRegistry`, installs a `TranscodeRunner::with_ladder(RenditionSpec::default_ladder(), SoftwareTranscoderFactory::new)`, loads `crates/lvqr-conformance/fixtures/fmp4/cmaf-h264-baseline-360p-1s.mp4`, splits into `ftyp+moov` (init) + `moof+mdat+mfra` (fragment body) via a hand-rolled top-level box scan, emits on `live/demo`, polls the registry until all three `live/demo/{720p,480p,240p}` output broadcasts appear (10 s deadline), subscribes to each, drops the source broadcaster to trigger EOS propagation, drains each rendition's subscription with per-fragment 8 s timeout + 20 s overall deadline, and asserts (a) each rendition produced at least one output fragment + non-zero bytes, (b) each output bitrate falls within +/- 40% of the target `video_bitrate_kbps` (coarse check; x264 rate control jitters at startup with 1 s of content), and (c) `720p_bytes > 240p_bytes` as a ladder-miswiring sanity check. Skip-with-log branch when the factory's `is_available()` returns false, so runners without the GStreamer plugin set see a green test with a clear diagnostic rather than a hard fail.
+
+3. **Session 105 close doc** (this commit).
+
+### Key 4.6 session B design decisions baked in (confirmed in-commit per the plan-vs-code rule)
+
+* **Video-only for 105 B; audio passthrough deferred to 106 C.** The briefing gave latitude to fold AAC passthrough into this session (~50 LOC for a sibling `AudioPassthroughTranscoderFactory` that copies `"1.mp4"` fragments between registry entries). The call is to defer: 105 B already introduces one load-bearing new subsystem (the real GStreamer pipeline) and the integration test is a single-track video fixture. Session 106 C owns the LL-HLS master playlist composition, which is the natural place to land audio passthrough because the master playlist either references per-rendition self-contained mp4s or references a separate audio rendition; either shape is a one-session job atop today's surface.
+* **`gst::parse::launch` for the body + programmatic `AppSrc` / `AppSink` downcast for the endpoints.** The body is static-per-rendition and reads well as a string; the endpoints need programmatic access to set `max-bytes` / `block` on appsrc and to register the appsink `new-sample` callback. Matches the gstreamer-rs cookbook idiom.
+* **Init-segment push via `BufferFlags::HEADER`; fallback to `ctx.meta.init_segment` if the drain task joins mid-broadcast.** The source `FragmentMeta::init_segment` is the canonical init bytes LVQR's ingest bridges populate; pushing them as a HEADER-flagged buffer at worker start lets qtdemux parse `ftyp+moov` before any `moof+mdat` arrives. If `init_segment` is `None` at `on_start`, we fall through to passing every source fragment verbatim -- qtdemux handles a buffer containing `ftyp+moov+moof+mdat` correctly (exercised by the integration test's fixture, which contains both).
+* **Recursion guard via suffix heuristic, not via runtime output-broadcast tracking.** The alternative (factory maintains a set of its own output broadcast names and skips them) requires cross-factory coordination because a 480p factory must also skip 720p output broadcasts; threading the full ladder's names into every factory is API creep for a case the `\d+p` heuristic catches correctly for 100% of realistic rendition-name conventions. 106 C adds an explicit `skip_source_suffixes` override for operators with non-conventional names.
+* **`threads=2` on x264enc is a hard constraint, not a tuning choice.** Default `threads=ncores` + three parallel pipelines + each pipeline's 5-10 GStreamer streaming threads blows through macOS's default per-process thread ceiling and produces `EAGAIN` on `pthread_create`. The 720p rung (highest resolution, most x264 worker demand) fails first; 480p and 240p usually succeed. `threads=2` is plenty for real-time encode of a single rendition at `speed-preset=superfast`; any future hardware-accelerated rung (106 C's NVENC / VideoToolbox flags) can ship without this cap.
+* **Plugin availability is a factory opt-out, not a panic.** The 104 A briefing considered a `panic!` at factory construction to surface missing plugins loudly. 105 B rejects that: the factory returns `None` from `build()` with a one-shot warn log so the rest of the server keeps running and the operator gets a clear diagnostic via the logs without the process crashing. Matches the existing non-video-track `None` idiom.
+* **`x264enc` keyframe interval hard-coded at `key-int-max=60` (2 s at 30 fps).** Source-GOP-aware tuning (inheriting the source's keyframe cadence so LL-HLS segment boundaries align across renditions) is explicit scope for 106 C. Hard-coding 60 for 105 B matches the `mp4mux fragment-duration=2000` window so every x264 GOP ends on a fragment boundary for typical 30 fps content.
+* **Output codec string on `FragmentMeta` is advisory (`"avc1.640028"` = High 4.0 placeholder).** x264enc's actual profile depends on frame geometry + settings; operators that need the authoritative codec parse the SPS from the init segment bytes in `FragmentBroadcaster::meta().init_segment`. The 104 A `"avc1.640028"` placeholder is kept; 106 C adds SPS-aware codec-string population if downstream consumers need it.
+* **Integration test drives a real GStreamer pipeline, not a mocked harness.** Per CLAUDE.md's testing rules + the briefing's "theatrical test" warning. The `software_ladder.rs` test produces 31 output fragments per rendition + ~2280 / 1144 / 384 kbps at 720p / 480p / 240p (9% / 5% / 4% under target on three consecutive runs). +/- 40% tolerance leaves plenty of headroom for CI variance without letting a miswired factory ship a "working" ladder at the wrong bitrates.
+* **Skip-with-log when plugins are missing, not a hard fail.** The factory's `is_available()` flag consolidates the plugin probe; the test reads it once at setup and logs-and-returns if false. Runners without the full plugin install see a green test with a specific list of missing elements instead of a red test that only fails on hosts the CI admin might not control.
+
+### Ground truth (session 105 close)
+
+* **Head**: feat commit `1796a24` + this close-doc commit (two new commits on `main`). Local is N+2 above `origin/main` (head `3757c48` is still the `origin/main` head from the session 104 briefing push event). `git log --oneline origin/main..main` shows exactly two commits.
+* **Tests (default features gate)**: **892** passed, 0 failed, 1 ignored on macOS (default features). Unchanged from the session 104 A baseline because every new test in 105 B is `#[cfg(feature = "transcode")]`-gated. The 1 ignored is the pre-existing `moq_sink` doctest.
+* **Tests (transcode feature gate)**:
+  * `cargo test -p lvqr-transcode --features transcode --lib`: **22** passed (+6 new inline on `software.rs`).
+  * `cargo test -p lvqr-transcode --features transcode --test software_ladder`: **1** passed (integration test; wall clock ~0.3 s after the first build on an M-series mac).
+* **CI gates locally clean**:
+  * `cargo fmt --all --check`.
+  * `cargo clippy --workspace --all-targets --benches -- -D warnings`.
+  * `cargo clippy -p lvqr-transcode --features transcode --all-targets -- -D warnings`.
+  * `cargo test -p lvqr-transcode` 16 passed + 1 doctest (feature-off path parity with 104 A).
+  * `cargo test --workspace` 892 / 0 / 1 (unchanged).
+  * `cargo check -p lvqr-cli --features transcode` clean (feature wiring compiles).
+* **Workspace**: **29 crates**, unchanged.
+* **crates.io**: unchanged since session 98's publish event. Session 105 B adds optional gstreamer deps to `lvqr-transcode` (new feature, non-breaking) and a new optional feature + optional dep to `lvqr-cli` (non-breaking). A future release cycle first-time publishes `lvqr-transcode 0.4.0` alongside the pending 4.4-chain re-publishes of `lvqr-cluster` / `lvqr-cli` / `lvqr-admin` / `lvqr-test-utils`.
+
+### Prerequisites + developer install recipe
+
+The `transcode` feature requires GStreamer 1.22+ runtime + plugin set on the host. The factory probes at construction time and opts out with a clear warn log if any element is missing; a full gate run (`cargo test -p lvqr-transcode --features transcode`) needs every element below to resolve.
+
+**Required GStreamer elements** (probed by `SoftwareTranscoderFactory::new`): `appsrc`, `qtdemux`, `h264parse`, `avdec_h264`, `videoscale`, `videoconvert`, `x264enc`, `mp4mux`, `appsink`.
+
+**macOS** -- prefer the official `.pkg` installer to avoid Homebrew's heavy dep chain (LLVM, Z3, etc. that bloom out from the Homebrew `gstreamer` formula):
+
+```
+# Runtime + devel pkgs from https://gstreamer.freedesktop.org/download/
+#   gstreamer-1.0-<version>-universal.pkg
+#   gstreamer-1.0-devel-<version>-universal.pkg
+# Install both. Then in your shell profile:
+export PATH="/Library/Frameworks/GStreamer.framework/Commands:$PATH"
+export PKG_CONFIG_PATH="/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig:$PKG_CONFIG_PATH"
+export DYLD_FALLBACK_LIBRARY_PATH="/Library/Frameworks/GStreamer.framework/Versions/1.0/lib:$DYLD_FALLBACK_LIBRARY_PATH"
+# Verify:
+gst-inspect-1.0 x264enc qtdemux mp4mux avdec_h264
+```
+
+The `DYLD_FALLBACK_LIBRARY_PATH` export is load-bearing for `cargo test` on macOS: without it, test binaries fail with `dyld: Library not loaded: @rpath/libgstapp-1.0.0.dylib` because the GStreamer framework's dylibs live outside the default dyld search path.
+
+**Debian / Ubuntu**:
+
+```
+apt install libgstreamer1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav
+```
+
+`gstreamer1.0-libav` provides `avdec_h264`; `gst-plugins-ugly` provides `x264enc`; `gst-plugins-bad` provides `mp4mux` + `qtdemux`.
+
+Homebrew install (`brew install gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly`) also works but builds LLVM from source on a fresh machine and can take 30+ minutes. Prefer the .pkg path on macOS for developer ergonomics.
+
+### Tier 4 execution status
+
+| # | Item | Status | Sessions |
+|---|---|---|---|
+| 4.2 | WASM per-fragment filters | **COMPLETE** | 85 / 86 / 87 |
+| 4.1 | io_uring archive writes | **COMPLETE** | 88 / 89 / 90 |
+| 4.3 | C2PA signed media | **COMPLETE** | 91-94 |
+| 4.8 | One-token-all-protocols | **COMPLETE** | 95 / 96 |
+| 4.5 | In-process AI agents | **COMPLETE** | 97 / 98 / 99 / 100 |
+| 4.4 | Cross-cluster federation | **COMPLETE** | 101 / 102 / 103 |
+| 4.6 | Server-side transcoding | **A + B DONE**, C pending | 104 / 105 / 106 |
+| 4.7 | Latency SLO scheduling | PLANNED | 107-108 |
+
+6 of 8 Tier 4 items COMPLETE; 4.6 two-thirds done. Remaining: 4.6 C + 4.7.
+
+### Session 106 entry point
+
+**Tier 4 item 4.6 session C: `lvqr-cli` wiring + `--transcode-rendition` flag + LL-HLS master playlist composition.**
+
+Scope per `tracking/TIER_4_PLAN.md` section 4.6 row 106 C. Concrete deliverables:
+
+1. `lvqr-cli`'s `ServeConfig` gains `transcode_renditions: Vec<RenditionSpec>` (feature-gated on `transcode`) and a matching `--transcode-rendition <RENDITION>` CLI flag (repeatable; `LVQR_TRANSCODE_RENDITION` env fallback). Flag value parses short preset names (`720p` / `480p` / `240p`) to `RenditionSpec::preset_*` out of the box; operators with custom ladders supply TOML.
+2. `lvqr-cli::start()` installs a `TranscodeRunner` on the shared registry whenever `transcode_renditions` is non-empty, building one `SoftwareTranscoderFactory` per rendition. `ServerHandle` gains a `transcode_runner: Option<TranscodeRunnerHandle>` accessor mirroring the existing `agent_runner` / `wasm_filter` shape.
+3. `lvqr-hls`'s master playlist composition learns about source-plus-rendition groupings. Any `<source>` broadcast that also has `<source>/<rendition>` siblings on the registry gets a master playlist referencing every variant with `BANDWIDTH` (`RenditionSpec::video_bitrate_kbps * 1000`) + `RESOLUTION` (`<width>x<height>`) + `NAME` (`RenditionSpec::name`). The source itself is the first variant at its own bitrate (unknown precisely; use the ingest rate as a fallback).
+4. AAC audio passthrough: a sibling `AudioPassthroughTranscoderFactory` that opts in to `"1.mp4"` tracks and copies fragments from `<source>/1.mp4` to `<source>/<rendition>/1.mp4` verbatim. ~50 LOC; no GStreamer dependency.
+5. Integration test `crates/lvqr-cli/tests/transcode_ladder_e2e.rs`: boots a TestServer with `transcode_renditions = default_ladder()`, publishes a 3 s RTMP stream, reads `/hls/live/demo/master.m3u8`, asserts four variants (source + three renditions) all appear + all referenced media playlists serve real x264-encoded segments.
+
+Pre-session decisions to lock in-commit:
+
+* CLI flag shape: short-form preset names (`720p`) as sugar, TOML for custom ladders. Operators can mix: `--transcode-rendition 720p --transcode-rendition custom.toml`.
+* Source variant in the master playlist: `BANDWIDTH` defaults to the highest rung's bitrate + 20% when unknown; operators can override via `--source-bandwidth-kbps`. Alternative (probe the source's actual bitrate) is 107 A territory (latency SLO infrastructure).
+* Recursion-guard override: `SoftwareTranscoderFactory::skip_source_suffixes(Vec<String>)` builder for operators using non-conventional rendition names. Default behavior (the `\d+p` heuristic) stays.
+* HW encoder preview: 106 C is software-only. NVENC / VAAPI / VideoToolbox hardware-encoder variants are deferred to a post-4.6 session because they require per-platform plugin probes + separate integration tests.
+
+Biggest risks for 106 C:
+
+* **LL-HLS master playlist + relative URIs**: every variant playlist URI is relative to the master's URL; the HLS bridge must output the right path for each rendition without the operator having to hand-configure.
+* **Bitrate accounting on the source variant**: if the source's actual bitrate is unknown at playlist-generation time, the master playlist picks a placeholder that can mislead ABR clients; the "highest rung + 20%" heuristic is a safe default but documentation should call this out.
+* **TestServer + TranscodeRunner composition**: the existing `TestServerConfig` has no transcode field; adding one follows the `with_whisper_model` / `with_c2pa` pattern but needs the same `lvqr-test-utils` feature flag gymnastics (`transcode = ["lvqr-cli/transcode"]`).
+
+### Session 105 push event carry-over
+
+If the user instructs a push after session 105 closes, follow up with a `docs: session 105 push event` commit that refreshes the HANDOFF status header to `origin/main synced (head <new_head>)` -- same pattern as the sessions 99 / 100 / 102 / 103 / 104 push-event commits. Do NOT push without a direct user instruction.
 
 ## Session 104 close (2026-04-21)
 
