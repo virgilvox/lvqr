@@ -1,8 +1,8 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 912 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; local `main` N+2 ahead of `origin/main` (pre-commit head `88d712b`)
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 912 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **origin/main synced (head `4fcc172`)**
 
-**Last Updated**: 2026-04-21 (session 108 B close). Tier 4 is closed. Session 108 B shipped the Prometheus / Grafana alert pack + operator runbook on top of the 4.7 A tracker wiring. Next sessions are whatever the maintainer picks up: v1.1 follow-ups (WS / DASH / MoQ / WHEP SLO instrumentation, stream-modifying WASM filters, hardware-encoder feature flags, WHEP audio transcoder), Tier 5 client SDK work, or the M4 marketing milestone demo.
+**Last Updated**: 2026-04-21 (session 108 B push event). Tier 4 is closed and live on `origin/main`. Session 108 B's two commits (`0b9e173` feat + `4fcc172` close-doc) are pushed. `git log --oneline origin/main..main` is empty. crates.io is unchanged. Next sessions are whatever the maintainer picks up: v1.1 follow-ups (WS / DASH / MoQ / WHEP SLO instrumentation, stream-modifying WASM filters, hardware-encoder feature flags, WHEP audio transcoder), Tier 5 client SDK work, or the M4 marketing milestone demo.
 
 ## Session 108 B close (2026-04-21)
 
