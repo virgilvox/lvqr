@@ -1,8 +1,8 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.4 COMPLETE + 4.6 sessions A + B DONE (6 of 8 Tier 4 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.8; 4.6 two-thirds done); 892 workspace tests on the default gate (+6 transcode-gated inline + 1 transcode-gated integration), 29 crates; **local `main` ahead of origin/main by the session 105 feat + close-doc commits; push pending operator instruction**
+## Project Status: v0.4.0 -- Tier 3 COMPLETE; Tier 4 item 4.4 COMPLETE + 4.6 sessions A + B DONE (6 of 8 Tier 4 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.8; 4.6 two-thirds done); 892 workspace tests on the default gate (+7 transcode-gated inline + 1 transcode-gated integration), 29 crates; **origin/main synced (head `adfffe5`)**
 
-**Last Updated**: 2026-04-21 (session 105 close). Session 105 B landed the first real GStreamer software-encoder pipeline on top of session 104 A's scaffold. `lvqr-transcode` gained a default-OFF `transcode` Cargo feature that pulls `gstreamer` 0.23 + `gstreamer-app` + `gstreamer-video` + `glib`; a new `SoftwareTranscoderFactory` + `SoftwareTranscoder` drive the default 720p / 480p / 240p ABR ladder into the shared `FragmentBroadcasterRegistry` as `<source>/<rendition>` broadcasts. `lvqr-cli` gained a sibling `transcode` feature folded into `full`; the composition-root wiring (`--transcode-rendition` flag + LL-HLS master playlist) lands in session 106 C. Local `main` is ahead of origin/main by two commits (feat + this close-doc) awaiting a push instruction; crates.io is unchanged since the post-session-98 publish event. The next release cycle adds `lvqr-transcode 0.4.0` as a first-time publish alongside the pending 4.4-chain re-publishes of `lvqr-cluster` / `lvqr-cli` / `lvqr-admin` / `lvqr-test-utils`.
+**Last Updated**: 2026-04-21 (session 105 push event). Session 105's three commits (`1796a24` feat + `f14dbdf` close-doc + `adfffe5` audit-fix converting appsink output timestamps from ns to 90 kHz ticks) are pushed to `origin/main`. `git log --oneline origin/main..main` is empty. crates.io is unchanged since the post-session-98 publish event; the next release cycle first-time-publishes `lvqr-transcode 0.4.0` alongside the pending 4.4-chain re-publishes of `lvqr-cluster` / `lvqr-cli` / `lvqr-admin` / `lvqr-test-utils`. Session 106 entry point is Tier 4 item 4.6 session C (`lvqr-cli` composition-root wiring + `--transcode-rendition` flag + `AudioPassthroughTranscoderFactory` sibling + LL-HLS master playlist composition; see the "Session 106 entry point" callout under the session 105 close block and the `tracking/SESSION_106_BRIEFING.md` kickoff prompt).
 
 ## Session 105 close (2026-04-21)
 
@@ -34,12 +34,12 @@
 * **Integration test drives a real GStreamer pipeline, not a mocked harness.** Per CLAUDE.md's testing rules + the briefing's "theatrical test" warning. The `software_ladder.rs` test produces 31 output fragments per rendition + ~2280 / 1144 / 384 kbps at 720p / 480p / 240p (9% / 5% / 4% under target on three consecutive runs). +/- 40% tolerance leaves plenty of headroom for CI variance without letting a miswired factory ship a "working" ladder at the wrong bitrates.
 * **Skip-with-log when plugins are missing, not a hard fail.** The factory's `is_available()` flag consolidates the plugin probe; the test reads it once at setup and logs-and-returns if false. Runners without the full plugin install see a green test with a specific list of missing elements instead of a red test that only fails on hosts the CI admin might not control.
 
-### Ground truth (session 105 close)
+### Ground truth (session 105 close, refreshed at push event)
 
-* **Head**: feat commit `1796a24` + this close-doc commit (two new commits on `main`). Local is N+2 above `origin/main` (head `3757c48` is still the `origin/main` head from the session 104 briefing push event). `git log --oneline origin/main..main` shows exactly two commits.
+* **Head**: feat commit `1796a24` + close-doc commit `f14dbdf` + post-audit fix commit `adfffe5` (three new commits on `main`, all pushed). `git log --oneline origin/main..main` is empty after the push.
 * **Tests (default features gate)**: **892** passed, 0 failed, 1 ignored on macOS (default features). Unchanged from the session 104 A baseline because every new test in 105 B is `#[cfg(feature = "transcode")]`-gated. The 1 ignored is the pre-existing `moq_sink` doctest.
 * **Tests (transcode feature gate)**:
-  * `cargo test -p lvqr-transcode --features transcode --lib`: **22** passed (+6 new inline on `software.rs`).
+  * `cargo test -p lvqr-transcode --features transcode --lib`: **23** passed (+7 new inline on `software.rs`: geometry/bitrate-embed, non-video opt-out, video build, plugin probe, output-name concat, rendition-suffix heuristic, and the audit-fix `ns_to_ticks` conversion).
   * `cargo test -p lvqr-transcode --features transcode --test software_ladder`: **1** passed (integration test; wall clock ~0.3 s after the first build on an M-series mac).
 * **CI gates locally clean**:
   * `cargo fmt --all --check`.
@@ -128,9 +128,15 @@ Biggest risks for 106 C:
 * **Bitrate accounting on the source variant**: if the source's actual bitrate is unknown at playlist-generation time, the master playlist picks a placeholder that can mislead ABR clients; the "highest rung + 20%" heuristic is a safe default but documentation should call this out.
 * **TestServer + TranscodeRunner composition**: the existing `TestServerConfig` has no transcode field; adding one follows the `with_whisper_model` / `with_c2pa` pattern but needs the same `lvqr-test-utils` feature flag gymnastics (`transcode = ["lvqr-cli/transcode"]`).
 
-### Session 105 push event carry-over
+### Session 105 push event (2026-04-21)
 
-If the user instructs a push after session 105 closes, follow up with a `docs: session 105 push event` commit that refreshes the HANDOFF status header to `origin/main synced (head <new_head>)` -- same pattern as the sessions 99 / 100 / 102 / 103 / 104 push-event commits. Do NOT push without a direct user instruction.
+Session 105's three commits are pushed to `origin/main`:
+
+1. `1796a24` feat(transcode): real gstreamer software ladder behind `transcode` feature.
+2. `f14dbdf` docs: session 105 close -- Tier 4 item 4.6 session B DONE.
+3. `adfffe5` fix(transcode): convert appsink output timestamps to 90 kHz ticks (post-close audit fix covering a latent unit mismatch where `gst::ClockTime::nseconds()` was being written as-is into `Fragment::dts` / `pts` / `duration` whose declared unit is `FragmentMeta::timescale` ticks; left as-is would have delivered 11 111x-too-large values to session 106 C's LL-HLS composition).
+
+Push event doc refreshes the status header to `origin/main synced (head adfffe5)`, adjusts the ground-truth test counts (`--features transcode --lib` 22 -> 23 for the new `ns_to_ticks` inline test), and refreshes `README.md` with a Tier 4 status bump + crate map + CLI reference through session 105 B. Same pattern as sessions 99 / 100 / 102 / 103 / 104 push-event commits.
 
 ## Session 104 close (2026-04-21)
 
