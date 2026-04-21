@@ -71,6 +71,6 @@ pub mod subtitles;
 pub use manifest::{
     HlsError, Manifest, Part, PlaylistBuilder, PlaylistBuilderConfig, Segment, ServerControl, render_manifest,
 };
-pub use master::{MasterPlaylist, MediaRendition, MediaRenditionType, VariantStream};
+pub use master::{MasterPlaylist, MediaRendition, MediaRenditionType, RenditionMeta, VariantStream};
 pub use server::{HlsServer, MultiHlsServer, OwnerResolver, RedirectFuture};
 pub use subtitles::{CaptionCue, DEFAULT_MAX_CUES, DEFAULT_MIN_TARGET_DURATION_SECS, SubtitlesServer, now_unix_millis};

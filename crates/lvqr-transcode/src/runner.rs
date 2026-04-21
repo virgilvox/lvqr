@@ -250,6 +250,23 @@ async fn drive(
 ) {
     let rendition_name = ctx.rendition.name.clone();
 
+    // Refresh the meta snapshot before `on_start`. The
+    // `on_entry_created` callback fires synchronously inside
+    // `FragmentBroadcasterRegistry::get_or_create`, *before* the
+    // ingest side calls `set_init_segment`. A transcoder that
+    // reads `ctx.meta.init_segment` at on_start time would miss
+    // the header bytes -- which is a silent break for the
+    // software pipeline (qtdemux finds no playable streams). The
+    // refresh below catches the late init without changing the
+    // trait surface. Tier 4 item 4.6 session 106 C fix.
+    sub.refresh_meta();
+    let ctx = TranscoderContext {
+        broadcast: ctx.broadcast,
+        track: ctx.track,
+        meta: sub.meta().clone(),
+        rendition: ctx.rendition,
+    };
+
     // on_start: a panic here means we abort the drain loop.
     // Handing fragments to a transcoder whose setup panicked
     // would amplify the fault, not contain it.

@@ -21,6 +21,12 @@ c2pa = ["lvqr-cli/c2pa", "lvqr-archive/c2pa"]
 # off; the `whisper-rs` bindgen + cmake closure stays out of the
 # default test-utils build. Tier 4 item 4.5 session D.
 whisper = ["lvqr-cli/whisper", "dep:lvqr-agent"]
+# Surface the `lvqr-cli/transcode` feature through TestServer so the
+# `transcode_ladder_e2e.rs` integration test can install a ladder via
+# `ServeConfig::transcode_renditions`. Default off; the GStreamer 1.22+
+# transitive closure stays out of the default test-utils build. Tier 4
+# item 4.6 session 106 C.
+transcode = ["lvqr-cli/transcode", "dep:lvqr-transcode"]
 
 [dependencies]
 lvqr-core = { workspace = true }
@@ -43,6 +49,10 @@ lvqr-moq = { workspace = true }
 # accessor returns an `&lvqr_agent::AgentRunnerHandle`, so the
 # dep must resolve when the feature is on.
 lvqr-agent = { workspace = true, optional = true }
+# Gated on the `transcode` feature: the TestServer's `transcode_runner()`
+# accessor returns an `&lvqr_transcode::TranscodeRunnerHandle`, and the
+# `with_transcode_ladder` builder names `RenditionSpec` directly.
+lvqr-transcode = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "macros", "net"] }
 tokio-util = { workspace = true }
 bytes = { workspace = true }

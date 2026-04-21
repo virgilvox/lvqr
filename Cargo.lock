@@ -3489,6 +3489,7 @@ dependencies = [
  "lvqr-core",
  "lvqr-fragment",
  "lvqr-moq",
+ "lvqr-transcode",
  "lvqr-wasm",
  "rand 0.8.5",
  "rcgen 0.13.2",

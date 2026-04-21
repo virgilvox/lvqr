@@ -55,6 +55,10 @@ pub struct TestServerConfig {
     c2pa: Option<lvqr_archive::provenance::C2paConfig>,
     #[cfg(feature = "whisper")]
     whisper_model: Option<PathBuf>,
+    #[cfg(feature = "transcode")]
+    transcode_renditions: Vec<lvqr_transcode::RenditionSpec>,
+    #[cfg(feature = "transcode")]
+    source_bandwidth_kbps: Option<u32>,
     federation_links: Vec<lvqr_cluster::FederationLink>,
     relay_addr: Option<SocketAddr>,
 }
@@ -116,6 +120,32 @@ impl TestServerConfig {
     #[cfg(feature = "whisper")]
     pub fn with_whisper_model(mut self, path: impl Into<PathBuf>) -> Self {
         self.whisper_model = Some(path.into());
+        self
+    }
+
+    /// Install a transcode ABR ladder on the TestServer's
+    /// `ServeConfig`. The server builds one
+    /// `SoftwareTranscoderFactory` + one
+    /// `AudioPassthroughTranscoderFactory` per rendition against
+    /// the shared fragment registry; the LL-HLS master-playlist
+    /// composer emits one `#EXT-X-STREAM-INF` per rendition
+    /// sibling the transcoder produces. Gated on
+    /// `feature = "transcode"` on `lvqr-test-utils`. Tier 4 item
+    /// 4.6 session 106 C.
+    #[cfg(feature = "transcode")]
+    pub fn with_transcode_ladder(mut self, renditions: Vec<lvqr_transcode::RenditionSpec>) -> Self {
+        self.transcode_renditions = renditions;
+        self
+    }
+
+    /// Override the advertised source-variant `BANDWIDTH` in the
+    /// master playlist (in kilobits per second). Defaults (None)
+    /// to `highest_rung_kbps * 1.2`. Only meaningful alongside
+    /// [`with_transcode_ladder`](Self::with_transcode_ladder).
+    /// Tier 4 item 4.6 session 106 C.
+    #[cfg(feature = "transcode")]
+    pub fn with_source_bandwidth_kbps(mut self, kbps: u32) -> Self {
+        self.source_bandwidth_kbps = Some(kbps);
         self
     }
 
@@ -228,6 +258,10 @@ impl TestServer {
             c2pa: config.c2pa,
             #[cfg(feature = "whisper")]
             whisper_model: config.whisper_model,
+            #[cfg(feature = "transcode")]
+            transcode_renditions: config.transcode_renditions,
+            #[cfg(feature = "transcode")]
+            source_bandwidth_kbps: config.source_bandwidth_kbps,
             wasm_filter: config.wasm_filter,
             // Prometheus install is process-wide and panics on second
             // call, so tests always disable it. Metrics macros still
@@ -318,6 +352,17 @@ impl TestServer {
     #[cfg(feature = "whisper")]
     pub fn agent_runner(&self) -> Option<&lvqr_agent::AgentRunnerHandle> {
         self.handle.agent_runner()
+    }
+
+    /// `TranscodeRunner` handle (read-only). Returns `None` when
+    /// [`TestServerConfig::with_transcode_ladder`] was not used.
+    /// Tests read per-`(transcoder, rendition, broadcast, track)`
+    /// counters off this handle to assert the ladder factories
+    /// actually observed the RTMP source. Gated on
+    /// `feature = "transcode"`. Tier 4 item 4.6 session 106 C.
+    #[cfg(feature = "transcode")]
+    pub fn transcode_runner(&self) -> Option<&lvqr_transcode::TranscodeRunnerHandle> {
+        self.handle.transcode_runner()
     }
 
     /// Cloneable handle to the server's relay-backing

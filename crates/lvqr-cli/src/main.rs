@@ -1,10 +1,15 @@
 use anyhow::Result;
 use clap::Parser;
 use lvqr_auth::{JwtAuthConfig, JwtAuthProvider, NoopAuthProvider, SharedAuth, StaticAuthConfig, StaticAuthProvider};
+#[cfg(feature = "transcode")]
+use lvqr_cli::parse_transcode_renditions;
 use lvqr_cli::{ServeConfig, start};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+#[cfg(feature = "transcode")]
+use clap::ArgAction;
 
 #[derive(Parser, Debug)]
 #[command(name = "lvqr", version, about = "Live Video QUIC Relay")]
@@ -175,6 +180,42 @@ struct ServeArgs {
     #[cfg(feature = "whisper")]
     #[arg(long, env = "LVQR_WHISPER_MODEL")]
     whisper_model: Option<PathBuf>,
+
+    /// ABR ladder rendition. Repeatable: `--transcode-rendition 720p
+    /// --transcode-rendition 480p` installs both. Each value is one of:
+    ///
+    /// * a short preset name (`720p`, `480p`, `240p`) -> the matching
+    ///   [`lvqr_transcode::RenditionSpec`] preset;
+    /// * a path ending in `.toml` -> the file is read + deserialized
+    ///   as a custom `RenditionSpec` (fields: `name`, `width`,
+    ///   `height`, `video_bitrate_kbps`, `audio_bitrate_kbps`).
+    ///
+    /// Everything else is a parse error at CLI time so misconfigured
+    /// ladders surface up-front instead of via silent drop.
+    ///
+    /// `LVQR_TRANSCODE_RENDITION` accepts a comma-separated list
+    /// because clap's env parser does not repeat.
+    ///
+    /// Requires the `transcode` Cargo feature; without it the flag
+    /// is absent from the CLI. Tier 4 item 4.6 session 106 C.
+    #[cfg(feature = "transcode")]
+    #[arg(
+        long = "transcode-rendition",
+        env = "LVQR_TRANSCODE_RENDITION",
+        value_delimiter = ',',
+        action = ArgAction::Append,
+    )]
+    transcode_rendition: Vec<String>,
+
+    /// Operator override for the source variant's advertised
+    /// `BANDWIDTH` in the LL-HLS master playlist, in kilobits per
+    /// second. Defaults to `highest_rung_kbps * 1.2` when unset.
+    /// Only meaningful alongside `--transcode-rendition`.
+    /// Requires the `transcode` Cargo feature. Tier 4 item 4.6
+    /// session 106 C.
+    #[cfg(feature = "transcode")]
+    #[arg(long, env = "LVQR_SOURCE_BANDWIDTH_KBPS")]
+    source_bandwidth_kbps: Option<u32>,
 
     /// HS256 shared secret enabling JWT authentication. When set, the JWT
     /// provider replaces the static-token provider and all auth surfaces
@@ -358,6 +399,10 @@ async fn serve_from_args(
         c2pa: None,
         #[cfg(feature = "whisper")]
         whisper_model: args.whisper_model,
+        #[cfg(feature = "transcode")]
+        transcode_renditions: parse_transcode_renditions(&args.transcode_rendition)?,
+        #[cfg(feature = "transcode")]
+        source_bandwidth_kbps: args.source_bandwidth_kbps,
         wasm_filter: args.wasm_filter,
         install_prometheus: true,
         otel_metrics_recorder,

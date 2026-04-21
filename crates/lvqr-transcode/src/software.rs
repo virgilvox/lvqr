@@ -103,6 +103,7 @@ pub struct SoftwareTranscoderFactory {
     rendition: RenditionSpec,
     output_registry: FragmentBroadcasterRegistry,
     missing_elements: Vec<&'static str>,
+    skip_source_suffixes: Vec<String>,
 }
 
 impl SoftwareTranscoderFactory {
@@ -133,7 +134,23 @@ impl SoftwareTranscoderFactory {
             rendition,
             output_registry,
             missing_elements,
+            skip_source_suffixes: Vec::new(),
         }
+    }
+
+    /// Register additional trailing-component suffixes the factory should
+    /// treat as already-transcoded outputs and skip. Appends to the
+    /// built-in `\d+p` recursion guard (`720p`, `480p`, `1080p`, ...);
+    /// the default heuristic stays in effect so operators using the
+    /// convention never need to call this method.
+    ///
+    /// Operators who run custom rendition names (`ultra`, `low-motion`,
+    /// etc.) pass them here so the registry's `on_entry_created` firing
+    /// for those outputs does not spawn a new software pipeline on the
+    /// factory's own outputs.
+    pub fn skip_source_suffixes(mut self, suffixes: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.skip_source_suffixes.extend(suffixes.into_iter().map(Into::into));
+        self
     }
 
     /// `true` when every required GStreamer element was found at
@@ -167,7 +184,7 @@ impl TranscoderFactory for SoftwareTranscoderFactory {
         if ctx.track != DEFAULT_SOURCE_TRACK {
             return None;
         }
-        if looks_like_rendition_output(&ctx.broadcast) {
+        if looks_like_rendition_output(&ctx.broadcast, &self.skip_source_suffixes) {
             // Prevent the TranscodeRunner from chaining transcoders
             // across their own output broadcasts. The output broadcast
             // name convention is `<source>/<rendition>`; without this
@@ -687,20 +704,26 @@ fn ns_to_ticks(ns: u64, timescale: u32) -> u64 {
 
 /// `true` when `broadcast`'s trailing path component matches the
 /// conventional `<digits>p` rendition marker (`720p`, `480p`, `1080p`,
-/// `144p`, etc.).
+/// `144p`, etc.) OR appears in `extra`.
 ///
 /// Used by [`SoftwareTranscoderFactory::build`] to opt out of
 /// already-transcoded broadcasts and prevent ladder recursion. Custom
 /// rendition names that do not match the `\d+p` shape are treated as
-/// source broadcasts and will trigger a transcode; 106 C's CLI wiring
-/// adds an explicit `skip_source_suffixes` override for operators that
-/// use non-conventional names. Source broadcasts that happen to end in
-/// `<digits>p` (e.g. a live stream literally named `live/720p`) would
-/// also be skipped -- documented v1 limitation.
-fn looks_like_rendition_output(broadcast: &str) -> bool {
+/// source broadcasts unless their suffix was registered via
+/// [`SoftwareTranscoderFactory::skip_source_suffixes`]. Source
+/// broadcasts that happen to end in `<digits>p` (e.g. a live stream
+/// literally named `live/720p`) are still skipped -- documented v1
+/// limitation.
+fn looks_like_rendition_output(broadcast: &str, extra: &[String]) -> bool {
     let Some(suffix) = broadcast.rsplit('/').next() else {
         return false;
     };
+    if suffix.is_empty() {
+        return false;
+    }
+    if extra.iter().any(|s| s == suffix) {
+        return true;
+    }
     if suffix.len() < 2 {
         return false;
     }
@@ -822,6 +845,7 @@ mod tests {
 
     #[test]
     fn looks_like_rendition_output_matches_digits_p_suffixes() {
+        let extra: Vec<String> = Vec::new();
         // Conventional rendition markers: positive.
         for name in [
             "live/demo/720p",
@@ -832,7 +856,7 @@ mod tests {
             "x/2160p",
         ] {
             assert!(
-                looks_like_rendition_output(name),
+                looks_like_rendition_output(name, &extra),
                 "{name} should be detected as a rendition output"
             );
         }
@@ -849,9 +873,44 @@ mod tests {
             "live/demo/720px",    // non-digit before 'p'
         ] {
             assert!(
-                !looks_like_rendition_output(name),
+                !looks_like_rendition_output(name, &extra),
                 "{name:?} must NOT be detected as a rendition output"
             );
         }
+    }
+
+    #[test]
+    fn skip_source_suffixes_extends_recursion_guard() {
+        let extra = vec!["ultra".to_string(), "low-motion".to_string()];
+        assert!(looks_like_rendition_output("live/demo/ultra", &extra));
+        assert!(looks_like_rendition_output("live/demo/low-motion", &extra));
+        // Default heuristic still applies.
+        assert!(looks_like_rendition_output("live/demo/720p", &extra));
+        // Unrelated names still treated as source.
+        assert!(!looks_like_rendition_output("live/demo/sports", &extra));
+    }
+
+    #[test]
+    fn factory_skip_source_suffixes_builder_opts_out_of_custom_names() {
+        let registry = FragmentBroadcasterRegistry::new();
+        let factory = SoftwareTranscoderFactory::new(RenditionSpec::preset_720p(), registry)
+            .skip_source_suffixes(["ultra".to_string()]);
+        if !factory.is_available() {
+            eprintln!(
+                "skipping: required GStreamer elements missing {:?}",
+                factory.missing_elements()
+            );
+            return;
+        }
+        let ctx = TranscoderContext {
+            broadcast: "live/demo/ultra".into(),
+            track: "0.mp4".into(),
+            meta: FragmentMeta::new("avc1.640028", 90_000),
+            rendition: factory.rendition().clone(),
+        };
+        assert!(
+            factory.build(&ctx).is_none(),
+            "custom suffix must be treated as already-transcoded",
+        );
     }
 }

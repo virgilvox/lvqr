@@ -628,6 +628,20 @@ struct MultiHlsState {
     /// Optional callback consulted when an incoming request names a
     /// broadcast this node does not host. See [`OwnerResolver`].
     owner_resolver: Option<OwnerResolver>,
+    /// ABR ladder metadata the master-playlist composer uses to
+    /// emit one `#EXT-X-STREAM-INF` per rendition sibling of a
+    /// source broadcast. Populated at server startup by the
+    /// `lvqr-cli` composition root from the operator-supplied
+    /// `--transcode-rendition` list (Tier 4 item 4.6 session 106
+    /// C). Empty when transcode is disabled or no ladder is
+    /// configured; master playlist falls back to the single-variant
+    /// source-only path.
+    ladder: std::sync::RwLock<Vec<crate::master::RenditionMeta>>,
+    /// Operator override for the source variant's advertised
+    /// `BANDWIDTH`. Defaults to `highest_rung_bps * 1.2` when
+    /// `None` and the ladder is non-empty; `2_500_000` when the
+    /// ladder is empty (pre-session 106 C behavior).
+    source_bandwidth_bps: std::sync::RwLock<Option<u64>>,
 }
 
 /// Per-broadcast state tracked by [`MultiHlsServer`].
@@ -660,6 +674,8 @@ impl MultiHlsServer {
                 config,
                 broadcasts: std::sync::Mutex::new(HashMap::new()),
                 owner_resolver: None,
+                ladder: std::sync::RwLock::new(Vec::new()),
+                source_bandwidth_bps: std::sync::RwLock::new(None),
             }),
         }
     }
@@ -676,6 +692,8 @@ impl MultiHlsServer {
                 config,
                 broadcasts: std::sync::Mutex::new(HashMap::new()),
                 owner_resolver: Some(resolver),
+                ladder: std::sync::RwLock::new(Vec::new()),
+                source_bandwidth_bps: std::sync::RwLock::new(None),
             }),
         }
     }
@@ -840,6 +858,74 @@ impl MultiHlsServer {
         if let Some(s) = subs {
             s.finalize();
         }
+    }
+
+    /// Register the ABR ladder the master-playlist composer consults
+    /// when a request for `<source>/master.m3u8` arrives. Each entry's
+    /// `name` is matched against sibling broadcasts of the form
+    /// `<source>/<name>`; siblings that have published at least a
+    /// video rendition produce one `#EXT-X-STREAM-INF` variant line
+    /// with the ladder entry's `BANDWIDTH`, `RESOLUTION`, and
+    /// `CODECS`. Calling again replaces the entire ladder.
+    ///
+    /// Empty ladder -> master playlist falls back to the single-
+    /// variant source-only shape the pre-session-106-C version
+    /// emitted. Tier 4 item 4.6 session 106 C.
+    pub fn set_ladder(&self, ladder: Vec<crate::master::RenditionMeta>) {
+        *self.inner.ladder.write().expect("multi hls ladder lock poisoned") = ladder;
+    }
+
+    /// Current ladder snapshot. Read-only clone; useful for tests
+    /// and admin diagnostics.
+    pub fn ladder(&self) -> Vec<crate::master::RenditionMeta> {
+        self.inner
+            .ladder
+            .read()
+            .expect("multi hls ladder lock poisoned")
+            .clone()
+    }
+
+    /// Override the advertised `BANDWIDTH` for the source variant in
+    /// the master playlist. Defaults (`None`) to
+    /// `highest_rung_bps * 1.2` when a ladder is configured, and to
+    /// `2_500_000` when the ladder is empty. Tier 4 item 4.6
+    /// session 106 C.
+    pub fn set_source_bandwidth_bps(&self, bps: Option<u64>) {
+        *self
+            .inner
+            .source_bandwidth_bps
+            .write()
+            .expect("multi hls source_bandwidth lock poisoned") = bps;
+    }
+
+    /// Current source-variant bandwidth override, if any.
+    pub fn source_bandwidth_bps(&self) -> Option<u64> {
+        *self
+            .inner
+            .source_bandwidth_bps
+            .read()
+            .expect("multi hls source_bandwidth lock poisoned")
+    }
+
+    /// Return the set of `<name>` suffixes for every broadcast of
+    /// shape `<source>/<name>` that has a video rendition tracked
+    /// today. Used by [`handle_master_playlist`] to find sibling
+    /// rendition broadcasts without needing to name the specific
+    /// ladder rungs up-front. Test-facing.
+    pub(crate) fn variant_siblings(&self, source: &str) -> Vec<String> {
+        let map = self
+            .inner
+            .broadcasts
+            .lock()
+            .expect("multi hls broadcasts mutex poisoned");
+        let prefix = format!("{source}/");
+        let mut siblings: Vec<String> = map
+            .keys()
+            .filter_map(|key| key.strip_prefix(&prefix).map(|s| s.to_string()))
+            .filter(|suffix| !suffix.contains('/'))
+            .collect();
+        siblings.sort();
+        siblings
     }
 
     /// Number of broadcasts currently tracked (regardless of how
@@ -1124,17 +1210,73 @@ async fn handle_master_playlist(multi: &MultiHlsServer, broadcast: &str) -> Resp
     } else {
         video_codec
     };
-    master.variants.push(crate::master::VariantStream {
-        // Session 13 shipped a flat 2.5 Mbps estimate; leaving it
-        // unchanged because bandwidth discovery still requires a
-        // producer-side catalog that the bridge does not emit yet.
-        bandwidth_bps: 2_500_000,
+
+    // Session 106 C: multi-variant master playlist. Scan the tracked
+    // broadcasts for `<source>/<name>` siblings that have a live
+    // video rendition; emit one variant per sibling, sorted highest-
+    // to-lowest bandwidth per the HLS ABR-client convention. The
+    // source variant is always included as the top-or-bottom entry;
+    // we bias it highest so clients that honour playlist order pick
+    // the source first.
+    let ladder = multi.ladder();
+    let siblings = multi.variant_siblings(broadcast);
+    let mut sibling_variants: Vec<(u64, crate::master::VariantStream)> = Vec::new();
+    for suffix in &siblings {
+        let Some(meta) = ladder.iter().find(|m| &m.name == suffix) else {
+            continue;
+        };
+        // Only emit the sibling if the rendition broadcaster has a
+        // live video rendition; empty siblings are in-progress and
+        // should not show up as a variant until they have one frame.
+        let sibling_broadcast = format!("{broadcast}/{suffix}");
+        if multi.video(&sibling_broadcast).is_none() {
+            continue;
+        }
+        let has_sibling_audio = multi.audio(&sibling_broadcast).is_some();
+        // Each rendition is self-contained (video + audio served by
+        // its own per-broadcast HLS surface), so the master playlist
+        // does NOT reference the top-level audio group from the
+        // rendition variants. The rendition's audio playlist is
+        // reachable at `<rendition>/audio.m3u8`, the same relative
+        // shape the source variant uses.
+        let variant = crate::master::VariantStream {
+            bandwidth_bps: meta.bandwidth_bps,
+            codecs: meta.codecs.clone(),
+            resolution: meta.resolution,
+            audio_group: None,
+            subtitles_group: has_subtitles.then(|| subtitles_group_id.to_string()),
+            uri: format!("./{suffix}/playlist.m3u8"),
+        };
+        let _ = has_sibling_audio;
+        sibling_variants.push((meta.bandwidth_bps, variant));
+    }
+
+    let source_bandwidth_bps = multi.source_bandwidth_bps().unwrap_or_else(|| {
+        if let Some(top) = ladder.iter().map(|m| m.bandwidth_bps).max() {
+            top + top / 5
+        } else {
+            // Pre-session-106-C default: 2.5 Mbps flat estimate.
+            2_500_000
+        }
+    });
+    let source_variant = crate::master::VariantStream {
+        bandwidth_bps: source_bandwidth_bps,
         codecs,
         resolution: None,
         audio_group: has_audio.then(|| audio_group_id.to_string()),
         subtitles_group: has_subtitles.then(|| subtitles_group_id.to_string()),
         uri: "playlist.m3u8".into(),
-    });
+    };
+
+    // Sort siblings highest-to-lowest; the source variant is
+    // inserted at the front so clients honouring playlist order pick
+    // the source first.
+    sibling_variants.sort_by(|a, b| b.0.cmp(&a.0));
+    master.variants.push(source_variant);
+    for (_, variant) in sibling_variants {
+        master.variants.push(variant);
+    }
+
     let body = master.render();
     ([(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")], body).into_response()
 }
@@ -1285,6 +1427,116 @@ mod tests {
             .await
             .expect("request");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn master_playlist_emits_one_variant_per_rendition_sibling() {
+        use crate::master::RenditionMeta;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let multi = MultiHlsServer::new(PlaylistBuilderConfig::default());
+        // Source broadcast + three rendition siblings. Each rendition
+        // ensures a video rendition so the composer emits a variant
+        // for it.
+        let _ = multi.ensure_video("live/demo");
+        let _ = multi.ensure_video("live/demo/720p");
+        let _ = multi.ensure_video("live/demo/480p");
+        let _ = multi.ensure_video("live/demo/240p");
+
+        multi.set_ladder(vec![
+            RenditionMeta {
+                name: "720p".into(),
+                bandwidth_bps: RenditionMeta::bandwidth_bps_with_overhead(2_500),
+                resolution: Some((1280, 720)),
+                codecs: "avc1.640028,mp4a.40.2".into(),
+            },
+            RenditionMeta {
+                name: "480p".into(),
+                bandwidth_bps: RenditionMeta::bandwidth_bps_with_overhead(1_200),
+                resolution: Some((854, 480)),
+                codecs: "avc1.640028,mp4a.40.2".into(),
+            },
+            RenditionMeta {
+                name: "240p".into(),
+                bandwidth_bps: RenditionMeta::bandwidth_bps_with_overhead(400),
+                resolution: Some((426, 240)),
+                codecs: "avc1.640028,mp4a.40.2".into(),
+            },
+        ]);
+
+        let app = multi.router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/hls/live/demo/master.m3u8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+        let body = std::str::from_utf8(&body_bytes).expect("utf8").to_string();
+
+        // Four variants: source + three renditions.
+        let stream_inf_count = body.matches("#EXT-X-STREAM-INF").count();
+        assert_eq!(stream_inf_count, 4, "master playlist should have 4 variants: {body}");
+        // Each rendition's URI is the relative form the briefing locks in.
+        assert!(body.contains("./720p/playlist.m3u8"), "body: {body}");
+        assert!(body.contains("./480p/playlist.m3u8"), "body: {body}");
+        assert!(body.contains("./240p/playlist.m3u8"), "body: {body}");
+        // Rendition BANDWIDTH + RESOLUTION attributes round-tripped.
+        assert!(body.contains("BANDWIDTH=2750000"), "720p kbps*1.1 = 2750000: {body}");
+        assert!(body.contains("RESOLUTION=1280x720"));
+        assert!(body.contains("RESOLUTION=854x480"));
+        assert!(body.contains("RESOLUTION=426x240"));
+        // Source bandwidth default: max(ladder) * 1.2 = 2750000 * 1.2 = 3300000.
+        assert!(
+            body.contains("BANDWIDTH=3300000"),
+            "source variant bandwidth missing: {body}"
+        );
+        // Source variant first (highest bandwidth, honouring playlist order).
+        let source_pos = body.find("\nplaylist.m3u8").expect("source uri present");
+        let first_rend_pos = body.find("./720p/playlist.m3u8").expect("720p uri present");
+        assert!(
+            source_pos < first_rend_pos,
+            "source variant must be emitted first: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn master_playlist_source_bandwidth_override_applies() {
+        use crate::master::RenditionMeta;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let multi = MultiHlsServer::new(PlaylistBuilderConfig::default());
+        let _ = multi.ensure_video("live/demo");
+        let _ = multi.ensure_video("live/demo/720p");
+        multi.set_ladder(vec![RenditionMeta {
+            name: "720p".into(),
+            bandwidth_bps: 2_750_000,
+            resolution: Some((1280, 720)),
+            codecs: "avc1.640028,mp4a.40.2".into(),
+        }]);
+        multi.set_source_bandwidth_bps(Some(9_000_000));
+
+        let app = multi.router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/hls/live/demo/master.m3u8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = std::str::from_utf8(&body_bytes).unwrap().to_string();
+        assert!(body.contains("BANDWIDTH=9000000"), "override not applied: {body}");
     }
 
     #[tokio::test]

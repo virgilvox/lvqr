@@ -231,6 +231,28 @@ pub struct ServeConfig {
     /// 4.4.
     #[cfg(feature = "cluster")]
     pub federation_links: Vec<lvqr_cluster::FederationLink>,
+    /// ABR ladder the server produces from every source broadcast.
+    /// When empty, `start()` installs no transcoders and no master-
+    /// playlist variants are emitted for rendition siblings. When
+    /// non-empty, `start()` installs one
+    /// `SoftwareTranscoderFactory` + one
+    /// `AudioPassthroughTranscoderFactory` per rendition against the
+    /// shared `FragmentBroadcasterRegistry` and registers the
+    /// ladder metadata on the HLS server so the master playlist
+    /// composer emits one `#EXT-X-STREAM-INF` per sibling.
+    /// Feature-gated: accessible only when `lvqr-cli` is built with
+    /// `--features transcode` so the GStreamer transitive closure
+    /// stays out of deployments that do not want the ladder.
+    /// Tier 4 item 4.6 session 106 C.
+    #[cfg(feature = "transcode")]
+    pub transcode_renditions: Vec<lvqr_transcode::RenditionSpec>,
+    /// Operator override for the source variant's advertised
+    /// `BANDWIDTH` in the master playlist, in kilobits per second.
+    /// Defaults (`None`) to `highest_rung_kbps * 1.2`. Only
+    /// meaningful when `transcode_renditions` is non-empty.
+    /// Tier 4 item 4.6 session 106 C.
+    #[cfg(feature = "transcode")]
+    pub source_bandwidth_kbps: Option<u32>,
 }
 
 impl ServeConfig {
@@ -274,6 +296,10 @@ impl ServeConfig {
             cluster_advertise_rtsp: None,
             #[cfg(feature = "cluster")]
             federation_links: Vec::new(),
+            #[cfg(feature = "transcode")]
+            transcode_renditions: Vec::new(),
+            #[cfg(feature = "transcode")]
+            source_bandwidth_kbps: None,
         }
     }
 }
@@ -316,6 +342,15 @@ pub struct ServerHandle {
     /// `#[cfg(feature = "whisper")]`.
     #[cfg(feature = "whisper")]
     agent_runner: Option<lvqr_agent::AgentRunnerHandle>,
+    /// `TranscodeRunner` handle kept alive for the server's
+    /// lifetime when [`ServeConfig::transcode_renditions`] is
+    /// non-empty. Dropping the handle aborts every per-rendition
+    /// drain task the runner spawned; holding it on `ServerHandle`
+    /// mirrors the `agent_runner` and `wasm_filter` patterns so
+    /// the lifetime semantics are identical. Tier 4 item 4.6
+    /// session 106 C. Feature-gated `#[cfg(feature = "transcode")]`.
+    #[cfg(feature = "transcode")]
+    transcode_runner: Option<lvqr_transcode::TranscodeRunnerHandle>,
     /// WASM filter hot-reload watcher kept alive for the
     /// server's lifetime when `--wasm-filter` is configured.
     /// On every debounced change to the module path, the
@@ -503,6 +538,19 @@ impl ServerHandle {
     #[cfg(feature = "whisper")]
     pub fn agent_runner(&self) -> Option<&lvqr_agent::AgentRunnerHandle> {
         self.agent_runner.as_ref()
+    }
+
+    /// `TranscodeRunner` handle backing this server, when
+    /// [`ServeConfig::transcode_renditions`] was non-empty at
+    /// `start()` time. Returns `None` when no ladder is
+    /// configured. Tests read per-`(transcoder, rendition,
+    /// broadcast, track)` counters off this handle to assert
+    /// the ladder factories actually observed the source
+    /// broadcast. Feature-gated on `transcode`. Tier 4 item
+    /// 4.6 session 106 C.
+    #[cfg(feature = "transcode")]
+    pub fn transcode_runner(&self) -> Option<&lvqr_transcode::TranscodeRunnerHandle> {
+        self.transcode_runner.as_ref()
     }
 
     /// Trigger graceful shutdown and wait for every subsystem to drain.
@@ -871,6 +919,65 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     if let Some(ref dash) = dash_server {
         BroadcasterDashBridge::install(dash.clone(), &shared_registry);
     }
+
+    // Tier 4 item 4.6 session 106 C: if the operator passed
+    // `--transcode-rendition <NAME>` one or more times, install one
+    // `SoftwareTranscoderFactory` (GStreamer-backed video encoder) +
+    // one `AudioPassthroughTranscoderFactory` (zero-dep audio copy)
+    // per rendition against the shared registry. Every source
+    // broadcast's video + audio tracks then fan out into
+    // `<source>/<rendition>/{0,1}.mp4` output broadcasters the HLS
+    // bridge drains automatically. The ladder's metadata is also
+    // registered on the HLS server so the master-playlist composer
+    // emits one `#EXT-X-STREAM-INF` per rendition sibling.
+    #[cfg(feature = "transcode")]
+    let transcode_runner_handle = if config.transcode_renditions.is_empty() {
+        None
+    } else {
+        let mut runner = lvqr_transcode::TranscodeRunner::new();
+        let skip_suffixes: Vec<String> = config.transcode_renditions.iter().map(|r| r.name.clone()).collect();
+        for spec in &config.transcode_renditions {
+            let video_factory = lvqr_transcode::SoftwareTranscoderFactory::new(spec.clone(), shared_registry.clone())
+                .skip_source_suffixes(skip_suffixes.clone());
+            let audio_factory =
+                lvqr_transcode::AudioPassthroughTranscoderFactory::new(spec.clone(), shared_registry.clone())
+                    .skip_source_suffixes(skip_suffixes.clone());
+            runner = runner.with_factory(video_factory).with_factory(audio_factory);
+        }
+        tracing::info!(
+            renditions = ?config
+                .transcode_renditions
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>(),
+            "transcode ladder enabled",
+        );
+        // Publish ladder metadata to the HLS master-playlist composer.
+        if let Some(ref hls) = hls_server {
+            let meta: Vec<lvqr_hls::RenditionMeta> = config
+                .transcode_renditions
+                .iter()
+                .map(|r| lvqr_hls::RenditionMeta {
+                    name: r.name.clone(),
+                    bandwidth_bps: lvqr_hls::RenditionMeta::bandwidth_bps_with_overhead(
+                        r.video_bitrate_kbps + r.audio_bitrate_kbps,
+                    ),
+                    resolution: Some((r.width, r.height)),
+                    // Hard-coded placeholder per session 106 C
+                    // decision (d): real SPS / ASC parsing is a
+                    // session-107-or-later job.
+                    codecs: "avc1.640028,mp4a.40.2".into(),
+                })
+                .collect();
+            hls.set_ladder(meta);
+            hls.set_source_bandwidth_bps(
+                config
+                    .source_bandwidth_kbps
+                    .map(|kbps| (kbps as u64).saturating_mul(1_000)),
+            );
+        }
+        Some(runner.install(&shared_registry))
+    };
 
     // Tier 4 item 4.4 session B: start a FederationRunner against any
     // configured peer-cluster MoQ relays. Each runner task opens an
@@ -1445,6 +1552,8 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         _wasm_reloader: wasm_reloader_handle,
         #[cfg(feature = "whisper")]
         agent_runner: agent_runner_handle,
+        #[cfg(feature = "transcode")]
+        transcode_runner: transcode_runner_handle,
         fragment_registry: shared_registry,
         origin: relay_origin,
         #[cfg(feature = "cluster")]
@@ -1939,5 +2048,92 @@ mod whisper_serve_config_tests {
             ..ServeConfig::loopback_ephemeral()
         };
         assert_eq!(cfg.whisper_model.as_deref(), Some(path.as_path()));
+    }
+}
+
+/// Resolve a single `--transcode-rendition` CLI / env value into a
+/// [`lvqr_transcode::RenditionSpec`]. Session 106 C accepts three short
+/// preset names (`"720p"`, `"480p"`, `"240p"`) and a path ending in
+/// `.toml` that is read + deserialized as a custom `RenditionSpec`.
+/// Anything else is a hard error so misconfigured ladders surface at
+/// CLI parse time instead of via silent drop. Tier 4 item 4.6 session
+/// 106 C.
+#[cfg(feature = "transcode")]
+pub fn parse_one_transcode_rendition(value: &str) -> anyhow::Result<lvqr_transcode::RenditionSpec> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("--transcode-rendition value is empty"));
+    }
+    match trimmed {
+        "720p" => Ok(lvqr_transcode::RenditionSpec::preset_720p()),
+        "480p" => Ok(lvqr_transcode::RenditionSpec::preset_480p()),
+        "240p" => Ok(lvqr_transcode::RenditionSpec::preset_240p()),
+        other if other.ends_with(".toml") => {
+            let body = std::fs::read_to_string(other)
+                .map_err(|e| anyhow::anyhow!("failed to read rendition toml {other}: {e}"))?;
+            let spec: lvqr_transcode::RenditionSpec =
+                toml::from_str(&body).map_err(|e| anyhow::anyhow!("failed to parse rendition toml {other}: {e}"))?;
+            Ok(spec)
+        }
+        other => Err(anyhow::anyhow!(
+            "--transcode-rendition: unknown preset {other:?}; expected one of 720p / 480p / 240p, \
+             or a path ending in .toml"
+        )),
+    }
+}
+
+/// Resolve the repeated `--transcode-rendition` flag list into
+/// the [`ServeConfig::transcode_renditions`] value. Tier 4 item 4.6
+/// session 106 C.
+#[cfg(feature = "transcode")]
+pub fn parse_transcode_renditions(values: &[String]) -> anyhow::Result<Vec<lvqr_transcode::RenditionSpec>> {
+    values.iter().map(|v| parse_one_transcode_rendition(v)).collect()
+}
+
+#[cfg(all(test, feature = "transcode"))]
+mod transcode_serve_config_tests {
+    use super::{ServeConfig, parse_one_transcode_rendition, parse_transcode_renditions};
+
+    #[test]
+    fn loopback_ephemeral_defaults_transcode_renditions_to_empty() {
+        let cfg = ServeConfig::loopback_ephemeral();
+        assert!(cfg.transcode_renditions.is_empty());
+        assert!(cfg.source_bandwidth_kbps.is_none());
+    }
+
+    #[test]
+    fn transcode_rendition_720p_parses_to_preset() {
+        let spec = parse_one_transcode_rendition("720p").expect("parse 720p");
+        assert_eq!(spec, lvqr_transcode::RenditionSpec::preset_720p());
+    }
+
+    #[test]
+    fn transcode_rendition_rejects_unknown_preset() {
+        let err = parse_one_transcode_rendition("ultra").expect_err("must reject unknown preset");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown preset"), "error message: {msg}");
+    }
+
+    #[test]
+    fn parse_list_preserves_order_and_builds_default_ladder() {
+        let values = vec!["720p".to_string(), "480p".to_string(), "240p".to_string()];
+        let ladder = parse_transcode_renditions(&values).expect("parse list");
+        assert_eq!(ladder, lvqr_transcode::RenditionSpec::default_ladder());
+    }
+
+    #[test]
+    fn transcode_rendition_reads_toml_file() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("rendition.toml");
+        std::fs::write(
+            &path,
+            "name = \"custom\"\nwidth = 1920\nheight = 1080\nvideo_bitrate_kbps = 5000\naudio_bitrate_kbps = 192\n",
+        )
+        .expect("write");
+        let spec = parse_one_transcode_rendition(path.to_str().unwrap()).expect("parse toml");
+        assert_eq!(
+            spec,
+            lvqr_transcode::RenditionSpec::new("custom", 1920, 1080, 5_000, 192)
+        );
     }
 }

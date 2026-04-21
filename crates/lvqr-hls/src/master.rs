@@ -110,6 +110,43 @@ pub struct VariantStream {
     pub uri: String,
 }
 
+/// Metadata the server needs to render one rendition of a
+/// multi-variant ladder into a master playlist variant.
+///
+/// Populated by `lvqr-cli` at startup from the operator-supplied
+/// `--transcode-rendition` list (Tier 4 item 4.6 session 106 C).
+/// Decoupled from `lvqr_transcode::RenditionSpec` so `lvqr-hls` does
+/// not take a dependency on the transcode crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenditionMeta {
+    /// Short human-readable identifier (e.g. `"720p"`). Used as
+    /// the `NAME=` attribute and as the trailing path component of
+    /// the sibling broadcast (`<source>/<name>`).
+    pub name: String,
+    /// Advertised `BANDWIDTH=` value for the variant line. Typical
+    /// overhead above the encoder's target bitrate is +10%; see the
+    /// `bandwidth_bps_with_overhead` helper.
+    pub bandwidth_bps: u64,
+    /// Optional `RESOLUTION=WxH` attribute. Always present for
+    /// ladder rungs; omitted for the source variant when its real
+    /// resolution is unknown.
+    pub resolution: Option<(u32, u32)>,
+    /// `CODECS=...` attribute. Session 106 C ships a placeholder
+    /// (`"avc1.640028,mp4a.40.2"`); session 107 or later can parse
+    /// the real SPS + ASC off the rendition's init segment.
+    pub codecs: String,
+}
+
+impl RenditionMeta {
+    /// Helper: convert kilobits-per-second into a BANDWIDTH value with
+    /// the conventional +10% HLS overhead margin. Matches what the
+    /// session 106 C CLI wiring defaults to.
+    pub fn bandwidth_bps_with_overhead(kbps: u32) -> u64 {
+        let base = (kbps as u64).saturating_mul(1_000);
+        base + base / 10
+    }
+}
+
 /// A full master / multivariant playlist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasterPlaylist {

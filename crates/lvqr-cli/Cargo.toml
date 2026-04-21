@@ -50,7 +50,11 @@ whisper = [
 # `--transcode-rendition` flag and the LL-HLS master playlist composition);
 # the feature lives here in 105 B so `cargo build -p lvqr-cli --features full`
 # exercises the GStreamer dep graph on CI the moment an operator opts in.
-transcode = ["dep:lvqr-transcode", "lvqr-transcode/transcode"]
+transcode = [
+    "dep:lvqr-transcode",
+    "lvqr-transcode/transcode",
+    "lvqr-test-utils/transcode",
+]
 
 [dependencies]
 lvqr-core = { workspace = true }

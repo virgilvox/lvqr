@@ -274,7 +274,16 @@ pub fn mediastreamvalidator_playlist(
     }
 }
 
-fn is_on_path(name: &str) -> bool {
+/// `true` when `name` resolves to a file on `$PATH`. Used by the
+/// ffprobe / mediastreamvalidator wrappers above and exposed so
+/// integration tests that shell out to external tools (ffmpeg,
+/// gst-inspect-1.0, etc.) can soft-skip on hosts without the tool
+/// installed rather than hard-failing.
+pub fn is_on_path(name: &str) -> bool {
+    is_on_path_inner(name)
+}
+
+fn is_on_path_inner(name: &str) -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };

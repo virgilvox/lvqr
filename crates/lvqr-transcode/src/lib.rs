@@ -57,6 +57,11 @@
 //!   playlist references every rendition as a variant with
 //!   `BANDWIDTH` / `RESOLUTION` matching
 //!   [`RenditionSpec`].
+//! * [`AudioPassthroughTranscoderFactory`]: always-available sibling of
+//!   [`SoftwareTranscoderFactory`] that copies `<source>/1.mp4`
+//!   fragments verbatim into `<source>/<rendition>/1.mp4` so each
+//!   rendition broadcaster is a self-contained mp4 the LL-HLS bridge
+//!   drains without special-casing the missing audio.
 //! * End-to-end demo: ingest one 1080p RTMP stream, watch the
 //!   LL-HLS master playlist advertise four variants
 //!   (source + three ladder rungs).
@@ -97,6 +102,7 @@
 //! already encodes the same subscribe / drain / panic-isolate
 //! pattern by hand.
 
+mod audio_passthrough;
 mod passthrough;
 mod rendition;
 mod runner;
@@ -105,6 +111,7 @@ mod transcoder;
 #[cfg(feature = "transcode")]
 mod software;
 
+pub use audio_passthrough::{AudioPassthroughTranscoder, AudioPassthroughTranscoderFactory};
 pub use passthrough::{PassthroughTranscoder, PassthroughTranscoderFactory};
 pub use rendition::RenditionSpec;
 pub use runner::{TranscodeRunner, TranscodeRunnerHandle, TranscoderStats};
