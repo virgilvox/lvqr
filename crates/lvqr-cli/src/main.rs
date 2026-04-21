@@ -142,6 +142,19 @@ struct ServeArgs {
     #[arg(long, env = "LVQR_SUBSCRIBE_TOKEN")]
     subscribe_token: Option<String>,
 
+    /// Disable the subscribe-auth gate on live HLS and DASH
+    /// routes. When unset (default), the live HLS and DASH
+    /// routers are wrapped with the same `SubscribeAuth`
+    /// provider that already protects `/ws/*`, `/playback/*`,
+    /// and WHEP: Noop provider deployments see no behavior
+    /// change (everything allowed); configured deployments
+    /// (static token, JWT) get an automatic 401 on unauthed
+    /// requests. Set this flag for deployments that want open
+    /// live HLS/DASH playback with auth scoped to ingest,
+    /// admin, and DVR only. Session 112.
+    #[arg(long, env = "LVQR_NO_AUTH_LIVE_PLAYBACK")]
+    no_auth_live_playback: bool,
+
     /// Directory to record broadcasts into. Omit to disable recording.
     #[arg(long, env = "LVQR_RECORD_DIR")]
     record_dir: Option<PathBuf>,
@@ -421,6 +434,7 @@ async fn serve_from_args(
         // invocations do not change behavior.
         #[cfg(feature = "cluster")]
         federation_links: Vec::new(),
+        no_auth_live_playback: args.no_auth_live_playback,
     };
 
     let handle = start(config).await?;

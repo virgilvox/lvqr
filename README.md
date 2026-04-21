@@ -95,10 +95,15 @@ in-process AI agents, cross-cluster federation, peer mesh).
   (`lvqr.bearer.<jwt>` subprotocol). Per-broadcast claim binding
   enforced where the carrier knows the broadcast name at auth
   time. Subscribe-side: WHEP handshake, WebSocket relay
-  (`/ws/*`), DVR playback (`/playback/*`), and admin
-  (`/api/v1/*`) all apply the `SubscribeAuth` provider.
-  **Not gated today: live HLS and DASH segment routes and the
-  mesh `/signal` WebSocket.** See
+  (`/ws/*`), live LL-HLS + MPEG-DASH playback, DVR playback
+  (`/playback/*`), and admin (`/api/v1/*`) all apply the
+  `SubscribeAuth` provider. Tokens ride the
+  `Authorization: Bearer` header; live HLS + DASH also accept
+  `?token=<token>` as a fallback for native `<video>` players
+  that cannot set headers. `--no-auth-live-playback` is the
+  escape hatch for deployments that want open live HLS + DASH
+  with auth scoped to ingest, admin, and DVR only. **Not gated
+  today: the mesh `/signal` WebSocket.** See
   [Known v0.4.0 limitations](#known-v040-limitations) and
   [`docs/auth.md`](docs/auth.md).
 
@@ -311,12 +316,14 @@ subscriber registration and an end-to-end test.
 - [ ] **WHEP audio transcoder (AAC to Opus)** atop the 4.6
   GStreamer pipeline so RTMP publishers reach browser WebRTC
   with audio. Today WHEP serves video-only from non-Opus ingest.
-- [ ] **Live HLS and DASH subscribe auth.** Apply the existing
-  `SubscribeAuth` provider to live HLS playlist and DASH manifest
-  routes. Auth on by default when `--subscribe-token` or
-  `--jwt-secret` is configured; `--no-auth-live-playback` is the
-  escape hatch for deployments that want open live playback with
-  auth scoped to ingest, admin, and DVR.
+- [x] ~~Live HLS and DASH subscribe auth.~~ Shipped in session
+  112 via a tower middleware applied to the HLS and DASH
+  routers at the CLI composition root. Auth on by default when
+  the `SubscribeAuth` provider is configured (Noop provider
+  deployments see no behavior change);
+  `--no-auth-live-playback` is the escape hatch for deployments
+  that want open live playback with auth scoped to ingest,
+  admin, and DVR.
 - [ ] **One hardware encoder backend** (VideoToolbox for macOS or
   NVENC for Linux, picked per deployment target). Remaining
   three backends (VAAPI, QSV, and whichever of NVENC or
@@ -348,16 +355,6 @@ subscriber registration and an end-to-end test.
 
 Operators planning deployments should read these before shipping.
 
-- **Live HLS and DASH segment routes are not auth-gated.** The
-  WebSocket relay (`/ws/*`), DVR playback (`/playback/*`), and
-  admin (`/api/v1/*`) surfaces enforce the subscribe token;
-  live HLS playlist and DASH manifest routes do not. Operators
-  who want live playback behind auth should front the HLS and
-  DASH ports with a reverse proxy that enforces a bearer token.
-  Tracked as the first phase-A security item in
-  [`tracking/PLAN_V1.1.md`](tracking/PLAN_V1.1.md) and will land
-  in the next minor release as an auth-on-by-default gate with
-  `--no-auth-live-playback` as the escape hatch.
 - **Mesh `/signal` WebSocket is not auth-gated.** The mesh
   coordinator accepts `Register` messages from any client.
   Operators not using the peer mesh should leave `--mesh-enabled`

@@ -1,0 +1,46 @@
+name: Supply-chain audit
+
+# Session 112: closes the audit-debt item surfaced in
+# `tracking/archive/AUDIT-READINESS-2026-04-13.md:37-61` ("cargo-audit
+# supply-chain scan is not wired into CI"). Scheduled daily so a new
+# RustSec advisory against a pinned dep surfaces within one day, and
+# on every push to main so a dep bump that pulls in an advisory
+# surfaces on the merge commit. Pull-request trigger intentionally
+# omitted: audit failures on PRs can be noisy for advisories that
+# already exist on main, and the PR author rarely owns the fix.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 07:00 UTC daily -- lines up with RustSec's typical publish window
+    # and avoids the 00:00 UTC congestion hour on GitHub Actions.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache key so the audit job does not share state
+          # with the main CI build; cargo-audit installs in
+          # `~/.cargo/bin` which Swatinem/rust-cache would otherwise
+          # invalidate on every dep change.
+          key: audit
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      - name: Run cargo audit
+        # --deny warnings upgrades unmaintained and unsound advisories
+        # to failures so the job stays informative. Lockfile mode
+        # targets `Cargo.lock` directly so the audit covers the exact
+        # pinned versions a release build would pull.
+        run: cargo audit --deny warnings

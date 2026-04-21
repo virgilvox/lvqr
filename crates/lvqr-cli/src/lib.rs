@@ -24,8 +24,9 @@ pub use lvqr_admin::{LatencyTracker, SloEntry};
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, Query, State, WebSocketUpgrade};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Path, Query, Request, State, WebSocketUpgrade};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
@@ -258,6 +259,17 @@ pub struct ServeConfig {
     /// Tier 4 item 4.6 session 106 C.
     #[cfg(feature = "transcode")]
     pub source_bandwidth_kbps: Option<u32>,
+    /// Escape hatch for deployments that want open live HLS +
+    /// DASH playback with auth scoped to ingest, admin, and
+    /// DVR only. When `false` (default), the composition root
+    /// wraps the HLS and DASH routers with the same
+    /// `SubscribeAuth` gate that already protects `/ws/*`,
+    /// `/playback/*`, and WHEP. When `true`, the live HLS and
+    /// DASH routers are exposed without an auth layer -- the
+    /// pre-session-112 v0.4.0 behavior. Unauthed deployments
+    /// (Noop provider) see no behavior change either way
+    /// because the provider always allows. Session 112.
+    pub no_auth_live_playback: bool,
 }
 
 impl ServeConfig {
@@ -305,6 +317,7 @@ impl ServeConfig {
             transcode_renditions: Vec::new(),
             #[cfg(feature = "transcode")]
             source_bandwidth_kbps: None,
+            no_auth_live_playback: false,
         }
     }
 }
@@ -1485,11 +1498,28 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         };
 
         let shutdown_on_exit_hls = bg_shutdown_for_task.clone();
+        let hls_auth = auth.clone();
+        let hls_auth_disabled = config.no_auth_live_playback;
         let hls_fut = async move {
             let Some((listener, server)) = hls_router_pair else {
                 return;
             };
-            let router = server.router().layer(CorsLayer::permissive());
+            // Session 112: apply the subscribe-auth gate to live
+            // HLS routes. Noop provider deployments see no
+            // behavior change (provider always allows). Configured
+            // deployments (static token, JWT) get an automatic
+            // 401 on requests without a valid bearer. Escape hatch
+            // is `--no-auth-live-playback` for deployments that
+            // deliberately want open live playback.
+            let mut router = server.router();
+            if !hls_auth_disabled {
+                let state = LivePlaybackAuthState {
+                    auth: hls_auth,
+                    entry: "hls_live",
+                };
+                router = router.layer(from_fn_with_state(state, live_playback_auth_middleware));
+            }
+            let router = router.layer(CorsLayer::permissive());
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move { hls_shutdown.cancelled().await })
                 .await;
@@ -1500,11 +1530,21 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         };
 
         let shutdown_on_exit_dash = bg_shutdown_for_task.clone();
+        let dash_auth = auth.clone();
+        let dash_auth_disabled = config.no_auth_live_playback;
         let dash_fut = async move {
             let Some((listener, server)) = dash_router_pair else {
                 return;
             };
-            let router = server.router().layer(CorsLayer::permissive());
+            let mut router = server.router();
+            if !dash_auth_disabled {
+                let state = LivePlaybackAuthState {
+                    auth: dash_auth,
+                    entry: "dash_live",
+                };
+                router = router.layer(from_fn_with_state(state, live_playback_auth_middleware));
+            }
+            let router = router.layer(CorsLayer::permissive());
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move { dash_shutdown.cancelled().await })
                 .await;
@@ -1599,6 +1639,116 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         #[cfg(feature = "cluster")]
         federation_runner: federation_runner_handle,
     })
+}
+
+// =====================================================================
+// Live HLS + DASH subscribe auth middleware (session 112)
+// =====================================================================
+
+/// State for the live-playback auth middleware. Clones are cheap
+/// (one `Arc` and a `'static` label).
+#[derive(Clone)]
+struct LivePlaybackAuthState {
+    auth: SharedAuth,
+    /// Metric label for `lvqr_auth_failures_total{entry}` and the
+    /// structured log line. Expected values: `"hls_live"`, `"dash_live"`.
+    entry: &'static str,
+}
+
+/// Tower middleware that applies the subscribe-auth gate to live HLS
+/// and DASH routes. The router it wraps serves `/hls/{broadcast}/...`
+/// or `/dash/{broadcast}/...` catch-all paths; this middleware
+/// extracts `broadcast` by the same `rfind('/')` rule the handlers
+/// use, extracts a bearer token from the `Authorization` header or
+/// the `?token=` query parameter, and calls
+/// `SharedAuth::check(AuthContext::Subscribe { token, broadcast })`.
+/// On `Allow` the request flows through; on `Deny` the middleware
+/// short-circuits with a 401 carrying the provider's deny reason.
+///
+/// When the provider is `NoopAuthProvider` (no `--subscribe-token`,
+/// no `--jwt-secret`), every check returns `Allow`, so this
+/// middleware is a pure pass-through. Configured deployments get
+/// the gate automatically.
+///
+/// Paths that do not match the `/{prefix}/{broadcast}/<tail>` shape
+/// (eg. an accidental request to a path the inner router does not
+/// know) fall through to the inner router, which will 404 normally.
+/// The middleware never denies on a broadcast it cannot parse so
+/// the 404 reason is preserved.
+async fn live_playback_auth_middleware(
+    State(state): State<LivePlaybackAuthState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    let query = request.uri().query().unwrap_or("").to_string();
+
+    let Some(broadcast) = extract_live_playback_broadcast(&path) else {
+        return next.run(request).await;
+    };
+
+    let token = extract_live_playback_token(request.headers(), &query);
+
+    let decision = state.auth.check(&AuthContext::Subscribe {
+        token,
+        broadcast: broadcast.clone(),
+    });
+    match decision {
+        AuthDecision::Allow => next.run(request).await,
+        AuthDecision::Deny { reason } => {
+            metrics::counter!("lvqr_auth_failures_total", "entry" => state.entry).increment(1);
+            tracing::warn!(
+                broadcast = %broadcast,
+                entry = state.entry,
+                reason = %reason,
+                "live playback denied"
+            );
+            (StatusCode::UNAUTHORIZED, reason).into_response()
+        }
+    }
+}
+
+/// Extract the broadcast name from an `/hls/{broadcast}/<tail>` or
+/// `/dash/{broadcast}/<tail>` path. Returns `None` when the path
+/// does not carry the expected prefix or when the split would leave
+/// an empty broadcast or tail (matches the handler's
+/// `split_broadcast_path` logic in `lvqr-hls::server` /
+/// `lvqr-dash::server`).
+fn extract_live_playback_broadcast(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/hls/").or_else(|| path.strip_prefix("/dash/"))?;
+    let idx = rest.rfind('/')?;
+    if idx == 0 {
+        return None;
+    }
+    let broadcast = &rest[..idx];
+    let tail = &rest[idx + 1..];
+    if broadcast.is_empty() || tail.is_empty() {
+        return None;
+    }
+    Some(broadcast.to_string())
+}
+
+/// Extract a bearer token for the live-playback auth check. Prefers
+/// the `Authorization: Bearer <token>` header; falls back to the
+/// `?token=<token>` query parameter so native `<video>` elements (which
+/// cannot set request headers) have a working path.
+fn extract_live_playback_token(headers: &HeaderMap, query: &str) -> Option<String> {
+    if let Some(hv) = headers.get(header::AUTHORIZATION)
+        && let Ok(raw) = hv.to_str()
+        && let Some(tok) = raw.strip_prefix("Bearer ")
+        && !tok.is_empty()
+    {
+        return Some(tok.to_string());
+    }
+    for kv in query.split('&') {
+        if let Some((k, v)) = kv.split_once('=')
+            && k == "token"
+            && !v.is_empty()
+        {
+            return Some(v.to_string());
+        }
+    }
+    None
 }
 
 // =====================================================================

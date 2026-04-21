@@ -61,6 +61,7 @@ pub struct TestServerConfig {
     source_bandwidth_kbps: Option<u32>,
     federation_links: Vec<lvqr_cluster::FederationLink>,
     relay_addr: Option<SocketAddr>,
+    no_auth_live_playback: bool,
 }
 
 impl TestServerConfig {
@@ -214,6 +215,18 @@ impl TestServerConfig {
         self.wasm_filter = Some(path.into());
         self
     }
+
+    /// Disable the subscribe-auth gate on live HLS and DASH
+    /// routes. Mirrors the CLI's `--no-auth-live-playback` flag.
+    /// When unset (default), the TestServer wires the same
+    /// `SubscribeAuth` gate on the HLS + DASH routers that
+    /// `/ws/*` and `/playback/*` already use. Integration tests
+    /// that want to exercise the "open live playback with gated
+    /// ingest" shape flip this on. Session 112.
+    pub fn without_live_playback_auth(mut self) -> Self {
+        self.no_auth_live_playback = true;
+        self
+    }
 }
 
 /// A running LVQR server bound to ephemeral loopback ports.
@@ -279,6 +292,7 @@ impl TestServer {
             cluster_advertise_dash: None,
             cluster_advertise_rtsp: None,
             federation_links: config.federation_links,
+            no_auth_live_playback: config.no_auth_live_playback,
         };
         let handle = start(serve_config).await?;
         Ok(Self { handle })
