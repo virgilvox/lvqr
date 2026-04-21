@@ -5,20 +5,35 @@ are meant to relay media to other viewers via WebRTC
 DataChannels, offloading the bulk of server bandwidth for
 high-fan-out broadcasts.
 
-> **Status: topology planner only.** The mesh coordinator
-> assigns peer positions in a relay tree, detects dead peers,
-> and reassigns orphans. Actual media forwarding between peers
-> over WebRTC DataChannels is **not implemented today**; media
-> delivery uses the server-backed MoQ / HLS / DASH / WHEP
-> egress described in [`architecture.md`](architecture.md). The
-> bandwidth math in the "Bandwidth offload" section below is
-> the *intended* behavior after the Tier 4 data-plane work
-> lands; the offload percentage reported by `/api/v1/mesh` is
-> intended offload based on tree shape, not measured traffic.
+> **Status as of v0.4.0: topology planner + signaling ship;
+> client-side WebRTC relay ships in `@lvqr/core`; server-side
+> data-plane wiring is pending.** The Rust side (`lvqr-mesh`,
+> `lvqr-signal`) assigns peer positions in a relay tree,
+> detects dead peers, reassigns orphans, and pushes
+> `AssignParent` messages over `/signal` at Register time. The
+> JavaScript side (`@lvqr/core` `MeshPeer` class at
+> `bindings/js/packages/core/src/mesh.ts`) connects to
+> `/signal`, handles `AssignParent`, opens an
+> `RTCPeerConnection` to the assigned parent, sets up a
+> DataChannel, and forwards received media frames to children.
+> What is missing:
+> - Server-side subscriber registration on the WebSocket relay
+>   (`ws_relay_session` does not yet call `MeshCoordinator::add_peer`).
+> - Server-side injection of MoQ frame bytes into a
+>   DataChannel to seed root peers.
+> - Subscribe-token admission on `/signal`.
+> - An end-to-end test proving a second browser peer receives
+>   frames through the mesh instead of directly from the server.
 >
-> Tracking in [`tracking/ROADMAP.md`](../tracking/ROADMAP.md)
-> Tier 4. Separate from WASM per-fragment filters and the
-> AI-agent work.
+> Until all four land, a deployment that sets `--mesh-enabled`
+> still serves every subscriber directly from the server; the
+> offload percentage reported by `/api/v1/mesh` is intended
+> offload based on tree shape, not measured traffic.
+>
+> Tracking in
+> [`tracking/PLAN_V1.1.md`](../tracking/PLAN_V1.1.md) under
+> "Peer mesh data plane". Separate from WASM per-fragment
+> filters and the AI-agent work.
 
 ## How the topology planner works
 

@@ -1,8 +1,10 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 917 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **origin/main synced (head `e382f34`)**
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; the `examples/tier4-demos/` exit criterion remains open and is tracked in the v1.1 checklist); 917 workspace tests on the default gate, 29 crates; origin/main head `11a5989` (README developer-facing rewrite). Session 111-A audit + plan-docs commit is in-flight: creates `tracking/PLAN_V1.1.md`, corrects README drift on shipped SDKs and WASM mutation capability, adds "Known v0.4.0 limitations", refreshes `docs/mesh.md`.
 
-**Last Updated**: 2026-04-21 (session 110 push event). Session 110's full chain is pushed to `origin/main`: `ffc28a5` feat(slo) v1.1-B WS + WHEP egress instrumentation, `3d9e4ac` close-doc, `208305f` audit tidy (factual corrections on the close block), `7ab557b` WHEP positive-path SLO assertion lock-in (all three `e2e_str0m_loopback*.rs` tests now attach a tracker + assert one sample under `transport="whep"` after the client-side `MediaData`), `e382f34` HANDOFF status header bump. `git log --oneline origin/main..main` is empty after this commit. crates.io is unchanged -- 110 additively extends `RawSampleObserver::on_raw_sample` + `SessionHandle::on_raw_sample` with a trailing `ingest_time_ms: u64` parameter, grows the private `SessionMsg::Video` struct variant in `lvqr-whep::str0m_backend`, adds a `Str0mAnswerer::with_slo_tracker` builder, re-exports `LatencyTracker` from `lvqr-whep::lib`, and adds `lvqr-admin` + `lvqr-core` to `lvqr-whep`'s dep list. No crate version bumps.
+**Last Updated**: 2026-04-21 (session 111-A, docs accuracy sweep). Origin/main head is `11a5989`, reached via the session 110 push chain (`ffc28a5` feat(slo) v1.1-B WS+WHEP egress instrumentation, `3d9e4ac` close-doc, `208305f` audit tidy, `7ab557b` WHEP positive-path SLO assertion, `e382f34` HANDOFF header bump, `d72da65` push-event refresh) plus two docs follow-ups (`c835b19` session 111 entry picker, `11a5989` README developer-facing rewrite). crates.io is unchanged since the 110 push chain: 110 additively extended `RawSampleObserver::on_raw_sample` + `SessionHandle::on_raw_sample` with a trailing `ingest_time_ms: u64`, grew the private `SessionMsg::Video` struct variant in `lvqr-whep::str0m_backend`, added `Str0mAnswerer::with_slo_tracker`, re-exported `LatencyTracker` from `lvqr-whep::lib`, and added `lvqr-admin` + `lvqr-core` to `lvqr-whep`'s dep list. No crate version bumps.
+
+**Session 111-A in-flight**: docs accuracy sweep on top of a 2026-04-21 deep audit. Creates `tracking/PLAN_V1.1.md` with the four-phase plan (Phase A stop-the-bleeding, Phase B user-visible wins, Phase C operator polish, Phase D v1.1 marquee). Corrects README drift on published SDKs, WASM mutation capability, mesh client-side state, Tier 4 exit criterion. Adds "Known v0.4.0 limitations" README section naming the HLS + DASH live-route auth gap, WHEP AAC drop, `/signal` unauth, `/metrics` unauth, no hardware encoders, no nightly soak, and no admission control. Refreshes `docs/mesh.md` to reflect that the JS `MeshPeer` client already ships in `@lvqr/core`. Reorients the session 111 entry block around the PLAN_V1.1 queue. No code changes.
 
 ## Session 110 close (2026-04-21)
 
@@ -67,22 +69,31 @@
 * **No admission control** (unchanged from 108 B).
 * **No time-windowed retention on the admin snapshot** (unchanged from 107 A).
 
-## Session 111 entry point -- maintainer's pick from post-Tier-4 follow-up candidates
+## Session 111 entry point -- plan reprioritized via 2026-04-21 audit
 
-Session 110 closed the v1.1-B WS + WHEP egress SLO work, bringing the Tier 4 item 4.7 latency tracker's coverage to four of five egress surfaces. The fifth surface (pure MoQ subscribers) stays out of server-side measurement scope per 110's scoping decision. No specific scope is locked in for session 111; the maintainer picks from the table below. Each row points at the design notes that would carry forward into a full kick-off briefing.
+A deep audit on 2026-04-21 surfaced five "COMPLETE" claims that paper over real gaps, three test-coverage holes, and six docs-drift items. The post-Tier-4 candidate table that previously lived here has been replaced by a four-phase plan in [`tracking/PLAN_V1.1.md`](PLAN_V1.1.md). Read PLAN_V1.1.md first; the next three rows below are the immediate session queue.
 
-| # | Candidate | Rough scope | Risk | Unblocks |
-|---|---|---|---|---|
-| 1 | `examples/tier4-demos/` first public demo script | 1 session, polish-heavy | low | Tier 4 exit criterion the plan enumerated as "M4 marketing demo" |
-| 2 | Hardware encoder feature flags (NVENC / VideoToolbox / VAAPI / QSV) | 3-5 sessions per backend | high (platform-specific CI) | ABR ladder on GPU; WHIP + RTMP with zero CPU cost on publish |
-| 3 | Stream-modifying WASM filter pipelines | 2-3 sessions, contract rewrite | high | v1.1 marquee feature; unblocks third-party filter marketplace |
-| 4 | WHEP audio transcoder (AAC -> Opus) | 2-3 sessions | medium | true WebRTC browser audio from RTMP publishers |
-| 5 | Tier 5 client SDK (browser, Rust, Python) | ~20 sessions, product decisions | high | distribution story + pure MoQ subscriber SLO (server-side measurement is blocked without a MoQ wire change, which 110 explicitly rejected) |
-| 6 | MoQ frame-carried ingest-time propagation (revisit) | 1-2 sessions, design-heavy | medium | pure MoQ subscriber SLO without Tier 5 SDK (but requires a wire-incompat change LVQR deliberately punted on) |
+### Immediate queue
 
-**How to kick off session 111:** pick a row, read the referenced briefing column (for row 1 the closest precedent is the 106 C `transcode_ladder_e2e.rs` integration-test polish commit; for rows 2-6 no full briefing exists yet and the first act of the session is to author one at `tracking/SESSION_111_BRIEFING.md` after the pick is locked). The 110 rules all still apply: no Claude attribution in commits, no emojis, no em-dashes, 120-col max, real ingest + egress in integration tests, only edit in-repo, no push without direct instruction, plan-vs-code refresh on any design deviation.
+| Session | Scope | Risk | File deliverables |
+|---|---|---|---|
+| **111-A** | Docs accuracy sweep. Fix README drift (published SDKs, WASM mutation capability, mesh client-side state, Tier 4 exit criterion). Add "Known v0.4.0 limitations" README section naming HLS/DASH auth gap, WHEP AAC drop, `/signal` unauth, `/metrics` unauth, no hardware encoders. Refresh `docs/mesh.md`. Author `tracking/PLAN_V1.1.md`. | low | README.md, docs/mesh.md, tracking/PLAN_V1.1.md, tracking/HANDOFF.md |
+| **111-B** | Mesh server-side prereqs (original 111 briefing scope, narrowed). Wire `MeshCoordinator::add_peer` into `ws_relay_session`. Gate `/signal` with `SubscribeAuth`. Add `ServerHandle::mesh()` accessor. Lock in MoQ-over-DataChannel wire format in-commit. One integration test: two WS subscribers, second receives `AssignParent` naming the first. | low | crates/lvqr-cli/src/lib.rs, crates/lvqr-signal/src/signaling.rs, crates/lvqr-cli/tests/mesh_ws_registration_e2e.rs |
+| **112** | Security hardening. Apply `SubscribeAuth` to HLS + DASH live routes. Auth on by default when a provider is configured (static token, JWT); `--no-auth-live-playback` flag as escape hatch. Noop provider deployments unchanged. Add `cargo audit` CI job. Integration tests for both on and off. | low | crates/lvqr-cli/src/lib.rs, crates/lvqr-cli/src/main.rs, crates/lvqr-cli/tests/hls_live_auth_e2e.rs, .github/workflows/audit.yml |
 
-**Recommended lean:** row 1 (`examples/tier4-demos/`) is the lowest-risk polish-heavy session and closes a long-standing Tier 4 exit-criterion gap the plan enumerated as "M4 marketing demo". Row 4 (WHEP audio transcoder) is the highest-leverage single-codec-gap closer for browser WebRTC from RTMP publishers, building on 106's GStreamer software transcoder pipeline. Row 2 (hardware encoders) is a multi-session commitment and should wait until the maintainer has a concrete deployment target that needs a specific GPU backend.
+After 112 comes phase B (sessions 113-116): WHEP audio AAC->Opus, cross-ingress E2E tests, mesh JS-side end-to-end, tier4-demos first script. See PLAN_V1.1.md for full sequencing and rationale.
+
+### Why the reprioritization
+
+The prior session-111 picker table leaned toward row 1 (tier4-demos) as "lowest risk, closes the marketing demo gap" and row 4 (WHEP audio) as "highest leverage". Both picks were sound but missed three higher-leverage items surfaced only by the 2026-04-21 audit:
+
+1. **README drift is actively misleading.** The client libraries table marks `@lvqr/core` and `@lvqr/player` as "on the roadmap" despite both being published at v0.3.1 on npm. The WASM v1 description says "read-only tap" despite `lvqr-wasm/src/lib.rs:17-23` shipping payload-mutation in v1. Tier 4 was marked complete without the `examples/tier4-demos/` exit criterion. Fix cost: one low-risk session.
+2. **HLS and DASH live routes are silently unauthenticated.** `crates/lvqr-hls/src/server.rs:7-9` defers auth to the CLI composition root; `crates/lvqr-cli/src/lib.rs:1492` and `:1507` apply only `CorsLayer::permissive()`. Operators who set `--auth` today get an auth story that covers ingest, `/ws/*`, `/playback/*`, and `/api/v1/*` but leaves live HLS playlists and DASH manifests world-readable. Surface in docs now (111-A) and close the gap next (112) by applying `SubscribeAuth` to the HLS + DASH routers with `--no-auth-live-playback` as the escape hatch. Noop provider deployments see no behavior change.
+3. **The original briefing's Tier 5 SDK scope estimate is wrong.** The briefing said "~20 sessions, high risk, greenfield"; the npm + PyPI + crates.io packages already exist. Real scope is 5-8 sessions of completion + CI work, not authoring.
+
+### Kickoff rules (unchanged from session 110)
+
+No Claude attribution in commits. No emojis. No em-dashes. 120-column max. Real ingest and egress in integration tests. Only edit in-repo. No push without direct instruction. Plan-vs-code refresh on any design deviation.
 
 ## Session 109 A close (2026-04-21)
 

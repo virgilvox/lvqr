@@ -1,0 +1,218 @@
+# LVQR v1.1 Plan
+
+Authored 2026-04-21 on top of a deep audit after the Tier 4 close.
+Supersedes the "post-Tier-4 candidate table" in `SESSION_110_BRIEFING.md`.
+
+## Premise
+
+Tier 4 is closed by its own rubric (eight items shipped, workspace at v0.4.0,
+25 Rust crates + 2 npm packages + 1 PyPI package published). A 2026-04-21
+audit surfaced that five "COMPLETE" claims in the handoff and README paper
+over real gaps, the briefing's post-Tier-4 candidate table misranks two
+items, and three test-coverage holes meaningfully undercut the "shipped"
+story. This document resequences the v1.1 work around those findings.
+
+## Verified findings the reprioritization is built on
+
+### Silent gaps inside "COMPLETE" claims
+
+1. **Live HLS + DASH routes are unauthenticated** even when `--auth` is
+   configured. `crates/lvqr-hls/src/server.rs:7-9` explicitly defers auth
+   to the CLI composition root; `crates/lvqr-cli/src/lib.rs:1492` and
+   `:1507` mount both routers with only `CorsLayer::permissive()`. `/ws/*`,
+   `/playback/*`, and `/api/v1/*` enforce tokens; live HLS/DASH segments
+   do not. The "One token, every protocol" README claim is true for
+   ingest + DVR + admin, misleading for live egress.
+
+2. **WHEP silently drops AAC.** `crates/lvqr-whep/src/str0m_backend.rs:42-46`
+   admits "There is no in-tree AAC -> Opus transcoder". Every RTMP or SRT
+   or RTSP publisher feeding a WHEP subscriber is video-only. This is the
+   single most user-visible v1.1 gap for the OBS-to-browser workflow.
+
+3. **WASM filters are already mutation-capable.** `crates/lvqr-wasm/src/lib.rs:17-23`
+   lets guests drop or rewrite payload bytes. The README still advertises
+   v1 as a read-only tap. Docs drift, not a code gap.
+
+4. **Hardware encoder backends are absent from Cargo.** `crates/lvqr-transcode/Cargo.toml`
+   has only the `transcode` feature (software x264). No `hw-nvenc`,
+   `hw-vaapi`, `hw-videotoolbox`, or `hw-qsv` feature flags. Comments in
+   `lvqr-transcode/src/lib.rs` reference them as future work.
+
+5. **Tier 4 exit criterion unshipped.** `TIER_4_PLAN.md:795` enumerates a
+   working `examples/tier4-demos/` public demo script as the Tier 4 exit
+   gate. It never landed. Tier 4 closed without meeting this gate.
+
+### Test coverage holes
+
+- **Zero WHIP to non-WebRTC E2E.** WHIP is the canonical webcam-in ingest;
+  no test exercises WHIP to HLS, WHIP to DASH, WHIP to WS, WHIP to WHEP,
+  WHIP to archive.
+- **Zero RTMP to WHEP E2E.** OBS to browser WebRTC is the most common user
+  story and has no coverage.
+- **Zero browser-playback E2E.** `tests/e2e/test-app.spec.ts` lines 3-17
+  document that the existing Playwright test does not exercise any
+  streaming code path.
+- **Zero JS and Python SDK tests in CI.** `bindings/js` has no test script;
+  `bindings/python/tests/test_client.py` exists but no workflow invokes
+  pytest.
+- **DVR archive READ E2E absent.** Write side exercised by
+  `rtmp_archive_e2e.rs`; no archive-read test covers the `/playback/*`
+  scrub routes.
+- **Nightly 24h soak not scheduled.** `lvqr-soak` tests run fast-path only;
+  no scheduled long-duration CI job.
+- **whisper, cluster, transcode features off-CI.** `.github/workflows/ci.yml`
+  runs default plus `c2pa` plus `io-uring` only; three feature flags have
+  no CI protection.
+
+### Audit debt from 2026-04-13 audits with UNCONFIRMED status
+
+Rate limiting, `/metrics` token flag, admin auth-failure metric,
+`CorsLayer` tightening, `cargo audit` CI job, 5-artifact contract
+enforcement (script exists, soft-fail only).
+
+### Docs drift
+
+- `README.md:231` marks `@lvqr/core` and `@lvqr/player` as "on the roadmap";
+  both published at v0.3.1 on npm.
+- `README.md:244-246` treats Tier 5 client SDKs as unchecked; JS + Python
+  admin + Rust `lvqr-core` clients all exist.
+- `README.md:260-264` treats "Client-side DataChannel parent/child relay
+  in `@lvqr/core`" as unchecked; already implemented in
+  `bindings/js/packages/core/src/mesh.ts`.
+
+## Reprioritized phase plan
+
+### Phase A: stop the bleeding (sessions 111-112, low risk)
+
+| Session | Scope | Rationale |
+|---|---|---|
+| **111-A** | Docs accuracy sweep. Fix README drift on published SDKs, WASM mutation capability, mesh client state, Tier 4 exit criterion. Add "Known v0.4.0 limitations" section naming HLS/DASH auth gap and WHEP AAC drop. Refresh `docs/mesh.md` to reflect the JS `MeshPeer` is already shipped. | The README actively misleads anyone landing on the repo today. Zero risk, immediate value. |
+| **111-B** | Mesh server-side prereqs (original 111 briefing). Wire `MeshCoordinator::add_peer` into `ws_relay_session`. Gate `/signal` with `SubscribeAuth`. Add `ServerHandle::mesh()` snapshot accessor. Lock in MoQ-over-DataChannel wire format in-commit. Add one integration test asserting a second WS subscriber receives `AssignParent` naming the first as parent. | Low-risk unblock for future mesh work. Narrow scope, clear deliverable. |
+| **112** | Security hardening. Apply the existing `SubscribeAuth` provider to HLS and DASH live routes. Auth on by default whenever the provider is configured (static token, JWT); `--no-auth-live-playback` flag as the escape hatch for deployments that want open live playback with auth scoped to ingest + admin + DVR only. Noop provider deployments see no behavior change. Add integration tests for both on and off. Ship `cargo audit` CI job. | Closes the live-route auth gap with zero impact on unauthed deployments and an explicit escape hatch for the narrow "I want open live HLS but gated ingest" case. |
+
+### Phase B: user-visible wins (sessions 113-116, medium risk)
+
+| Session | Scope | Rationale |
+|---|---|---|
+| **113** | WHEP audio transcoder (AAC to Opus). Reuse the session 106 GStreamer pipeline: `faad ! audioconvert ! audioresample ! opusenc`. Gate behind a new `whep-audio` feature or fold into the existing `transcode` feature. Add one integration test: RTMP publish to WHEP subscriber with audio assertion. | Single highest-impact v1.1 item. Closes the OBS-to-browser audio gap. |
+| **114** | Test gap closers. WHIP-to-HLS E2E, RTMP-to-WHEP E2E (pairs with 113), SRT-to-DASH E2E. Three integration tests in one session. | Covers the three biggest cross-crate E2E gaps surfaced by the audit. |
+| **115** | Mesh data-plane step 2. Exercise the existing `@lvqr/core` `MeshPeer` client against the session 111-B server wiring. Add Playwright E2E with two browser peers. Flip `docs/mesh.md` from "topology planner only" to "topology planner + signaling wired; DataChannel media relay ready for end-to-end testing". | First real mesh data-plane milestone. |
+| **116** | `examples/tier4-demos/` first public demo script. One polished scripted demo chaining WASM filter + Whisper captions + ABR transcode + archive + C2PA verify. Closes the Tier 4 exit criterion that was skipped. | Marketing-grade output; required by Tier 4 rubric. |
+
+### Phase C: operator-grade polish (sessions 117-121)
+
+| Session | Scope |
+|---|---|
+| 117 | Archive READ DVR E2E + DASH-IF conformance validator in CI. |
+| 118 | SDK completion. Flesh out `@lvqr/core` admin client to cover all `/api/v1/*` routes (mesh, slo, cluster, federation). Add Vitest smoke tests. Add pytest invocation in CI. |
+| 119 | Nightly 24h soak CI job (scheduled workflow; soft-fail for first week then hard). Enable whisper, cluster, transcode features in a CI matrix. |
+| 120 | OAuth2 or JWKS dynamic key discovery. Closes README v1.1 checklist item. |
+| 121 | HMAC-signed playback URLs for one-off links. Closes README v1.1 checklist item. |
+
+### Phase D: v1.1 marquee (sessions 122+)
+
+| Session | Scope |
+|---|---|
+| 122-125 | Mesh data-plane completion. Client-side parent/child relay hardening, actual-vs-intended offload reporting, per-peer capacity advertisement, TURN deployment recipe, 3+ browser Playwright E2E. Flip `docs/mesh.md` to "IMPLEMENTED". |
+| 126-129 | One hardware encoder backend. Pick based on deployment target: VideoToolbox for macOS dev, NVENC for Linux prod. Defer the other three to v1.2. |
+| 130-132 | Stream-modifying WASM pipelines v2 with chaining. Documented v1.1 marquee feature. |
+| 133+ | Tier 5 ecosystem: Helm chart, Kubernetes operator, Terraform module, docs site. |
+
+## Items intentionally deferred to v1.2 or later
+
+- Three of the four hardware encoder backends (only one ships in v1.1).
+- MoQ frame-carried ingest-time propagation (110 scoping rejected it;
+  Tier 5 client SDK push-back endpoint is the preferred path).
+- Webhook auth provider (row on v1.1 checklist; lower leverage than OAuth2).
+- SCTE-35 passthrough.
+- Dedicated DVR scrub web UI.
+- Hot config reload.
+- SIP ingest (explicit anti-scope per ROADMAP).
+- Room-composite egress (explicit anti-scope per ROADMAP).
+- Live-signed C2PA streams (explicit anti-scope per TIER_4_PLAN).
+- GPU WASM filters (explicit anti-scope per TIER_4_PLAN).
+
+## Rationale for the reordering
+
+### Why docs first
+
+The README at head `11a5989` tells readers that `@lvqr/core` is "on the
+roadmap". It was published to npm at v0.3.1. Anyone reading the README
+today leaves with the wrong impression. Fix cost is 30 minutes; value is
+unambiguous.
+
+### Why security second, not first
+
+The HLS and DASH live-route auth gap is real. Noop-provider deployments
+(no auth configured) see no behavior change from a fix because the
+provider passes everything through. The break surface is narrow:
+deployments that explicitly set `--subscribe-token` or `--jwt-secret`
+and rely on live HLS and DASH staying open. That intersection is likely
+empty (operators who set subscribe-auth generally want subscriber auth
+everywhere) and has an explicit escape hatch via
+`--no-auth-live-playback`. Land the fix in the next release as
+auth-on-by-default.
+
+### Why WHEP audio third, not first
+
+The candidate table in `SESSION_110_BRIEFING.md` ranks WHEP audio as row 4
+with "medium risk" and ~2-3 sessions scope. In practice, the GStreamer
+pipeline from session 106 already handles the decode side; the remaining
+work is an Opus encoder on the output side and wiring into the WHEP
+session's audio PT. Scope is closer to 1-2 sessions. User impact is huge:
+every RTMP publisher to WebRTC subscriber workflow today gets video only.
+
+### Why the Tier 5 SDK scope call in the briefing is wrong
+
+The briefing estimates Tier 5 client SDK at ~20 sessions with "high" risk
+and treats it as greenfield. Reality: `@lvqr/core` at 1143 LOC across six
+TypeScript modules already ships a MoQ-Lite subscriber, WebTransport +
+WebSocket transport detection, admin client, and a full `MeshPeer` client.
+`@lvqr/player` at 316 LOC ships the `<lvqr-player>` web component.
+`lvqr` on PyPI ships the admin client. `lvqr-core` on crates.io ships the
+Rust side. The remaining work is **completion and CI** (expand admin
+client coverage, add reconnect semantics, wire Vitest + pytest into CI,
+end-to-end test against a running server), not authoring from scratch.
+Realistic scope: 5-8 sessions across phase C and D.
+
+### Why mesh data-plane completion is phase D, not phase B
+
+The full mesh data-plane checklist in `README.md:251-278` has ten items.
+Sessions 111-B and 115 close the first three (server-side subscriber
+registration, signal `AssignParent`, client parent/child relay E2E).
+The remaining seven (actual-vs-intended offload, per-peer capacity
+advertisement, TURN recipe, 3+ browser Playwright) are a multi-session
+commitment with real product decisions (NAT traversal strategy, capacity
+measurement protocol, fallback semantics). Better to ship the first three
+as a working slice, validate with real users, then commit to the rest.
+
+## Success criteria for v1.1 exit
+
+- Every item on the README roadmap checklist is either:
+  (a) checked as shipped with a linked integration test, or
+  (b) deliberately moved to a v1.2 anti-scope bucket with rationale.
+- No "COMPLETE" claim in any handoff or docs file contradicts a silent
+  gap in the code.
+- Every Cargo feature has at least one CI job exercising it.
+- WHEP can deliver audio from any AAC ingest.
+- Live HLS and DASH routes enforce the same auth as `/ws/*` by default.
+- `examples/tier4-demos/` has at least one scripted demo that runs.
+- Mesh data-plane handles the happy path with two browser peers end to
+  end.
+
+## How to kick off the next session
+
+Pick the top unshipped phase-A or phase-B row. Read this document and
+the matching row's scope line. Author `tracking/SESSION_N_BRIEFING.md`
+before opening any source file if the row has a non-trivial design
+decision. Honor the absolute rules in `CLAUDE.md` (no Claude attribution,
+no emojis, no em-dashes, 120-col max, real ingest and egress in
+integration tests, only edit in-repo, no push without direct instruction).
+
+## Revisit triggers
+
+Revise this document if any of the following happens:
+- A new audit surfaces additional "COMPLETE" gaps not listed here.
+- An external deployment surfaces a priority this plan deranks too low.
+- A phase takes significantly longer than the session estimate and
+  threatens the phase-C exit window.

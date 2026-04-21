@@ -44,7 +44,11 @@ in-process AI agents, cross-cluster federation, peer mesh).
   playlist, ABR ladder variants, automatic `ENDLIST` on disconnect
 - **MPEG-DASH**: live-profile dynamic MPD with flip to
   `type="static"` on disconnect
-- **WHEP** WebRTC video egress via `str0m` (H.264 + HEVC)
+- **WHEP** WebRTC video egress via `str0m` (H.264 + HEVC).
+  Audio requires an Opus publisher today; AAC ingest audio is
+  dropped at the WHEP session (AAC -> Opus transcoder is on the
+  v1.1 roadmap). See
+  [Known v0.4.0 limitations](#known-v040-limitations)
 - **MoQ** over QUIC / WebTransport via `moq-lite`, zero-copy fanout
 - **WebSocket fMP4** for browsers without WebTransport
 - **DVR scrub** via `/playback/*` backed by a `redb` segment index
@@ -52,9 +56,11 @@ in-process AI agents, cross-cluster federation, peer mesh).
 ### Programmable data plane
 - **WASM per-fragment filters** (`--wasm-filter <path>`,
   `LVQR_WASM_FILTER`) via `wasmtime 25`. Guests observe every
-  ingested fragment; `notify`-backed hot-reload atomically swaps
-  the running filter. v1 is a read-only tap; stream-modifying
-  pipelines are on the roadmap. Examples under
+  ingested fragment and may drop it (negative return) or rewrite
+  its payload bytes (non-negative length return). `notify`-backed
+  hot-reload atomically swaps the running filter. Fragment
+  metadata (track id, PTS, DTS, flags) is read-only in v1;
+  multi-filter chaining is on the v1.1 roadmap. Examples under
   `crates/lvqr-wasm/examples/`.
 - **In-process AI agents** (`lvqr-agent`, `lvqr-agent-whisper`).
   One drain task per agent per `(broadcast, track)`,
@@ -82,13 +88,19 @@ in-process AI agents, cross-cluster federation, peer mesh).
 ### Auth
 - Pluggable: noop, static tokens, or HS256 JWT with `iss` + `aud`
   validation.
-- **One token, every protocol.** The same JWT admits a publisher
+- **One token, every ingest.** The same JWT admits a publisher
   across RTMP (stream key IS the JWT), WHIP
   (`Authorization: Bearer`), SRT (`streamid=m=publish,r=<broadcast>,t=<jwt>`),
   RTSP (`Authorization: Bearer`), and WebSocket ingest
   (`lvqr.bearer.<jwt>` subprotocol). Per-broadcast claim binding
   enforced where the carrier knows the broadcast name at auth
-  time. See [`docs/auth.md`](docs/auth.md).
+  time. Subscribe-side: WHEP handshake, WebSocket relay
+  (`/ws/*`), DVR playback (`/playback/*`), and admin
+  (`/api/v1/*`) all apply the `SubscribeAuth` provider.
+  **Not gated today: live HLS and DASH segment routes and the
+  mesh `/signal` WebSocket.** See
+  [Known v0.4.0 limitations](#known-v040-limitations) and
+  [`docs/auth.md`](docs/auth.md).
 
 ### Storage
 - **fMP4 recorder** (`--record-dir`) subscribed to `EventBus`.
@@ -225,11 +237,17 @@ full model, ops recipes, and tuning knobs.
 
 ## Client libraries
 
-| Language | Install | Status | Description |
+| Language | Install | Version | Description |
 |---|---|---|---|
-| Rust | `cargo add lvqr-core` | shipped | Shared types, `EventBus`, admin client |
-| JavaScript | `@lvqr/core`, `@lvqr/player` | on the roadmap | MoQ client, WebSocket fallback, mesh peer relay, `<lvqr-player>` web component |
-| Python | `pip install lvqr` | admin client only | Admin API client |
+| Rust | `cargo add lvqr-core` | 0.4.0 (crates.io) | Shared types, `EventBus`, admin client |
+| JavaScript | `npm i @lvqr/core` | 0.3.1 (npm) | MoQ-Lite subscriber over WebTransport, WebSocket fMP4 fallback, admin client, `MeshPeer` WebRTC DataChannel relay (client-side; server-side data plane pending) |
+| JavaScript | `npm i @lvqr/player` | 0.3.1 (npm) | Drop-in `<lvqr-player>` web component with MSE fallback |
+| Python | `pip install lvqr` | 0.3.1 (PyPI) | Admin API client (no streaming surface) |
+
+See [`docs/sdk/javascript.md`](docs/sdk/javascript.md) for the JS
+API reference and
+[`bindings/python/python/lvqr/`](bindings/python/python/lvqr/) for
+the Python module.
 
 ## Roadmap
 
@@ -237,55 +255,75 @@ Tier 1 (protocols), Tier 2 (unified fragment model + cluster
 plane), Tier 3 (cluster auth + redirect-to-owner), and Tier 4
 (programmable data plane: WASM filters, io_uring archive, C2PA,
 cross-cluster federation, AI agents, ABR transcoding, latency
-SLO, one-token auth) are all **shipped**.
+SLO, one-token auth) all **ship** as of v0.4.0. The Tier 4 exit
+criterion "first `examples/tier4-demos/` public demo script" is
+the one open Tier 4 deliverable and is listed below.
 
-The remaining v1.1+ checklist, ordered roughly by leverage:
+Full v1.1 phase plan with session-by-session sequencing lives in
+[`tracking/PLAN_V1.1.md`](tracking/PLAN_V1.1.md).
 
-### Client & distribution
-- [ ] **Tier 5 client SDKs.** `@lvqr/core` + `@lvqr/player` npm
-  packages. Rust + Python clients. Needed for the MoQ playback
-  story and for the peer-mesh data plane to work end-to-end.
-- [ ] **First `examples/tier4-demos/` public demo script.**
-  Closes the Tier 4 exit-criterion gap.
+The remaining v1.1 checklist, ordered by phase:
+
+### Client SDKs (shipped; completion work pending)
+JavaScript (`@lvqr/core`, `@lvqr/player` at 0.3.1 on npm), Python
+(`lvqr` at 0.3.1 on PyPI, admin client only), and Rust
+(`lvqr-core` at 0.4.0 on crates.io) already ship. Remaining work:
+- [ ] Expand `@lvqr/core` admin client to cover every `/api/v1/*`
+  route (mesh, slo, cluster, federation).
+- [ ] Add Vitest + pytest to CI so SDK drift surfaces at PR time.
+- [ ] Document reconnect + retry semantics in the SDK README.
+- [ ] First `examples/tier4-demos/` public demo script (closes the
+  Tier 4 exit criterion).
 
 ### Peer mesh data plane
-- [ ] **Server-side subscriber registration** -- wire `MeshCoordinator::add_peer`
-  into the WS relay (and future WebRTC relay) subscriber path
-  so every subscriber is placed in the tree at connect time.
-- [ ] **Signal `AssignParent` from server to client** over the
-  existing `/signal` WebSocket (protocol already shipped in
-  `lvqr-signal`).
-- [ ] **Subscribe-token admission** on `/signal` (currently
+Topology planner, WebSocket signaling, `/api/v1/mesh` admin route,
+and the client-side `MeshPeer` (WebRTC DataChannel forwarding,
+opening `RTCPeerConnection` to the assigned parent, forwarding to
+children) already exist. The data-plane gap is server-side
+subscriber registration and an end-to-end test.
+- [ ] **Server-side subscriber registration** - wire
+  `MeshCoordinator::add_peer` into `ws_relay_session` so every WS
+  subscriber is placed in the tree at connect time and receives an
+  `AssignParent` over `/signal`.
+- [ ] **Subscribe-token admission on `/signal`** (currently
   unauthenticated).
-- [ ] **Client-side DataChannel parent/child relay** in
-  `@lvqr/core`: open an `RTCPeerConnection` to the assigned
-  parent, receive MoQ frames over a DataChannel, forward to
-  assigned children, deliver to MSE. Fallback to server-direct
-  egress if DataChannel setup fails.
-- [ ] **Wire format** for MoQ frames over DataChannel (leading
-  candidate: raw MoQ frame bytes + `object_id` header).
+- [ ] **Add `ServerHandle::mesh()` snapshot accessor** so
+  integration tests can assert on coordinator state.
+- [ ] **Lock in MoQ-over-DataChannel wire format** in-commit
+  (leading candidate: raw MoQ frame bytes prefixed by an 8-byte
+  big-endian `object_id`).
+- [ ] **Two-peer end-to-end test** proving a subscriber connected
+  through the mesh receives the same fMP4 frames as a
+  server-direct subscriber.
 - [ ] **Actual-vs-intended offload reporting**: clients report
   "served by peer X"; coordinator aggregates; `/api/v1/mesh`
-  returns measured.
+  returns measured offload.
 - [ ] **Per-peer capacity advertisement** so rebalancing uses
   bandwidth + CPU instead of hardcoded `max-children`.
 - [ ] **TURN deployment recipe** + STUN fallback config. Document
   coturn integration for peers behind symmetric NAT.
-- [ ] **End-to-end integration test** with 3+ browser clients
-  (playwright + fake WebRTC; feeds into the existing 5-artifact
-  test contract).
+- [ ] **Three-peer browser Playwright E2E** feeding the 5-artifact
+  test contract.
 - [ ] Flip [`docs/mesh.md`](docs/mesh.md) from "topology planner
-  only" to "IMPLEMENTED" once the data plane lands.
+  only" to "IMPLEMENTED".
 
 ### Egress + encoders
-- [ ] **WHEP audio transcoder (AAC → Opus)** atop the 4.6
+- [ ] **WHEP audio transcoder (AAC to Opus)** atop the 4.6
   GStreamer pipeline so RTMP publishers reach browser WebRTC
-  with audio.
-- [ ] **Hardware encoder backends**: NVENC, VideoToolbox, VAAPI,
-  QSV. Multi-session commitment; pick a target GPU backend per
-  deployment.
-- [ ] **Stream-modifying WASM filter pipelines.** v1 WASM runtime
-  is a read-only tap; v1.1 lets guests rewrite fragments.
+  with audio. Today WHEP serves video-only from non-Opus ingest.
+- [ ] **Live HLS and DASH subscribe auth.** Apply the existing
+  `SubscribeAuth` provider to live HLS playlist and DASH manifest
+  routes. Auth on by default when `--subscribe-token` or
+  `--jwt-secret` is configured; `--no-auth-live-playback` is the
+  escape hatch for deployments that want open live playback with
+  auth scoped to ingest, admin, and DVR.
+- [ ] **One hardware encoder backend** (VideoToolbox for macOS or
+  NVENC for Linux, picked per deployment target). Remaining
+  three backends (VAAPI, QSV, and whichever of NVENC or
+  VideoToolbox is not picked first) deferred to v1.2.
+- [ ] **Stream-modifying WASM filter chains.** v1 already lets
+  single filters drop or rewrite fragment payload bytes; v1.1
+  lets operators compose multiple filters.
 - [ ] **MoQ egress latency SLO.** Server-side measurement would
   require a MoQ wire change that was explicitly rejected in the
   v1.1-B scoping call (keeps foreign MoQ clients compatible).
@@ -305,6 +343,49 @@ The remaining v1.1+ checklist, ordered roughly by leverage:
 
 **Source of truth for session-by-session progress:**
 [`tracking/HANDOFF.md`](tracking/HANDOFF.md).
+
+## Known v0.4.0 limitations
+
+Operators planning deployments should read these before shipping.
+
+- **Live HLS and DASH segment routes are not auth-gated.** The
+  WebSocket relay (`/ws/*`), DVR playback (`/playback/*`), and
+  admin (`/api/v1/*`) surfaces enforce the subscribe token;
+  live HLS playlist and DASH manifest routes do not. Operators
+  who want live playback behind auth should front the HLS and
+  DASH ports with a reverse proxy that enforces a bearer token.
+  Tracked as the first phase-A security item in
+  [`tracking/PLAN_V1.1.md`](tracking/PLAN_V1.1.md) and will land
+  in the next minor release as an auth-on-by-default gate with
+  `--no-auth-live-playback` as the escape hatch.
+- **Mesh `/signal` WebSocket is not auth-gated.** The mesh
+  coordinator accepts `Register` messages from any client.
+  Operators not using the peer mesh should leave `--mesh-enabled`
+  off (the default); operators using it should front `/signal`
+  with a reverse proxy gate until the v1.1 signal auth lands.
+- **WHEP has no AAC audio.** The WHEP session negotiates Opus;
+  AAC ingest audio (every RTMP, SRT, RTSP, and WS publisher) is
+  dropped with a one-shot warning log. WHIP publishers sending
+  Opus reach WHEP subscribers with audio. An AAC to Opus
+  transcoder is on the v1.1 checklist.
+- **`/metrics` is unauthenticated.** Intentional, but document
+  this to your ops team. Scope the scrape endpoint via firewall
+  or reverse proxy if the deployment is multi-tenant.
+- **Hardware encoders are not shipped.** `lvqr-transcode` only
+  offers a software x264 pipeline (behind the `transcode` Cargo
+  feature). NVENC, VideoToolbox, VAAPI, and QSV backends are
+  on the v1.1 and v1.2 roadmap.
+- **Pure MoQ subscribers do not contribute to the latency SLO
+  histogram.** LL-HLS, MPEG-DASH, WebSocket fMP4, and WHEP are
+  instrumented; MoQ subscribers are not, by design (the
+  alternative required a MoQ wire change that was rejected).
+  Client-side SDK push-back is the intended path.
+- **No admission control.** The SLO tracker measures latency and
+  fires alerts; it does not refuse new subscribers when the SLO
+  is already burning.
+- **No nightly 24h soak in CI.** `lvqr-soak` has a fast-path
+  smoke test; the long-duration soak job is on the v1.1
+  checklist.
 
 ## CLI reference
 
