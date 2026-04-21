@@ -2,7 +2,15 @@
 
 ## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE (8 of 8 items done: 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6 + 4.7 + 4.8)**; 912 workspace tests on the default gate (+31 transcode-feature lib + 1 transcode-feature integration + 1 transcode-feature e2e), 29 crates; **origin/main synced (head `4fcc172`)**
 
-**Last Updated**: 2026-04-21 (session 108 B push event). Tier 4 is closed and live on `origin/main`. Session 108 B's two commits (`0b9e173` feat + `4fcc172` close-doc) are pushed. `git log --oneline origin/main..main` is empty. crates.io is unchanged. Next sessions are whatever the maintainer picks up: v1.1 follow-ups (WS / DASH / MoQ / WHEP SLO instrumentation, stream-modifying WASM filters, hardware-encoder feature flags, WHEP audio transcoder), Tier 5 client SDK work, or the M4 marketing milestone demo.
+**Last Updated**: 2026-04-21 (session 108 B push event). Tier 4 is closed and live on `origin/main`. Session 108 B's two commits (`0b9e173` feat + `4fcc172` close-doc) are pushed. `git log --oneline origin/main..main` is empty. crates.io is unchanged.
+
+## Session 109 entry point -- v1.1-A: broaden egress SLO instrumentation
+
+**Full kick-off prompt:** [`tracking/SESSION_109_BRIEFING.md`](SESSION_109_BRIEFING.md). Copy its contents into a fresh Claude conversation.
+
+**One-line summary:** the 4.7 A tracker + 4.7 B alert pack + Grafana dashboard already label-match generically on `(broadcast, transport)`, but only the LL-HLS drain loop currently calls `LatencyTracker::record`. Session 109 A broadens instrumentation to the WebSocket fMP4 relay (`transport="ws"`) and the MPEG-DASH bridge drain (`transport="dash"`) by threading the shared tracker through `WsRelayState` + `BroadcasterDashBridge::install` and recording one sample per subscriber-delivered fragment. The Grafana dashboard + rule pack light up automatically; no alert-pack edits. MoQ + WHEP egress instrumentation stay deferred to a 109 B / 109 C follow-up because their subscriber-delivery shape is not a `Fragment` + `BroadcasterStream` pair today.
+
+After 109 A the SLO tracker sees samples from three of five egress surfaces. The remaining two (MoQ, WHEP) + other v1.1 items (hardware encoders, stream-modifying WASM filters, WHEP audio transcoder, at least one public demo under `examples/tier4-demos/`, and Tier 5 client SDK work) stay on the maintainer's choice queue; see the "Post-Tier-4 follow-up candidates" section of the briefing for the prioritized list.
 
 ## Session 108 B close (2026-04-21)
 

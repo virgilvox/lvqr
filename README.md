@@ -259,6 +259,18 @@ these is either explicitly on
 / Tier 4 or documented as out-of-scope for v1.
 None is a silent gap.
 
+## What's next (post-Tier-4, v1.1)
+
+Tier 4 closed at session 108 B. The v1.1 follow-up list
+lives in [`tracking/SESSION_109_BRIEFING.md`](tracking/SESSION_109_BRIEFING.md#post-tier-4-follow-up-candidates);
+the next session's focus is DASH egress SLO
+instrumentation (the lightest adjacency to the 4.7 work
+that just shipped). Longer follow-ups -- MoQ frame-carried
+ingest-time propagation, hardware encoders, stream-
+modifying WASM filters, WHEP audio, public demo scripts,
+Tier 5 client SDKs -- are sized in that same briefing's
+prioritization table.
+
 ## Quickstart
 
 ### 1. Start the server
