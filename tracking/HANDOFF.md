@@ -1,8 +1,26 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist). **Phase A v1.1 + all mesh-prereqs + phase-B rows 113 (WHEP AAC-to-Opus) + 114 partial (WHIP->HLS + SRT->DASH E2E tests; RTMP->WHEP audio still pending as feature-gated test) SHIPPED**. 941 workspace tests on the default gate (+7 over 113 close), 29 crates. Next: session 115 (mesh data-plane step 2 with Playwright two-browser E2E), or finish session 114 row 2 (RTMP->WHEP audio E2E on a GStreamer-enabled CI host).
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist). **Phase A v1.1 + all mesh-prereqs + phase-B rows 113 (WHEP AAC-to-Opus) + 114 partial (WHIP->HLS + SRT->DASH E2E tests; RTMP->WHEP audio still pending as feature-gated test) SHIPPED on local `main`, unpushed**. 941 workspace tests on the default gate (+7 over 113 close), 29 crates. Next: session 115 (mesh data-plane step 2 with Playwright two-browser E2E), or finish session 114 row 2 (RTMP->WHEP audio E2E on a GStreamer-enabled CI host).
 
-**Last Updated**: 2026-04-21 (session 114 partial close). Local head pre-114 is `3e9b444` (session 113 docs). After 114's commit pair lands, local head advances by two more (feat + docs).
+**Last Updated**: 2026-04-21 (session 114 partial close). Local `main` head is `b315345` (session 114 close-doc); origin/main remains at `2e50635`. **4 unpushed commits on local main**: `323be2f` feat(whep) 113 + `3e9b444` docs 113 close + `b70be73` feat(test) 114 partial + `b315345` docs 114 close. No push instruction issued this session; a future push event would emit them as a single batch.
+
+### Commit chain on local `main` (chronological)
+
+| SHA | Type | Scope |
+|---|---|---|
+| `b79cf6a` | docs | **111-A** v1.1 plan + README drift fixes + Known v0.4.0 limitations + docs/mesh.md refresh |
+| `791152d` | feat(auth) | **112** live HLS + DASH subscribe auth middleware + `--no-auth-live-playback` flag + cargo audit CI workflow (7 new tests) |
+| `6206870` | feat(mesh) | **111-B1** /signal subscribe auth via `?token=` + `ServerHandle::mesh_coordinator()` + MoQ-over-DataChannel wire-format decision doc (6 new tests) |
+| `97bc16d` | refactor(cli) | Split `lib.rs` -- extract `auth_middleware.rs` + `ws.rs` modules (2513 -> 1830 lines) |
+| `8da444a` | refactor(cli) | Split `lib.rs` -- extract `config.rs` + `handle.rs` modules (1830 -> 1110 lines) |
+| `db23215` | feat(mesh) | **111-B2** WS-relay peer registration + leading `peer_assignment` JSON text frame + `ws_relay_session` idle-disconnect fix + idempotent `/signal` register callback (2 new tests) |
+| `7bc16a9` | feat(mesh) | **111-B3** Sec-WebSocket-Protocol echo in `lvqr-signal` + bearer subprotocol extraction in `signal_auth_middleware` (2 new tests) |
+| `d340a6f` | docs | Sync README + docs/mesh.md with mesh prereqs shipped (4 checklist items flipped to shipped) |
+| `2e50635` | docs | Session 111-B3 close -- HANDOFF status refresh + README Known Limitations "Fixed on main" flags + kickoff prompt [**origin/main head**] |
+| `323be2f` | feat(whep) | **113** WHEP AAC-to-Opus transcoder + `on_audio_config` observer hook + ADTS wrap + factory probe + session poll-loop Opus arm (integration test gated on `transcode` feature) |
+| `3e9b444` | docs | Session 113 close -- HANDOFF + README "Fixed on main" flag + PLAN_V1.1.md row 113 SHIPPED |
+| `b70be73` | feat(test) | **114 partial** WHIP->HLS + SRT->DASH E2E tests + 5 session-113 audit unit tests (parse_aac_asc refactor) (+7 default-gate tests, 934 -> 941) |
+| `b315345` | docs | Session 114 partial close -- HANDOFF + PLAN_V1.1.md row 114 PARTIALLY SHIPPED [**local main head**] |
 
 ## Session 114 close (partial) (2026-04-21)
 
@@ -32,7 +50,7 @@
 
 ### Ground truth (session 114 partial close)
 
-* **Head**: feat commit (pending) + this close-doc commit (pending). Local `main` will be N+2 ahead of `origin/main`; pre-commit head is `3e9b444` (session 113 close-doc).
+* **Head**: feat commit `b70be73` + close-doc commit `b315345`. Local `main` is 4 commits ahead of `origin/main` (head `2e50635`); both 113 and 114 commit pairs are unpushed.
 * **Tests (default features gate)**: **941** passed, 0 failed, 1 ignored. +7 over session 113's 934: the 4 `parse_aac_asc` + `aac_freq_index_to_hz` unit tests (+4), the `on_audio_config_aac_does_not_panic_and_survives_drop` tokio test (+1), `srt_publish_reaches_dash_router` (+1), `whip_publish_reaches_hls_playlist` (+1).
 * **CI gates locally clean**: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` 941 / 0 / 1.
 * **Workspace**: **29 crates**, unchanged.
@@ -42,22 +60,6 @@
 
 * **Row 2 (RTMP to WHEP audio E2E) deferred**. The AAC-to-Opus encoder path requires GStreamer at test time; the dev host used for session 114 does not have GStreamer installed. A follow-up session on a GStreamer-provisioned CI runner can land the test directly by combining `rtmp_dash_e2e.rs`'s RTMP publisher with the `e2e_str0m_loopback_opus.rs` str0m-client subscriber pattern, plus a real AAC sample source (either the `aac_opus_roundtrip.rs`'s `audiotestsrc ! avenc_aac` generator or a captured WAV -> AAC fixture).
 * All session 113 known limitations (per-session encoder, approximate Opus SLO stamp) unchanged.
-
-## Session 113 close (2026-04-21)
-
-| SHA | Type | Scope |
-|---|---|---|
-| `b79cf6a` | docs | **111-A** v1.1 plan + README drift fixes + Known v0.4.0 limitations + docs/mesh.md refresh |
-| `791152d` | feat(auth) | **112** live HLS + DASH subscribe auth middleware + `--no-auth-live-playback` flag + cargo audit CI workflow (7 new tests) |
-| `6206870` | feat(mesh) | **111-B1** /signal subscribe auth via `?token=` + `ServerHandle::mesh_coordinator()` + MoQ-over-DataChannel wire-format decision doc (6 new tests) |
-| `97bc16d` | refactor(cli) | Split `lib.rs` -- extract `auth_middleware.rs` + `ws.rs` modules (2513 -> 1830 lines) |
-| `8da444a` | refactor(cli) | Split `lib.rs` -- extract `config.rs` + `handle.rs` modules (1830 -> 1110 lines) |
-| `db23215` | feat(mesh) | **111-B2** WS-relay peer registration + leading `peer_assignment` JSON text frame + `ws_relay_session` idle-disconnect fix + idempotent `/signal` register callback (2 new tests) |
-| `7bc16a9` | feat(mesh) | **111-B3** Sec-WebSocket-Protocol echo in `lvqr-signal` + bearer subprotocol extraction in `signal_auth_middleware` (2 new tests) |
-| `d340a6f` | docs | Sync README + docs/mesh.md with mesh prereqs shipped (4 checklist items flipped to shipped) |
-| `2e50635` | docs | Session 111-B3 close -- HANDOFF status refresh + README Known Limitations "Fixed on main" flags + kickoff prompt |
-| _pending_ | feat(whep) | **113** WHEP AAC-to-Opus transcoder + `on_audio_config` observer hook + ADTS wrap + factory probe + session poll-loop Opus arm |
-| _pending_ | docs | Session 113 close -- HANDOFF refresh + README WHEP AAC "Fixed on main" flag + PLAN_V1.1.md row 113 SHIPPED |
 
 ## Session 113 close (2026-04-21)
 
@@ -87,7 +89,7 @@
 
 ### Ground truth (session 113 close)
 
-* **Head**: feat commit (pending) + this close-doc commit (pending). Local `main` will be N+2 ahead of `origin/main`; no push event in this block. Pre-commit head on `origin/main`: `2e50635`.
+* **Head**: feat commit `323be2f` + close-doc commit `3e9b444`. No push event in this block. Origin/main head remains `2e50635`.
 * **Tests (default features gate)**: **934** passed, 0 failed, 1 ignored on macOS. Unchanged from session 112's 934: the new `aac_opus_roundtrip.rs` test is behind `#![cfg(feature = "transcode")]` so the default gate does not even compile the test target. Hosts with GStreamer installed (`cargo test -p lvqr-transcode --features transcode`) pick up the new test.
 * **Tier 4 execution status**: **COMPLETE** (unchanged). Phase B row 113 lands on top of a closed Tier 4.
 * **CI gates locally clean**:
@@ -209,22 +211,28 @@ See the "Next session kickoff prompt" section immediately below for the canonica
 
 Paste the block below into a fresh Claude Code session to hand off cleanly. Keep it in sync with the current "Session N entry point" block above whenever the queue advances.
 
-> You are continuing work on LVQR, a Rust live video streaming server. Local `main` head pre-push is the session 114 close-doc commit (SHA pending). Phase A of `tracking/PLAN_V1.1.md` is fully shipped + pushed. Phase B row 113 (WHEP AAC-to-Opus) SHIPPED; phase B row 114 PARTIALLY SHIPPED (WHIP->HLS + SRT->DASH E2E tests landed; RTMP->WHEP audio E2E deferred). Workspace tests: **941** passed / 0 failed / 1 ignored on the default gate. 29 crates.
+> You are continuing work on LVQR, a Rust live video streaming server. Local `main` head is `b315345` (session 114 partial close-doc); origin/main is at `2e50635`. **4 commits unpushed**: `323be2f` feat(whep) 113 WHEP AAC-to-Opus transcoder, `3e9b444` docs 113 close, `b70be73` feat(test) 114 partial WHIP->HLS + SRT->DASH E2E + 113 audit tests, `b315345` docs 114 close. Phase A of `tracking/PLAN_V1.1.md` fully shipped + pushed; phase B row 113 SHIPPED, row 114 PARTIALLY SHIPPED (WHIP->HLS + SRT->DASH E2E tests landed; RTMP->WHEP audio E2E deferred to a GStreamer-provisioned host). Workspace tests: **941** passed / 0 failed / 1 ignored on the default gate. 29 crates. Rust crates at v0.4.0 on crates.io; `@lvqr/core` + `@lvqr/player` at 0.3.1 on npm; `lvqr` at 0.3.1 on PyPI (admin-client only).
 >
-> **Session scope**: session 115 -- mesh data-plane step 2 (phase B row 3). Exercise the `@lvqr/core` `MeshPeer` client against the session 111-B server wiring via a Playwright two-browser E2E. Optionally land the deferred RTMP->WHEP audio E2E test if GStreamer is available on the CI host.
+> **Session scope (pick one; both are acceptable plan-vs-code reads)**:
+>
+> * **Option A (plan-compliant, medium scope)** -- session 115 per `PLAN_V1.1.md` row 115: mesh data-plane step 2. Exercise the existing `@lvqr/core` `MeshPeer` client against the 111-B server wiring via a Playwright two-browser E2E test. Flip `docs/mesh.md` from "topology planner only" to "topology planner + signaling wired; DataChannel media relay ready for end-to-end testing". Requires adding Playwright to the dev-deps in `bindings/js` + authoring a two-page harness. Expected 2-4 hours.
+>
+> * **Option B (host-sensitive, narrower scope)** -- finish session 114 row 2: `crates/lvqr-cli/tests/rtmp_whep_audio_e2e.rs`. Feature-gated on `transcode`; skips cleanly on hosts without GStreamer (matching the `aac_opus_roundtrip.rs` pattern). RTMP publisher (reuse `rtmp_dash_e2e.rs`'s `publish_two_keyframes` pattern) + real AAC sample source (call into `aac_opus_roundtrip.rs`'s `audiotestsrc ! avenc_aac` generator) + str0m WHEP client (reuse `e2e_str0m_loopback_opus.rs`'s poll-loop shape) + assert at least one `Event::MediaData` lands on the Opus mid. Expected 1-2 hours on a GStreamer-enabled host; on a host without GStreamer the test is a compile-and-skip.
+>
+> If unsure, default to Option B because it closes the single largest documented user-visible deliverable gap from 113+114 and its skip-on-no-GStreamer fallback makes the work landable on any host. Option A is the right call if you have Playwright set up and a couple of hours.
 >
 > **Read first, in this order**:
-> 1. `CLAUDE.md` -- absolute rules.
-> 2. `tracking/HANDOFF.md` top through the "Session 114 close" block + this kickoff prompt.
-> 3. `tracking/PLAN_V1.1.md` -- current four-phase plan, row 115 specifically.
-> 4. `bindings/js/packages/core/src/mesh.ts` -- the existing JS MeshPeer client the Playwright test drives.
-> 5. `crates/lvqr-cli/tests/mesh_ws_registration_e2e.rs` -- closest precedent for server-side mesh testing from session 111-B2.
+> 1. `CLAUDE.md` -- absolute rules (no Claude attribution in commits, no emojis, no em-dashes, 120-col max).
+> 2. `tracking/HANDOFF.md` top through the "Session 115 entry point" block and this kickoff prompt.
+> 3. `tracking/PLAN_V1.1.md` -- current four-phase plan, rows 114 and 115.
+> 4. For **Option B**: `crates/lvqr-transcode/tests/aac_opus_roundtrip.rs` (AAC generation pattern + GStreamer skip idiom), `crates/lvqr-cli/tests/rtmp_dash_e2e.rs` (RTMP publish harness), `crates/lvqr-whep/tests/e2e_str0m_loopback_opus.rs` (str0m Opus-subscriber poll loop).
+> 5. For **Option A**: `bindings/js/packages/core/src/mesh.ts` (the MeshPeer client under test), `crates/lvqr-cli/tests/mesh_ws_registration_e2e.rs` (server-side mesh E2E precedent from 111-B2), `docs/mesh.md` (the doc to flip).
 >
-> **Absolute rules**: never add Claude as author, co-author, or contributor in git commits, files, or any other attribution (no `Co-Authored-By` trailers); no emojis in code, commit messages, or documentation; no em-dashes in prose; 120-column max in Rust; real ingest and egress in integration tests; only edit files within this repository; do NOT push to origin without a direct user instruction; plan-vs-code refresh on any design deviation from PLAN_V1.1.md; never skip git hooks; never force-push main.
+> **Absolute rules**: never add Claude as author, co-author, or contributor in git commits, files, or any other attribution (no `Co-Authored-By` trailers); no emojis in code, commit messages, or documentation; no em-dashes in prose; 120-column max in Rust; real ingest and egress in integration tests (no `tower::ServiceExt::oneshot` shortcuts, no mocked sockets); only edit files within this repository; do NOT push to origin without a direct user instruction; plan-vs-code refresh on any design deviation from `PLAN_V1.1.md`; never skip git hooks (no `--no-verify`, no `--no-gpg-sign`); never force-push main.
 >
-> **Verification gates**: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (default gate) stays >= 941 / 0 / 1.
+> **Verification gates**: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (default gate) stays >= 941 / 0 / 1. For Option B with GStreamer present, also run `cargo test -p lvqr-cli --features transcode --test rtmp_whep_audio_e2e`.
 >
-> **After session 115**: write a "Session 115 close" block at the top of HANDOFF.md; mark `tracking/PLAN_V1.1.md` row 115 SHIPPED; update the project_lvqr_status auto-memory; commit as a feat commit + a close-doc commit (two commits). Push only if the user says so.
+> **After session 115**: write a "Session 115 close" block at the top of HANDOFF.md immediately after the status header; mark the chosen `tracking/PLAN_V1.1.md` row (114 or 115) SHIPPED (or PARTIALLY SHIPPED if only part lands); update the `project_lvqr_status` auto-memory; commit as a feat commit + a close-doc commit (two commits). Push only if the user says so. If the user does ask to push, also re-verify `git log --oneline origin/main..main` before pushing so the unpushed 113 + 114 chain rides along as a single batch.
 
 ## Session 109 A close (2026-04-21)
 
