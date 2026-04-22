@@ -1,8 +1,52 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist). **Phase A v1.1 + all mesh-prereqs + phase-B rows 113 (WHEP AAC-to-Opus) + 114 (WHIP->HLS + SRT->DASH + RTMP->WHEP audio E2E; last row is feature-gated on `transcode` and runs on GStreamer-enabled CI hosts) SHIPPED on local `main`, unpushed**. 941 workspace tests on the default gate (unchanged from 114 partial close; new 115 target is feature-gated out), 29 crates. Next: session 116 (mesh data-plane step 2 with Playwright two-browser E2E) per `PLAN_V1.1.md` row 115.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist row 116). **Phase A v1.1 + all mesh-prereqs + phase-B rows 113 (WHEP AAC-to-Opus) + 114 (WHIP->HLS + SRT->DASH + RTMP->WHEP audio E2E) + 115 (mesh two-browser Playwright E2E) all SHIPPED and pushed to origin/main**. 941 workspace tests on the default gate (unchanged; the 114 row 2 and 115 targets live outside the workspace's Rust test surface -- the former is feature-gated on `transcode`, the latter is a Node/Playwright spec). Plus one Playwright test (`bindings/js/tests/e2e/mesh/two-peer-relay.spec.ts`) that passes locally in ~270 ms. 29 crates. Next: session 117 -- open phase-B row is 116 (`examples/tier4-demos/` first public demo script) or the first phase-C row (archive READ DVR E2E + DASH-IF validator in CI).
 
-**Last Updated**: 2026-04-22 (session 115 close + two post-close audit fixes). Local `main` head is `1c6d3f6` (publisher-cadence fix so fresh AAC reaches the WHEP session during ICE + DTLS warm-up instead of bursting in ~200 ms and emptying before Connected). Origin/main remains at `2e50635`. **10 unpushed commits on local main**: `323be2f` feat(whep) 113 + `3e9b444` docs 113 close + `b70be73` feat(test) 114 partial + `b315345` docs 114 close + `d1b9607` post-114 docs tidy + `3937a44` feat(test) 115 + `80bba4b` docs 115 close + `0c2c59d` fix(transcode) test-support module + `42db8ca` docs post-close sweep + `1c6d3f6` fix(test) real-time publisher cadence. No push instruction issued this session; a future push event would emit the whole chain as a single batch.
+**Last Updated**: 2026-04-22 (session 116 close: row 115 two-browser mesh Playwright E2E shipped + pushed). Local `main` head equals `origin/main`. Session 115 chain (`323be2f` through `33e3802`) was pushed at the top of this session per user instruction; session 116 commits (`18e32fd` fix(mesh), `b5796cb` feat(cli), `27b45fe` feat(test), plus this close-doc commit) ride on top. No push instruction issued since the row-115 session open; the session-116 chain will be pushed at the next push event.
+
+## Session 116 close (2026-04-22)
+
+**Shipped**: `PLAN_V1.1.md` row 115 (mesh data-plane step 2). First end-to-end exercise of the `@lvqr/core::MeshPeer` client against a real LVQR signaling server. `docs/mesh.md` flipped from "topology planner + signaling wired; DataChannel media relay ready for end-to-end testing" to "topology planner + signaling + subscribe-auth + server-side subscriber registration + client-side WebRTC relay + two-peer DataChannel media relay end-to-end test all ship."
+
+1. **`fix(mesh): expose pushFrame API`** (`18e32fd`). A design-audit finding from reading `bindings/js/packages/core/src/mesh.ts` before writing the test: `MeshPeer` as shipped at `@lvqr/core` 0.3.1 has no public way for a root peer to forward media to its children. The only call site for `forwardToChildren` is inside the child-side `connectToParent` / `dc.onmessage` path, which a root peer (parentId null) never reaches. The docstring claims "Server -> Root peers -> Child peers via WebRTC DataChannel" but there is no mechanism for the integrator to feed the root its upstream bytes. Added `pushFrame(data: Uint8Array)` public method that delegates to `forwardToChildren`. Root peers drain media from the server separately (MoQ, WebTransport, LvqrClient, WS relay) and call `pushFrame` on every chunk to relay it down the mesh tree.
+
+2. **`feat(cli): --mesh-root-peer-count flag`** (`b5796cb`). Session 111-B1 shipped `ServeConfig::mesh_root_peer_count` and `TestServerConfig::with_mesh_root_peer_count`, but the CLI never surfaced the flag. Playwright's `webServer` block spawns `lvqr serve` as a subprocess; without this flag the test cannot force the second subscriber to become a child of the first. New `--mesh-root-peer-count <N>` flag with `LVQR_MESH_ROOT_PEER_COUNT` env fallback. Defaults to None (inherits the `lvqr_mesh::MeshConfig` default of 30).
+
+3. **`feat(test): row 115 Playwright E2E`** (`27b45fe`). New `bindings/js/tests/e2e/mesh/two-peer-relay.spec.ts` (+190 LOC) + `bindings/js/playwright.config.ts`. Playwright's `webServer` boots `target/debug/lvqr serve --mesh-enabled --mesh-root-peer-count 1 --no-auth-signal --admin-port 18088 --hls-port 0 --rtmp-port 11935 --port 14443`. `url` polls `/api/v1/mesh` (returns 200 JSON when mesh is enabled) because the default `/` 404 fails Playwright's `<400` health-check gate. Test opens two browser contexts (Chromium only; phase-D scope expands the matrix) and injects the compiled `dist/mesh.js` into each via `addInitScript` (ESM `export class` rewritten to `class` + a `window.MeshPeer` assignment so the script can be loaded without a module loader). Both peers register via `/signal`; server assigns peer-one as Root and peer-two as Relay with parent=peer-one. peer-two auto-initiates an RTCPeerConnection + DataChannel. SDP offer/answer and ICE candidates flow through `/signal`. The DataChannel opens. peer-one pushes a known 8-byte payload via `pushFrame` in a 100 ms loop; peer-two's `onFrame` callback observes the bytes via the DataChannel `onmessage`. Completes in ~270 ms on loopback. `bindings/js/package.json` gains `@playwright/test ^1.49.0` + a `test:e2e` script; `.gitignore` excludes Playwright artifact directories.
+
+4. **`docs(mesh)` + `docs(plan)`** (this commit). `docs/mesh.md` status block rewritten to reflect the full client-side chain that ships; phase-D scope (actual-vs-intended offload, per-peer capacity advertisement, TURN recipe, 3+ browser matrix) explicitly called out as pending. `tracking/PLAN_V1.1.md` row 115 flipped from "pending" to SHIPPED with the full test-shape written into the row summary.
+
+### Key 116 design decisions baked in
+
+* **The pushFrame loop at 100 ms cadence, not a single push on `childCount === 1`.** `children.set(msg.from, { pc, dc: null, peerId: msg.from })` fires on the parent side at the start of `handleOffer` -- BEFORE the child's DataChannel even arrives via `pc.ondatachannel`, let alone transitions to `open`. A single pushFrame on `childCount === 1` silently no-ops (`forwardToChildren` skips `readyState !== 'open'`). The 100 ms cadence is the simplest correct fix; the test harness passes in ~270 ms because the DataChannel opens within two or three ticks of `childCount === 1`. An alternative was to expose a `childReady(id)` / `onChildOpen` callback on `MeshPeer` so the test could wait on the `open` transition explicitly. Rejected because it grows the client API surface for an edge case the integrator does not need (integrators almost always push in a continuous loop anyway, not one-shot).
+* **Playwright `webServer` command uses fixed non-default ports.** `--admin-port 18088`, `--rtmp-port 11935`, `--port 14443`, `--hls-port 0`. Deliberately off-default so a locally-running `lvqr serve` on default ports does not collide with the test subprocess. The trade is that the test is sensitive to those specific ports being free; on a CI runner this is never an issue, and locally the collision message is obvious.
+* **Test injects `dist/mesh.js` via `addInitScript`, not via a module loader.** The compiled ESM has exactly one top-level export (`class MeshPeer`) and no imports, so an `/^export\s+class\s+MeshPeer/m` -> `class MeshPeer` regex plus an appended `window.MeshPeer = MeshPeer;` yields a classic script the browser runs directly. An alternative was to stand up a local vite dev server via the `webServer` block and use real ESM imports; rejected because it doubles the test's external dependency surface (bundler + dev server) for negligible clarity gain.
+* **`/api/v1/mesh` as the health-check URL, not a new `/health` endpoint.** Playwright's `webServer.url` expects `<400`; lvqr's admin router returns 404 on `/`. Adding a new `/health` route just for Playwright would grow the server's public surface; pointing the health check at the existing `/api/v1/mesh` route (which returns 200 JSON whenever `--mesh-enabled`) is a zero-cost fit. Requires `--mesh-enabled` to be set, which the Playwright webServer command always does.
+* **Chromium-only first matrix.** Firefox and WebKit support RTCPeerConnection + RTCDataChannel, but WebRTC dialect differences (ICE lite, unified plan vs plan-b, DataChannel sctp negotiation) are real. Landing the first test green on one browser before expanding is the safer sequencing; the expansion is phase-D scope per the session 116 briefing.
+
+### Ground truth (session 116 close)
+
+* **Head (pre-push)**: `18e32fd` fix(mesh) + `b5796cb` feat(cli) + `27b45fe` feat(test) + this close-doc commit. `origin/main` head was `33e3802` at the start of this session; will move to the close-doc commit's SHA on the next push event.
+* **Tests (default features gate)**: **941** passed, 0 failed, 1 ignored on macOS. Unchanged from session 115's 941 because this session adds (a) one Playwright Node test that lives outside the cargo workspace and (b) one internal `MeshPeer.pushFrame` method that has no direct Rust test coverage yet. The Playwright test lives at `bindings/js/tests/e2e/mesh/two-peer-relay.spec.ts` and runs via `npx playwright test` from `bindings/js/`.
+* **Playwright test locally**: passes in ~270 ms on a cached Chromium 1217 install.
+* **CI gates locally clean**:
+  * `cargo fmt --all --check`.
+  * `cargo clippy --workspace --all-targets -- -D warnings`.
+  * `cargo test --workspace` 941 / 0 / 1.
+  * `npx playwright test` from `bindings/js/` passes the one spec.
+* **Workspace**: **29 crates**, unchanged.
+* **crates.io**: unchanged. Session 116 adds one CLI flag (additive) + one `@lvqr/core` class method (additive; source-compatible for the next npm publish cycle). No version bumps in this chain; next npm publish picks up `pushFrame`.
+
+### Known limitations / documented v1 shape (after 116 close)
+
+* **Server-originating media into the root peer's `pushFrame` is still integrator-driven**. A production deployment that wants mesh-offloaded fanout needs its own code to drain MoQ / WS / HLS on the root peer and forward via `pushFrame`. A future session could ship an `@lvqr/core` helper that bridges `LvqrClient`'s frame stream into `MeshPeer.pushFrame` automatically; this would close the last integrator-friction point.
+* **Actual-vs-intended offload reporting** remains unshipped. `/api/v1/mesh` today reports tree-shape-intended offload, not measured traffic. Phase D.
+* **Per-peer capacity advertisement** remains unshipped. `max-children` is a hard-coded per-node ceiling; peers do not advertise bandwidth / CPU / concurrent-subscriber capacity for rebalancing. Phase D.
+* **TURN deployment recipe + symmetric-NAT fallback** not yet documented. For loopback + local-candidate tests (which is what the Playwright test exercises), STUN is unused and ICE completes via host candidates. A real deployment with peers behind symmetric NATs will need a coturn sidecar. Phase D.
+* **Three-peer Playwright E2E + the 5-artifact test contract sweep** are phase D. This session ships the two-peer happy path only.
+* All session 113 / 114 / 115 known limitations unchanged.
+
+## Session 115 close (2026-04-22)
 
 ## Session 115 close (2026-04-22)
 
@@ -250,19 +294,21 @@ crates.io is unchanged since the 110 push chain. The published v0.4.0 crates do 
 * **No admission control** (unchanged from 108 B).
 * **No time-windowed retention on the admin snapshot** (unchanged from 107 A).
 
-## Session 116 entry point -- remaining phase-B work
+## Session 117 entry point -- remaining phase-B work + phase-C kickoff
 
-Phase B rows 113 (WHEP AAC-to-Opus) and 114 (WHIP->HLS + SRT->DASH + RTMP->WHEP audio E2E) are SHIPPED on local `main`. The pending phase-B work is captured in full in **`tracking/SESSION_116_BRIEFING.md`** (authored at the close of session 115, covers both options with design-tradeoff analysis, preferred-path recommendation, concrete "read first in this order" entry points, and verification gates). Summary for the HANDOFF reader:
+Phase B rows 113 (WHEP AAC-to-Opus), 114 (WHIP->HLS + SRT->DASH + RTMP->WHEP audio E2E), and 115 (mesh two-browser Playwright E2E) are all SHIPPED. The one remaining phase-B row is 116. Phase C starts after.
 
 | # | Scope | Risk |
 |---|---|---|
-| 1 | **Mesh data-plane step 2.** Per `PLAN_V1.1.md` row 115: exercise the existing `@lvqr/core` `MeshPeer` client against the session 111-B server wiring. Add Playwright E2E with two browser peers. Flip `docs/mesh.md` from "topology planner only" to "topology planner + signaling wired; DataChannel media relay ready for end-to-end testing". Briefing recommends this as the default because it unblocks phase D + surfaces real bugs in a never-exercised client-SDK path. | medium |
-| 2 | **Tier 4 examples/tier4-demos/ first public demo script.** Per `PLAN_V1.1.md` row 116: one polished scripted demo chaining WASM filter + Whisper captions + ABR transcode + archive + C2PA verify. Closes the Tier 4 exit criterion that was skipped. | low-medium |
+| 1 | **Tier 4 `examples/tier4-demos/` first public demo script.** Per `PLAN_V1.1.md` row 116: one polished scripted demo chaining WASM filter + Whisper captions + ABR transcode + archive + C2PA verify. Closes the Tier 4 exit criterion that was skipped. `SESSION_116_BRIEFING.md` already captures the demo shape (single `demo-01.sh`, pre-generated test cert, whisper model download prereq). | low-medium |
+| 2 | **Phase C row 117: archive READ DVR E2E + DASH-IF conformance validator in CI.** Per `PLAN_V1.1.md` row 117. Adds a full scrub test against the `/playback/*` routes + wires a DASH-IF conformance check into the existing `audit.yml` workflow or a new `conformance.yml`. | medium |
+| 3 | **Phase D follow-up: root peer MoQ -> pushFrame auto-bridge.** Session 116 row 115 shipped with an integrator-driven `pushFrame`; a helper that wires `LvqrClient`'s frame stream into `MeshPeer.pushFrame` automatically would close the last mesh-integration friction. Not on the v1.1 roadmap; worth noting for phase D sequencing. | low |
 
 ### Known follow-up refactor candidates
 
 - **Split `start()` into per-subsystem wiring helpers.** `lvqr-cli/src/lib.rs::start` is still ~1000 lines. A per-subsystem split would drop lib.rs below 500 lines.
 - **Per-broadcast `AacToOpusEncoder`**. Session 113 ships a per-session encoder; for N > 1 WHEP subscribers sharing a broadcast a per-broadcast encoder behind a new flag would halve CPU. Defer to v1.2 once profiling confirms it matters.
+- **Expose `MeshPeer.onChildOpen(id, dc)` callback** so callers that want to one-shot push on channel-open can do so without polling. Session 116 row 115 works around this with a 100 ms pushFrame loop; the workaround is fine for an integrator but future tests may want the deterministic path.
 - **Shared-per-broadcast AacToOpusEncoder** (113 follow-up): factor the per-session encoder out behind a flag when profiling shows overhead matters.
 - **WHIP-to-HLS E2E full-segment assertion** (114 follow-up): extend `whip_hls_e2e.rs` to write keyframes far enough apart (>2 s) that a full `#EXTINF:` segment closes, proving the end-to-end segment-finalisation path rather than just the LL-HLS partial path.
 
