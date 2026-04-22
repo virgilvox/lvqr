@@ -359,17 +359,33 @@ test.
 ## Known v0.4.0 limitations
 
 Operators planning deployments should read these before shipping.
+Items flagged **Fixed on `main`** have shipped in commits on
+`origin/main` after the v0.4.0 crates.io release; they land for
+consumers on the next release cycle. Operators who need the fix
+today should build from `main` instead of pinning to the
+published crate.
 
-- **Mesh `/signal` WebSocket is not auth-gated.** The mesh
-  coordinator accepts `Register` messages from any client.
-  Operators not using the peer mesh should leave `--mesh-enabled`
-  off (the default); operators using it should front `/signal`
-  with a reverse proxy gate until the v1.1 signal auth lands.
+- **Mesh `/signal` WebSocket is not auth-gated.** The v0.4.0
+  crate accepts `Register` messages from any client. Operators
+  not using the peer mesh should leave `--mesh-enabled` off (the
+  default); operators using it should front `/signal` with a
+  reverse proxy gate. **Fixed on `main`** in sessions 111-B1 +
+  111-B3: `/signal` now accepts the subscribe bearer via
+  `Sec-WebSocket-Protocol: lvqr.bearer.<token>` (preferred) or
+  `?token=<token>` query fallback, with `--no-auth-signal` as
+  the escape hatch.
+- **Live HLS + DASH routes were not auth-gated in v0.4.0**
+  even when `--subscribe-token` or `--jwt-secret` was set.
+  **Fixed on `main`** in session 112: the HLS and DASH routers
+  are now wrapped with the same `SubscribeAuth` gate as
+  `/ws/*`, with `--no-auth-live-playback` as the escape hatch
+  for deployments that want open live playback.
 - **WHEP has no AAC audio.** The WHEP session negotiates Opus;
   AAC ingest audio (every RTMP, SRT, RTSP, and WS publisher) is
   dropped with a one-shot warning log. WHIP publishers sending
   Opus reach WHEP subscribers with audio. An AAC to Opus
-  transcoder is on the v1.1 checklist.
+  transcoder is on the v1.1 checklist (session 113 scope in
+  `tracking/PLAN_V1.1.md`).
 - **`/metrics` is unauthenticated.** Intentional, but document
   this to your ops team. Scope the scrape endpoint via firewall
   or reverse proxy if the deployment is multi-tenant.

@@ -1,12 +1,29 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist). **Phase A v1.1 + mesh-prereqs FULLY SHIPPED**: 111-A docs, 112 live HLS/DASH auth + cargo audit CI, 111-B1 signal auth + mesh coordinator accessor, refactor split of lib.rs into auth_middleware + ws, refactor split into config + handle modules, 111-B2 WS-relay peer registration + leading assignment frame, 111-B3 Sec-WebSocket-Protocol echo on `lvqr-signal`. 934 workspace tests on the default gate, 29 crates. Next: session 113 (WHEP AAC to Opus transcoder, phase B first row, highest-impact v1.1 user-visible item).
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist). **Phase A v1.1 + all mesh-prereqs FULLY SHIPPED + pushed**. 934 workspace tests on the default gate, 29 crates. Next: session 113 (WHEP AAC to Opus transcoder, phase B first row, highest-impact v1.1 user-visible item).
 
-**Last Updated**: 2026-04-21 (sessions 111-A + 112). Origin/main head is `11a5989`, reached via the session 110 push chain (`ffc28a5`, `3d9e4ac`, `208305f`, `7ab557b`, `e382f34`, `d72da65`) plus two docs follow-ups (`c835b19`, `11a5989`). crates.io is unchanged since the 110 push chain.
+**Last Updated**: 2026-04-21 (phase A v1.1 close). Origin/main head is `d340a6f` (docs sync for mesh prereq checklist). The full phase A commit chain on main, chronological:
+
+| SHA | Type | Scope |
+|---|---|---|
+| `b79cf6a` | docs | **111-A** v1.1 plan + README drift fixes + Known v0.4.0 limitations + docs/mesh.md refresh |
+| `791152d` | feat(auth) | **112** live HLS + DASH subscribe auth middleware + `--no-auth-live-playback` flag + cargo audit CI workflow (7 new tests) |
+| `6206870` | feat(mesh) | **111-B1** /signal subscribe auth via `?token=` + `ServerHandle::mesh_coordinator()` + MoQ-over-DataChannel wire-format decision doc (6 new tests) |
+| `97bc16d` | refactor(cli) | Split `lib.rs` -- extract `auth_middleware.rs` + `ws.rs` modules (2513 -> 1830 lines) |
+| `8da444a` | refactor(cli) | Split `lib.rs` -- extract `config.rs` + `handle.rs` modules (1830 -> 1110 lines) |
+| `db23215` | feat(mesh) | **111-B2** WS-relay peer registration + leading `peer_assignment` JSON text frame + `ws_relay_session` idle-disconnect fix + idempotent `/signal` register callback (2 new tests) |
+| `7bc16a9` | feat(mesh) | **111-B3** Sec-WebSocket-Protocol echo in `lvqr-signal` + bearer subprotocol extraction in `signal_auth_middleware` (2 new tests) |
+| `d340a6f` | docs | Sync README + docs/mesh.md with mesh prereqs shipped (4 checklist items flipped to shipped) |
+
+crates.io is unchanged since the 110 push chain. The published v0.4.0 crates do NOT have the 111-B or 112 changes; consumers who need them should build from main or wait for the next release cycle.
 
 **Session 111-A shipped** (docs accuracy sweep): authored `tracking/PLAN_V1.1.md` with the four-phase plan (A stop-the-bleeding, B user-visible wins, C operator polish, D v1.1 marquee); corrected README drift on published SDKs, WASM mutation capability, mesh client-side state, Tier 4 exit criterion; added "Known v0.4.0 limitations" README section; refreshed `docs/mesh.md`. Docs-only commit `b79cf6a`.
 
 **Session 112 shipped** (live HLS + DASH subscribe auth + supply-chain audit CI): the HLS and DASH routers at the CLI composition root are now wrapped with a tower middleware that applies the `SubscribeAuth` provider to every `/hls/{broadcast}/...` and `/dash/{broadcast}/...` request. Broadcast extraction mirrors the handler's `split_broadcast_path` rule (rfind('/')). Token extraction honors the `Authorization: Bearer <token>` header first and `?token=<token>` query parameter second, matching the existing `/playback/*` pattern. `NoopAuthProvider` deployments see no behavior change because the provider always returns `Allow`. Configured deployments (static subscribe-token, JWT) get an automatic 401 on unauthed requests. New `--no-auth-live-playback` CLI flag (and `LVQR_NO_AUTH_LIVE_PLAYBACK` env var) and corresponding `no_auth_live_playback: bool` field on `ServeConfig` and `TestServerConfig::without_live_playback_auth()` as the escape hatch. New integration test `crates/lvqr-cli/tests/hls_live_auth_e2e.rs` with 7 cases (missing token rejected; bearer header accepted; query token accepted; wrong bearer rejected; DASH same shape; escape hatch disables the gate; Noop provider never gates). New CI workflow `.github/workflows/audit.yml` running `cargo audit --deny warnings` daily on a cron plus on push to main and on manual dispatch, closing the audit-debt item from `tracking/archive/AUDIT-READINESS-2026-04-13.md:37-61` that flagged "cargo-audit supply-chain scan is not wired into CI". All gates green: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` 924 / 0 / 1. Tests 917 -> 924 (the 7 new tests in `hls_live_auth_e2e.rs`). No crate version bumps; the `SubscribeAuth` + `Arc` + tower middleware are internal plumbing, the new CLI flag is additive, the new `ServeConfig` field is additive with a `false` default via `loopback_ephemeral()`.
+
+**Sessions 111-B1 + 111-B2 + 111-B3 shipped** (mesh server-side prereqs). `lvqr-cli/src/lib.rs::start()` now hoists `MeshCoordinator` construction out of the admin-router conditional and stores it on `ServerHandle::mesh_coordinator: Option<Arc<MeshCoordinator>>` (111-B1). `/signal` WebSocket is gated behind the shared `SubscribeAuth` provider via a middleware in `crate::auth_middleware::signal_auth_middleware` that extracts the bearer from `Sec-WebSocket-Protocol: lvqr.bearer.<token>` first (111-B3) and `?token=<token>` second (111-B1); escape hatch is `--no-auth-signal` / `TestServerConfig::without_signal_auth()`. `lvqr_signal::SignalServer::ws_handler` echoes any offered bearer subprotocol back on the upgrade response so RFC-6455-strict clients accept the handshake (111-B3). Every `ws_relay_session` generates a server-side `ws-{counter}` peer_id, calls `MeshCoordinator::add_peer` at connect time, and sends a leading JSON text frame `{"type":"peer_assignment","peer_id":...,"role":...,"parent_id":...,"depth":...}` on the WS before any binary MoQ frames (111-B2). Disconnect calls `remove_peer` + `reassign_peer` for every orphan; the session loop watches both the MoQ-side rx and `socket.recv()` so idle subscribers (no frames flowing) exit promptly on client-side close instead of pinning the mesh peer entry forever. `/signal` Register callback is idempotent via `MeshCoordinator::get_peer` so a client that already holds a `ws-{n}` peer_id from `/ws` can reuse it on `/signal` without a second tree entry (111-B2). MoQ-over-DataChannel wire format locked in at `docs/mesh.md` as 8-byte big-endian `object_id` prefix + raw MoQ frame bytes per DataChannel message (111-B1). 10 new integration tests total across the three sessions. crates.io unchanged.
+
+**Refactor commits `97bc16d` + `8da444a` shipped** (lib.rs decomposition). `lvqr-cli/src/lib.rs` dropped from 2513 lines at the start of the session chain to 1110 lines, split across 8 focused modules: `archive.rs`, `auth_middleware.rs` (205 LOC), `captions.rs`, `cluster_claim.rs`, `config.rs` (419 LOC, hosts `ServeConfig` + transcode parse helpers), `handle.rs` (334 LOC, hosts `ServerHandle` with pub(crate) fields so the composition root still builds via struct literal), `hls.rs`, `ws.rs` (544 LOC). Public API surface unchanged via `pub use` re-exports from `lib.rs`. Remaining big chunk is the ~1000-line `start()` composition root; documented as a follow-up refactor candidate that needs a dedicated design session.
 
 ## Session 110 close (2026-04-21)
 
@@ -71,33 +88,71 @@
 * **No admission control** (unchanged from 108 B).
 * **No time-windowed retention on the admin snapshot** (unchanged from 107 A).
 
-## Session 111 entry point -- plan reprioritized via 2026-04-21 audit
+## Session 113 entry point -- WHEP AAC to Opus transcoder (phase B row 1)
 
-A deep audit on 2026-04-21 surfaced five "COMPLETE" claims that paper over real gaps, three test-coverage holes, and six docs-drift items. The post-Tier-4 candidate table that previously lived here has been replaced by a four-phase plan in [`tracking/PLAN_V1.1.md`](PLAN_V1.1.md). Read PLAN_V1.1.md first; the next three rows below are the immediate session queue.
+Phase A of `tracking/PLAN_V1.1.md` is fully shipped + pushed. The remaining v1.1 work lives in phase B and later. **Session 113 is the phase B lead row** and the highest-impact v1.1 user-visible item: every RTMP, SRT, RTSP, and WebSocket publisher today reaches WHEP subscribers video-only because the WHEP session negotiates Opus but the publishers produce AAC and the in-tree AAC-to-Opus transcoder does not exist. Closing this gap makes "OBS to browser WebRTC with audio" work out of the box.
 
-### Immediate queue
+### Scope for session 113
 
-| Session | Scope | Risk | File deliverables |
-|---|---|---|---|
-| **111-A** | Docs accuracy sweep. Fix README drift (published SDKs, WASM mutation capability, mesh client-side state, Tier 4 exit criterion). Add "Known v0.4.0 limitations" README section naming HLS/DASH auth gap, WHEP AAC drop, `/signal` unauth, `/metrics` unauth, no hardware encoders. Refresh `docs/mesh.md`. Author `tracking/PLAN_V1.1.md`. | low | README.md, docs/mesh.md, tracking/PLAN_V1.1.md, tracking/HANDOFF.md |
-| **111-B1** | **SHIPPED.** Gated `/signal` with subscribe-auth via `?token=<token>`; escape hatch `--no-auth-signal`. Hoisted `MeshCoordinator` onto `ServerHandle::mesh_coordinator()`. Added `signal_url()` helper + `mesh_root_peer_count` tuning knob. Documented MoQ-over-DataChannel wire format in `docs/mesh.md`. 6 new integration tests. Workspace 924 -> 930. | low | crates/lvqr-cli/src/lib.rs, crates/lvqr-cli/src/main.rs, crates/lvqr-test-utils/src/test_server.rs, crates/lvqr-cli/tests/signal_auth_e2e.rs, docs/mesh.md |
-| **111-B2** | **SHIPPED.** Every `ws_relay_session` now generates a server-side peer_id (`ws-{counter}`), registers with `MeshCoordinator::add_peer` at connect time, and sends a leading JSON text frame `{"type":"peer_assignment","peer_id":...,"role":...,"parent_id":...,"depth":...}` on the WS before any binary MoQ frames. Disconnect removes the peer + reassigns orphans. Side fix: `ws_relay_session` main loop now watches both the MoQ-side channel and `socket.recv()` so idle subscribers (no frames flowing) exit promptly on client-side close instead of pinning the mesh peer entry forever. `/signal` callback made idempotent via `MeshCoordinator::get_peer` so a client that already registered via `/ws` can reuse the same peer_id on `/signal` without a double tree entry. 2 new integration tests. Workspace 930 -> 932. **Sec-WebSocket-Protocol echo on `lvqr-signal` is DEFERRED to 111-B3** so this session stays scoped. | low | crates/lvqr-cli/src/ws.rs, crates/lvqr-cli/src/lib.rs, crates/lvqr-cli/tests/mesh_ws_registration_e2e.rs |
-| **111-B3** | **SHIPPED.** `lvqr_signal::SignalServer::ws_handler` now echoes any `lvqr.bearer.<token>` subprotocol the client offers so RFC 6455-strict clients accept the handshake. `signal_auth_middleware` extended to extract the bearer from `Sec-WebSocket-Protocol` first and `?token=` second. Two new integration tests (`signal_accepts_valid_bearer_subprotocol`, `signal_rejects_invalid_bearer_subprotocol`). Workspace 932 -> 934. docs/mesh.md auth section now documents both channels with preference order. | low | crates/lvqr-signal/src/signaling.rs, crates/lvqr-cli/src/auth_middleware.rs, crates/lvqr-cli/tests/signal_auth_e2e.rs, docs/mesh.md |
-| **112** | **SHIPPED.** Applied `SubscribeAuth` to HLS + DASH live routes via a tower middleware at the CLI composition root. Auth on by default when a provider is configured; `--no-auth-live-playback` is the escape hatch. Noop provider deployments unchanged. Added `cargo audit` CI job (daily schedule + push to main). 7 new integration tests in `crates/lvqr-cli/tests/hls_live_auth_e2e.rs`. Workspace tests 917 -> 924, all gates green. | low | crates/lvqr-cli/src/lib.rs, crates/lvqr-cli/src/main.rs, crates/lvqr-test-utils/src/test_server.rs, crates/lvqr-cli/tests/hls_live_auth_e2e.rs, .github/workflows/audit.yml |
+| # | Scope | Risk |
+|---|---|---|
+| 1 | New feature-gated `AacToOpusTranscoderFactory` in `lvqr-transcode` (or a new `lvqr-transcode-audio` if the dep graph demands) that builds a GStreamer pipeline `appsrc ! faad ! audioconvert ! audioresample ! opusenc ! appsink`. Mirrors the session-106 `SoftwareTranscoderFactory` worker-thread pattern. | medium (platform-specific GStreamer plugin availability) |
+| 2 | Plumbing: WHEP `str0m_backend` gains an AAC input path that routes frames through the transcoder when the negotiated audio PT is Opus. Builder on `Str0mAnswerer::with_aac_to_opus_transcoder(Arc<dyn Transcoder>)` or similar. | medium |
+| 3 | Encoder output side: emit Opus samples via `Writer::write` with the negotiated Opus PT. Update `write_sample` to handle the audio path symmetrically with the existing video path. | medium |
+| 4 | Integration test: RTMP publish -> WHEP subscribe, assert at least one Opus audio frame reaches the str0m client. Extend `crates/lvqr-whep/tests/e2e_str0m_loopback_opus.rs` or add a new `rtmp_whep_audio_e2e.rs`. | low once 1-3 are in place |
+| 5 | Docs: flip the README "WHEP drops AAC" Known Limitations bullet to shipped. Update `docs/slo.md` if the WHEP SLO label changes. | low |
 
-After 112 comes phase B (sessions 113-116): WHEP audio AAC->Opus, cross-ingress E2E tests, mesh JS-side end-to-end, tier4-demos first script. See PLAN_V1.1.md for full sequencing and rationale.
+See `tracking/PLAN_V1.1.md` row 113 for the phase-level rationale. The session 106 close block below (session 106 scaffold + software x264 pipeline) is the closest precedent.
 
-### Why the reprioritization
+### Phase A shipped rows (historical, for bisect)
 
-The prior session-111 picker table leaned toward row 1 (tier4-demos) as "lowest risk, closes the marketing demo gap" and row 4 (WHEP audio) as "highest leverage". Both picks were sound but missed three higher-leverage items surfaced only by the 2026-04-21 audit:
+| Session | Status | Scope |
+|---|---|---|
+| **111-A** | SHIPPED | Docs accuracy sweep + PLAN_V1.1.md + Known v0.4.0 limitations |
+| **112** | SHIPPED | Live HLS + DASH subscribe-auth middleware + cargo audit CI |
+| **111-B1** | SHIPPED | `/signal` `?token=` auth + `ServerHandle::mesh_coordinator()` + wire-format doc |
+| **refactor** | SHIPPED | Split lib.rs into auth_middleware + ws modules |
+| **refactor** | SHIPPED | Split lib.rs into config + handle modules |
+| **111-B2** | SHIPPED | WS-relay peer registration + leading peer_assignment frame + idle-disconnect fix + idempotent /signal register |
+| **111-B3** | SHIPPED | Sec-WebSocket-Protocol echo on `lvqr-signal` + bearer subprotocol extraction in `signal_auth_middleware` |
+| **docs** | SHIPPED | Sync README + docs/mesh.md mesh checklist after 111-B2/B3 |
 
-1. **README drift is actively misleading.** The client libraries table marks `@lvqr/core` and `@lvqr/player` as "on the roadmap" despite both being published at v0.3.1 on npm. The WASM v1 description says "read-only tap" despite `lvqr-wasm/src/lib.rs:17-23` shipping payload-mutation in v1. Tier 4 was marked complete without the `examples/tier4-demos/` exit criterion. Fix cost: one low-risk session.
-2. **HLS and DASH live routes are silently unauthenticated.** `crates/lvqr-hls/src/server.rs:7-9` defers auth to the CLI composition root; `crates/lvqr-cli/src/lib.rs:1492` and `:1507` apply only `CorsLayer::permissive()`. Operators who set `--auth` today get an auth story that covers ingest, `/ws/*`, `/playback/*`, and `/api/v1/*` but leaves live HLS playlists and DASH manifests world-readable. Surface in docs now (111-A) and close the gap next (112) by applying `SubscribeAuth` to the HLS + DASH routers with `--no-auth-live-playback` as the escape hatch. Noop provider deployments see no behavior change.
-3. **The original briefing's Tier 5 SDK scope estimate is wrong.** The briefing said "~20 sessions, high risk, greenfield"; the npm + PyPI + crates.io packages already exist. Real scope is 5-8 sessions of completion + CI work, not authoring.
+### Known follow-up refactor candidates
 
-### Kickoff rules (unchanged from session 110)
+Not scoped for session 113 itself; listed so a future maintainer can pick them at a planning break:
 
-No Claude attribution in commits. No emojis. No em-dashes. 120-column max. Real ingest and egress in integration tests. Only edit in-repo. No push without direct instruction. Plan-vs-code refresh on any design deviation.
+- **Split `start()` into per-subsystem wiring helpers.** `lvqr-cli/src/lib.rs::start` is still ~1000 lines (lib.rs total: 1110 LOC). A per-subsystem split (mesh, HLS, DASH, WHEP, WHIP, RTSP, SRT, federation, archive, transcode, whisper) each returning a typed bundle the composition root assembles would drop lib.rs below 500 lines. Needs a dedicated design pass; the lib.rs monolith concern was raised explicitly by the maintainer and the first two refactor rounds (auth_middleware + ws, config + handle) addressed 56% of the prior 2513-line size.
+- **Session 114**: WHIP to HLS E2E test. Single integration test, closes the biggest audit-flagged cross-ingress test gap (WHIP -> non-WebRTC egress). Uses the existing `lvqr-whip::tests/e2e_str0m_loopback.rs` str0m publisher pattern against a TestServer with HLS enabled.
+- **Session 116**: `examples/tier4-demos/` first public demo script. Closes the Tier 4 exit criterion the plan enumerated as "M4 marketing demo".
+
+### Kickoff rules (unchanged)
+
+No Claude attribution in commits (CLAUDE.md rule). No emojis anywhere (code, commits, docs). No em-dashes in prose. 120-column max for Rust. Real ingest and egress in integration tests (no `tower::ServiceExt::oneshot` shortcuts, no mocked sockets). Only edit in-repo. No push without direct instruction. Plan-vs-code refresh on any design deviation from PLAN_V1.1.md.
+
+See the "Next session kickoff prompt" section immediately below for the canonical context-pointer + rules list to paste into a fresh session.
+
+## Next session kickoff prompt
+
+Paste the block below into a fresh Claude Code session to hand off cleanly. Keep it in sync with the current "Session N entry point" block above whenever the queue advances.
+
+> You are continuing work on LVQR, a Rust live video streaming server. `origin/main` head is `d340a6f`. Phase A of `tracking/PLAN_V1.1.md` is fully shipped + pushed: 111-A docs sweep, 112 live HLS+DASH auth + cargo audit CI, 111-B1/B2/B3 full mesh server-side prereqs, plus two `lvqr-cli/lib.rs` refactor splits (lib.rs went from 2513 lines to 1110 lines across 8 modules). Workspace tests: **934** passed / 0 failed / 1 ignored on the default gate. 29 crates. Rust crates at v0.4.0 on crates.io; `@lvqr/core` + `@lvqr/player` at 0.3.1 on npm; `lvqr` at 0.3.1 on PyPI (admin-client only).
+>
+> **Session scope**: session 113 -- WHEP AAC to Opus transcoder (phase B row 1, highest-impact v1.1 user-visible item). Closes the documented "WHEP drops AAC" Known Limitation so every RTMP / SRT / RTSP / WS publisher reaches WebRTC subscribers with audio instead of video-only. See `tracking/HANDOFF.md` "Session 113 entry point" block for the five-row scope breakdown and `tracking/PLAN_V1.1.md` row 113 for the phase-level rationale. The session 105 + 106 close blocks (further down HANDOFF.md) are the closest precedent: session 105 shipped the first GStreamer software-encoder pipeline with a worker-thread pattern + sync_channel(64) + recursion guard; session 113 mirrors that shape for an audio `faad ! audioconvert ! audioresample ! opusenc` pipeline plus plumbing into WHEP's `str0m_backend` audio write path.
+>
+> **Read first, in this order**:
+> 1. `CLAUDE.md` -- absolute rules (no Claude attribution in commits, no emojis, no em-dashes, 120-col max).
+> 2. `tracking/HANDOFF.md` top through the "Session 113 entry point" block and this kickoff prompt.
+> 3. `tracking/PLAN_V1.1.md` -- current four-phase plan, row 113 specifically.
+> 4. `crates/lvqr-transcode/src/software.rs` -- the session-105 worker-thread GStreamer pattern you are mirroring for audio.
+> 5. `crates/lvqr-transcode/src/runner.rs` + `src/lib.rs` -- the `Transcoder` + `TranscoderFactory` + `TranscodeRunner` surface your new audio factory plugs into.
+> 6. `crates/lvqr-whep/src/str0m_backend.rs` -- the answerer and `run_session_loop` you are extending with an audio write path; search for `TODO: no AAC -> Opus transcoder` / "no in-tree AAC -> Opus transcoder".
+> 7. `crates/lvqr-whep/tests/e2e_str0m_loopback_opus.rs` -- closest test precedent for an Opus-carrying WHEP session; your new `rtmp_whep_audio_e2e.rs` mirrors its str0m-client structure.
+>
+> **Absolute rules**: never add Claude as author, co-author, or contributor in git commits, files, or any other attribution (no `Co-Authored-By` trailers); no emojis in code, commit messages, or documentation; no em-dashes in prose; 120-column max in Rust; real ingest and egress in integration tests (no `tower::ServiceExt::oneshot` shortcuts, no mocked sockets); only edit files within this repository; do NOT push to origin without a direct user instruction; plan-vs-code refresh on any deviation from the scope in PLAN_V1.1.md; never skip git hooks (no `--no-verify`, no `--no-gpg-sign`); never force-push main.
+>
+> **Verification gates**: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; new integration test green under the `transcode` feature (+ on `rtmp` if feature-gated); `cargo test -p lvqr-transcode --features transcode` green; `cargo test -p lvqr-whep` green; `cargo test --workspace` (default gate) stays >= 934 / 0 / 1.
+>
+> **After session 113**: write a "Session 113 close" block at the top of HANDOFF.md immediately after the status header; flip the README "WHEP drops AAC" Known Limitation bullet; update `tracking/PLAN_V1.1.md` row 113 to SHIPPED; update the project_lvqr_status auto-memory; commit as a feat commit + a close-doc commit (two commits). Push only if the user says so.
 
 ## Session 109 A close (2026-04-21)
 
