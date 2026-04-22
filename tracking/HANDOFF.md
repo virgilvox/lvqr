@@ -1,8 +1,34 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist row 116). **Phase A v1.1 + all mesh-prereqs + phase-B rows 113 (WHEP AAC-to-Opus) + 114 (WHIP->HLS + SRT->DASH + RTMP->WHEP audio E2E) + 115 (mesh two-browser Playwright E2E) all SHIPPED and pushed to origin/main**. 941 workspace tests on the default gate (unchanged; the 114 row 2 and 115 targets live outside the workspace's Rust test surface -- the former is feature-gated on `transcode`, the latter is a Node/Playwright spec). Plus one Playwright test (`bindings/js/tests/e2e/mesh/two-peer-relay.spec.ts`) that passes locally in ~270 ms. 29 crates. Next: session 117 -- open phase-B row is 116 (`examples/tier4-demos/` first public demo script) or the first phase-C row (archive READ DVR E2E + DASH-IF validator in CI).
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist row 116). **Phase A v1.1 + all mesh-prereqs + phase-B rows 113 (WHEP AAC-to-Opus) + 114 (WHIP->HLS + SRT->DASH + RTMP->WHEP audio E2E) + 115 (mesh two-browser Playwright E2E) all SHIPPED and pushed to origin/main**. 941 workspace tests on the default gate + 1 Playwright E2E green on CI. 29 crates. Next: session 117 -- open phase-B row is 116 (`examples/tier4-demos/` first public demo script) or the first phase-C row (archive READ DVR E2E + DASH-IF validator in CI).
 
-**Last Updated**: 2026-04-22 (session 116 close: row 115 two-browser mesh Playwright E2E shipped + pushed). Local `main` head equals `origin/main`. Session 115 chain (`323be2f` through `33e3802`) was pushed at the top of this session per user instruction; session 116 commits (`18e32fd` fix(mesh), `b5796cb` feat(cli), `27b45fe` feat(test), plus this close-doc commit) ride on top. No push instruction issued since the row-115 session open; the session-116 chain will be pushed at the next push event.
+**Last Updated**: 2026-04-22 (session 116 close + post-close quality sweep). Local `main` head equals `origin/main` at **`3e026f6`**. Session 116's feat+close chain (`18e32fd`..`998726f`) rides on top of session 115's (`33e3802`); a 5-commit post-close quality sweep rides on top of those (`1ed9f0a`, `9dfdbe0`, `07ce9b9`, `0df2bd1`, `940d597`, `3e026f6`).
+
+## Post-116 quality sweep (2026-04-22)
+
+Five commits + one API affordance on top of the session 116 close. Each is a real fix for a latent issue surfaced either by the first CI run of the new mesh-e2e workflow or by a design-audit pass on the just-shipped code.
+
+1. **`1ed9f0a` ci(mesh-e2e)**: new `.github/workflows/mesh-e2e.yml`. The Playwright test landed in `27b45fe` passed locally but had no CI hook -- any refactor of `@lvqr/core::MeshPeer` / `lvqr-signal` / `lvqr-mesh` / `lvqr-cli`'s mesh wiring could silently break it. The workflow boots `lvqr-cli` in debug, npm-installs the `bindings/js` workspace, rebuilds `@lvqr/core/dist`, installs Chromium with system deps, runs `npx playwright test`. Dedicated rather than extending `e2e.yml` because the mesh suite has a separate npm workspace + playwright.config.ts. Soft-fail (`continue-on-error: true`) for the first weeks.
+
+2. **`9dfdbe0` fix(test)**: the Playwright test now passes `iceServers: []` to MeshPeer so restricted CI runners don't hang on Google STUN lookup. Host candidates gather regardless of iceServers config; on loopback they're sufficient. Local rerun with `[]` still passes in ~460 ms (vs. ~270 ms with default STUN).
+
+3. **`07ce9b9` fix(js)**: two latent-hang bugs in @lvqr/core 0.3.1 fixed on `main`. `LvqrClient` now exposes `connectTimeoutMs` (default 10_000) applied to WebTransport + WebSocket + WebSocket-broadcast paths via a shared `withConnectTimeout` helper that closes the in-flight handshake on timeout. `LvqrAdminClient` now exposes `fetchTimeoutMs` (default 10_000) applied to every admin HTTP call via AbortController. Both latent on the published npm; fixes land at the next publish cycle.
+
+4. **`0df2bd1` fix(hls)**: Rust 1.95 stable promoted `clippy::unnecessary_sort_by` to warn-by-default; CI (which tracks stable) started failing the `Format and Lint` job. `crates/lvqr-hls/src/server.rs:1274` rewritten from `sort_by(|a, b| b.0.cmp(&a.0))` to `sort_by_key(|b| std::cmp::Reverse(b.0))`. Three other workspace `sort_by` sites are on String keys where the `sort_by_key` suggestion would require cloning; clippy correctly skips those.
+
+5. **`940d597` fix(whip)**: proptest in `crates/lvqr-whip/tests/proptest_depack.rs` caught a round-trip-preservation bug on CI (Rust 1.95 / Ubuntu). Minimal failing input: `nals = [[0x00, 0x00, 0x01]]`. A NAL body containing an embedded Annex B start-code pattern confuses the splitter into emitting two empty NALs. Real H.264 encoders escape this via an emulation-prevention byte (`00 00 03 xx`); the test's "well-formed" generator did not. Two changes: `prop_assume!` filter on the generator to reject NAL bodies whose `[0, 0, x <= 3]` window would require emulation prevention, plus a pinned `proptest_depack.proptest-regressions` file carrying the CI-discovered seed so the exact adversarial case replays on every future run. Adversarial (unescaped) path still covered by the pair of `_never_panics` properties that already live in the same file.
+
+6. **`3e026f6` feat(mesh)**: new `onChildOpen(childId, dc)` callback on `MeshConfig`. Fires once per child when its DataChannel transitions to `open` on the parent side. Integrators who want deterministic one-shot push (e.g. init segment for a late-joining subscriber) can use this instead of the 100 ms `pushFrame` poll-loop the Playwright test uses as a workaround. Callback errors are swallowed so a throwing integrator does not tear down the parent-side state machine. Additive to `@lvqr/core`'s public API (optional field with default no-op); source- and ABI-compatible.
+
+### Ground truth (post-116 sweep)
+
+* **Head**: `3e026f6`. Local `main` = `origin/main`. 23 commits pushed across the session 113-116 arc; the last 11 are this session's mesh/quality chain.
+* **Tests (default gate)**: **941** passed, 0 failed, 1 ignored. Unchanged; all session-116 new test targets are either feature-gated (`transcode`) or live outside the cargo workspace (Playwright).
+* **Playwright**: 1 passed in ~270-460 ms on cached Chromium 1217.
+* **CI**: Mesh E2E green on `9dfdbe0`; Test Contract green twice; Archive c2pa + Archive io-uring + Docker all green on `07ce9b9`'s run (before the clippy fix). `CI` and `LL-HLS Conformance` running against `3e026f6` at the last observation; expected green after the clippy fix cleared `Format and Lint`.
+* **crates.io / npm / PyPI**: unchanged. The client-SDK bug fixes + the new `pushFrame` / `onChildOpen` APIs ride on `main` and land at the next @lvqr/core publish.
+
+
 
 ## Session 116 close (2026-04-22)
 
