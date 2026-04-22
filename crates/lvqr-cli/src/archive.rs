@@ -616,12 +616,221 @@ async fn file_handler(
         }
     };
 
+    let total = bytes.len();
+
+    // RFC 7233 range-request support. Most HTML5 `<video>` tags
+    // issue `Range: bytes=0-` on the first request and then scrub
+    // via `Range: bytes=N-` as the viewer seeks; without this
+    // branch every seek re-downloads the whole segment from byte
+    // zero. Multi-range requests (`bytes=0-10,20-30`) would need
+    // `multipart/byteranges` encoding which is rare in the wild;
+    // we fall through to 200 OK + full body on them so a client
+    // that asks for multiple ranges still receives a valid
+    // response, just not partitioned the way it expected.
+    if let Some(hv) = headers.get(header::RANGE) {
+        match parse_single_range(hv, total) {
+            ParsedRange::Single(start, end) => {
+                // Inclusive on both ends per RFC 7233; a request for
+                // `bytes=0-0` returns exactly byte 0 (one byte).
+                let slice = bytes[start..=end].to_vec();
+                return Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .header(header::CONTENT_LENGTH, slice.len())
+                    .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"))
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .body(Body::from(slice))
+                    .expect("valid response");
+            }
+            ParsedRange::Unsatisfiable => {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+                    .body(Body::empty())
+                    .expect("valid response");
+            }
+            ParsedRange::Ignored => {
+                // Fall through to the full-body response below.
+            }
+        }
+    }
+
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_LENGTH, bytes.len())
+        .header(header::CONTENT_LENGTH, total)
+        .header(header::ACCEPT_RANGES, "bytes")
         .body(Body::from(bytes))
         .expect("valid response")
+}
+
+/// Outcome of attempting to parse a `Range:` header. `Single`
+/// carries an inclusive `[start, end]` byte range; `Unsatisfiable`
+/// means the header was well-formed but the range lies outside the
+/// resource (416); `Ignored` means the header is malformed or
+/// requests a form we do not implement (multi-range), in which case
+/// the handler falls through to a normal 200 response so the client
+/// still receives the full body.
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedRange {
+    Single(usize, usize),
+    Unsatisfiable,
+    Ignored,
+}
+
+fn parse_single_range(raw: &axum::http::HeaderValue, total: usize) -> ParsedRange {
+    let Ok(s) = raw.to_str() else {
+        return ParsedRange::Ignored;
+    };
+    let Some(spec) = s.trim().strip_prefix("bytes=") else {
+        return ParsedRange::Ignored;
+    };
+    // Multi-range requests use comma-separated specs; fall back to
+    // a full-body 200 OK rather than implementing
+    // `multipart/byteranges`.
+    if spec.contains(',') {
+        return ParsedRange::Ignored;
+    }
+    let Some((start_s, end_s)) = spec.split_once('-') else {
+        return ParsedRange::Ignored;
+    };
+    let start_s = start_s.trim();
+    let end_s = end_s.trim();
+    if total == 0 {
+        // Empty file: every range is unsatisfiable.
+        return ParsedRange::Unsatisfiable;
+    }
+    match (start_s.is_empty(), end_s.is_empty()) {
+        (false, false) => {
+            let Ok(start) = start_s.parse::<usize>() else {
+                return ParsedRange::Ignored;
+            };
+            let Ok(end) = end_s.parse::<usize>() else {
+                return ParsedRange::Ignored;
+            };
+            if start > end || start >= total {
+                return ParsedRange::Unsatisfiable;
+            }
+            // Clamp the end to the final byte per RFC 7233: a
+            // client asking for `bytes=0-999999` against a 100-byte
+            // file gets the full 100 bytes.
+            let end = end.min(total - 1);
+            ParsedRange::Single(start, end)
+        }
+        (false, true) => {
+            // `bytes=A-`: from A to end of resource.
+            let Ok(start) = start_s.parse::<usize>() else {
+                return ParsedRange::Ignored;
+            };
+            if start >= total {
+                return ParsedRange::Unsatisfiable;
+            }
+            ParsedRange::Single(start, total - 1)
+        }
+        (true, false) => {
+            // `bytes=-N`: suffix range, last N bytes.
+            let Ok(n) = end_s.parse::<usize>() else {
+                return ParsedRange::Ignored;
+            };
+            if n == 0 {
+                return ParsedRange::Unsatisfiable;
+            }
+            let n = n.min(total);
+            ParsedRange::Single(total - n, total - 1)
+        }
+        (true, true) => ParsedRange::Ignored,
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::{ParsedRange, parse_single_range};
+    use axum::http::HeaderValue;
+
+    fn hv(s: &str) -> HeaderValue {
+        HeaderValue::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn bytes_a_b_inclusive() {
+        assert_eq!(parse_single_range(&hv("bytes=0-99"), 200), ParsedRange::Single(0, 99));
+        assert_eq!(
+            parse_single_range(&hv("bytes=50-150"), 200),
+            ParsedRange::Single(50, 150)
+        );
+        // Single byte: bytes=5-5 should return exactly byte 5.
+        assert_eq!(parse_single_range(&hv("bytes=5-5"), 10), ParsedRange::Single(5, 5));
+    }
+
+    #[test]
+    fn bytes_a_open_tail() {
+        assert_eq!(
+            parse_single_range(&hv("bytes=100-"), 200),
+            ParsedRange::Single(100, 199)
+        );
+        assert_eq!(parse_single_range(&hv("bytes=0-"), 200), ParsedRange::Single(0, 199));
+    }
+
+    #[test]
+    fn bytes_suffix_last_n() {
+        assert_eq!(parse_single_range(&hv("bytes=-50"), 200), ParsedRange::Single(150, 199));
+        // Suffix larger than resource: clamp to whole file.
+        assert_eq!(parse_single_range(&hv("bytes=-9999"), 200), ParsedRange::Single(0, 199));
+    }
+
+    #[test]
+    fn end_clamped_to_last_byte() {
+        // Over-long end: RFC 7233 says clamp.
+        assert_eq!(
+            parse_single_range(&hv("bytes=0-99999"), 100),
+            ParsedRange::Single(0, 99)
+        );
+    }
+
+    #[test]
+    fn start_at_or_beyond_length_is_unsatisfiable() {
+        assert_eq!(
+            parse_single_range(&hv("bytes=200-300"), 200),
+            ParsedRange::Unsatisfiable
+        );
+        assert_eq!(parse_single_range(&hv("bytes=500-"), 200), ParsedRange::Unsatisfiable);
+    }
+
+    #[test]
+    fn zero_suffix_is_unsatisfiable() {
+        assert_eq!(parse_single_range(&hv("bytes=-0"), 200), ParsedRange::Unsatisfiable);
+    }
+
+    #[test]
+    fn backwards_range_is_unsatisfiable() {
+        assert_eq!(parse_single_range(&hv("bytes=100-50"), 200), ParsedRange::Unsatisfiable);
+    }
+
+    #[test]
+    fn malformed_headers_are_ignored() {
+        // Wrong unit (bytes= prefix missing).
+        assert_eq!(parse_single_range(&hv("0-99"), 200), ParsedRange::Ignored);
+        // Non-numeric.
+        assert_eq!(parse_single_range(&hv("bytes=abc-def"), 200), ParsedRange::Ignored);
+        // Missing dash.
+        assert_eq!(parse_single_range(&hv("bytes=100"), 200), ParsedRange::Ignored);
+        // Empty on both sides.
+        assert_eq!(parse_single_range(&hv("bytes=-"), 200), ParsedRange::Ignored);
+    }
+
+    #[test]
+    fn multi_range_requests_fall_through() {
+        // Multi-range is legal per RFC 7233 but we do not implement
+        // `multipart/byteranges`, so the handler falls back to a
+        // full-body 200 via the `Ignored` branch.
+        assert_eq!(parse_single_range(&hv("bytes=0-10,20-30"), 200), ParsedRange::Ignored);
+    }
+
+    #[test]
+    fn empty_file_every_range_unsatisfiable() {
+        assert_eq!(parse_single_range(&hv("bytes=0-10"), 0), ParsedRange::Unsatisfiable);
+        assert_eq!(parse_single_range(&hv("bytes=-10"), 0), ParsedRange::Unsatisfiable);
+    }
 }
 
 /// Derive the broadcast key a `/playback/file/{*rel}` request

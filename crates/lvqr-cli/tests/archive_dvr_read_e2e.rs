@@ -94,11 +94,19 @@ impl HttpResponse {
 }
 
 async fn http_get(addr: SocketAddr, path: &str) -> HttpResponse {
+    http_get_with_range(addr, path, None).await
+}
+
+async fn http_get_with_range(addr: SocketAddr, path: &str, range: Option<&str>) -> HttpResponse {
     let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
         .await
         .expect("http GET connect timed out")
         .expect("http GET connect failed");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let range_header = match range {
+        Some(r) => format!("Range: {r}\r\n"),
+        None => String::new(),
+    };
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{range_header}Connection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
     tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut buf))
@@ -590,6 +598,137 @@ async fn playback_routes_emit_expected_content_types() {
         "file Content-Length {cl} must match actual body length {}",
         resp.body.len(),
     );
+
+    drop(rtmp_stream);
+    drop(session);
+    server.shutdown().await.expect("shutdown");
+}
+
+// =====================================================================
+// Test 4: HTTP Range: bytes= on /playback/file/*.
+// =====================================================================
+
+/// `/playback/file/*` honors RFC 7233 byte-range requests.
+/// HTML5 `<video>` tags issue `Range: bytes=0-` on first fetch
+/// and subsequently request `Range: bytes=<seek>-` as the viewer
+/// scrubs. Without range support every seek would re-download
+/// the full segment from byte zero, which made `<video>`-driven
+/// DVR scrubbing impractical on segments larger than a handful
+/// of kilobytes.
+///
+/// Covers four flavors:
+/// * `bytes=A-B` -- explicit closed range, 206 Partial Content
+/// * `bytes=A-` -- open-ended tail, 206 Partial Content
+/// * `bytes=-N` -- last N bytes (suffix), 206 Partial Content
+/// * invalid range (`bytes=99999-`) -- 416 Range Not Satisfiable
+///
+/// Also asserts the response carries `Accept-Ranges: bytes` on
+/// the non-ranged path so clients probing for range support
+/// see a positive signal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn playback_file_supports_byte_range_requests() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("lvqr=info")
+        .with_test_writer()
+        .try_init();
+
+    let archive_tmp = TempDir::new().expect("tempdir");
+    let archive_path = archive_tmp.path().to_path_buf();
+
+    let server = TestServer::start(TestServerConfig::default().with_archive_dir(&archive_path))
+        .await
+        .expect("start TestServer");
+    let rtmp_addr = server.rtmp_addr();
+    let admin_addr = server.admin_addr();
+
+    let (rtmp_stream, session) = publish_keyframe_train(rtmp_addr, "live", "dvr", &[0, 2000, 4000]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Pick the first archived segment + establish the ground
+    // truth by fetching the full body first.
+    let range_rows: Vec<serde_json::Value> = {
+        let r = http_get(admin_addr, "/playback/live/dvr").await;
+        serde_json::from_slice(&r.body).expect("range body is JSON")
+    };
+    let first_seq = range_rows[0]["segment_seq"].as_u64().unwrap();
+    let file_path = format!("/playback/file/live/dvr/0.mp4/{first_seq:08}.m4s");
+
+    let full = http_get(admin_addr, &file_path).await;
+    assert_eq!(full.status, 200, "baseline full GET status");
+    assert_eq!(
+        full.header("accept-ranges"),
+        Some("bytes"),
+        "non-ranged file response must advertise Accept-Ranges",
+    );
+    let total = full.body.len();
+    assert!(
+        total >= 32,
+        "need at least 32 bytes of segment to exercise range arithmetic, got {total}",
+    );
+
+    // Closed range: `bytes=0-15`. Expect 16 bytes (inclusive).
+    let resp = http_get_with_range(admin_addr, &file_path, Some("bytes=0-15")).await;
+    assert_eq!(resp.status, 206, "closed-range status");
+    assert_eq!(resp.body.len(), 16, "closed-range body length");
+    assert_eq!(
+        resp.body,
+        full.body[0..16],
+        "closed-range bytes must match full body prefix"
+    );
+    assert_eq!(
+        resp.header("content-range"),
+        Some(format!("bytes 0-15/{total}").as_str()),
+        "closed-range Content-Range",
+    );
+    assert_eq!(resp.header("content-length"), Some("16"), "closed-range Content-Length");
+
+    // Open-tail range: `bytes=<total/2>-`. Expect the back half.
+    let mid = total / 2;
+    let resp = http_get_with_range(admin_addr, &file_path, Some(&format!("bytes={mid}-"))).await;
+    assert_eq!(resp.status, 206, "open-tail status");
+    assert_eq!(
+        resp.body.len(),
+        total - mid,
+        "open-tail body length: total={total} mid={mid}",
+    );
+    assert_eq!(resp.body, full.body[mid..], "open-tail bytes must match full body tail");
+    assert_eq!(
+        resp.header("content-range"),
+        Some(format!("bytes {mid}-{}/{total}", total - 1).as_str()),
+        "open-tail Content-Range",
+    );
+
+    // Suffix range: `bytes=-8`. Expect the last 8 bytes.
+    let resp = http_get_with_range(admin_addr, &file_path, Some("bytes=-8")).await;
+    assert_eq!(resp.status, 206, "suffix-range status");
+    assert_eq!(resp.body.len(), 8, "suffix-range body length");
+    assert_eq!(
+        resp.body,
+        full.body[total - 8..],
+        "suffix-range bytes must match full body last 8",
+    );
+    assert_eq!(
+        resp.header("content-range"),
+        Some(format!("bytes {}-{}/{total}", total - 8, total - 1).as_str()),
+        "suffix-range Content-Range",
+    );
+
+    // Unsatisfiable range: start beyond end-of-file. 416 per
+    // RFC 7233 with `Content-Range: bytes */<total>`.
+    let beyond = total + 1000;
+    let resp = http_get_with_range(admin_addr, &file_path, Some(&format!("bytes={beyond}-"))).await;
+    assert_eq!(resp.status, 416, "unsatisfiable status");
+    assert_eq!(
+        resp.header("content-range"),
+        Some(format!("bytes */{total}").as_str()),
+        "unsatisfiable Content-Range",
+    );
+
+    // Multi-range falls through to a normal 200 (we do not emit
+    // multipart/byteranges).
+    let resp = http_get_with_range(admin_addr, &file_path, Some("bytes=0-10,20-30")).await;
+    assert_eq!(resp.status, 200, "multi-range should fall through to 200");
+    assert_eq!(resp.body.len(), total, "multi-range full body returned");
 
     drop(rtmp_stream);
     drop(session);
