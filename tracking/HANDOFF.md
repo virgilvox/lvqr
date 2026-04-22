@@ -1,8 +1,49 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist). **Phase A v1.1 + all mesh-prereqs + phase-B row 113 (WHEP AAC-to-Opus) SHIPPED**. 934 workspace tests on the default gate, 29 crates. Next: session 114 (WHIP-to-HLS + RTMP-to-WHEP + SRT-to-DASH E2E test gap closers).
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist). **Phase A v1.1 + all mesh-prereqs + phase-B rows 113 (WHEP AAC-to-Opus) + 114 partial (WHIP->HLS + SRT->DASH E2E tests; RTMP->WHEP audio still pending as feature-gated test) SHIPPED**. 941 workspace tests on the default gate (+7 over 113 close), 29 crates. Next: session 115 (mesh data-plane step 2 with Playwright two-browser E2E), or finish session 114 row 2 (RTMP->WHEP audio E2E on a GStreamer-enabled CI host).
 
-**Last Updated**: 2026-04-21 (session 113 close). Origin/main head is `2e50635` pre-113 push; after the 113 commit pair lands, local head advances by two (feat + docs). The full phase A + phase-B row 113 commit chain on main, chronological:
+**Last Updated**: 2026-04-21 (session 114 partial close). Local head pre-114 is `3e9b444` (session 113 docs). After 114's commit pair lands, local head advances by two more (feat + docs).
+
+## Session 114 close (partial) (2026-04-21)
+
+**Shipped**: 2 of 3 phase-B row-2 E2E tests + 5 audit-coverage unit tests on session 113 plumbing. Row 2 (RTMP to WHEP audio with real str0m client) is written up as unshipped scope below so it can be picked up by a future session on a GStreamer-provisioned CI host.
+
+1. **Row 1: WHIP to HLS E2E test** (`crates/lvqr-cli/tests/whip_hls_e2e.rs`, +340 LOC). Drives a real `str0m::Rtc` publisher against the WHIP HTTP surface, POSTs an SDP offer to `/whip/live/test`, validates the `201 Created` response + `Location: /whip/live/test/{session_id}` header + parseable SDP answer, extracts the host candidate, completes ICE + DTLS + SRTP in-process over loopback UDP, writes synthetic H.264 samples (SPS + PPS + IDR per sample at ~50 Hz) through the client's `Writer::write`, and polls `/hls/live/test/playlist.m3u8` every 200 ms until the playlist carries at least one `#EXT-X-PART:` or `#EXTINF:` entry. Completes in ~0.4 s locally. Covers the full path: WHIP HTTP router -> `Str0mIngestAnswerer` -> `run_session_loop` -> `WhipMoqBridge` sample-side -> `MoqTrackSink` + `FragmentBroadcasterRegistry` -> `BroadcasterHlsBridge` drain -> `MultiHlsServer` -> axum HTTP.
+   * New dev-dep `str0m = "0.18"` on `lvqr-cli` (same pin as `lvqr-whep`). Matches the existing precedent where `lvqr-cli` dev-deps call into `lvqr-ingest`'s publisher crates directly (e.g. `rml_rtmp`, `srt-tokio`) for E2E tests.
+   * Assertion tolerance: accepts `#EXT-X-PART:` (LL-HLS partial) OR `#EXTINF:` (full segment) because the default 2 s / 90 kHz segment budget may not close a full segment inside a ~400 ms test run. The LL-HLS bridge is already covered elsewhere on the full-segment path via `rtmp_hls_e2e.rs`; this test's value is the WHIP-side plumbing.
+
+2. **Row 3: SRT to DASH E2E test** (`crates/lvqr-cli/tests/srt_dash_e2e.rs`, +260 LOC). Mirrors the `srt_hls_e2e.rs` publisher (SRT caller pushing a minimal PAT + PMT + two H.264 keyframes spaced 2 s apart at 180_000 ticks / 90 kHz) against the `rtmp_dash_e2e.rs` DASH subscriber assertions (`<MPD>` element + `type="dynamic"` + `<AdaptationSet>` + `seg-video-$Number$.m4s` template + `init-video.m4s` with `ftyp` prefix + `seg-video-1.m4s` with `moof` prefix + 404 on an unknown broadcast). Completes in ~1.2 s locally. Key design call: the SRT socket is held open across the DASH read assertions to keep the broadcast in the live `type="dynamic"` state; closing immediately after the TS payload send cascades through `BroadcastStopped` into `MultiDashServer::finalize_broadcast` and flips the manifest to `type="static"` with the on-demand profile. The socket is explicitly `close()`d at the end of the test for symmetric teardown.
+
+3. **Session 113 audit tests** (5 new tests in `crates/lvqr-whep/src/str0m_backend.rs`). Refactored the AAC `AudioSpecificConfig` parse from an inline-in-`on_audio_config` body to a `parse_aac_asc(bytes: &[u8]) -> Option<(u8, u32, u8)>` free function so the byte-layout contract is independently testable. Unit tests:
+   * `parse_aac_asc_aac_lc_48khz_stereo`: ASC `[0x11, 0x90]` parses to `(2, 48_000, 2)`.
+   * `parse_aac_asc_aac_lc_44100_stereo_matches_flv_test_fixture`: ASC `[0x12, 0x10]` (the exact bytes `flv_audio_seq_header` in `rtmp_hls_e2e.rs` produces) parses to `(2, 44_100, 2)`.
+   * `parse_aac_asc_returns_none_for_short_input`: empty and 1-byte inputs return `None`.
+   * `aac_freq_index_to_hz_known_values`: known indices (0 / 3 / 4 / 7 / 12) map to the right Hz, and out-of-table indices (13, 15) fall back to 44.1 kHz.
+   * `on_audio_config_aac_does_not_panic_and_survives_drop`: integration-lite tokio test that pushes a real FLV-shaped ASC + an empty ASC + a non-AAC codec through a live `Str0mSessionHandle` and asserts clean shutdown. Without the `aac-opus` feature the poll loop drops the `SessionMsg::AudioConfig` after parsing; this test locks in the parse path.
+
+4. **Session 114 close doc** (this block). `tracking/PLAN_V1.1.md` row 114 marked "PARTIALLY SHIPPED" with row 2 (RTMP-to-WHEP audio) called out as the one piece deferred; row 2's scope is sized as 1-2 hours of work on a CI host with GStreamer installed.
+
+### Key 114 design decisions baked in
+
+* **Dev-dep `str0m` is specifically pinned on `lvqr-cli`**, not routed through `lvqr-whip` (which would require making str0m re-exports). The precedent is already set: `lvqr-cli` dev-deps directly name `rml_rtmp`, `srt-tokio`, and `moq-native` to drive publishers / subscribers; str0m is the same shape. Version pin matches the existing `lvqr-whep` dep so the cargo lock stays minimal.
+* **WHIP-to-HLS test tolerates both `#EXT-X-PART:` and `#EXTINF:` entries**. LL-HLS partials appear within ~1 s of the first keyframe; full segments require a 2 s span between keyframes. The test's 20 s deadline is generous but the assertion accepts the partials so the test stays under 1 s on a warm ICE handshake. Full-segment drain is already covered by `rtmp_hls_e2e.rs`.
+* **SRT-to-DASH test holds the SRT socket open across the DASH read**. Without this, the `BroadcastStopped` event fires on socket close and `MultiDashServer::finalize_broadcast` flips the manifest to the on-demand profile (`type="static"`). The test explicitly closes the socket only after the dynamic-state assertions complete, to document the teardown invariant.
+* **Session 113 ASC parser extracted from inline to a named free function**. The extraction adds one `parse_aac_asc` function + removes 14 lines of inline parsing from `Str0mSessionHandle::on_audio_config`. Behavior is byte-for-byte identical; the extraction exists purely so the parse can be unit-tested without booting a full session.
+
+### Ground truth (session 114 partial close)
+
+* **Head**: feat commit (pending) + this close-doc commit (pending). Local `main` will be N+2 ahead of `origin/main`; pre-commit head is `3e9b444` (session 113 close-doc).
+* **Tests (default features gate)**: **941** passed, 0 failed, 1 ignored. +7 over session 113's 934: the 4 `parse_aac_asc` + `aac_freq_index_to_hz` unit tests (+4), the `on_audio_config_aac_does_not_panic_and_survives_drop` tokio test (+1), `srt_publish_reaches_dash_router` (+1), `whip_publish_reaches_hls_playlist` (+1).
+* **CI gates locally clean**: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` 941 / 0 / 1.
+* **Workspace**: **29 crates**, unchanged.
+* **crates.io**: unchanged. 114 adds only tests + one internal refactor (`parse_aac_asc` extraction) that is behavior-preserving.
+
+### Known limitations / documented v1 shape (after 114 partial close)
+
+* **Row 2 (RTMP to WHEP audio E2E) deferred**. The AAC-to-Opus encoder path requires GStreamer at test time; the dev host used for session 114 does not have GStreamer installed. A follow-up session on a GStreamer-provisioned CI runner can land the test directly by combining `rtmp_dash_e2e.rs`'s RTMP publisher with the `e2e_str0m_loopback_opus.rs` str0m-client subscriber pattern, plus a real AAC sample source (either the `aac_opus_roundtrip.rs`'s `audiotestsrc ! avenc_aac` generator or a captured WAV -> AAC fixture).
+* All session 113 known limitations (per-session encoder, approximate Opus SLO stamp) unchanged.
+
+## Session 113 close (2026-04-21)
 
 | SHA | Type | Scope |
 |---|---|---|
@@ -140,28 +181,23 @@ crates.io is unchanged since the 110 push chain. The published v0.4.0 crates do 
 * **No admission control** (unchanged from 108 B).
 * **No time-windowed retention on the admin snapshot** (unchanged from 107 A).
 
-## Session 114 entry point -- cross-ingress E2E test gap closers (phase B row 2)
+## Session 115 entry point -- remaining phase-B work
 
-Phase A of `tracking/PLAN_V1.1.md` is fully shipped + pushed. Phase B row 113 (WHEP AAC-to-Opus transcoder) is SHIPPED as of this commit. **Session 114 is the phase B second row**: close the three biggest cross-crate E2E gaps the 2026-04-13 audit surfaced. One of these is the RTMP-to-WHEP audio test that 113 deferred; doing it here alongside the two sibling gap-closers keeps the test-build scope contiguous.
+Phase B rows 113 (WHEP AAC-to-Opus) and 114 (partial: WHIP->HLS + SRT->DASH E2E tests) are SHIPPED on local `main`. The pending phase-B work is:
 
-### Scope for session 114
+### Scope for session 115
 
 | # | Scope | Risk |
 |---|---|---|
-| 1 | **WHIP to HLS E2E test.** Single integration test that boots `TestServer` with WHIP + HLS enabled, publishes via an str0m client (reusing the `lvqr-whip::tests/e2e_str0m_loopback.rs` publisher pattern), and asserts the HLS master playlist advertises the broadcast + at least one media fragment flows through the subscriber side. | low |
-| 2 | **RTMP to WHEP audio E2E test.** Deferred from 113 scope row 4. `cargo test -p lvqr-cli --features transcode --test rtmp_whep_audio_e2e`. Requires GStreamer on the CI host (skip cleanly when absent, matching the 113 `aac_opus_roundtrip` pattern). Publishes real AAC via RTMP, boots str0m client negotiating Opus, asserts at least one `Event::MediaData` on the Opus mid. | medium (real AAC generation for RTMP) |
-| 3 | **SRT to DASH E2E test.** Closes the third-biggest cross-ingress test gap. Mirrors the `rtmp_dash_e2e.rs` structure but drives an SRT caller publisher (reusing the `rtsp_hls_e2e.rs` / `srt_hls_e2e.rs` toolchain). | low |
-
-See `tracking/PLAN_V1.1.md` row 114 for the phase-level rationale.
+| 1 | **Mesh data-plane step 2.** Per `PLAN_V1.1.md` row 115: exercise the existing `@lvqr/core` `MeshPeer` client against the session 111-B server wiring. Add Playwright E2E with two browser peers. Flip `docs/mesh.md` from "topology planner only" to "topology planner + signaling wired; DataChannel media relay ready for end-to-end testing". | medium |
+| 2 (opt) | **RTMP-to-WHEP audio E2E test** (deferred from 114). Requires GStreamer on the CI host. Add `crates/lvqr-cli/tests/rtmp_whep_audio_e2e.rs` feature-gated on `transcode` + gracefully skipped on hosts without GStreamer. Uses the `aac_opus_roundtrip.rs` `audiotestsrc ! avenc_aac` generator pattern to produce real AAC, pushes via RTMP, subscribes via str0m client, asserts Opus `Event::MediaData` on the subscriber side. | low once GStreamer is available |
 
 ### Known follow-up refactor candidates
 
-Not scoped for session 114 itself:
-
-- **Split `start()` into per-subsystem wiring helpers.** `lvqr-cli/src/lib.rs::start` is still ~1000 lines. A per-subsystem split would drop lib.rs below 500 lines; dedicated design pass required.
-- **Session 115**: Mesh data-plane step 2 with Playwright two-browser E2E.
+- **Split `start()` into per-subsystem wiring helpers.** `lvqr-cli/src/lib.rs::start` is still ~1000 lines. A per-subsystem split would drop lib.rs below 500 lines.
 - **Session 116**: `examples/tier4-demos/` first public demo script.
-- **Shared-per-broadcast AacToOpusEncoder** (113 follow-up): factor the per-session encoder out into a shared-per-broadcast one behind a flag when profiling shows the per-subscriber overhead matters. Current per-session pattern is explicit for v0.4 single-digit-subscriber deployments.
+- **Shared-per-broadcast AacToOpusEncoder** (113 follow-up): factor the per-session encoder out behind a flag when profiling shows overhead matters.
+- **WHIP-to-HLS E2E full-segment assertion** (114 follow-up): extend `whip_hls_e2e.rs` to write keyframes far enough apart (>2 s) that a full `#EXTINF:` segment closes, proving the end-to-end segment-finalisation path rather than just the LL-HLS partial path.
 
 ### Kickoff rules (unchanged)
 
@@ -173,23 +209,22 @@ See the "Next session kickoff prompt" section immediately below for the canonica
 
 Paste the block below into a fresh Claude Code session to hand off cleanly. Keep it in sync with the current "Session N entry point" block above whenever the queue advances.
 
-> You are continuing work on LVQR, a Rust live video streaming server. `origin/main` head is the session 113 close-doc commit (SHA pending until the 113 commit pair lands). Phase A of `tracking/PLAN_V1.1.md` is fully shipped + pushed. Phase B row 113 (WHEP AAC-to-Opus transcoder + `on_audio_config` observer hook + lazy per-session encoder + composition-root wiring + `aac_opus_roundtrip.rs` integration test) SHIPPED on top of that. Workspace tests: **934** passed / 0 failed / 1 ignored on the default gate. 29 crates. Rust crates at v0.4.0 on crates.io; `@lvqr/core` + `@lvqr/player` at 0.3.1 on npm; `lvqr` at 0.3.1 on PyPI (admin-client only).
+> You are continuing work on LVQR, a Rust live video streaming server. Local `main` head pre-push is the session 114 close-doc commit (SHA pending). Phase A of `tracking/PLAN_V1.1.md` is fully shipped + pushed. Phase B row 113 (WHEP AAC-to-Opus) SHIPPED; phase B row 114 PARTIALLY SHIPPED (WHIP->HLS + SRT->DASH E2E tests landed; RTMP->WHEP audio E2E deferred). Workspace tests: **941** passed / 0 failed / 1 ignored on the default gate. 29 crates.
 >
-> **Session scope**: session 114 -- cross-ingress E2E test gap closers (phase B row 2). Closes the three biggest cross-crate E2E gaps from the 2026-04-13 audit: (1) WHIP to HLS, (2) RTMP to WHEP audio (deferred from 113), (3) SRT to DASH. See `tracking/HANDOFF.md` "Session 114 entry point" block for the three-row scope breakdown and `tracking/PLAN_V1.1.md` row 114 for the phase-level rationale.
+> **Session scope**: session 115 -- mesh data-plane step 2 (phase B row 3). Exercise the `@lvqr/core` `MeshPeer` client against the session 111-B server wiring via a Playwright two-browser E2E. Optionally land the deferred RTMP->WHEP audio E2E test if GStreamer is available on the CI host.
 >
 > **Read first, in this order**:
 > 1. `CLAUDE.md` -- absolute rules.
-> 2. `tracking/HANDOFF.md` top through the "Session 113 close" + "Session 114 entry point" + this kickoff prompt.
-> 3. `tracking/PLAN_V1.1.md` -- current four-phase plan.
-> 4. `crates/lvqr-cli/tests/rtmp_hls_e2e.rs` + `crates/lvqr-whip/tests/e2e_str0m_loopback.rs` -- publisher-side test harnesses you are reusing.
-> 5. `crates/lvqr-cli/tests/transcode_ladder_e2e.rs` -- GStreamer-gated test skip-pattern precedent for the RTMP-to-WHEP audio test.
-> 6. `crates/lvqr-transcode/tests/aac_opus_roundtrip.rs` -- encoder-side round-trip test shipped in 113; mirror its GStreamer skip pattern.
+> 2. `tracking/HANDOFF.md` top through the "Session 114 close" block + this kickoff prompt.
+> 3. `tracking/PLAN_V1.1.md` -- current four-phase plan, row 115 specifically.
+> 4. `bindings/js/packages/core/src/mesh.ts` -- the existing JS MeshPeer client the Playwright test drives.
+> 5. `crates/lvqr-cli/tests/mesh_ws_registration_e2e.rs` -- closest precedent for server-side mesh testing from session 111-B2.
 >
 > **Absolute rules**: never add Claude as author, co-author, or contributor in git commits, files, or any other attribution (no `Co-Authored-By` trailers); no emojis in code, commit messages, or documentation; no em-dashes in prose; 120-column max in Rust; real ingest and egress in integration tests; only edit files within this repository; do NOT push to origin without a direct user instruction; plan-vs-code refresh on any design deviation from PLAN_V1.1.md; never skip git hooks; never force-push main.
 >
-> **Verification gates**: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (default gate) stays >= 934 / 0 / 1 (the new RTMP-to-WHEP audio test is feature-gated on `transcode` + skips on missing GStreamer).
+> **Verification gates**: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (default gate) stays >= 941 / 0 / 1.
 >
-> **After session 114**: write a "Session 114 close" block at the top of HANDOFF.md; mark `tracking/PLAN_V1.1.md` row 114 SHIPPED; update the project_lvqr_status auto-memory; commit as a feat commit + a close-doc commit (two commits). Push only if the user says so.
+> **After session 115**: write a "Session 115 close" block at the top of HANDOFF.md; mark `tracking/PLAN_V1.1.md` row 115 SHIPPED; update the project_lvqr_status auto-memory; commit as a feat commit + a close-doc commit (two commits). Push only if the user says so.
 
 ## Session 109 A close (2026-04-21)
 
