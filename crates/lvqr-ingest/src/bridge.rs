@@ -371,9 +371,17 @@ impl RtmpMoqBridge {
                     // audio sample rate (44.1 kHz vs 48 kHz vs other).
                     let audio_timescale = config.sample_rate;
                     let init = audio_init_segment(&config);
+                    let asc = config.asc.clone();
                     stream.audio_sink.set_init_segment(init.clone());
                     stream.audio_config = Some(config);
                     stream.audio_init = Some(init.clone());
+                    if let Some(obs) = raw_observer_audio.as_ref() {
+                        // Session 113: fire the codec-config hook so
+                        // the WHEP AAC-to-Opus transcoder has the
+                        // AudioSpecificConfig before the first raw
+                        // AAC sample arrives.
+                        obs.on_audio_config(&stream_name, "1.mp4", crate::MediaCodec::Aac, &asc);
+                    }
                     publish_init(
                         &registry_audio,
                         &stream_name,

@@ -3554,6 +3554,7 @@ dependencies = [
  "lvqr-cmaf",
  "lvqr-core",
  "lvqr-ingest",
+ "lvqr-transcode",
  "proptest",
  "rand 0.8.5",
  "str0m",

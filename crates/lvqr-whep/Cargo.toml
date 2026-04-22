@@ -10,6 +10,15 @@ authors.workspace = true
 keywords = ["streaming", "webrtc", "whep", "rtp", "egress"]
 categories = ["multimedia", "network-programming"]
 
+[features]
+default = []
+# Session 113: AAC-to-Opus transcoding for AAC publishers (RTMP / SRT /
+# RTSP / WS) fanning out to WHEP subscribers that negotiated Opus. Pulls
+# `lvqr-transcode` with its own `transcode` feature, which in turn pulls
+# the gstreamer-rs crates. Default OFF so hosts without the GStreamer
+# runtime continue to build the WHEP crate.
+aac-opus = ["dep:lvqr-transcode", "lvqr-transcode/transcode"]
+
 [dependencies]
 axum = { workspace = true }
 bytes = { workspace = true }
@@ -23,6 +32,9 @@ str0m = "0.18"
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 tracing = { workspace = true }
+# Feature-gated on `aac-opus`. The `transcode` sub-feature is activated
+# via the feature list above so the AacToOpus types are reachable.
+lvqr-transcode = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = "1"

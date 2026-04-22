@@ -493,8 +493,18 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         // LatencyTracker into the str0m answerer so every spawned
         // session's poll loop records one sample per successful
         // `Writer::write` under transport="whep".
-        let answerer = Arc::new(lvqr_whep::Str0mAnswerer::new(str0m_cfg).with_slo_tracker(slo_tracker.clone()))
-            as Arc<dyn lvqr_whep::SdpAnswerer>;
+        let answerer_builder = lvqr_whep::Str0mAnswerer::new(str0m_cfg).with_slo_tracker(slo_tracker.clone());
+        // Session 113: when built with the `transcode` meta-feature
+        // (which activates `lvqr-whep/aac-opus`), attach the AAC-to-
+        // Opus encoder factory so RTMP / SRT / RTSP AAC publishers
+        // reach Opus-only WHEP subscribers with audio. The factory
+        // probes GStreamer elements once; missing elements log and
+        // the factory opts out per-session, so a misconfigured host
+        // still serves video to WHEP without panicking.
+        #[cfg(feature = "transcode")]
+        let answerer_builder =
+            answerer_builder.with_aac_to_opus_factory(Arc::new(lvqr_transcode::AacToOpusEncoderFactory::new()));
+        let answerer = Arc::new(answerer_builder) as Arc<dyn lvqr_whep::SdpAnswerer>;
         let server = lvqr_whep::WhepServer::new(answerer);
         let observer: lvqr_ingest::SharedRawSampleObserver = Arc::new(server.clone());
         bridge_builder = bridge_builder.with_raw_sample_observer(observer);

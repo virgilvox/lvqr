@@ -109,6 +109,8 @@ mod runner;
 mod transcoder;
 
 #[cfg(feature = "transcode")]
+mod aac_opus;
+#[cfg(feature = "transcode")]
 mod software;
 
 pub use audio_passthrough::{AudioPassthroughTranscoder, AudioPassthroughTranscoderFactory};
@@ -117,5 +119,7 @@ pub use rendition::RenditionSpec;
 pub use runner::{TranscodeRunner, TranscodeRunnerHandle, TranscoderStats};
 pub use transcoder::{Transcoder, TranscoderContext, TranscoderFactory};
 
+#[cfg(feature = "transcode")]
+pub use aac_opus::{AacAudioConfig, AacToOpusEncoder, AacToOpusEncoderFactory, OpusFrame};
 #[cfg(feature = "transcode")]
 pub use software::{SoftwareTranscoder, SoftwareTranscoderFactory};

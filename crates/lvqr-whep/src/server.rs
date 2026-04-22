@@ -24,6 +24,18 @@ use lvqr_ingest::{MediaCodec, RawSampleObserver};
 use rand::RngCore;
 use std::sync::Arc;
 
+/// Cached codec-configuration snapshot for a `(broadcast, track)`
+/// pair. Populated by [`WhepServer`]'s [`RawSampleObserver`] impl on
+/// every `on_audio_config` call so a WHEP subscriber that joins after
+/// the upstream publisher's first AAC sequence header still receives
+/// the config via `SessionHandle::on_audio_config`.
+#[derive(Debug, Clone)]
+pub(crate) struct AudioConfigSnapshot {
+    pub track: String,
+    pub codec: MediaCodec,
+    pub config_bytes: Bytes,
+}
+
 /// Unique identifier for an active WHEP subscriber session.
 ///
 /// Encoded as 16 random bytes rendered as 32 lowercase hex
@@ -141,6 +153,19 @@ pub trait SessionHandle: Send + Sync + 'static {
     /// `transport="whep"` at `writer.write` time. Zero means
     /// "unset"; the egress guard skips it, same as HLS + DASH.
     fn on_raw_sample(&self, track: &str, codec: MediaCodec, sample: &RawSample, ingest_time_ms: u64);
+
+    /// Called once per track when the upstream bridge learns the
+    /// codec configuration (AAC AudioSpecificConfig, for example).
+    /// Session 113 added this hook so the AAC-to-Opus transcoder
+    /// in [`crate::str0m_backend::Str0mSessionHandle`] can set up
+    /// its GStreamer decoder with the right sample-rate / channel
+    /// / profile without sniffing the first AAC access unit.
+    ///
+    /// Default no-op; implementations that do not need the config
+    /// inherit the stub. `codec_config` is the raw payload: AAC
+    /// AudioSpecificConfig for [`MediaCodec::Aac`], empty for
+    /// codecs that do not carry an explicit config.
+    fn on_audio_config(&self, _track: &str, _codec: MediaCodec, _codec_config: &[u8]) {}
 }
 
 /// Concrete SDP answerer contract. Separating this from the
@@ -171,6 +196,12 @@ pub(crate) struct SessionEntry {
 pub(crate) struct WhepState {
     pub answerer: Arc<dyn SdpAnswerer>,
     pub sessions: DashMap<SessionId, SessionEntry>,
+    /// Audio codec-config cache keyed by broadcast name. Populated
+    /// by [`RawSampleObserver::on_audio_config`]; consumed on every
+    /// new `create_session` so a WHEP subscriber that joins after
+    /// the publisher's first sequence header still sees the config.
+    /// Session 113.
+    pub audio_configs: DashMap<String, AudioConfigSnapshot>,
 }
 
 /// Cheaply cloneable handle to the WHEP server.
@@ -193,8 +224,18 @@ impl WhepServer {
             state: Arc::new(WhepState {
                 answerer,
                 sessions: DashMap::new(),
+                audio_configs: DashMap::new(),
             }),
         }
+    }
+
+    /// Look up the cached audio codec config for `broadcast`, if
+    /// any. Used by the router's `handle_offer` path to deliver the
+    /// config to a freshly-created session before the first AAC
+    /// sample lands. Returns a clone so the caller does not keep a
+    /// dashmap guard while calling back into `SessionHandle`.
+    pub(crate) fn cached_audio_config(&self, broadcast: &str) -> Option<AudioConfigSnapshot> {
+        self.state.audio_configs.get(broadcast).map(|e| e.value().clone())
     }
 
     /// Number of active subscriber sessions currently registered.
@@ -218,6 +259,21 @@ impl RawSampleObserver for WhepServer {
             let session = entry.value();
             if session.broadcast == broadcast {
                 session.handle.on_raw_sample(track, codec, sample, ingest_time_ms);
+            }
+        }
+    }
+
+    fn on_audio_config(&self, broadcast: &str, track: &str, codec: MediaCodec, codec_config: &[u8]) {
+        let snapshot = AudioConfigSnapshot {
+            track: track.to_string(),
+            codec,
+            config_bytes: Bytes::copy_from_slice(codec_config),
+        };
+        self.state.audio_configs.insert(broadcast.to_string(), snapshot.clone());
+        for entry in self.state.sessions.iter() {
+            let session = entry.value();
+            if session.broadcast == broadcast {
+                session.handle.on_audio_config(track, codec, codec_config);
             }
         }
     }

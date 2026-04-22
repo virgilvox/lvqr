@@ -98,6 +98,14 @@ async fn handle_offer(
     let broadcast = path;
     let (handle, answer) = server.state.answerer.create_session(&broadcast, &body)?;
 
+    // Session 113: if the upstream publisher has already broadcast
+    // the AAC sequence header, replay it to the new session
+    // handle so a subscriber that joined after publish-start still
+    // gets the AudioSpecificConfig the AAC-to-Opus transcoder needs.
+    if let Some(cfg) = server.cached_audio_config(&broadcast) {
+        handle.on_audio_config(&cfg.track, cfg.codec, &cfg.config_bytes);
+    }
+
     let session_id = SessionId::new_random();
     server.state.sessions.insert(
         session_id.clone(),

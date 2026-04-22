@@ -37,19 +37,27 @@
 //! agnostic (length-prefixed framing is the same for both), so
 //! the write path is shared.
 //!
+//! Session 113 closes the AAC-on-Opus gap: when the answerer is
+//! built with [`Str0mAnswerer::with_aac_to_opus_factory`] and the
+//! subscriber negotiates Opus, AAC samples arriving on `1.mp4` are
+//! routed through an [`lvqr_transcode::AacToOpusEncoder`] spawned
+//! once the AAC AudioSpecificConfig is known. The encoder's Opus
+//! output flows back into the same poll loop via a `tokio::sync::
+//! mpsc::UnboundedReceiver` arm and lands on `Writer::write` through
+//! the negotiated Opus `Pt`. The feature is gated behind the
+//! `aac-opus` Cargo feature so deployments without GStreamer
+//! continue to build the crate with the legacy drop-and-warn shape.
+//!
 //! What this module still deliberately does NOT do:
 //!
-//! * Audio write. The ingest bridge emits AAC raw access units; WHEP
-//!   negotiated Opus. There is no in-tree AAC -> Opus transcoder, so
-//!   `on_raw_sample` for `1.mp4` logs a one-shot warning and drops
-//!   the sample. See `crates/lvqr-whep/docs/media-write.md` for the
-//!   full rationale.
 //! * Trickle ICE ingestion. WHEP rarely needs trickle once the offer
 //!   already embeds every host candidate; the HTTP surface still
 //!   accepts PATCH bodies so conformant clients do not error out.
 //!   `add_trickle` logs once and returns success.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(feature = "aac-opus")]
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -66,6 +74,9 @@ use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
+
+#[cfg(feature = "aac-opus")]
+use lvqr_transcode::{AacAudioConfig, AacToOpusEncoder, AacToOpusEncoderFactory, OpusFrame};
 
 use crate::server::{SdpAnswerer, SessionHandle, WhepError};
 
@@ -111,6 +122,8 @@ impl Default for Str0mConfig {
 pub struct Str0mAnswerer {
     config: Str0mConfig,
     slo: Option<LatencyTracker>,
+    #[cfg(feature = "aac-opus")]
+    aac_opus_factory: Option<Arc<AacToOpusEncoderFactory>>,
 }
 
 impl Str0mAnswerer {
@@ -123,7 +136,12 @@ impl Str0mAnswerer {
         INIT.get_or_init(|| {
             str0m::crypto::from_feature_flags().install_process_default();
         });
-        Self { config, slo: None }
+        Self {
+            config,
+            slo: None,
+            #[cfg(feature = "aac-opus")]
+            aac_opus_factory: None,
+        }
     }
 
     /// Attach a shared [`LatencyTracker`] to this answerer. Every
@@ -133,6 +151,23 @@ impl Str0mAnswerer {
     /// Tier 4 item 4.7 session 110 B.
     pub fn with_slo_tracker(mut self, tracker: LatencyTracker) -> Self {
         self.slo = Some(tracker);
+        self
+    }
+
+    /// Attach an AAC-to-Opus transcoder factory. Each session the
+    /// answerer creates clones the factory handle and lazily spawns
+    /// a per-session encoder once the publisher's AAC
+    /// AudioSpecificConfig arrives and the first AAC sample needs
+    /// to be routed through the Opus writer.
+    ///
+    /// Session 113. Available only when the crate is built with
+    /// `--features aac-opus`. Without the feature (or when the
+    /// factory is `None`), AAC samples routed to a WHEP subscriber
+    /// with an Opus-only answer are still dropped with a one-shot
+    /// warn, matching the pre-113 behaviour.
+    #[cfg(feature = "aac-opus")]
+    pub fn with_aac_to_opus_factory(mut self, factory: Arc<AacToOpusEncoderFactory>) -> Self {
+        self.aac_opus_factory = Some(factory);
         self
     }
 }
@@ -183,7 +218,17 @@ impl SdpAnswerer for Str0mAnswerer {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (sample_tx, sample_rx) = mpsc::unbounded_channel::<SessionMsg>();
+        // Session 113: separate channel for Opus frames the AAC-to-
+        // Opus encoder emits asynchronously on its GStreamer worker
+        // thread. The poll loop adds a new select arm on the
+        // receiver; the encoder is built lazily (if at all) so the
+        // sender is handed to the encoder at build time and the
+        // poll loop holds the receiver on the stack frame.
+        let (opus_tx, opus_rx) = mpsc::unbounded_channel::<OpusMsg>();
         let broadcast_owned = broadcast.to_string();
+
+        #[cfg(feature = "aac-opus")]
+        let aac_opus_factory = self.aac_opus_factory.clone();
 
         // Spawn the sans-IO poll loop. `tokio::spawn` requires an
         // active runtime; `WhepServer` is only constructed inside
@@ -196,8 +241,12 @@ impl SdpAnswerer for Str0mAnswerer {
             local_addr,
             shutdown_rx,
             sample_rx,
+            opus_tx,
+            opus_rx,
             broadcast_owned,
             self.slo.clone(),
+            #[cfg(feature = "aac-opus")]
+            aac_opus_factory,
         ));
 
         tracing::debug!(
@@ -210,15 +259,28 @@ impl SdpAnswerer for Str0mAnswerer {
             samples: sample_tx,
             shutdown: Some(shutdown_tx),
             trickle_warned: AtomicBool::new(false),
-            audio_warned: AtomicBool::new(false),
+            unknown_track_warned: AtomicBool::new(false),
         });
         Ok((handle, answer_bytes))
     }
 }
 
-/// Message pumped from `Str0mSessionHandle::on_raw_sample` into the
-/// poll loop task. Kept private so the channel shape can evolve
-/// without affecting the public `SessionHandle` trait.
+/// Opus frames flowing from the AAC-to-Opus encoder worker back
+/// into the session poll loop. The poll loop owns the receiver and
+/// gets a dedicated `select!` arm; the sender clones through the
+/// encoder's appsink callback. Kept as a discrete type so the build
+/// without `aac-opus` still has a nameable channel shape even
+/// though the encoder never writes to it.
+#[derive(Debug, Clone)]
+struct OpusMsg {
+    payload: Bytes,
+    duration_ticks: u32,
+}
+
+/// Message pumped from `Str0mSessionHandle::on_raw_sample` /
+/// `on_audio_config` into the poll loop task. Kept private so the
+/// channel shape can evolve without affecting the public
+/// `SessionHandle` trait.
 enum SessionMsg {
     /// A video sample ready to hand to `Writer::write`. `payload` is
     /// the AVCC-framed bytes straight from the ingest bridge; the
@@ -236,6 +298,31 @@ enum SessionMsg {
         keyframe: bool,
         codec: MediaCodec,
         ingest_time_ms: u64,
+    },
+    /// An AAC raw access unit and its source-clock dts. Session 113
+    /// routes this into the per-session AAC-to-Opus encoder when the
+    /// answerer was built with a factory and the AudioSpecificConfig
+    /// has arrived; otherwise the poll loop drops with a one-shot
+    /// warn, matching the pre-113 behaviour. The dts is in the
+    /// publisher's audio-clock ticks (matching the rate on the
+    /// AudioConfig message); the encoder handles the rescale to
+    /// Opus 48 kHz internally.
+    Aac {
+        payload: Bytes,
+        dts: u64,
+        ingest_time_ms: u64,
+    },
+    /// The publisher's AAC AudioSpecificConfig. Session 113 stores
+    /// this on `SessionCtx` so the AAC-to-Opus encoder can be built
+    /// lazily on the first AAC sample; `config_bytes` is the raw
+    /// 2-byte (or longer for HE-AAC) ASC payload exactly as FLV
+    /// delivered it. Only fires when the incoming track is `1.mp4`
+    /// and codec is [`MediaCodec::Aac`].
+    AudioConfig {
+        config_bytes: Bytes,
+        sample_rate: u32,
+        channels: u8,
+        object_type: u8,
     },
 }
 
@@ -283,6 +370,33 @@ struct SessionCtx {
     /// silently so a mismatched publisher/subscriber pairing
     /// does not spam the log.
     unmatched_codec_logged: bool,
+
+    /// Session 113: cached AAC AudioSpecificConfig the publisher
+    /// sent via `on_audio_config`. Required to spawn the
+    /// AAC-to-Opus encoder. `None` until the first config lands.
+    #[cfg(feature = "aac-opus")]
+    aac_config: Option<AacAudioConfig>,
+    /// Session 113: the per-session AAC-to-Opus encoder. Built
+    /// lazily on the first AAC sample after `aac_config` is
+    /// known and the answerer was constructed with a factory.
+    #[cfg(feature = "aac-opus")]
+    aac_encoder: Option<AacToOpusEncoder>,
+    /// Session 113: running decode timestamp in Opus 48 kHz ticks
+    /// for writing Opus frames through `Writer::write`. Advanced
+    /// by each [`OpusFrame::duration_ticks`] the encoder emits.
+    opus_write_dts: u64,
+    /// Session 113: most-recent AAC sample's ingest wall-clock
+    /// (ms since UNIX epoch). Used as an approximate
+    /// `ingest_time_ms` stamp for Opus SLO samples on the WHEP
+    /// audio path; the opusenc worker buffers internally so there
+    /// is no 1:1 correspondence between AAC in and Opus out, but
+    /// 20 ms Opus frames vs ~21-23 ms AAC frames line up closely
+    /// enough for a histogram bucket. `0` is "unset"; the record
+    /// guard skips it to match the HLS + DASH + video WHEP drains.
+    last_aac_ingest_ms: u64,
+    /// Session 113: one-shot warn guard for AAC drops when the
+    /// session was created without an AAC-to-Opus factory.
+    aac_without_factory_warned: bool,
 }
 
 /// Run the sans-IO `Rtc` state machine forward.
@@ -298,17 +412,30 @@ struct SessionCtx {
 ///
 /// Any of these unwinds the task cleanly; `tokio::spawn` drops the
 /// `Rtc` and closes the `UdpSocket` on return.
+#[allow(clippy::too_many_arguments)]
 async fn run_session_loop(
     mut rtc: Rtc,
     socket: UdpSocket,
     local_addr: SocketAddr,
     mut shutdown: oneshot::Receiver<()>,
     mut samples: mpsc::UnboundedReceiver<SessionMsg>,
+    opus_tx: mpsc::UnboundedSender<OpusMsg>,
+    mut opus_rx: mpsc::UnboundedReceiver<OpusMsg>,
     broadcast: String,
     slo: Option<LatencyTracker>,
+    #[cfg(feature = "aac-opus")] aac_opus_factory: Option<Arc<AacToOpusEncoderFactory>>,
 ) {
     let mut ctx = SessionCtx::default();
     let mut buf = vec![0u8; 2048];
+
+    // Hand the opus_tx into the aac encoder when we build one;
+    // keep a separate clone on the stack so the lifetime is not
+    // tied to a single build attempt (the encoder builds lazily
+    // once both the factory and the AAC config are ready). Without
+    // the feature, the sender is held but never written.
+    #[cfg(feature = "aac-opus")]
+    let encoder_opus_tx = opus_tx.clone();
+    let _ = &opus_tx; // silence unused when feature is off
     loop {
         // Drain outputs until `Rtc` blocks on a timeout. Events are
         // absorbed into the local `SessionCtx` so later sample-arm
@@ -422,6 +549,85 @@ async fn run_session_loop(
                             }
                         }
                     }
+                    Some(SessionMsg::Aac { payload, dts, ingest_time_ms }) => {
+                        ctx.last_aac_ingest_ms = ingest_time_ms;
+                        #[cfg(feature = "aac-opus")]
+                        {
+                            // Build the encoder lazily on the first
+                            // AAC sample whenever the factory and
+                            // the AudioSpecificConfig are both
+                            // ready. If either is missing, drop
+                            // with a one-shot warn.
+                            if ctx.aac_encoder.is_none()
+                                && let (Some(factory), Some(aac_cfg)) =
+                                    (aac_opus_factory.as_ref(), ctx.aac_config.as_ref())
+                            {
+                                match factory.build(aac_cfg.clone(), opus_frame_sender_bridge(encoder_opus_tx.clone())) {
+                                    Some(enc) => {
+                                        tracing::info!(
+                                            %broadcast,
+                                            sample_rate = aac_cfg.sample_rate,
+                                            channels = aac_cfg.channels,
+                                            "whep: AAC-to-Opus encoder spawned",
+                                        );
+                                        ctx.aac_encoder = Some(enc);
+                                    }
+                                    None => {
+                                        if !ctx.aac_without_factory_warned {
+                                            ctx.aac_without_factory_warned = true;
+                                            tracing::warn!(
+                                                %broadcast,
+                                                "whep: AAC-to-Opus factory returned None (GStreamer elements missing?); dropping AAC samples",
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(enc) = ctx.aac_encoder.as_ref() {
+                                enc.push(&payload, dts);
+                            } else if !ctx.aac_without_factory_warned {
+                                ctx.aac_without_factory_warned = true;
+                                tracing::warn!(
+                                    %broadcast,
+                                    "whep: AAC sample arrived before AudioSpecificConfig or without factory; dropping",
+                                );
+                            }
+                        }
+                        #[cfg(not(feature = "aac-opus"))]
+                        {
+                            let _ = (payload, dts);
+                            if !ctx.aac_without_factory_warned {
+                                ctx.aac_without_factory_warned = true;
+                                tracing::warn!(
+                                    %broadcast,
+                                    "whep: built without `aac-opus` feature; dropping AAC audio samples",
+                                );
+                            }
+                        }
+                    }
+                    Some(SessionMsg::AudioConfig { config_bytes, sample_rate, channels, object_type }) => {
+                        #[cfg(feature = "aac-opus")]
+                        {
+                            ctx.aac_config = Some(AacAudioConfig {
+                                asc: config_bytes.clone(),
+                                sample_rate,
+                                channels,
+                                object_type,
+                            });
+                            tracing::debug!(
+                                %broadcast,
+                                sample_rate,
+                                channels,
+                                object_type,
+                                asc_len = config_bytes.len(),
+                                "whep: AAC AudioSpecificConfig received",
+                            );
+                        }
+                        #[cfg(not(feature = "aac-opus"))]
+                        {
+                            let _ = (config_bytes, sample_rate, channels, object_type);
+                        }
+                    }
                     None => {
                         // All senders dropped (handle dropped). The
                         // shutdown oneshot also fires in that case but
@@ -430,6 +636,37 @@ async fn run_session_loop(
                         // away and we can coalesce onto shutdown.
                         tracing::debug!(%broadcast, "sample channel closed");
                         return;
+                    }
+                }
+            }
+            opus = opus_rx.recv() => {
+                match opus {
+                    Some(OpusMsg { payload, duration_ticks }) => {
+                        // Session 113: write each Opus frame from
+                        // the AAC-to-Opus encoder through the
+                        // negotiated Opus Pt. The encoder runs on
+                        // its own GStreamer worker thread and
+                        // emits frames asynchronously; the poll
+                        // loop owns the outbound wire and the SLO
+                        // record guard.
+                        if ctx.connected
+                            && let (Some(mid), Some(pt)) = (ctx.audio_mid, ctx.audio_pt_opus)
+                        {
+                            let ok = write_opus_frame(&mut rtc, &mut ctx, &broadcast, mid, pt, payload, duration_ticks);
+                            if ok
+                                && let Some(tracker) = slo.as_ref()
+                                && ctx.last_aac_ingest_ms > 0
+                            {
+                                let latency = now_unix_ms().saturating_sub(ctx.last_aac_ingest_ms);
+                                tracker.record(&broadcast, TRANSPORT_LABEL, latency);
+                            }
+                        }
+                    }
+                    None => {
+                        // opus_tx was dropped; this only happens
+                        // when the encoder's appsink callback loses
+                        // the tx clone on teardown. The outer
+                        // samples channel drives real shutdown.
                     }
                 }
             }
@@ -610,6 +847,66 @@ fn write_sample(
     }
 }
 
+/// Write one Opus packet through the negotiated Opus writer.
+/// Returns `true` when str0m accepted the packet (an RTP packet
+/// went out the wire), `false` when str0m rejected it or the
+/// session is not in a writable state.
+fn write_opus_frame(
+    rtc: &mut Rtc,
+    ctx: &mut SessionCtx,
+    broadcast: &str,
+    mid: Mid,
+    pt: Pt,
+    payload: Bytes,
+    duration_ticks: u32,
+) -> bool {
+    let Some(writer) = rtc.writer(mid) else {
+        return false;
+    };
+    let wallclock = Instant::now();
+    let rtp_time = MediaTime::new(ctx.opus_write_dts, str0m::media::Frequency::FORTY_EIGHT_KHZ);
+    match writer.write(pt, wallclock, rtp_time, payload.to_vec()) {
+        Ok(()) => {
+            ctx.opus_write_dts = ctx.opus_write_dts.wrapping_add(duration_ticks as u64);
+            if !ctx.first_write_logged {
+                ctx.first_write_logged = true;
+                tracing::info!(%broadcast, "first Opus frame written to str0m");
+            }
+            true
+        }
+        Err(e) => {
+            if !ctx.write_error_logged {
+                ctx.write_error_logged = true;
+                tracing::warn!(%broadcast, error = %e, "writer.write(opus) failed (logging once)");
+            }
+            false
+        }
+    }
+}
+
+/// Adapter that turns the poll loop's [`OpusMsg`] channel sender
+/// into the [`lvqr_transcode::OpusFrame`] sender that
+/// [`AacToOpusEncoderFactory::build`] expects. The encoder does not
+/// know about the poll loop's internal message shape; this adapter
+/// spawns a small relay task that translates between the two types.
+#[cfg(feature = "aac-opus")]
+fn opus_frame_sender_bridge(out_tx: mpsc::UnboundedSender<OpusMsg>) -> mpsc::UnboundedSender<OpusFrame> {
+    let (in_tx, mut in_rx) = mpsc::unbounded_channel::<OpusFrame>();
+    tokio::spawn(async move {
+        while let Some(frame) = in_rx.recv().await {
+            let msg = OpusMsg {
+                payload: frame.payload,
+                duration_ticks: frame.duration_ticks,
+            };
+            if out_tx.send(msg).is_err() {
+                // Session poll loop ended; drop remaining.
+                break;
+            }
+        }
+    });
+    in_tx
+}
+
 /// Convert an AVCC length-prefixed NAL sequence into an Annex B
 /// byte stream.
 ///
@@ -662,7 +959,7 @@ pub struct Str0mSessionHandle {
     samples: mpsc::UnboundedSender<SessionMsg>,
     shutdown: Option<oneshot::Sender<()>>,
     trickle_warned: AtomicBool,
-    audio_warned: AtomicBool,
+    unknown_track_warned: AtomicBool,
 }
 
 impl Drop for Str0mSessionHandle {
@@ -692,7 +989,7 @@ impl SessionHandle for Str0mSessionHandle {
         // tracks; the codec tag is now authoritative and
         // `write_sample` routes audio through the Opus mid.
         if track != "0.mp4" && track != "1.mp4" {
-            if !self.audio_warned.swap(true, Ordering::Relaxed) {
+            if !self.unknown_track_warned.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     track = %track,
                     "whep unknown-track write; dropping samples (only 0.mp4/1.mp4 wired)",
@@ -700,17 +997,75 @@ impl SessionHandle for Str0mSessionHandle {
             }
             return;
         }
-        let msg = SessionMsg::Video {
-            payload: sample.payload.clone(),
-            dts: sample.dts,
-            keyframe: sample.keyframe,
-            codec,
-            ingest_time_ms,
+        // Session 113: route AAC audio samples to the transcoder
+        // pipeline instead of the video writer. The poll loop
+        // decides whether the encoder exists (factory wired + ASC
+        // known) and either pushes through opusenc or drops with a
+        // one-shot warn. Non-AAC codecs (H.264, H.265, Opus) stay
+        // on the `Video` path; `write_sample` routes them to the
+        // matching Mid via the codec tag.
+        let msg = if matches!(codec, MediaCodec::Aac) {
+            SessionMsg::Aac {
+                payload: sample.payload.clone(),
+                dts: sample.dts,
+                ingest_time_ms,
+            }
+        } else {
+            SessionMsg::Video {
+                payload: sample.payload.clone(),
+                dts: sample.dts,
+                keyframe: sample.keyframe,
+                codec,
+                ingest_time_ms,
+            }
         };
         // Ignore send failure: the task has exited and we will be
         // dropped soon. Nothing useful for the caller to do.
         let _ = self.samples.send(msg);
     }
+
+    fn on_audio_config(&self, _track: &str, codec: MediaCodec, codec_config: &[u8]) {
+        // Session 113: only AAC carries a meaningful config today.
+        // Non-AAC codecs either pass through (Opus) or have not
+        // wired an on_audio_config path (HEVC's hvcC lands only as
+        // a future session).
+        if !matches!(codec, MediaCodec::Aac) {
+            return;
+        }
+        if codec_config.len() < 2 {
+            tracing::warn!(
+                len = codec_config.len(),
+                "whep: AAC AudioSpecificConfig too short; dropping",
+            );
+            return;
+        }
+        // ISO/IEC 14496-3 AudioSpecificConfig layout:
+        //   5 bits: audioObjectType
+        //   4 bits: samplingFrequencyIndex
+        //   4 bits: channelConfiguration (if freq_idx != 15)
+        // The FLV AAC sequence header embeds the ASC directly.
+        let b0 = codec_config[0];
+        let b1 = codec_config[1];
+        let object_type = b0 >> 3;
+        let freq_idx = ((b0 & 0x07) << 1) | (b1 >> 7);
+        let channels = (b1 >> 3) & 0x0F;
+        let sample_rate = aac_freq_index_to_hz(freq_idx);
+        let msg = SessionMsg::AudioConfig {
+            config_bytes: Bytes::copy_from_slice(codec_config),
+            sample_rate,
+            channels,
+            object_type,
+        };
+        let _ = self.samples.send(msg);
+    }
+}
+
+/// ISO/IEC 14496-3 Table 1.16: AAC samplingFrequencyIndex -> Hz.
+fn aac_freq_index_to_hz(idx: u8) -> u32 {
+    const RATES: [u32; 13] = [
+        96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000, 7_350,
+    ];
+    RATES.get(idx as usize).copied().unwrap_or(44_100)
 }
 
 #[cfg(test)]

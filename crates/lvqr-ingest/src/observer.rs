@@ -95,6 +95,21 @@ pub trait RawSampleObserver: Send + Sync {
     /// harnesses) pass `0`; consumers treat `0` as unset and skip
     /// the sample, matching the HLS + DASH drain guard.
     fn on_raw_sample(&self, broadcast: &str, track: &str, codec: MediaCodec, sample: &RawSample, ingest_time_ms: u64);
+
+    /// Called once per track when the bridge learns the codec
+    /// configuration bytes (AAC `AudioSpecificConfig`, H.264 SPS/PPS
+    /// `avcC` record, etc.). Session 113 added this hook so the
+    /// WHEP AAC-to-Opus transcoder can set up its decoder with the
+    /// right sample rate / channel / profile without re-parsing the
+    /// first audio sample.
+    ///
+    /// `codec_config` is the raw config payload: for AAC this is
+    /// the 2-byte (or longer for HE-AAC) AudioSpecificConfig
+    /// exactly as the FLV AAC sequence header carries it; for
+    /// future video codecs it would be the avcC / hvcC box body.
+    /// Consumers that do not need codec_config can leave the
+    /// default no-op impl.
+    fn on_audio_config(&self, _broadcast: &str, _track: &str, _codec: MediaCodec, _codec_config: &[u8]) {}
 }
 
 /// Drop-in raw-sample observer that does nothing.
