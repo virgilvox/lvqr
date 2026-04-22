@@ -92,6 +92,10 @@ test('two-peer DataChannel mesh relays a root-pushed frame to the child', async 
         signalUrl,
         peerId,
         track,
+        // Empty iceServers: on loopback, host candidates are
+        // sufficient and we want to avoid any external STUN lookup
+        // that a sandboxed CI runner might block or slow down.
+        iceServers: [],
       });
     },
     { signalUrl: SIGNAL_URL, track: BROADCAST, peerId: 'peer-one' },
@@ -111,6 +115,7 @@ test('two-peer DataChannel mesh relays a root-pushed frame to the child', async 
         signalUrl,
         peerId,
         track,
+        iceServers: [],
       });
     },
     { signalUrl: SIGNAL_URL, track: BROADCAST, peerId: 'peer-two' },
