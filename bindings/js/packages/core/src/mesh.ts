@@ -22,6 +22,16 @@ export interface MeshConfig {
   iceServers?: RTCIceServer[];
   /** Called when a media frame is received from the parent. */
   onFrame?: (data: Uint8Array) => void;
+  /**
+   * Called on the parent side when a child's DataChannel transitions
+   * to `open`. Fires once per child per connection. Integrators that
+   * want to push a one-shot payload the moment a child is ready (e.g.
+   * an init segment buffered from the server) can use this callback
+   * instead of polling `childCount`. The `childId` is the peer_id the
+   * child registered with; `dc` is the DataChannel the fanout path
+   * will use for `pushFrame`.
+   */
+  onChildOpen?: (childId: string, dc: RTCDataChannel) => void;
 }
 
 interface PeerConnection {
@@ -206,6 +216,27 @@ export class MeshPeer {
       const existing = this.children.get(msg.from);
       if (existing) {
         existing.dc = dc;
+      }
+      // Fire `onChildOpen` once the channel transitions to open so
+      // integrators can push a one-shot payload (e.g. init segment)
+      // the moment the channel is usable. `dc.readyState` is
+      // typically "connecting" here and flips to "open" after SCTP
+      // handshake completes.
+      if (dc.readyState === 'open') {
+        try {
+          this.config.onChildOpen?.(msg.from, dc);
+        } catch {
+          // swallow: integrator callback errors should not tear down
+          // the parent-side state machine.
+        }
+      } else {
+        dc.addEventListener('open', () => {
+          try {
+            this.config.onChildOpen?.(msg.from, dc);
+          } catch {
+            // swallow
+          }
+        });
       }
     };
 
