@@ -17,6 +17,19 @@ export interface StreamInfo {
   subscribers: number;
 }
 
+export interface LvqrAdminClientOptions {
+  /**
+   * Per-request deadline in milliseconds. Applied to every admin
+   * HTTP call so a misbehaving server that accepts the TCP
+   * connection but never responds does not hang the Promise
+   * forever. Defaults to 10_000 (10 s). Set to 0 to disable (not
+   * recommended for production).
+   */
+  fetchTimeoutMs?: number;
+}
+
+const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
+
 /**
  * Client for the LVQR admin HTTP API.
  *
@@ -29,15 +42,17 @@ export interface StreamInfo {
  */
 export class LvqrAdminClient {
   private baseUrl: string;
+  private options: LvqrAdminClientOptions;
 
-  constructor(baseUrl: string) {
+  constructor(baseUrl: string, options: LvqrAdminClientOptions = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
+    this.options = options;
   }
 
   /** Check if the relay is healthy. */
   async healthz(): Promise<boolean> {
     try {
-      const resp = await fetch(`${this.baseUrl}/healthz`);
+      const resp = await this.fetchWithTimeout(`${this.baseUrl}/healthz`);
       return resp.ok;
     } catch {
       return false;
@@ -46,15 +61,35 @@ export class LvqrAdminClient {
 
   /** Get relay statistics. */
   async stats(): Promise<RelayStats> {
-    const resp = await fetch(`${this.baseUrl}/api/v1/stats`);
+    const resp = await this.fetchWithTimeout(`${this.baseUrl}/api/v1/stats`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     return resp.json();
   }
 
   /** List active streams. */
   async listStreams(): Promise<StreamInfo[]> {
-    const resp = await fetch(`${this.baseUrl}/api/v1/streams`);
+    const resp = await this.fetchWithTimeout(`${this.baseUrl}/api/v1/streams`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     return resp.json();
+  }
+
+  /**
+   * `fetch` wrapper that enforces the configured fetch timeout via
+   * an AbortController. A timeout cancels the in-flight request and
+   * rejects with a descriptive AbortError so callers can distinguish
+   * timeout from network failure via `e.name === 'AbortError'`.
+   */
+  private async fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Response> {
+    const timeoutMs = this.options.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
+    if (timeoutMs <= 0) {
+      return fetch(url, init);
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }

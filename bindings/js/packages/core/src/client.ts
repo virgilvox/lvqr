@@ -15,7 +15,18 @@ export interface LvqrClientOptions {
   fingerprint?: string;
   /** Optional viewer token for relays that require authentication. */
   token?: string;
+  /**
+   * Per-connect attempt deadline in milliseconds. Applied to
+   * WebTransport `ready` and the WebSocket `open` handshake so a
+   * server that accepts the TCP connection but never completes the
+   * upgrade (common on misconfigured reverse proxies) does not hang
+   * the Promise forever. Defaults to 10_000 (10 s). Set to 0 to
+   * disable (not recommended for production).
+   */
+  connectTimeoutMs?: number;
 }
+
+const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 
 export interface LvqrEvents {
   /** Received an fMP4 frame (init segment or moof+mdat). */
@@ -181,9 +192,50 @@ export class LvqrClient {
         this.emit('disconnected', e.message);
       });
 
-    await wt.ready;
+    await this.withConnectTimeout(wt.ready, 'WebTransport', () => {
+      try {
+        wt.close();
+      } catch {
+        // ignore: wt may already be failed
+      }
+    });
     this.transport = wt;
     this.moqSubscriber = new MoqSubscriber(wt);
+  }
+
+  /**
+   * Race `promise` against this client's connect-timeout. On
+   * timeout, invoke `onCancel` (e.g. to close an in-flight
+   * WebSocket / WebTransport) and reject with a descriptive Error.
+   * `timeoutMs === 0` disables the deadline.
+   */
+  private async withConnectTimeout<T>(
+    promise: Promise<T>,
+    label: string,
+    onCancel: () => void,
+  ): Promise<T> {
+    const timeoutMs = this.options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+    if (timeoutMs <= 0) {
+      return promise;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        try {
+          onCancel();
+        } catch {
+          // ignore cancel-failure: we still want the timeout to win.
+        }
+        reject(new Error(`${label} connect timed out after ${timeoutMs} ms`));
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    }
   }
 
   private async connectWebSocket(): Promise<void> {
@@ -191,24 +243,21 @@ export class LvqrClient {
       .replace(/^https:/, 'wss:')
       .replace(/^http:/, 'ws:');
 
-    return new Promise((resolve, reject) => {
-      const ws = new WebSocket(wsUrl);
-      ws.binaryType = 'arraybuffer';
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
 
+    const openPromise = new Promise<void>((resolve, reject) => {
       ws.onopen = () => {
         this.transport = ws;
         resolve();
       };
-
       ws.onerror = () => {
         reject(new Error('WebSocket connection failed'));
       };
-
       ws.onclose = () => {
         this._connected = false;
         this.emit('disconnected', 'websocket closed');
       };
-
       ws.onmessage = (event) => {
         if (event.data instanceof ArrayBuffer && event.data.byteLength > 0) {
           const view = new Uint8Array(event.data);
@@ -218,6 +267,14 @@ export class LvqrClient {
           this.emit('frame', payload, trackName);
         }
       };
+    });
+
+    await this.withConnectTimeout(openPromise, 'WebSocket', () => {
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
     });
   }
 
@@ -233,27 +290,24 @@ export class LvqrClient {
    * access logs.
    */
   private async connectWebSocketBroadcast(url: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const protocols = this.options.token
-        ? [`lvqr.bearer.${this.options.token}`]
-        : undefined;
-      const ws = protocols ? new WebSocket(url, protocols) : new WebSocket(url);
-      ws.binaryType = 'arraybuffer';
+    const protocols = this.options.token
+      ? [`lvqr.bearer.${this.options.token}`]
+      : undefined;
+    const ws = protocols ? new WebSocket(url, protocols) : new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
 
+    const openPromise = new Promise<void>((resolve, reject) => {
       ws.onopen = () => {
         this.transport = ws;
         resolve();
       };
-
       ws.onerror = () => {
         reject(new Error('WebSocket broadcast connection failed'));
       };
-
       ws.onclose = () => {
         this._connected = false;
         this.emit('disconnected', 'websocket closed');
       };
-
       ws.onmessage = (event) => {
         if (event.data instanceof ArrayBuffer && event.data.byteLength > 0) {
           const view = new Uint8Array(event.data);
@@ -263,6 +317,14 @@ export class LvqrClient {
           this.emit('frame', payload, trackName);
         }
       };
+    });
+
+    await this.withConnectTimeout(openPromise, 'WebSocket broadcast', () => {
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
     });
   }
 }
