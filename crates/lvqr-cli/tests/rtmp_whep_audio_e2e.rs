@@ -300,18 +300,27 @@ async fn run_rtmp_publisher(rtmp_addr: SocketAddr, aac_access_units: Vec<Vec<u8>
     let r = session.publish_video_data(kf0, RtmpTimestamp::new(0), false).unwrap();
     send_result(&mut stream, &r).await;
 
-    // Spin the AAC access units out at ~21.33 ms per frame. The
-    // `u32` FLV timestamp field is millisecond granular, so we push
-    // a steady 21 ms cadence and let opusenc absorb the jitter.
+    // Spin the AAC access units out at real-time cadence (~21.33 ms
+    // per frame at 1024 samples / 48 kHz). The `u32` FLV timestamp
+    // field is millisecond granular, so we push a steady 21 ms
+    // cadence and let opusenc absorb the jitter. Real-time cadence
+    // is load-bearing for this test: bursting all 38 samples in a
+    // tight loop would finish in ~5 ms, well before the subscriber
+    // side's ICE + DTLS completes (loopback-typical ~200-500 ms),
+    // which would route every resulting Opus packet through the
+    // pre-Connected drop branch and produce zero Event::MediaData.
+    // Keeping the publisher alive for the full ~800 ms span gives
+    // ICE + DTLS plenty of time to settle while samples continue to
+    // arrive at the WHEP session poll loop.
+    let frame_interval = Duration::from_millis(21);
+    let mut next_tick = tokio::time::Instant::now();
     for (i, au) in aac_access_units.iter().enumerate() {
         let ts = (i as u32).saturating_mul(21);
         let tag = flv_audio_raw(au);
         let r = session.publish_audio_data(tag, RtmpTimestamp::new(ts), false).unwrap();
         send_result(&mut stream, &r).await;
-        // Small real-time tick so the bridge has a chance to run its
-        // fragment observer between samples instead of seeing the
-        // whole burst at once.
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        next_tick += frame_interval;
+        tokio::time::sleep_until(next_tick).await;
     }
 
     (stream, session)
@@ -340,15 +349,19 @@ async fn rtmp_aac_publish_reaches_whep_opus_subscriber() {
         return;
     }
 
-    // Generate ~800 ms of real AAC before starting the server so a
+    // Generate ~1600 ms of real AAC before starting the server so a
     // generator-plugin shortfall skips cleanly before the network
-    // listeners get bound.
-    let Some(aac_access_units) = generate_aac_access_units(800) else {
+    // listeners get bound. 1600 ms is load-bearing: the publisher
+    // spends this span pushing at real-time cadence, which keeps
+    // fresh AAC arriving at the WHEP session for the full 500-900 ms
+    // ICE + DTLS warm-up plus a healthy tail so the first post-
+    // Connected Opus frame has time to land.
+    let Some(aac_access_units) = generate_aac_access_units(1600) else {
         eprintln!("skipping rtmp_whep_audio_e2e: failed to generate AAC source samples via GStreamer");
         return;
     };
     assert!(
-        aac_access_units.len() >= 8,
+        aac_access_units.len() >= 16,
         "AAC generator produced too few access units: {}",
         aac_access_units.len(),
     );
