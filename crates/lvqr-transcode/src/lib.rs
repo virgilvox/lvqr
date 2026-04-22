@@ -112,6 +112,8 @@ mod transcoder;
 mod aac_opus;
 #[cfg(feature = "transcode")]
 mod software;
+#[cfg(feature = "transcode")]
+pub mod test_support;
 
 pub use audio_passthrough::{AudioPassthroughTranscoder, AudioPassthroughTranscoderFactory};
 pub use passthrough::{PassthroughTranscoder, PassthroughTranscoderFactory};

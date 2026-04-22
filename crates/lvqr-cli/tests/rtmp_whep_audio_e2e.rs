@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use lvqr_transcode::AacToOpusEncoderFactory;
+use lvqr_transcode::test_support::generate_aac_access_units;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
@@ -37,91 +38,10 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, RtcConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket as TokioUdp};
 
-use glib::object::Cast;
-use gstreamer as gst;
-use gstreamer::prelude::*;
-use gstreamer_app as gst_app;
-
 const RTMP_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const OVERALL_DEADLINE: Duration = Duration::from_secs(20);
 const MAX_POLL_SLEEP: Duration = Duration::from_millis(50);
-
-// =====================================================================
-// GStreamer AAC sample generator (mirrors aac_opus_roundtrip.rs shape)
-// =====================================================================
-
-/// Generate `duration_ms` of 48 kHz stereo AAC-LC access units
-/// via an in-test GStreamer pipeline. Each returned `Vec<u8>` is
-/// a single raw AAC access unit (ADTS header stripped). Returns
-/// `None` on any plugin shortfall so the parent test can skip.
-fn generate_aac_access_units(duration_ms: u64) -> Option<Vec<Vec<u8>>> {
-    gst::init().ok()?;
-    for elem in [
-        "audiotestsrc",
-        "audioconvert",
-        "audioresample",
-        "avenc_aac",
-        "aacparse",
-        "appsink",
-    ] {
-        if gst::ElementFactory::find(elem).is_none() {
-            eprintln!("skipping rtmp_whep_audio_e2e: generator missing element {elem}");
-            return None;
-        }
-    }
-
-    let pipeline_str = format!(
-        "audiotestsrc num-buffers={nb} wave=ticks samplesperbuffer=1024 \
-         ! audio/x-raw,rate=48000,channels=2 \
-         ! audioconvert \
-         ! audioresample \
-         ! avenc_aac \
-         ! aacparse \
-         ! audio/mpeg,mpegversion=4,stream-format=adts \
-         ! appsink name=sink emit-signals=true sync=false",
-        nb = (duration_ms as i32 * 48 / 1024).max(8),
-    );
-    let element = gst::parse::launch(&pipeline_str).ok()?;
-    let pipeline = element.downcast::<gst::Pipeline>().ok()?;
-    let sink_elem = pipeline.by_name("sink")?;
-    let sink = sink_elem.downcast::<gst_app::AppSink>().ok()?;
-
-    let mut access_units: Vec<Vec<u8>> = Vec::new();
-    pipeline.set_state(gst::State::Playing).ok()?;
-
-    let bus = pipeline.bus()?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(sample) = sink.pull_sample()
-            && let Some(buf) = sample.buffer()
-        {
-            let Ok(map) = buf.map_readable() else {
-                continue;
-            };
-            let slice = map.as_slice();
-            if slice.len() > 7 {
-                // Strip the 7-byte ADTS header; FLV audio tag carries
-                // the raw AAC access unit.
-                access_units.push(slice[7..].to_vec());
-            }
-        }
-        if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(20))
-            && matches!(msg.view(), gst::MessageView::Eos(_) | gst::MessageView::Error(_))
-        {
-            break;
-        }
-        if Instant::now() > deadline {
-            break;
-        }
-    }
-    pipeline.set_state(gst::State::Null).ok()?;
-    if access_units.is_empty() {
-        None
-    } else {
-        Some(access_units)
-    }
-}
 
 // =====================================================================
 // FLV wrappers (aligned with rtmp_hls_e2e.rs + aac_opus_roundtrip.rs)
