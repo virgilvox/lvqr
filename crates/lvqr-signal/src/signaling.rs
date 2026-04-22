@@ -194,8 +194,45 @@ impl Default for SignalServer {
     }
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(server): State<SignalServer>) -> impl IntoResponse {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
+    State(server): State<SignalServer>,
+) -> impl IntoResponse {
+    // Session 111-B3: if the client offered a
+    // `Sec-WebSocket-Protocol: lvqr.bearer.<token>` subprotocol,
+    // echo it back in the upgrade response so RFC 6455-strict
+    // clients accept the handshake. The subprotocol-carried
+    // bearer is consumed by the CLI's `signal_auth_middleware`
+    // BEFORE this handler runs; by the time we get here, auth
+    // has already allowed (or the middleware would have
+    // short-circuited with a 401). The echo is therefore purely
+    // a handshake-compat concern, not an auth concern.
+    let offered = offered_bearer_subprotocol(&headers);
+    let ws = match offered {
+        Some(ref p) => ws.protocols(std::iter::once(p.clone())),
+        None => ws,
+    };
     ws.on_upgrade(move |socket| handle_ws_connection(socket, server))
+}
+
+/// Pick any `lvqr.bearer.<token>` subprotocol offered by the
+/// client on the incoming `Sec-WebSocket-Protocol` header. Used
+/// by [`ws_handler`] to echo the protocol back on the upgrade
+/// response so the handshake completes. Returns `None` when no
+/// qualifying subprotocol was offered.
+fn offered_bearer_subprotocol(headers: &axum::http::HeaderMap) -> Option<String> {
+    let hv = headers.get("sec-websocket-protocol")?;
+    let raw = hv.to_str().ok()?;
+    for item in raw.split(',') {
+        let proto = item.trim();
+        if let Some(tok) = proto.strip_prefix("lvqr.bearer.")
+            && !tok.is_empty()
+        {
+            return Some(proto.to_string());
+        }
+    }
+    None
 }
 
 async fn handle_ws_connection(mut socket: WebSocket, server: SignalServer) {

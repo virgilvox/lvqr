@@ -97,6 +97,78 @@ async fn signal_accepts_valid_token_query() {
 }
 
 #[tokio::test]
+async fn signal_accepts_valid_bearer_subprotocol() {
+    // Session 111-B3: the /signal auth middleware now accepts
+    // `Sec-WebSocket-Protocol: lvqr.bearer.<token>` in addition
+    // to the `?token=` query fallback, and the lvqr-signal
+    // handler echoes the subprotocol back on the upgrade
+    // response so tungstenite's strict handshake validation
+    // succeeds. This test locks both pieces in together.
+    let server = TestServer::start(
+        TestServerConfig::new()
+            .with_mesh(3)
+            .with_auth(static_subscribe_auth("viewer-secret")),
+    )
+    .await
+    .expect("TestServer::start");
+
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = server.signal_url().into_client_request().expect("client request");
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        "lvqr.bearer.viewer-secret".parse().expect("valid header"),
+    );
+    let (ws, resp) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("signal upgrade with bearer subprotocol should have succeeded");
+    let echoed = resp
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    assert_eq!(
+        echoed.as_deref(),
+        Some("lvqr.bearer.viewer-secret"),
+        "server must echo the bearer subprotocol; got {echoed:?}"
+    );
+    drop(ws);
+
+    server.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn signal_rejects_invalid_bearer_subprotocol() {
+    let server = TestServer::start(
+        TestServerConfig::new()
+            .with_mesh(3)
+            .with_auth(static_subscribe_auth("viewer-secret")),
+    )
+    .await
+    .expect("TestServer::start");
+
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = server.signal_url().into_client_request().expect("client request");
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        "lvqr.bearer.wrong-token".parse().expect("valid header"),
+    );
+    let err = tokio_tungstenite::connect_async(req).await.expect_err("must reject");
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(resp) => {
+            assert_eq!(
+                resp.status().as_u16(),
+                401,
+                "expected 401 on wrong bearer subprotocol; got {}",
+                resp.status()
+            );
+        }
+        other => panic!("unexpected error variant: {other:?}"),
+    }
+
+    server.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn signal_rejects_wrong_token() {
     let server = TestServer::start(
         TestServerConfig::new()

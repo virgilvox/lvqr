@@ -154,15 +154,16 @@ pub(crate) struct SignalAuthState {
 }
 
 /// Tower middleware that applies the subscribe-auth gate to
-/// the mesh `/signal` WebSocket. Accepts the bearer via the
-/// `?token=<token>` query parameter. The WS subprotocol path
-/// is intentionally unused for 111-B1: the underlying
-/// `lvqr_signal::SignalServer` handler does not echo
-/// `Sec-WebSocket-Protocol` back to the client, so relying on
-/// subprotocol-carried bearer would break the RFC 6455
-/// handshake for strict clients. Future work in 111-B2+ can
-/// add subprotocol echo and re-enable the header path for
-/// consistency with `/ws/*`.
+/// the mesh `/signal` WebSocket. Accepts the bearer via
+/// `Sec-WebSocket-Protocol: lvqr.bearer.<token>` (preferred, as
+/// of session 111-B3 once `lvqr_signal::SignalServer` echoes
+/// the subprotocol back on the upgrade response) or via a
+/// `?token=<token>` query parameter fallback. The subprotocol
+/// path matches the existing `/ws/*` bearer transport and is
+/// what the `@lvqr/core` JS client uses; the query parameter
+/// stays accepted for native WebSocket constructors (Python
+/// `websockets`, browser `WebSocket` with subprotocol support
+/// missing in older WebViews, etc.).
 ///
 /// `NoopAuthProvider` deployments see no behavior change
 /// because the provider always returns `Allow`. Configured
@@ -173,7 +174,7 @@ pub(crate) async fn signal_auth_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    let token = extract_signal_token(request.uri().query().unwrap_or(""));
+    let token = extract_signal_token(request.headers(), request.uri().query().unwrap_or(""));
     let decision = state.auth.check(&AuthContext::Subscribe {
         token,
         broadcast: String::new(),
@@ -188,11 +189,25 @@ pub(crate) async fn signal_auth_middleware(
     }
 }
 
-/// Extract a bearer token from a `?token=<token>` query string
-/// for the `/signal` auth gate. Kept separate from
-/// [`extract_live_playback_token`] to make the design decision
-/// (no subprotocol support for 111-B1) grep-able per-surface.
-fn extract_signal_token(query: &str) -> Option<String> {
+/// Extract a bearer token for the `/signal` auth gate. Prefers
+/// `Sec-WebSocket-Protocol: lvqr.bearer.<token>` (the RFC-6455
+/// WebSocket convention, matches `/ws/*`); falls back to the
+/// `?token=<token>` query parameter for clients that cannot set
+/// request headers. Returns the first non-empty hit in that
+/// preference order, or `None` when neither is offered.
+fn extract_signal_token(headers: &HeaderMap, query: &str) -> Option<String> {
+    if let Some(hv) = headers.get("sec-websocket-protocol")
+        && let Ok(raw) = hv.to_str()
+    {
+        for item in raw.split(',') {
+            let proto = item.trim();
+            if let Some(tok) = proto.strip_prefix("lvqr.bearer.")
+                && !tok.is_empty()
+            {
+                return Some(tok.to_string());
+            }
+        }
+    }
     for kv in query.split('&') {
         if let Some((k, v)) = kv.split_once('=')
             && k == "token"

@@ -119,21 +119,28 @@ Peers connect to the `/signal` WebSocket endpoint and exchange:
 ### Authentication
 
 `/signal` participates in the shared subscribe-auth pipeline as
-of session 111-B1. Clients pass the bearer via
-`?token=<subscribe-token>` on the upgrade URL. The token is
-checked against the configured `SubscribeAuth` provider before
-the WebSocket upgrade completes. Noop-provider deployments see
-no behavior change. Configured deployments (static subscribe
-token or JWT) short-circuit with a 401 on any upgrade without
-a valid bearer.
+of session 111-B1. Clients pass the bearer via either of two
+channels (in preference order):
+
+1. `Sec-WebSocket-Protocol: lvqr.bearer.<subscribe-token>`
+   header. Matches the bearer transport used by `/ws/*`. The
+   `lvqr-signal` handler echoes the offered subprotocol back
+   on the upgrade response (session 111-B3) so RFC 6455-strict
+   clients accept the handshake.
+2. `?token=<subscribe-token>` query parameter. Fallback for
+   clients that cannot set request headers on the initial
+   WebSocket upgrade (older WebViews, some Python clients).
+
+The token is checked against the configured `SubscribeAuth`
+provider before the WebSocket upgrade completes. Noop-provider
+deployments see no behavior change. Configured deployments
+(static subscribe token or JWT) short-circuit with a 401 on
+any upgrade without a valid bearer.
 
 The `--no-auth-signal` CLI flag (and the
 `TestServerConfig::without_signal_auth()` builder) disables the
 gate for deployments that want open signaling with auth scoped
-elsewhere. `Sec-WebSocket-Protocol: lvqr.bearer.<token>` is
-intentionally not yet supported because the upstream
-`lvqr-signal` handler does not echo subprotocols; the feature
-is tracked as a follow-up after the subprotocol-echo lands.
+elsewhere.
 
 ## MoQ-over-DataChannel wire format (v1)
 
