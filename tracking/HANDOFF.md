@@ -252,13 +252,11 @@ crates.io is unchanged since the 110 push chain. The published v0.4.0 crates do 
 
 ## Session 116 entry point -- remaining phase-B work
 
-Phase B rows 113 (WHEP AAC-to-Opus) and 114 (WHIP->HLS + SRT->DASH + RTMP->WHEP audio E2E) are SHIPPED on local `main`. The pending phase-B work is:
-
-### Scope for session 116
+Phase B rows 113 (WHEP AAC-to-Opus) and 114 (WHIP->HLS + SRT->DASH + RTMP->WHEP audio E2E) are SHIPPED on local `main`. The pending phase-B work is captured in full in **`tracking/SESSION_116_BRIEFING.md`** (authored at the close of session 115, covers both options with design-tradeoff analysis, preferred-path recommendation, concrete "read first in this order" entry points, and verification gates). Summary for the HANDOFF reader:
 
 | # | Scope | Risk |
 |---|---|---|
-| 1 | **Mesh data-plane step 2.** Per `PLAN_V1.1.md` row 115: exercise the existing `@lvqr/core` `MeshPeer` client against the session 111-B server wiring. Add Playwright E2E with two browser peers. Flip `docs/mesh.md` from "topology planner only" to "topology planner + signaling wired; DataChannel media relay ready for end-to-end testing". | medium |
+| 1 | **Mesh data-plane step 2.** Per `PLAN_V1.1.md` row 115: exercise the existing `@lvqr/core` `MeshPeer` client against the session 111-B server wiring. Add Playwright E2E with two browser peers. Flip `docs/mesh.md` from "topology planner only" to "topology planner + signaling wired; DataChannel media relay ready for end-to-end testing". Briefing recommends this as the default because it unblocks phase D + surfaces real bugs in a never-exercised client-SDK path. | medium |
 | 2 | **Tier 4 examples/tier4-demos/ first public demo script.** Per `PLAN_V1.1.md` row 116: one polished scripted demo chaining WASM filter + Whisper captions + ABR transcode + archive + C2PA verify. Closes the Tier 4 exit criterion that was skipped. | low-medium |
 
 ### Known follow-up refactor candidates
