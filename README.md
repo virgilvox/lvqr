@@ -54,7 +54,9 @@ in-process AI agents, cross-cluster federation, peer mesh).
   fanout. Chrome / Edge 107+ via the `@lvqr/player` web component
   (published at v0.3.1 on npm).
 - **WebSocket fMP4** for browsers without WebTransport
-- **DVR scrub** via `/playback/*` backed by a `redb` segment index
+- **DVR scrub** via `/playback/*` backed by a `redb` segment index.
+  Segment fetches honor RFC 7233 `Range: bytes=` single-range
+  requests, so HTML5 `<video>` seekability works out of the box.
 
 ### Programmable data plane
 - **WASM per-fragment filters** (`--wasm-filter <path>`,
