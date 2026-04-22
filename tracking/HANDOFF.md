@@ -1,8 +1,57 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist row 116). **Phase A v1.1 + all mesh-prereqs + phase-B rows 113 (WHEP AAC-to-Opus) + 114 (WHIP->HLS + SRT->DASH + RTMP->WHEP audio E2E) + 115 (mesh two-browser Playwright E2E) all SHIPPED and pushed to origin/main**. 941 workspace tests on the default gate + 1 Playwright E2E green on CI. 29 crates. Next: session 117 -- open phase-B row is 116 (`examples/tier4-demos/` first public demo script) or the first phase-C row (archive READ DVR E2E + DASH-IF validator in CI).
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion CLOSED in session 117). **Phase A v1.1 + all mesh-prereqs + phase-B rows 113 (WHEP AAC-to-Opus) + 114 (WHIP->HLS + SRT->DASH + RTMP->WHEP audio E2E) + 115 (mesh two-browser Playwright E2E) + 116 (`examples/tier4-demos/demo-01.sh`) all SHIPPED. Phase B is now CLOSED.** 941 workspace tests on the default gate + 1 Playwright E2E green on CI. 29 crates. Next: session 118 -- the first phase-C row (archive READ DVR E2E + DASH-IF validator in CI).
 
-**Last Updated**: 2026-04-22 (session 116 close + post-close quality sweep). Local `main` head equals `origin/main` at **`3e026f6`**. Session 116's feat+close chain (`18e32fd`..`998726f`) rides on top of session 115's (`33e3802`); a 5-commit post-close quality sweep rides on top of those (`1ed9f0a`, `9dfdbe0`, `07ce9b9`, `0df2bd1`, `940d597`, `3e026f6`).
+**Last Updated**: 2026-04-22 (session 117 close). Local `main` is 2 commits ahead of `origin/main` (`2f84da3`) pending user push instruction. Session 117's commit pair (`feat(examples): tier4-demos/demo-01.sh` + `docs: session 117 close + README reality sweep + row 116 SHIPPED`) rides on top of the post-116 quality sweep (`3e026f6` + `2f84da3` doc).
+
+## Session 117 close (2026-04-22)
+
+**Shipped**: `PLAN_V1.1.md` row 116 (first public tier4-demos script) + a top-to-bottom README reality sweep. Closes the Tier 4 exit criterion left open when Tier 4 was marked COMPLETE; every phase-B row (113 + 114 + 115 + 116) is now SHIPPED on `main`.
+
+1. **`feat(examples): tier4-demos/demo-01.sh`** -- `examples/tier4-demos/demo-01.sh` (~250 LOC Bash) + `examples/tier4-demos/README.md` (~180 LOC). Boots a single `lvqr serve` on non-default ports (admin 18080, hls 18888, rtmp 11935, moq 14443) with `--wasm-filter` pointed at the in-repo `crates/lvqr-wasm/examples/frame-counter.wasm` fixture, `--transcode-rendition 720p / 480p / 240p`, `--archive-dir <scratch>/archive`, and `--whisper-model <env>` when `LVQR_WHISPER_MODEL` points at a ggml file. A 20 s ffmpeg colour-bars+sine publish drives `rtmp://127.0.0.1:11935/live/demo`. The script polls `/healthz`, then the HLS `master.m3u8` until 4 variants are advertised (source + 3 ABR rungs), then `/metrics` for `lvqr_wasm_fragments_total{outcome="keep"}`, then the scratch archive dir for `0.mp4/finalized.*` on publisher disconnect. A flat summary block prints URLs + counters + archive paths; the script exits non-zero if the ABR or archive assertions fail. Prereq probes for `lvqr`, `ffmpeg`, `curl`, `jq`, `gst-launch-1.0` all fail fast with pointers back to `examples/tier4-demos/README.md`. The feature-set probe (`lvqr serve --help | grep -- --transcode-rendition`) refuses to proceed on an underfeatured binary.
+
+2. **`docs`** -- this close-doc commit. Rewrites `tracking/PLAN_V1.1.md` row 116 from pending to SHIPPED with the demo shape + the C2PA scoping rationale rolled into the row. Rewrites the status header to reflect phase-B CLOSED + pointers to the next phase-C row (117: archive READ DVR E2E + DASH-IF validator). Authors this block. Updates the `project_lvqr_status` auto-memory to reflect session 117 + phase-B closure. Applies a top-to-bottom README reality sweep.
+
+### README reality sweep (rode along with the close-doc commit)
+
+Fixes a dozen drift points surfaced while authoring the demo:
+
+* **Test count**: `917 workspace tests passing` -> `941 workspace tests passing, 0 failing, 1 ignored, plus a Playwright browser E2E`. The old 917 has been stale since session 109 A.
+* **Tier 4 exit criterion**: flipped to CLOSED with a direct link to `examples/tier4-demos/`.
+* **WHEP AAC-to-Opus**: Egress+encoders checklist item flipped from unchecked to SHIPPED (session 113).
+* **Mesh two-peer browser E2E**: checklist item flipped from unchecked to SHIPPED (session 115) with a direct link to `bindings/js/tests/e2e/mesh/two-peer-relay.spec.ts` + `.github/workflows/mesh-e2e.yml`.
+* **Mesh feature overview**: "topology planner + WebSocket signaling server" paragraph rewritten to name the full shipped chain (server-side subscriber registration + client-side WebRTC DataChannel parent/child relay + the Playwright E2E on CI) with operator-grade completion scoped to phase D.
+* **Client libraries row**: `@lvqr/core` description now names `pushFrame`, `onChildOpen`, `connectTimeoutMs`, `fetchTimeoutMs` on `main` ahead of the next publish cycle.
+* **CLI reference**: added `--mesh-root-peer-count` and `--no-auth-signal` flags (both shipped but undocumented in the README). Peer-mesh block header rewritten from "topology planner only; media relay on the roadmap" to "topology planner + signaling + client-side relay ship; operator-grade completion on the phase-D roadmap".
+* **Phantom `/readyz` endpoint**: removed. `lvqr-admin::routes` mounts `/healthz` but never mounted `/readyz`; the README had been listing it since the pre-v0.3 era.
+* **`@lvqr/player` "upcoming"**: removed. The package has been on npm at 0.3.1 since session 103.
+* **Known v0.4.0 limitations**: added a **C2PA signing is programmatic-only** bullet that names the CLI-wiring gap (no `--c2pa-signing-cert` etc.), points at `ServeConfig.c2pa` + `crates/lvqr-cli/tests/c2pa_verify_e2e.rs` for the programmatic shape, and tags CLI wiring as phase-C.
+
+### Key 117 design decisions baked in
+
+* **C2PA sign+verify deliberately scoped OUT of `demo-01.sh`**. The SESSION_116_BRIEFING.md demo sketch included C2PA verify as one of the chained surfaces (`WASM + whisper + transcode + archive + C2PA verify`). On reading the code, `crates/lvqr-cli/src/config.rs:110` exposes `ServeConfig.c2pa: Option<C2paConfig>` but nothing in `crates/lvqr-cli/src/main.rs` parses CLI flags into it -- C2PA is programmatic-only today. Surfacing it through new `--c2pa-signing-cert` / `--c2pa-signing-key` / `--c2pa-signing-alg` / `--c2pa-assertion-creator` / `--c2pa-trust-anchor` flags is a legitimate additive CLI change but it needs a design pass (clap ValueEnum for `C2paSigningAlg`, validation that cert+key land together, feature-gating against the `c2pa` Cargo feature, at least one integration test exercising the flags), and that scope does not fit in a session already committed to a demo script + README sweep. Instead: demo-01 runs WASM + whisper + transcode + archive (every Tier 4 surface actually reachable from today's CLI), the demo README explicitly flags C2PA as "programmatic-only today, CLI wiring on the phase-C roadmap" + prints a one-liner (`cargo test -p lvqr-cli --features c2pa --test c2pa_verify_e2e`) for the programmatic end-to-end fixture, and the main README's Known Limitations section names the gap so nobody reading the doc leaves with the wrong impression. Adding CLI C2PA flags is now a candidate row for phase-C sequencing.
+* **Frame-counter WASM over a more dramatic filter**. The WASM surface under test is "the tap actually runs on every fragment"; the `lvqr_wasm_fragments_total{outcome="keep"}` counter is the demonstrable signal. The frame-counter module (identity filter) keeps every fragment, so downstream surfaces (HLS, transcode ladder, archive) still receive the full stream while the counter still ticks. The redact-keyframes alternative would drop every fragment, starving every downstream surface and making the demo's "four ABR variants advertised" + "archive finalized" assertions impossible. The rejected alternative was to ship a new demo-specific WASM module (e.g. a watermarker) that mutates payload bytes while still passing them through; that would have pulled a `wat2wasm` / `wasm-tools` build dep into the demo prereqs or required a checked-in binary, which grows the repo for negligible clarity gain.
+* **Whisper is opt-in via env var, not required**. `LVQR_WHISPER_MODEL` unset = demo skips captions cleanly, everything else still runs. The alternative was to make the demo refuse to run without a model; rejected because requiring a ~78 MB download just to exercise the other four Tier 4 surfaces is poor ergonomics. The README documents the Hugging Face download one-liner for operators who want the captions path covered.
+* **Non-default ports for the demo's `lvqr serve`**. `--admin-port 18080 --hls-port 18888 --rtmp-port 11935 --port 14443`. Same rationale as the session 116 Playwright config: a locally-running `lvqr serve` on zero-config ports should not collide with the demo's subprocess. The demo's README documents every override env var (`LVQR_DEMO_ADMIN_PORT` etc.) for operators on restricted runners.
+* **README reality sweep rides along with the close-doc commit, not its own commit**. Every drift entry is small and interlocking (fixing the Tier 4 exit criterion row implies flipping the phase-B row 116 checkbox, which implies updating the `@lvqr/core` description to reference the new `onChildOpen` shipped in the post-116 sweep, and so on). Splitting them into separate commits would manufacture review noise without isolating any load-bearing change. The two-commit shape (feat = demo files, docs = close + README sweep + PLAN row 116) matches the kickoff-prompt convention.
+
+### Ground truth (session 117 close)
+
+* **Head (pre-push)**: feat commit + this close-doc commit (pending). `origin/main` head at `2f84da3` unchanged from the post-116 sweep.
+* **Tests (default features gate)**: **941** passed, 0 failed, 1 ignored on macOS. Unchanged from the post-116 sweep because session 117 adds (a) Bash + Markdown files under `examples/tier4-demos/` that live outside the cargo workspace, and (b) zero Rust code. Demo-01 is runnable against a GStreamer-provisioned host; not verified end-to-end on this macOS dev host (GStreamer not installed via brew), matching the session-115 posture on `rtmp_whep_audio_e2e.rs`.
+* **CI gates locally clean**:
+  * `cargo fmt --all --check`.
+  * `cargo clippy --workspace --all-targets -- -D warnings`.
+  * `cargo test --workspace` 941 / 0 / 1.
+  * `bash -n examples/tier4-demos/demo-01.sh` clean.
+* **Workspace**: **29 crates**, unchanged.
+* **crates.io / npm / PyPI**: unchanged. Session 117 is shell + markdown + an existing-file README sweep; no Rust / TypeScript / Python code moved.
+
+### Known limitations / documented v1 shape (after 117 close)
+
+* **C2PA sign+verify is programmatic-only**. `ServeConfig.c2pa` works end to end but no CLI flag set it from `lvqr serve ...`. Phase-C row candidate: `--c2pa-signing-cert` + `--c2pa-signing-key` + `--c2pa-signing-alg` + `--c2pa-assertion-creator` + `--c2pa-trust-anchor` + `--c2pa-timestamp-authority`, each feature-gated on the `c2pa` Cargo feature.
+* **demo-01.sh is not invoked by CI**. The script needs GStreamer + ffmpeg on the runner; adding a dedicated workflow (mirror `mesh-e2e.yml`'s dedicated-workflow pattern) is a natural follow-up. Without CI coverage the demo can silently bitrot on CLI-flag renames. Phase-C row candidate.
+* All session 113 / 114 / 115 / 116 + post-116 known limitations unchanged.
 
 ## Post-116 quality sweep (2026-04-22)
 

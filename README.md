@@ -50,7 +50,9 @@ in-process AI agents, cross-cluster federation, peer mesh).
   `AacToOpusEncoder` (GStreamer, behind the `transcode` Cargo
   feature). **Fixed on `main` in session 113**; see
   [Known v0.4.0 limitations](#known-v040-limitations)
-- **MoQ** over QUIC / WebTransport via `moq-lite`, zero-copy fanout
+- **MoQ** over QUIC / WebTransport via `moq-lite`, zero-copy
+  fanout. Chrome / Edge 107+ via the `@lvqr/player` web component
+  (published at v0.3.1 on npm).
 - **WebSocket fMP4** for browsers without WebTransport
 - **DVR scrub** via `/playback/*` backed by a `redb` segment index
 
@@ -141,10 +143,15 @@ in-process AI agents, cross-cluster federation, peer mesh).
   `state` / `last_connected_at_ms` / `last_error` /
   `connect_attempts`. See [`docs/cluster.md`](docs/cluster.md).
 - **Peer mesh**: topology planner + WebSocket signaling server
-  ship today (`--mesh-enabled`, `--max-peers`). The actual
-  peer-to-peer media forwarding over WebRTC DataChannels is on
-  the roadmap; see the "Peer mesh" section of the
-  [roadmap](#roadmap) below and [`docs/mesh.md`](docs/mesh.md).
+  + server-side subscriber registration + client-side WebRTC
+  DataChannel parent/child relay ship today
+  (`--mesh-enabled`, `--max-peers`, `--mesh-root-peer-count`).
+  A two-browser Playwright E2E (`bindings/js/tests/e2e/mesh/`)
+  exercises the full signal-to-DataChannel-delivery chain on
+  every CI run. Operator-grade completion (actual-vs-intended
+  offload reporting, per-peer capacity advertisement, TURN
+  deployment recipe, three-peer matrix) is on the phase-D
+  roadmap; see [`docs/mesh.md`](docs/mesh.md).
 
 ## Quickstart
 
@@ -197,8 +204,8 @@ ffmpeg -re -i source.mp4 -c copy -f mpegts srt://localhost:8890?streamid=live/de
 - **DASH**: `http://localhost:8889/dash/live/demo/manifest.mpd`
 - **WHEP**: browser WebRTC player at
   `https://localhost:8443/whep/live/demo`
-- **MoQ**: Chrome/Edge 107+ via the upcoming `@lvqr/player` web
-  component (see [Roadmap](#roadmap))
+- **MoQ**: Chrome/Edge 107+ via the `@lvqr/player` web component
+  (published at `@lvqr/player@0.3.1` on npm)
 - **WebSocket fMP4**: `ws://localhost:8080/ws/live/demo` (MSE
   fallback for browsers without WebTransport)
 
@@ -210,7 +217,6 @@ end: `cd test-app && ./serve.sh` exposes a browser demo at
 
 ```bash
 curl http://localhost:8080/healthz             # liveness
-curl http://localhost:8080/readyz              # readiness
 curl http://localhost:8080/api/v1/streams      # active broadcasts
 curl http://localhost:8080/api/v1/stats        # connection counts
 curl http://localhost:8080/api/v1/slo          # latency SLO snapshot
@@ -246,7 +252,7 @@ full model, ops recipes, and tuning knobs.
 | Language | Install | Version | Description |
 |---|---|---|---|
 | Rust | `cargo add lvqr-core` | 0.4.0 (crates.io) | Shared types, `EventBus`, admin client |
-| JavaScript | `npm i @lvqr/core` | 0.3.1 (npm) | MoQ-Lite subscriber over WebTransport, WebSocket fMP4 fallback, admin client, `MeshPeer` WebRTC DataChannel relay (client-side; server-side data plane pending) |
+| JavaScript | `npm i @lvqr/core` | 0.3.1 (npm) | MoQ-Lite subscriber over WebTransport, WebSocket fMP4 fallback, admin client, `MeshPeer` WebRTC DataChannel relay (two-peer happy path verified via a Playwright browser E2E; operator-grade completion on the phase-D roadmap). `main` post-v0.3.1 adds `pushFrame(data)` on `MeshPeer`, an `onChildOpen(id, dc)` callback in `MeshConfig`, and `connectTimeoutMs` / `fetchTimeoutMs` on `LvqrClient` / `LvqrAdminClient`; land at the next publish cycle. |
 | JavaScript | `npm i @lvqr/player` | 0.3.1 (npm) | Drop-in `<lvqr-player>` web component with MSE fallback |
 | Python | `pip install lvqr` | 0.3.1 (PyPI) | Admin API client (no streaming surface) |
 
@@ -262,8 +268,11 @@ plane), Tier 3 (cluster auth + redirect-to-owner), and Tier 4
 (programmable data plane: WASM filters, io_uring archive, C2PA,
 cross-cluster federation, AI agents, ABR transcoding, latency
 SLO, one-token auth) all **ship** as of v0.4.0. The Tier 4 exit
-criterion "first `examples/tier4-demos/` public demo script" is
-the one open Tier 4 deliverable and is listed below.
+criterion -- a working
+[`examples/tier4-demos/`](examples/tier4-demos/) public demo
+script -- landed on `main` post-v0.4.0 in session 117
+(`demo-01.sh` chains WASM filter + whisper captions + ABR
+transcode + DVR archive end to end).
 
 Full v1.1 phase plan with session-by-session sequencing lives in
 [`tracking/PLAN_V1.1.md`](tracking/PLAN_V1.1.md).
@@ -278,8 +287,12 @@ JavaScript (`@lvqr/core`, `@lvqr/player` at 0.3.1 on npm), Python
   route (mesh, slo, cluster, federation).
 - [ ] Add Vitest + pytest to CI so SDK drift surfaces at PR time.
 - [ ] Document reconnect + retry semantics in the SDK README.
-- [ ] First `examples/tier4-demos/` public demo script (closes the
-  Tier 4 exit criterion).
+- [x] ~~First `examples/tier4-demos/` public demo script.~~ Shipped
+  in session 117 as
+  [`examples/tier4-demos/demo-01.sh`](examples/tier4-demos/demo-01.sh),
+  chaining the WASM filter, whisper captions, ABR transcode, and
+  DVR archive surfaces end to end. Closes the Tier 4 exit
+  criterion that was left open when Tier 4 was marked COMPLETE.
 
 ### Peer mesh data plane
 Topology planner, WebSocket signaling, `/api/v1/mesh` admin route,
@@ -303,9 +316,17 @@ test.
   session 111-B1 as an 8-byte big-endian `object_id` prefix +
   raw MoQ frame bytes per DataChannel message. Documented in
   `docs/mesh.md`.
-- [ ] **Two-peer end-to-end browser test** proving a subscriber
+- [x] ~~**Two-peer end-to-end browser test** proving a subscriber
   connected through the DataChannel mesh receives the same
-  fMP4 frames as a server-direct subscriber.
+  bytes via the peer relay as via the server-direct path.~~
+  Shipped in session 115 (row 115) as
+  [`bindings/js/tests/e2e/mesh/two-peer-relay.spec.ts`](bindings/js/tests/e2e/mesh/two-peer-relay.spec.ts).
+  The `mesh-e2e.yml` CI workflow runs it on every push to `main`.
+  `MeshPeer.pushFrame(data)` was added on `main` in the same
+  session so the root peer can forward server-drained media
+  into the mesh tree; `MeshConfig.onChildOpen(id, dc)` was
+  added as a post-116 follow-up for integrators who need a
+  deterministic one-shot push on DataChannel open.
 - [ ] **Actual-vs-intended offload reporting**: clients report
   "served by peer X"; coordinator aggregates; `/api/v1/mesh`
   returns measured offload.
@@ -316,12 +337,17 @@ test.
 - [ ] **Three-peer browser Playwright E2E** feeding the 5-artifact
   test contract.
 - [ ] Flip [`docs/mesh.md`](docs/mesh.md) from "topology planner
-  only" to "IMPLEMENTED".
+  only" to "IMPLEMENTED". (The two-peer slice ships; the phase-D
+  items above gate the "IMPLEMENTED" flip.)
 
 ### Egress + encoders
-- [ ] **WHEP audio transcoder (AAC to Opus)** atop the 4.6
+- [x] ~~**WHEP audio transcoder (AAC to Opus)** atop the 4.6
   GStreamer pipeline so RTMP publishers reach browser WebRTC
-  with audio. Today WHEP serves video-only from non-Opus ingest.
+  with audio.~~ Shipped on `main` in session 113 as
+  `lvqr-transcode::AacToOpusEncoder` (behind the `transcode`
+  Cargo feature). Exercised by
+  `crates/lvqr-cli/tests/rtmp_whep_audio_e2e.rs` on the
+  GStreamer-enabled CI matrix.
 - [x] ~~Live HLS and DASH subscribe auth.~~ Shipped in session
   112 via a tower middleware applied to the HLS and DASH
   routers at the CLI composition root. Auth on by default when
@@ -399,6 +425,17 @@ published crate.
   offers a software x264 pipeline (behind the `transcode` Cargo
   feature). NVENC, VideoToolbox, VAAPI, and QSV backends are
   on the v1.1 and v1.2 roadmap.
+- **C2PA signing is programmatic-only.** `ServeConfig.c2pa` on
+  the `lvqr-cli` API accepts a `C2paConfig` (on-disk PEMs via
+  `C2paSignerSource::CertKeyFiles` or a caller-supplied signer
+  for HSM/KMS backends), and the drain-terminated finalize +
+  `/playback/verify/{broadcast}` verify route both work end to
+  end. What is missing is a CLI-flag surface
+  (`--c2pa-signing-cert`, `--c2pa-signing-key`, etc.). Operators
+  who want signed archives today call `lvqr_cli::start`
+  programmatically with a `C2paConfig`; see
+  `crates/lvqr-cli/tests/c2pa_verify_e2e.rs` for the end-to-end
+  fixture. CLI wiring is on the phase-C roadmap.
 - **Pure MoQ subscribers do not contribute to the latency SLO
   histogram.** LL-HLS, MPEG-DASH, WebSocket fMP4, and WHEP are
   instrumented; MoQ subscribers are not, by design (the
@@ -478,9 +515,17 @@ lvqr serve [OPTIONS]
   --cluster-advertise-dash <URL>  Base URL for DASH redirect-to-owner
   --cluster-advertise-rtsp <URL>  Base URL for RTSP redirect-to-owner
 
-  Peer mesh (topology planner only; media relay on the roadmap):
+  Peer mesh (topology planner + signaling + client-side relay
+  ship; operator-grade completion on the phase-D roadmap):
   --mesh-enabled                  Enable peer mesh coordinator
   --max-peers <N>                 Max children per peer [default: 3]
+  --mesh-root-peer-count <N>      Cap on direct-from-origin peers
+                                  (additional joiners become
+                                  children via AssignParent).
+                                  Env: LVQR_MESH_ROOT_PEER_COUNT.
+  --no-auth-signal                Disable subscribe-token auth on
+                                  the /signal WebSocket.
+                                  Env: LVQR_NO_AUTH_SIGNAL.
 
   TLS:
   --tls-cert <PATH>               TLS cert PEM (auto-generated if omitted)
@@ -611,10 +656,12 @@ cargo bench -p lvqr-rtsp
 cargo bench -p lvqr-cmaf
 ```
 
-As of the latest close on `main`: 917 workspace tests passing,
-0 failing, 1 ignored (pre-existing `moq_sink` doctest). Every
-close must be green on fmt + clippy + workspace test; session
-deltas are tracked in [`tracking/HANDOFF.md`](tracking/HANDOFF.md).
+As of the latest close on `main`: 941 workspace tests passing,
+0 failing, 1 ignored (pre-existing `moq_sink` doctest), plus a
+Playwright browser E2E (`bindings/js/tests/e2e/mesh/`) running
+via a dedicated `mesh-e2e.yml` CI workflow. Every close must be
+green on fmt + clippy + workspace test; session deltas are
+tracked in [`tracking/HANDOFF.md`](tracking/HANDOFF.md).
 
 Feature flags and Docker recipes are in
 [`docs/deployment.md`](docs/deployment.md).
