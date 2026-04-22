@@ -12,6 +12,10 @@ bindings/js/packages/*/wasm/
 node_modules/
 bindings/js/packages/*/dist/
 
+# Playwright artifacts (bindings/js/tests/e2e)
+bindings/js/test-results/
+bindings/js/playwright-report/
+
 # Python
 __pycache__/
 *.py[cod]

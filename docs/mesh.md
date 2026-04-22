@@ -7,14 +7,13 @@ high-fan-out broadcasts.
 
 > **Status as of main (post v0.4.0): topology planner +
 > signaling + subscribe-auth + server-side subscriber
-> registration all ship; client-side WebRTC relay ships in
-> `@lvqr/core`; browser-to-browser DataChannel media relay is
-> the one remaining gap.** The Rust side (`lvqr-mesh`,
-> `lvqr-signal`) assigns peer positions in a relay tree,
-> detects dead peers, reassigns orphans, pushes `AssignParent`
-> messages over `/signal` at Register time, and gates `/signal`
-> behind the shared `SubscribeAuth` provider via both
-> `Sec-WebSocket-Protocol: lvqr.bearer.<token>` and
+> registration + client-side WebRTC relay + two-peer
+> DataChannel media relay end-to-end test all ship.** The Rust
+> side (`lvqr-mesh`, `lvqr-signal`) assigns peer positions in a
+> relay tree, detects dead peers, reassigns orphans, pushes
+> `AssignParent` messages over `/signal` at Register time, and
+> gates `/signal` behind the shared `SubscribeAuth` provider via
+> both `Sec-WebSocket-Protocol: lvqr.bearer.<token>` and
 > `?token=<token>`. Every `ws_relay_session` registers its
 > subscriber with `MeshCoordinator::add_peer` on connect and
 > sends a leading `peer_assignment` JSON text frame on the WS
@@ -25,23 +24,35 @@ high-fan-out broadcasts.
 > `/signal`, handles `AssignParent`, opens an
 > `RTCPeerConnection` to the assigned parent, sets up a
 > DataChannel, and forwards received media frames to children.
-> What is still missing:
-> - Server-side injection of MoQ frame bytes into a DataChannel
->   to seed root peers (the root peer today still pulls frames
->   directly from the server-backed MoQ / HLS / DASH / WHEP
->   egress; DataChannel-forwarded frames are client-to-client
->   only).
-> - An end-to-end test with two browser peers proving the
->   second peer receives frames through the DataChannel mesh
->   instead of directly from the server.
+> A root peer exposes `pushFrame(data)` so the integrator can
+> seed the mesh with bytes it drained from the server (MoQ,
+> WebTransport, WS relay, or any other egress). A two-browser
+> Playwright E2E
+> ([`bindings/js/tests/e2e/mesh/two-peer-relay.spec.ts`](../bindings/js/tests/e2e/mesh/two-peer-relay.spec.ts))
+> drives the full shape: `lvqr serve --mesh-enabled
+> --mesh-root-peer-count 1` is booted by Playwright's
+> `webServer`, two browser contexts register as `peer-one`
+> (Root) and `peer-two` (Relay with parent=peer-one), the SDP
+> offer/answer and ICE candidates flow through `/signal`, the
+> DataChannel opens, and `peer-one.pushFrame(knownBytes)` is
+> observed in `peer-two`'s `onFrame` callback. Completes in
+> under a second on loopback.
+>
+> What is still phase-D scope:
 > - Actual-vs-intended offload reporting (clients report
 >   "served by peer X"; coordinator aggregates; `/api/v1/mesh`
 >   returns measured).
+> - Per-peer capacity advertisement (bandwidth + CPU) so
+>   rebalancing uses measured capacity instead of hardcoded
+>   `max-children`.
+> - TURN deployment recipe for peers behind symmetric NAT.
+> - Three-peer Playwright matrix + the 5-artifact test contract
+>   sweep across WebRTC-heavy browsers.
 >
-> Until those land, a deployment that sets `--mesh-enabled`
-> still serves every subscriber directly from the server; the
-> offload percentage reported by `/api/v1/mesh` is intended
-> offload based on tree shape, not measured traffic.
+> Until phase-D lands, a deployment that sets `--mesh-enabled`
+> serves every subscriber directly from the server; the offload
+> percentage reported by `/api/v1/mesh` is intended offload
+> based on tree shape, not measured traffic.
 >
 > Tracking in
 > [`tracking/PLAN_V1.1.md`](../tracking/PLAN_V1.1.md) under
