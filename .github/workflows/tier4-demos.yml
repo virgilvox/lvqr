@@ -1,0 +1,92 @@
+name: Tier 4 demos
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# `examples/tier4-demos/demo-01.sh` landed in session 117 as the
+# Tier 4 exit-criterion public demo script. The demo boots a
+# single `lvqr serve` with the WASM filter + ABR transcode + DVR
+# archive + optional whisper-captions chain enabled, publishes
+# ~20 s of ffmpeg synthetic RTMP, and asserts the HLS master
+# playlist advertises 4 variants + the archive finalized on
+# publisher disconnect.
+#
+# Without a CI hook the demo would silently rot on any future
+# rename of a CLI flag (`--transcode-rendition`,
+# `--wasm-filter`, `--archive-dir`, port flags, etc.). This
+# workflow runs the script on every push to main + PR so a
+# contributor touching the CLI surface gets a loud signal.
+#
+# Whisper captions are deliberately OFF (LVQR_WHISPER_MODEL
+# unset) so the workflow does not need to download a ~78 MB
+# ggml model on every run. The demo's captions probe skips
+# cleanly with a "captions: skipped" summary line. A separate
+# workflow with a scheduled trigger + a cached whisper model is
+# a reasonable phase-C follow-up.
+#
+# Posture mirrors `dash-conformance.yml` + `hls-conformance.yml`
+# + `mesh-e2e.yml`: dedicated workflow, GStreamer + ffmpeg
+# installed fresh, `continue-on-error: true` initially so the
+# first-run artifact surfaces any setup fragility without
+# blocking PRs. Promotion to a required check comes after the
+# first clean run on main.
+
+jobs:
+  demo-01:
+    name: examples/tier4-demos/demo-01.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: tier4-demos-v1
+
+      - name: Install runtime + build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg jq \
+            gstreamer1.0-tools \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libclang-dev
+
+      - name: Build lvqr-cli (release, --features full)
+        run: cargo build -p lvqr-cli --release --features full
+
+      - name: Run demo-01.sh
+        id: demo
+        env:
+          # Scratch dir retained so the upload step can grab
+          # lvqr.log / ffmpeg.log for post-mortem on failures.
+          LVQR_DEMO_SCRATCH: /tmp/tier4-demos-out
+          # Default demo duration 20 s; unchanged here but
+          # exposed for convenience if future tuning is needed.
+          LVQR_DEMO_DURATION: "20"
+        run: |
+          mkdir -p /tmp/tier4-demos-out
+          ./examples/tier4-demos/demo-01.sh 2>&1 | tee /tmp/tier4-demos-out/demo-01.log
+
+      - name: Upload demo artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier4-demos-demo-01-output
+          path: /tmp/tier4-demos-out
+          if-no-files-found: warn
+          retention-days: 14
