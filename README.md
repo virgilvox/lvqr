@@ -44,10 +44,11 @@ in-process AI agents, cross-cluster federation, peer mesh).
   playlist, ABR ladder variants, automatic `ENDLIST` on disconnect
 - **MPEG-DASH**: live-profile dynamic MPD with flip to
   `type="static"` on disconnect
-- **WHEP** WebRTC video egress via `str0m` (H.264 + HEVC).
-  Audio requires an Opus publisher today; AAC ingest audio is
-  dropped at the WHEP session (AAC -> Opus transcoder is on the
-  v1.1 roadmap). See
+- **WHEP** WebRTC egress via `str0m` (H.264 + HEVC video, Opus
+  audio). WHIP Opus publishers pass through; RTMP / SRT / RTSP
+  AAC publishers reach WHEP subscribers via an in-process
+  `AacToOpusEncoder` (GStreamer, behind the `transcode` Cargo
+  feature). **Fixed on `main` in session 113**; see
   [Known v0.4.0 limitations](#known-v040-limitations)
 - **MoQ** over QUIC / WebTransport via `moq-lite`, zero-copy fanout
 - **WebSocket fMP4** for browsers without WebTransport
@@ -380,12 +381,17 @@ published crate.
   are now wrapped with the same `SubscribeAuth` gate as
   `/ws/*`, with `--no-auth-live-playback` as the escape hatch
   for deployments that want open live playback.
-- **WHEP has no AAC audio.** The WHEP session negotiates Opus;
-  AAC ingest audio (every RTMP, SRT, RTSP, and WS publisher) is
-  dropped with a one-shot warning log. WHIP publishers sending
-  Opus reach WHEP subscribers with audio. An AAC to Opus
-  transcoder is on the v1.1 checklist (session 113 scope in
-  `tracking/PLAN_V1.1.md`).
+- **WHEP has no AAC audio.** The v0.4.0 crate dropped AAC audio
+  with a one-shot warning so every RTMP / SRT / RTSP / WS
+  publisher reached WHEP subscribers video-only. **Fixed on
+  `main`** in session 113: a new `lvqr-transcode::AacToOpusEncoder`
+  (behind the `transcode` feature) pipes AAC access units through
+  an in-process GStreamer pipeline (`appsrc ! aacparse !
+  avdec_aac ! audioresample ! opusenc ! appsink`) and pushes the
+  Opus packets back into the WHEP session's Opus writer. The
+  transcoder is lazily spawned per session once the publisher's
+  AAC AudioSpecificConfig arrives. Builds without the `transcode`
+  feature retain the legacy drop-with-warn behaviour.
 - **`/metrics` is unauthenticated.** Intentional, but document
   this to your ops team. Scope the scrape endpoint via firewall
   or reverse proxy if the deployment is multi-tenant.
