@@ -2,7 +2,7 @@
 
 ## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist). **Phase A v1.1 + all mesh-prereqs + phase-B rows 113 (WHEP AAC-to-Opus) + 114 (WHIP->HLS + SRT->DASH + RTMP->WHEP audio E2E; last row is feature-gated on `transcode` and runs on GStreamer-enabled CI hosts) SHIPPED on local `main`, unpushed**. 941 workspace tests on the default gate (unchanged from 114 partial close; new 115 target is feature-gated out), 29 crates. Next: session 116 (mesh data-plane step 2 with Playwright two-browser E2E) per `PLAN_V1.1.md` row 115.
 
-**Last Updated**: 2026-04-22 (session 115 close + post-close fix). Local `main` head is `0c2c59d` (post-close fix sharing the AAC test-bytes generator via a new `lvqr_transcode::test_support` module so `rtmp_whep_audio_e2e.rs` does not need `gstreamer` as a direct dev-dep on `lvqr-cli`). Origin/main remains at `2e50635`. **8 unpushed commits on local main**: `323be2f` feat(whep) 113 + `3e9b444` docs 113 close + `b70be73` feat(test) 114 partial + `b315345` docs 114 close + `d1b9607` post-114 docs tidy + `3937a44` feat(test) 115 + `80bba4b` docs 115 close + `0c2c59d` fix(transcode) test-support module. No push instruction issued this session; a future push event would emit the whole chain as a single batch.
+**Last Updated**: 2026-04-22 (session 115 close + two post-close audit fixes). Local `main` head is `1c6d3f6` (publisher-cadence fix so fresh AAC reaches the WHEP session during ICE + DTLS warm-up instead of bursting in ~200 ms and emptying before Connected). Origin/main remains at `2e50635`. **10 unpushed commits on local main**: `323be2f` feat(whep) 113 + `3e9b444` docs 113 close + `b70be73` feat(test) 114 partial + `b315345` docs 114 close + `d1b9607` post-114 docs tidy + `3937a44` feat(test) 115 + `80bba4b` docs 115 close + `0c2c59d` fix(transcode) test-support module + `42db8ca` docs post-close sweep + `1c6d3f6` fix(test) real-time publisher cadence. No push instruction issued this session; a future push event would emit the whole chain as a single batch.
 
 ## Session 115 close (2026-04-22)
 
@@ -52,6 +52,17 @@ Fix commit `0c2c59d` hoists the `audiotestsrc ! avenc_aac ! aacparse` helper out
 
 Semantic note: the shared helper uses `if let Ok(map) = buf.map_readable()` to skip the current sample on a transient map failure, whereas the original `aac_opus_roundtrip.rs` used `buf.map_readable().ok()?` which would propagate a `None` return from the whole function. In practice `map_readable` does not fail on live in-process GStreamer buffers; the tolerant behavior is strictly a small improvement and does not change the "AAC round-trips through the encoder" assertion.
 
+### Post-115 fix (2026-04-22, commit `1c6d3f6`) -- real-time publisher cadence
+
+Second design-audit finding on the session 115 test. The original `run_rtmp_publisher` used `tokio::time::sleep(Duration::from_millis(5))` between AAC sample pushes, so the 38-frame burst from the 800 ms generator finished in ~200 ms. That is well shorter than the WHEP subscriber's ICE + DTLS warm-up on a typical loopback handshake (~500-900 ms, longer on a loaded CI runner). Every Opus packet the per-session `AacToOpusEncoder` produced during the warm-up window would route through `write_opus_frame`'s pre-Connected drop branch, and by the time ICE completed there would be no fresh AAC still arriving. Net effect: `Event::MediaData` would never fire on the client and the test would time out against the 20 s deadline with no useful diagnostic.
+
+Fix commit `1c6d3f6`:
+
+1. Switch the publisher's inter-sample sleep from 5 ms (busy-burst) to 21 ms via `tokio::time::sleep_until` so samples arrive at the RTMP bridge at real-time cadence (1024 samples / 48 kHz = 21 1/3 ms per frame). Publisher now stays alive for the full duration of the generated span instead of bursting in 200 ms.
+2. Bump the generator from 800 ms to 1600 ms so fresh AAC continues to reach the WHEP session poll loop through the full 500-900 ms ICE + DTLS warm-up plus a healthy tail for the first post-Connected Opus frame to land.
+
+Also confirmed `rml_rtmp::sessions::ClientSession` is `Send` (no `Rc` / `RefCell` / raw-pointer fields in `rml_rtmp-0.8.0/src/sessions/client/`), so `tokio::spawn(run_rtmp_publisher(..))` is sound even though no other test in the workspace spawns a `ClientSession`.
+
 ## Session 114 close (partial) (2026-04-21)
 
 ### Commit chain on local `main` (chronological)
@@ -74,7 +85,9 @@ Semantic note: the shared helper uses `if let Ok(map) = buf.map_readable()` to s
 | `d1b9607` | docs | Post-114 HANDOFF cleanup -- real SHAs + dedup + kickoff refresh |
 | `3937a44` | feat(test) | **115** RTMP->WHEP audio E2E -- closes 114 row 2 (feature-gated `transcode`); TestServer gains `with_whep()` |
 | `80bba4b` | docs | Session 115 close -- HANDOFF + PLAN_V1.1.md row 114 SHIPPED |
-| `0c2c59d` | fix(transcode) | Post-115 fix -- share the AAC test-bytes generator via `pub lvqr_transcode::test_support` so `rtmp_whep_audio_e2e.rs` does not need direct gstreamer dev-deps on `lvqr-cli`; `aac_opus_roundtrip.rs` refactored to the same shared helper (~80 LOC de-dup) [**local main head**] |
+| `0c2c59d` | fix(transcode) | Post-115 fix -- share the AAC test-bytes generator via `pub lvqr_transcode::test_support` so `rtmp_whep_audio_e2e.rs` does not need direct gstreamer dev-deps on `lvqr-cli`; `aac_opus_roundtrip.rs` refactored to the same shared helper (~80 LOC de-dup) |
+| `42db8ca` | docs | Session 115 post-close HANDOFF sweep -- chain table + audit-finding note |
+| `1c6d3f6` | fix(test) | Post-115 fix -- publisher AAC cadence switched from 5 ms burst to 21 ms real-time sleep_until; generator span 800 ms -> 1600 ms so fresh AAC continues to reach the WHEP session through the full 500-900 ms ICE + DTLS warm-up [**local main head**] |
 
 ## Session 114 close (partial) (2026-04-21)
 
