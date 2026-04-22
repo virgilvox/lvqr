@@ -29,10 +29,25 @@ proptest! {
     /// NAL bodies between four-byte start codes, the AVCC output
     /// must be parseable as a sequence of length-prefixed NALs
     /// whose bodies match the inputs exactly.
+    ///
+    /// "Well-formed" here means: no NAL body contains an embedded
+    /// `00 00 00..03` start-code-like pattern. Real H.264 encoders
+    /// escape those via an emulation-prevention byte (`00 00 03 xx`)
+    /// before emitting Annex B; a generator that does not do that
+    /// would produce byte sequences the splitter legitimately
+    /// reinterprets as additional start codes, which is not a bug
+    /// in the splitter. The adversarial / unescaped case is already
+    /// covered by the never-panics properties above.
     #[test]
     fn well_formed_round_trip_preserves_bodies(
         nals in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 1..40), 1..8)
     ) {
+        for nal in &nals {
+            for w in nal.windows(3) {
+                prop_assume!(!(w[0] == 0x00 && w[1] == 0x00 && w[2] <= 0x03));
+            }
+        }
+
         let mut annex_b = Vec::new();
         for nal in &nals {
             annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);

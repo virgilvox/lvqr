@@ -1,0 +1,16 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# Session 116 follow-up (CI run 24804745244 on Ubuntu with Rust 1.95
+# clippy, 2026-04-22): proptest caught a case where a NAL body
+# containing an embedded start-code pattern ([0, 0, 1]) was
+# reinterpreted by the splitter as an additional start code, producing
+# a round-trip-preservation failure. The prop_assume! filter in the
+# test source now excludes such inputs (real encoders apply
+# emulation-prevention before emitting them); this seed is pinned so
+# every future run replays the exact adversarial case.
+cc c837477ab4d547723a464b1b676169c791007723e9ade5d771efb43ee30ba0ac
