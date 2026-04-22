@@ -122,6 +122,16 @@ struct ServeArgs {
     #[arg(long, default_value = "3", env = "LVQR_MAX_PEERS")]
     max_peers: usize,
 
+    /// Number of root peers (direct server fanout) before new
+    /// subscribers are assigned as children of existing peers.
+    /// Defaults to `lvqr_mesh::MeshConfig::default().root_peer_count`
+    /// (30). Lower values force earlier promotion of subscribers into
+    /// child-of-root roles; useful for small-scale deployments and
+    /// end-to-end tests. Only meaningful when `--mesh-enabled`.
+    /// Session 116.
+    #[arg(long, env = "LVQR_MESH_ROOT_PEER_COUNT")]
+    mesh_root_peer_count: Option<usize>,
+
     /// Path to TLS certificate (PEM). Auto-generates self-signed if omitted.
     #[arg(long, env = "LVQR_TLS_CERT")]
     tls_cert: Option<PathBuf>,
@@ -446,7 +456,7 @@ async fn serve_from_args(
         federation_links: Vec::new(),
         no_auth_live_playback: args.no_auth_live_playback,
         no_auth_signal: args.no_auth_signal,
-        mesh_root_peer_count: None,
+        mesh_root_peer_count: args.mesh_root_peer_count,
     };
 
     let handle = start(config).await?;
