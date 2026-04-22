@@ -1,0 +1,113 @@
+name: Mesh E2E
+
+# Playwright end-to-end for the @lvqr/core MeshPeer client under
+# bindings/js/tests/e2e/. Distinct from .github/workflows/e2e.yml
+# (which covers the Tier 1 test-app shell under tests/e2e/) because
+# the mesh suite owns a separate npm workspace (bindings/js/), its
+# own playwright.config.ts, and boots a real `lvqr serve` subprocess
+# via Playwright's webServer block. Landed alongside session 116
+# row 115 (two-peer DataChannel relay).
+#
+# Triggers: changes to the @lvqr/core source, the test spec, the
+# signal / mesh / CLI crates that the test exercises end-to-end, or
+# this workflow file.
+#
+# Soft-fail for now via continue-on-error. WebRTC on a clean Linux
+# CI runner is mostly reliable but ICE + DataChannel negotiation has
+# environment-sensitive edge cases (IPv6, loopback routing, nested
+# virtualization) that are worth flagging rather than blocking PRs
+# on during the first few weeks of this workflow's life. Promote to
+# required once the green-run streak is established.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "bindings/js/packages/core/src/mesh.ts"
+      - "bindings/js/packages/core/src/index.ts"
+      - "bindings/js/tests/e2e/**"
+      - "bindings/js/playwright.config.ts"
+      - "bindings/js/package.json"
+      - "bindings/js/package-lock.json"
+      - "crates/lvqr-signal/**"
+      - "crates/lvqr-mesh/**"
+      - "crates/lvqr-cli/src/main.rs"
+      - "crates/lvqr-cli/src/lib.rs"
+      - ".github/workflows/mesh-e2e.yml"
+  push:
+    branches: [main]
+    paths:
+      - "bindings/js/packages/core/src/mesh.ts"
+      - "bindings/js/packages/core/src/index.ts"
+      - "bindings/js/tests/e2e/**"
+      - "bindings/js/playwright.config.ts"
+      - "bindings/js/package.json"
+      - "bindings/js/package-lock.json"
+      - "crates/lvqr-signal/**"
+      - "crates/lvqr-mesh/**"
+      - "crates/lvqr-cli/src/main.rs"
+      - "crates/lvqr-cli/src/lib.rs"
+      - ".github/workflows/mesh-e2e.yml"
+  workflow_dispatch:
+
+jobs:
+  mesh-e2e:
+    name: Playwright (chromium)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rust side: build the lvqr binary that Playwright's webServer
+      # will spawn. The binary path is resolved relative to
+      # bindings/js/playwright.config.ts as ../../target/debug/lvqr.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: mesh-e2e-v1
+      - name: Build lvqr-cli (debug)
+        run: cargo build -p lvqr-cli
+
+      # Rebuild @lvqr/core dist/ so the test's `addInitScript` pulls
+      # the latest MeshPeer (including any pushFrame / onChildOpen
+      # additions that motivated the workflow trigger).
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: bindings/js/package-lock.json
+
+      - name: Install bindings/js workspace dependencies
+        working-directory: bindings/js
+        run: npm install --no-audit --no-fund
+
+      - name: Build @lvqr/core dist/
+        working-directory: bindings/js/packages/core
+        run: npm run build:ts
+
+      - name: Install Chromium (with system deps)
+        working-directory: bindings/js
+        run: npx playwright install --with-deps chromium
+
+      - name: Run mesh Playwright tests
+        working-directory: bindings/js
+        run: npx playwright test
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh-playwright-report-${{ github.run_id }}
+          path: bindings/js/playwright-report
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload Playwright traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh-playwright-traces-${{ github.run_id }}
+          path: bindings/js/test-results
+          if-no-files-found: ignore
+          retention-days: 14
