@@ -2,7 +2,7 @@
 
 ## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist). **Phase A v1.1 + all mesh-prereqs + phase-B rows 113 (WHEP AAC-to-Opus) + 114 (WHIP->HLS + SRT->DASH + RTMP->WHEP audio E2E; last row is feature-gated on `transcode` and runs on GStreamer-enabled CI hosts) SHIPPED on local `main`, unpushed**. 941 workspace tests on the default gate (unchanged from 114 partial close; new 115 target is feature-gated out), 29 crates. Next: session 116 (mesh data-plane step 2 with Playwright two-browser E2E) per `PLAN_V1.1.md` row 115.
 
-**Last Updated**: 2026-04-22 (session 115 close). Local `main` head is `3937a44` (session 115 feat) pending the close-doc commit that replaces this header. Origin/main remains at `2e50635`. **6 unpushed commits on local main**: `323be2f` feat(whep) 113 + `3e9b444` docs 113 close + `b70be73` feat(test) 114 partial + `b315345` docs 114 close + `d1b9607` post-114 docs tidy + `3937a44` feat(test) 115. No push instruction issued this session; a future push event would emit the whole chain as a single batch.
+**Last Updated**: 2026-04-22 (session 115 close + post-close fix). Local `main` head is `0c2c59d` (post-close fix sharing the AAC test-bytes generator via a new `lvqr_transcode::test_support` module so `rtmp_whep_audio_e2e.rs` does not need `gstreamer` as a direct dev-dep on `lvqr-cli`). Origin/main remains at `2e50635`. **8 unpushed commits on local main**: `323be2f` feat(whep) 113 + `3e9b444` docs 113 close + `b70be73` feat(test) 114 partial + `b315345` docs 114 close + `d1b9607` post-114 docs tidy + `3937a44` feat(test) 115 + `80bba4b` docs 115 close + `0c2c59d` fix(transcode) test-support module. No push instruction issued this session; a future push event would emit the whole chain as a single batch.
 
 ## Session 115 close (2026-04-22)
 
@@ -44,6 +44,14 @@
 * All session 113 known limitations (per-session encoder, approximate Opus SLO stamp, no client-side render timing) unchanged.
 * All session 114 known limitations unchanged (LL-HLS partial-vs-segment tolerance in `whip_hls_e2e.rs`, SRT socket held open across DASH reads in `srt_dash_e2e.rs`).
 
+### Post-115 fix (2026-04-22, commit `0c2c59d`)
+
+A design audit on top of the close commit surfaced a latent CI-break in `crates/lvqr-cli/tests/rtmp_whep_audio_e2e.rs`: the test imported `gstreamer`, `gstreamer-app`, and `glib` directly, but `lvqr-cli`'s `Cargo.toml` does not list those as direct deps (they arrive only transitively via `lvqr-transcode` when the `transcode` feature is on). A transitive dep is not in the downstream crate's namespace for `use ...`, so the test file would resolve-error on any GStreamer-enabled CI host running `cargo test -p lvqr-cli --features transcode --test rtmp_whep_audio_e2e`. The default local gate did not catch it because the test is `#![cfg(feature = "transcode")]`-gated and never compiled on GStreamer-absent hosts.
+
+Fix commit `0c2c59d` hoists the `audiotestsrc ! avenc_aac ! aacparse` helper out of `crates/lvqr-transcode/tests/aac_opus_roundtrip.rs` into a new `pub mod lvqr_transcode::test_support` module gated on the existing `transcode` feature. Both the session 113 encoder round-trip test and the session 115 RTMP->WHEP test now call `lvqr_transcode::test_support::generate_aac_access_units(duration_ms)`, so neither needs a direct gstreamer dep; the gstreamer crate graph stays a private implementation detail of `lvqr-transcode`. Also dedups ~80 LOC of identical pipeline setup across the two tests. Default gate still 941 / 0 / 1.
+
+Semantic note: the shared helper uses `if let Ok(map) = buf.map_readable()` to skip the current sample on a transient map failure, whereas the original `aac_opus_roundtrip.rs` used `buf.map_readable().ok()?` which would propagate a `None` return from the whole function. In practice `map_readable` does not fail on live in-process GStreamer buffers; the tolerant behavior is strictly a small improvement and does not change the "AAC round-trips through the encoder" assertion.
+
 ## Session 114 close (partial) (2026-04-21)
 
 ### Commit chain on local `main` (chronological)
@@ -65,7 +73,8 @@
 | `b315345` | docs | Session 114 partial close -- HANDOFF + PLAN_V1.1.md row 114 PARTIALLY SHIPPED |
 | `d1b9607` | docs | Post-114 HANDOFF cleanup -- real SHAs + dedup + kickoff refresh |
 | `3937a44` | feat(test) | **115** RTMP->WHEP audio E2E -- closes 114 row 2 (feature-gated `transcode`); TestServer gains `with_whep()` |
-| (pending) | docs | Session 115 close -- HANDOFF + PLAN_V1.1.md row 114 SHIPPED [**local main head**] |
+| `80bba4b` | docs | Session 115 close -- HANDOFF + PLAN_V1.1.md row 114 SHIPPED |
+| `0c2c59d` | fix(transcode) | Post-115 fix -- share the AAC test-bytes generator via `pub lvqr_transcode::test_support` so `rtmp_whep_audio_e2e.rs` does not need direct gstreamer dev-deps on `lvqr-cli`; `aac_opus_roundtrip.rs` refactored to the same shared helper (~80 LOC de-dup) [**local main head**] |
 
 ## Session 114 close (partial) (2026-04-21)
 
