@@ -284,22 +284,27 @@ JavaScript (`@lvqr/core`, `@lvqr/player` at 0.3.1 on npm), Python
 Topology planner, WebSocket signaling, `/api/v1/mesh` admin route,
 and the client-side `MeshPeer` (WebRTC DataChannel forwarding,
 opening `RTCPeerConnection` to the assigned parent, forwarding to
-children) already exist. The data-plane gap is server-side
-subscriber registration and an end-to-end test.
-- [ ] **Server-side subscriber registration** - wire
-  `MeshCoordinator::add_peer` into `ws_relay_session` so every WS
-  subscriber is placed in the tree at connect time and receives an
-  `AssignParent` over `/signal`.
-- [ ] **Subscribe-token admission on `/signal`** (currently
-  unauthenticated).
-- [ ] **Add `ServerHandle::mesh()` snapshot accessor** so
-  integration tests can assert on coordinator state.
-- [ ] **Lock in MoQ-over-DataChannel wire format** in-commit
-  (leading candidate: raw MoQ frame bytes prefixed by an 8-byte
-  big-endian `object_id`).
-- [ ] **Two-peer end-to-end test** proving a subscriber connected
-  through the mesh receives the same fMP4 frames as a
-  server-direct subscriber.
+children) already exist. The data-plane gap is
+browser-to-browser DataChannel media relay and an end-to-end
+test.
+- [x] ~~Server-side subscriber registration.~~ Every
+  `ws_relay_session` now calls `MeshCoordinator::add_peer` at
+  connect time (server-generated `ws-{counter}` peer_id) and
+  sends a leading `peer_assignment` JSON text frame on the WS
+  before any binary MoQ frames. Shipped in session 111-B2.
+- [x] ~~Subscribe-token admission on `/signal`.~~ Shipped in
+  sessions 111-B1 + 111-B3 via
+  `Sec-WebSocket-Protocol: lvqr.bearer.<token>` (preferred) and
+  `?token=<token>` query fallback.
+- [x] ~~`ServerHandle::mesh_coordinator()` snapshot accessor.~~
+  Shipped in session 111-B1 for in-process integration tests.
+- [x] ~~MoQ-over-DataChannel wire format decision.~~ Locked in
+  session 111-B1 as an 8-byte big-endian `object_id` prefix +
+  raw MoQ frame bytes per DataChannel message. Documented in
+  `docs/mesh.md`.
+- [ ] **Two-peer end-to-end browser test** proving a subscriber
+  connected through the DataChannel mesh receives the same
+  fMP4 frames as a server-direct subscriber.
 - [ ] **Actual-vs-intended offload reporting**: clients report
   "served by peer X"; coordinator aggregates; `/api/v1/mesh`
   returns measured offload.
