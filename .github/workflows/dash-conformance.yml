@@ -1,0 +1,175 @@
+name: MPEG-DASH Conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# DASH-IF publishes a full-fledged conformance validator as a PHP
+# web application and as a Docker image (`dashif/conformance`).
+# Wiring the authoritative tool into CI is a multi-step dance
+# against its REST API that does not fit the one-shot validator
+# shape used by every other workflow in this repo, so the first
+# iteration here uses GPAC's `MP4Box -dash-check` as the primary
+# validator (apt-installable on ubuntu-latest, covers structural
+# conformance of the MPD + segment set) plus `ffmpeg` as the
+# client-pull fallback (any structural break causes ffmpeg to
+# refuse the stream).
+#
+# Posture matches `hls-conformance.yml` exactly: prefer the
+# authoritative tool, soft-fall-back to ffmpeg so the artifact
+# always carries an independent read of the same surface, and
+# mark the job `continue-on-error: true` until we see a clean
+# run on main. Promotion to a required check, and upgrade of the
+# primary validator to the DASH-IF container, are tracked as
+# follow-up rows in `tracking/PLAN_V1.1.md`.
+
+jobs:
+  dash-validator:
+    name: MPEG-DASH conformance (GPAC + ffmpeg client pull)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: dash-conformance-v1
+
+      - name: Install ffmpeg + GPAC
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg gpac
+
+      - name: Build lvqr-cli (release)
+        run: cargo build -p lvqr-cli --release
+
+      - name: Prepare artifact directory
+        run: mkdir -p /tmp/dash-out
+
+      - name: Start lvqr serve in background
+        run: |
+          set -euo pipefail
+          ./target/release/lvqr serve \
+            --port 4443 \
+            --rtmp-port 1935 \
+            --admin-port 18080 \
+            --hls-port 8888 \
+            --dash-port 8889 \
+            --whip-port 0 \
+            --whep-port 0 \
+            > /tmp/dash-out/lvqr-serve.log 2>&1 &
+          echo $! > /tmp/lvqr-serve.pid
+          # Wait for the DASH port to bind. `nc -z` exits 0 once the
+          # listener is up; 20 * 0.5 s = 10 s budget which is plenty
+          # on a cold GitHub runner.
+          for i in $(seq 1 20); do
+            if nc -z 127.0.0.1 8889 2>/dev/null; then
+              echo "lvqr serve DASH port is ready"
+              break
+            fi
+            sleep 0.5
+          done
+
+      - name: Push synthetic RTMP fixture with ffmpeg
+        run: |
+          set -euo pipefail
+          # Canonical fixture: 20 seconds of 640x360@30fps H.264
+          # baseline with AAC-LC 44.1 kHz stereo. Keyframe every
+          # second (g=30) keeps segment boundaries deterministic
+          # for the validator's timing checks. Mirrors the HLS
+          # conformance fixture byte-for-byte.
+          ffmpeg -hide_banner -loglevel warning \
+            -re \
+            -f lavfi -i testsrc=size=640x360:rate=30 \
+            -f lavfi -i sine=frequency=440:sample_rate=44100 \
+            -c:v libx264 -preset ultrafast -tune zerolatency \
+            -profile:v baseline -level 3.1 -pix_fmt yuv420p \
+            -g 30 -keyint_min 30 -sc_threshold 0 \
+            -c:a aac -b:a 128k -ac 2 \
+            -t 20 \
+            -f flv rtmp://127.0.0.1:1935/live/test 2>&1 | tee /tmp/dash-out/ffmpeg-publish.log
+
+      - name: Give the MPD time to finalize
+        run: sleep 3
+
+      - name: Capture MPD + init + first media segment
+        run: |
+          set +e
+          # MPD first; the validator reads segment URIs from it.
+          curl -sS -o /tmp/dash-out/manifest.mpd http://127.0.0.1:8889/dash/live/test/manifest.mpd
+          # Init segments (one per track; audio init may 404 if
+          # the bridge did not receive AAC in time -- log and
+          # continue so the artifact carries the partial read).
+          curl -sS -o /tmp/dash-out/init-video.m4s http://127.0.0.1:8889/dash/live/test/init-video.m4s
+          curl -sS -o /tmp/dash-out/init-audio.m4s http://127.0.0.1:8889/dash/live/test/init-audio.m4s || true
+          # First video media segment.
+          curl -sS -o /tmp/dash-out/seg-video-1.m4s http://127.0.0.1:8889/dash/live/test/seg-video-1.m4s || true
+          echo "--- manifest.mpd ---"
+          cat /tmp/dash-out/manifest.mpd || true
+          ls -la /tmp/dash-out
+
+      - name: Run GPAC MP4Box DASH conformance check
+        id: mp4box_check
+        run: |
+          set +e
+          # `-dash-check` structural conformance pass against a
+          # local MPD. MP4Box resolves segment URIs relative to
+          # the MPD base URL; we serve it via file:// because
+          # MP4Box's HTTP client is quirky about chunked-encoding
+          # live MPDs. Pull segments separately into the same
+          # directory; MP4Box checks the static tree.
+          cd /tmp/dash-out
+          MP4Box -dash-check manifest.mpd 2>&1 | tee mp4box-check.log
+          RC=${PIPESTATUS[0]}
+          echo "MP4Box -dash-check exit code: $RC"
+          # Soft-fail for now: the `continue-on-error: true` on
+          # the job means a non-zero exit here still surfaces in
+          # the artifact but does not block the PR. Flip after
+          # first clean run on main.
+          exit 0
+
+      - name: ffmpeg client-side DASH pull
+        if: always()
+        run: |
+          set +e
+          # Second cheap validator: ffmpeg as a DASH client pulls
+          # the MPD and remuxes to fMP4. Any structural break in
+          # the MPD (missing codecs attribute, bad SegmentTemplate
+          # timing, mismatched init segment) makes ffmpeg refuse.
+          # Runs even when MP4Box fails so the artifact always
+          # carries an independent read of the same surface.
+          ffmpeg -hide_banner -loglevel warning \
+            -i http://127.0.0.1:8889/dash/live/test/manifest.mpd \
+            -c copy -t 5 /tmp/dash-out/ffmpeg-pull.mp4 \
+            2>&1 | tee /tmp/dash-out/ffmpeg-pull.log
+          PULL_RC=${PIPESTATUS[0]}
+          ffprobe -v error -show_streams /tmp/dash-out/ffmpeg-pull.mp4 \
+            2>&1 | tee /tmp/dash-out/ffprobe.log
+          PROBE_RC=${PIPESTATUS[0]}
+          echo "ffmpeg pull exit: $PULL_RC; ffprobe exit: $PROBE_RC"
+          # Don't fail the step on the ffmpeg pull for now; it is
+          # the weaker backup signal and the authoritative check
+          # is MP4Box above.
+
+      - name: Stop lvqr serve
+        if: always()
+        run: |
+          if [ -f /tmp/lvqr-serve.pid ]; then
+            kill "$(cat /tmp/lvqr-serve.pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload conformance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dash-conformance-output
+          path: /tmp/dash-out
+          if-no-files-found: warn
+          retention-days: 14
