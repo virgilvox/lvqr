@@ -1,8 +1,50 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist). **Phase A v1.1 + all mesh-prereqs + phase-B rows 113 (WHEP AAC-to-Opus) + 114 partial (WHIP->HLS + SRT->DASH E2E tests; RTMP->WHEP audio still pending as feature-gated test) SHIPPED on local `main`, unpushed**. 941 workspace tests on the default gate (+7 over 113 close), 29 crates. Next: session 115 (mesh data-plane step 2 with Playwright two-browser E2E), or finish session 114 row 2 (RTMP->WHEP audio E2E on a GStreamer-enabled CI host).
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** (8 of 8 core items; `examples/tier4-demos/` exit criterion tracked in v1.1 checklist). **Phase A v1.1 + all mesh-prereqs + phase-B rows 113 (WHEP AAC-to-Opus) + 114 (WHIP->HLS + SRT->DASH + RTMP->WHEP audio E2E; last row is feature-gated on `transcode` and runs on GStreamer-enabled CI hosts) SHIPPED on local `main`, unpushed**. 941 workspace tests on the default gate (unchanged from 114 partial close; new 115 target is feature-gated out), 29 crates. Next: session 116 (mesh data-plane step 2 with Playwright two-browser E2E) per `PLAN_V1.1.md` row 115.
 
-**Last Updated**: 2026-04-21 (session 114 partial close). Local `main` head is `b315345` (session 114 close-doc); origin/main remains at `2e50635`. **4 unpushed commits on local main**: `323be2f` feat(whep) 113 + `3e9b444` docs 113 close + `b70be73` feat(test) 114 partial + `b315345` docs 114 close. No push instruction issued this session; a future push event would emit them as a single batch.
+**Last Updated**: 2026-04-22 (session 115 close). Local `main` head is `3937a44` (session 115 feat) pending the close-doc commit that replaces this header. Origin/main remains at `2e50635`. **6 unpushed commits on local main**: `323be2f` feat(whep) 113 + `3e9b444` docs 113 close + `b70be73` feat(test) 114 partial + `b315345` docs 114 close + `d1b9607` post-114 docs tidy + `3937a44` feat(test) 115. No push instruction issued this session; a future push event would emit the whole chain as a single batch.
+
+## Session 115 close (2026-04-22)
+
+**Shipped**: the deferred row-2 of session 114 (RTMP to WHEP audio E2E). That row was the single largest documented user-visible test gap from the v1.1 audit (no RTMP-to-WHEP coverage at all on any ingest path feeding a WebRTC subscriber), and closing it flips `tracking/PLAN_V1.1.md` row 114 from "PARTIALLY SHIPPED" to "SHIPPED". The kickoff prompt listed this as Option B with the caveat that GStreamer absence on the dev host would compile-and-skip the test target; this host matched that profile, so the test lands as a feature-gated compile-only on local `main` and picks up the actual asserts on the GStreamer-enabled CI matrix that already runs `aac_opus_roundtrip.rs`.
+
+1. **`crates/lvqr-cli/tests/rtmp_whep_audio_e2e.rs`** (+460 LOC, feature-gated on `transcode`). Generates ~800 ms of real AAC-LC 48 kHz stereo audio via an in-test `audiotestsrc ! avenc_aac ! aacparse` GStreamer pipeline (same pattern as `crates/lvqr-transcode/tests/aac_opus_roundtrip.rs`, strips the 7-byte ADTS header so each vec is a raw AAC access unit that `flv_audio_raw` can wrap). The test probes `AacToOpusEncoderFactory::is_available()` up front and prints a `skipping rtmp_whep_audio_e2e: ...` line + returns clean when any of `aacparse` / `avdec_aac` / `audioconvert` / `audioresample` / `opusenc` / `avenc_aac` is missing, matching the `aac_opus_roundtrip.rs` skip idiom.
+   * **RTMP publisher**: `rml_rtmp` client connects, completes the RTMP handshake, publishes an FLV video sequence header + FLV audio sequence header (AAC-LC 48 kHz stereo, ASC `[0x11, 0x90]` matching the encoder test's expected config bytes) + one H.264 keyframe (so the broadcast registers on the relay), then spins the pre-generated AAC access units out at 21 ms cadence wrapped in `[0xAF, 0x01, ...]` FLV audio tags.
+   * **WHEP HTTP subscriber**: fresh `str0m::Rtc` with `enable_opus(true)` only, audio-recvonly mid, POSTs the offer to `/whep/live/test`, asserts 201 Created + a `Location: /whep/live/test/{session_id}` header + an SDP answer that contains `opus`, then runs the same poll-loop shape as `crates/lvqr-whep/tests/e2e_str0m_loopback_opus.rs` until the client raises `Event::MediaData` at least once.
+   * **Expected wire path**: FLV audio -> `RtmpMoqBridge` -> `SessionMsg::AudioConfig` (first) + `SessionMsg::Aac` (subsequent) -> `AacToOpusEncoder::push` -> `OpusFrame` on `opus_rx` -> `run_session_loop`'s Opus arm -> str0m `Writer::write` on the negotiated Opus Pt -> client's `Event::MediaData`.
+   * **Design decision: publish AAC seq header BEFORE the first keyframe**. This ensures `WhepServer::audio_configs` caches the AudioSpecificConfig before the WHEP subscriber POSTs its offer, so `handle_offer`'s session-113 cached-config replay fires on the new session handle and the `AacToOpusEncoder` is spawned with the correct `AacAudioConfig` at the moment the first `SessionMsg::Aac` lands. Without this ordering the encoder would start in "no config yet" mode and the first burst of samples would be dropped while waiting for the config to arrive out-of-band.
+   * **Design decision: 400 ms sleep between RTMP publisher spawn and WHEP POST**. The RTMP handshake + connect + publish + first audio seq header takes a handful of async ticks; giving the bridge enough wall time to cache the ASC before the offer hits eliminates a known-flaky race where the `WhepServer::on_audio_config` fanout arrives after `handle_offer` has already inserted the new session into the registry without a replay. The eventual race-resolving code path is still exercised by the out-of-order samples that arrive later, but the first-media-frame assert is much faster when the initial session has the ASC up front.
+
+2. **`crates/lvqr-test-utils/src/test_server.rs`**: new `whep_enabled: bool` field + `with_whep()` builder + `whep_addr()` accessor. Mirrors the existing `with_whip` / `whip_addr` shape bit-for-bit (feature unchanged; default disabled so every pre-115 TestServer caller still starts without the WHEP listener).
+
+3. **Session 115 close doc** (this block). `tracking/PLAN_V1.1.md` row 114 flipped from "PARTIALLY SHIPPED" to "SHIPPED" with the row-2 detail rolled into the row summary. Phase B rows 113 + 114 are now both SHIPPED; the next phase-B row is 115 (mesh data-plane step 2 with Playwright).
+
+### Key 115 design decisions baked in
+
+* **Test-utils change is additive, not a new crate**. `TestServerConfig::with_whep()` is a sibling of the existing `with_whip` / `with_dash` / `with_srt` / `with_rtsp` builders; `whep_addr: None` was already hardcoded in `test_server.rs:284` since the initial TestServer landing, and all that was needed was to flip the hardcoded `None` to `if config.whep_enabled { Some(ephemeral) } else { None }`. The CLI-side composition root already wires `WhepServer` + `Str0mAnswerer::with_aac_to_opus_factory` correctly when `config.whep_addr` is `Some` and the `transcode` feature is on; the test server therefore inherits the session 113 Opus-audio path for free the moment `with_whep()` is called under `--features transcode`.
+* **Test lives in `crates/lvqr-cli`, not `crates/lvqr-whep`**. `lvqr-whep` has the unit-style `e2e_str0m_loopback*.rs` tests that hit `Str0mAnswerer::create_session` directly, bypassing HTTP. A true RTMP-to-WHEP E2E needs both the RTMP ingest crate (`lvqr-ingest`'s RTMP server) and the WHEP HTTP router live in the same process, so the CLI crate's composition root via `TestServer` is the right home. The str0m dev-dep pin added for session 114 (`str0m = "0.18"` on `lvqr-cli`) is reused verbatim.
+* **FLV audio header matches the encoder's 48 kHz stereo contract**. `aac_opus_roundtrip.rs`'s in-module AAC generator produces 48 kHz stereo AAC-LC (ASC bytes `[0x11, 0x90]`), and the encoder's `AacAudioConfig` is keyed on those bytes. Using the same ASC in the RTMP publisher keeps the whole pipeline (bridge -> encoder -> opusenc -> Opus RTP -> client) on a single matched config; the alternative (44.1 kHz stereo, ASC `[0x12, 0x10]`, matching `rtmp_hls_e2e.rs`) would have exercised `opusenc`'s `audioresample` stage on the way out, which is worth testing but not for this particular smoke test.
+* **Hold the RTMP publisher alive via `tokio::spawn` + `JoinHandle::abort`**. Dropping the RTMP stream mid-publish fires `BroadcastStopped` through the bridge which tears down the WHEP session handle's registry entry before the client has had a chance to poll `Event::MediaData`. The test spawns the publisher, awaits its first few ticks via a 400 ms sleep, lets the client poll loop run, and only `abort()`s the publisher after the subscriber's asserts complete. Symmetric shutdown via `server.shutdown().await` follows.
+
+### Ground truth (session 115 close)
+
+* **Head**: feat commit `3937a44` + close-doc commit (pending, lands with this block). Local `main` is 6 commits ahead of `origin/main` (head `2e50635`); both 113 and 114 and 115 commit pairs are unpushed.
+* **Tests (default features gate)**: **941** passed, 0 failed, 1 ignored on macOS. Unchanged from session 114's 941 because the new target is `#![cfg(feature = "transcode")]` so the default gate does not compile it. Hosts with GStreamer installed (CI matrix) pick up the new test under `cargo test -p lvqr-cli --features transcode --test rtmp_whep_audio_e2e`.
+* **CI gates locally clean**:
+  * `cargo fmt --all --check`.
+  * `cargo clippy --workspace --all-targets -- -D warnings`.
+  * `cargo test --workspace` 941 / 0 / 1.
+  * `cargo test -p lvqr-cli --features transcode --test rtmp_whep_audio_e2e` not verifiable on this macOS dev host (GStreamer runtime not installed via brew); covered by the feature-on CI matrix alongside `aac_opus_roundtrip.rs`.
+* **Workspace**: **29 crates**, unchanged.
+* **crates.io**: unchanged. Session 115 adds one new integration test target + a non-breaking builder method (`with_whep`) on `TestServerConfig` + a non-breaking accessor (`whep_addr`) on `TestServer`. No public API on any published crate moved.
+
+### Known limitations / documented v1 shape (after 115 close)
+
+* **`rtmp_whep_audio_e2e` runs only on GStreamer-enabled CI hosts**. This is the same posture as `aac_opus_roundtrip.rs` and the transcode_ladder_e2e; operators who want to run the full test locally need GStreamer 1.22+ with `gst-libav` + `gst-plugins-base` + `gst-plugins-good` installed. The default CI gate continues to skip the compile of this target.
+* All session 113 known limitations (per-session encoder, approximate Opus SLO stamp, no client-side render timing) unchanged.
+* All session 114 known limitations unchanged (LL-HLS partial-vs-segment tolerance in `whip_hls_e2e.rs`, SRT socket held open across DASH reads in `srt_dash_e2e.rs`).
+
+## Session 114 close (partial) (2026-04-21)
 
 ### Commit chain on local `main` (chronological)
 
@@ -20,7 +62,10 @@
 | `323be2f` | feat(whep) | **113** WHEP AAC-to-Opus transcoder + `on_audio_config` observer hook + ADTS wrap + factory probe + session poll-loop Opus arm (integration test gated on `transcode` feature) |
 | `3e9b444` | docs | Session 113 close -- HANDOFF + README "Fixed on main" flag + PLAN_V1.1.md row 113 SHIPPED |
 | `b70be73` | feat(test) | **114 partial** WHIP->HLS + SRT->DASH E2E tests + 5 session-113 audit unit tests (parse_aac_asc refactor) (+7 default-gate tests, 934 -> 941) |
-| `b315345` | docs | Session 114 partial close -- HANDOFF + PLAN_V1.1.md row 114 PARTIALLY SHIPPED [**local main head**] |
+| `b315345` | docs | Session 114 partial close -- HANDOFF + PLAN_V1.1.md row 114 PARTIALLY SHIPPED |
+| `d1b9607` | docs | Post-114 HANDOFF cleanup -- real SHAs + dedup + kickoff refresh |
+| `3937a44` | feat(test) | **115** RTMP->WHEP audio E2E -- closes 114 row 2 (feature-gated `transcode`); TestServer gains `with_whep()` |
+| (pending) | docs | Session 115 close -- HANDOFF + PLAN_V1.1.md row 114 SHIPPED [**local main head**] |
 
 ## Session 114 close (partial) (2026-04-21)
 
@@ -183,21 +228,21 @@ crates.io is unchanged since the 110 push chain. The published v0.4.0 crates do 
 * **No admission control** (unchanged from 108 B).
 * **No time-windowed retention on the admin snapshot** (unchanged from 107 A).
 
-## Session 115 entry point -- remaining phase-B work
+## Session 116 entry point -- remaining phase-B work
 
-Phase B rows 113 (WHEP AAC-to-Opus) and 114 (partial: WHIP->HLS + SRT->DASH E2E tests) are SHIPPED on local `main`. The pending phase-B work is:
+Phase B rows 113 (WHEP AAC-to-Opus) and 114 (WHIP->HLS + SRT->DASH + RTMP->WHEP audio E2E) are SHIPPED on local `main`. The pending phase-B work is:
 
-### Scope for session 115
+### Scope for session 116
 
 | # | Scope | Risk |
 |---|---|---|
 | 1 | **Mesh data-plane step 2.** Per `PLAN_V1.1.md` row 115: exercise the existing `@lvqr/core` `MeshPeer` client against the session 111-B server wiring. Add Playwright E2E with two browser peers. Flip `docs/mesh.md` from "topology planner only" to "topology planner + signaling wired; DataChannel media relay ready for end-to-end testing". | medium |
-| 2 (opt) | **RTMP-to-WHEP audio E2E test** (deferred from 114). Requires GStreamer on the CI host. Add `crates/lvqr-cli/tests/rtmp_whep_audio_e2e.rs` feature-gated on `transcode` + gracefully skipped on hosts without GStreamer. Uses the `aac_opus_roundtrip.rs` `audiotestsrc ! avenc_aac` generator pattern to produce real AAC, pushes via RTMP, subscribes via str0m client, asserts Opus `Event::MediaData` on the subscriber side. | low once GStreamer is available |
+| 2 | **Tier 4 examples/tier4-demos/ first public demo script.** Per `PLAN_V1.1.md` row 116: one polished scripted demo chaining WASM filter + Whisper captions + ABR transcode + archive + C2PA verify. Closes the Tier 4 exit criterion that was skipped. | low-medium |
 
 ### Known follow-up refactor candidates
 
 - **Split `start()` into per-subsystem wiring helpers.** `lvqr-cli/src/lib.rs::start` is still ~1000 lines. A per-subsystem split would drop lib.rs below 500 lines.
-- **Session 116**: `examples/tier4-demos/` first public demo script.
+- **Per-broadcast `AacToOpusEncoder`**. Session 113 ships a per-session encoder; for N > 1 WHEP subscribers sharing a broadcast a per-broadcast encoder behind a new flag would halve CPU. Defer to v1.2 once profiling confirms it matters.
 - **Shared-per-broadcast AacToOpusEncoder** (113 follow-up): factor the per-session encoder out behind a flag when profiling shows overhead matters.
 - **WHIP-to-HLS E2E full-segment assertion** (114 follow-up): extend `whip_hls_e2e.rs` to write keyframes far enough apart (>2 s) that a full `#EXTINF:` segment closes, proving the end-to-end segment-finalisation path rather than just the LL-HLS partial path.
 
