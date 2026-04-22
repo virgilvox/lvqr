@@ -1271,7 +1271,7 @@ async fn handle_master_playlist(multi: &MultiHlsServer, broadcast: &str) -> Resp
     // Sort siblings highest-to-lowest; the source variant is
     // inserted at the front so clients honouring playlist order pick
     // the source first.
-    sibling_variants.sort_by(|a, b| b.0.cmp(&a.0));
+    sibling_variants.sort_by_key(|b| std::cmp::Reverse(b.0));
     master.variants.push(source_variant);
     for (_, variant) in sibling_variants {
         master.variants.push(variant);
