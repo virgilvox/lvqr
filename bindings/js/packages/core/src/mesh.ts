@@ -111,6 +111,22 @@ export class MeshPeer {
     return this.children.size;
   }
 
+  /**
+   * Inject a media frame received from upstream (server) into the local
+   * mesh fanout. Used by root peers: a root has no parent DataChannel to
+   * drive `forwardToChildren`, so the integrator drains media from the
+   * server (via MoQ/WebTransport or WS) and calls `pushFrame` on every
+   * chunk to forward it to subscribed children.
+   *
+   * Non-root peers normally do not need this method; their fanout is
+   * driven from the parent-side `dc.onmessage` path. Calling `pushFrame`
+   * on a non-root peer is legal (it forwards to children) but bypasses
+   * the `onFrame` local-consumer callback.
+   */
+  pushFrame(data: Uint8Array): void {
+    this.forwardToChildren(data);
+  }
+
   private handleSignalMessage(msg: Record<string, unknown>): void {
     switch (msg.type) {
       case 'AssignParent':
