@@ -1032,24 +1032,13 @@ impl SessionHandle for Str0mSessionHandle {
         if !matches!(codec, MediaCodec::Aac) {
             return;
         }
-        if codec_config.len() < 2 {
+        let Some((object_type, sample_rate, channels)) = parse_aac_asc(codec_config) else {
             tracing::warn!(
                 len = codec_config.len(),
                 "whep: AAC AudioSpecificConfig too short; dropping",
             );
             return;
-        }
-        // ISO/IEC 14496-3 AudioSpecificConfig layout:
-        //   5 bits: audioObjectType
-        //   4 bits: samplingFrequencyIndex
-        //   4 bits: channelConfiguration (if freq_idx != 15)
-        // The FLV AAC sequence header embeds the ASC directly.
-        let b0 = codec_config[0];
-        let b1 = codec_config[1];
-        let object_type = b0 >> 3;
-        let freq_idx = ((b0 & 0x07) << 1) | (b1 >> 7);
-        let channels = (b1 >> 3) & 0x0F;
-        let sample_rate = aac_freq_index_to_hz(freq_idx);
+        };
         let msg = SessionMsg::AudioConfig {
             config_bytes: Bytes::copy_from_slice(codec_config),
             sample_rate,
@@ -1058,6 +1047,30 @@ impl SessionHandle for Str0mSessionHandle {
         };
         let _ = self.samples.send(msg);
     }
+}
+
+/// Parse an AAC AudioSpecificConfig into `(object_type, sample_rate_hz, channels)`.
+///
+/// ISO/IEC 14496-3 section 1.6.2.1 layout:
+/// * 5 bits: `audioObjectType`
+/// * 4 bits: `samplingFrequencyIndex`
+/// * 4 bits: `channelConfiguration` (when the frequency index is not 15)
+///
+/// Escape path (`samplingFrequencyIndex == 15`) is not handled today;
+/// FLV AAC-LC publishers never produce it because the FLV header
+/// canonicalises the sample rate via the ASC table. The function
+/// returns `None` when the input is shorter than 2 bytes.
+fn parse_aac_asc(bytes: &[u8]) -> Option<(u8, u32, u8)> {
+    if bytes.len() < 2 {
+        return None;
+    }
+    let b0 = bytes[0];
+    let b1 = bytes[1];
+    let object_type = b0 >> 3;
+    let freq_idx = ((b0 & 0x07) << 1) | (b1 >> 7);
+    let channels = (b1 >> 3) & 0x0F;
+    let sample_rate = aac_freq_index_to_hz(freq_idx);
+    Some((object_type, sample_rate, channels))
 }
 
 /// ISO/IEC 14496-3 Table 1.16: AAC samplingFrequencyIndex -> Hz.
@@ -1328,6 +1341,72 @@ mod tests {
         // Give the poll task a beat to absorb the sample. No assert:
         // the point is that none of the above panic, and the
         // subsequent handle drop still shuts the task down cleanly.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(handle);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // ---- Session 113: AAC AudioSpecificConfig parsing ----
+
+    #[test]
+    fn parse_aac_asc_aac_lc_48khz_stereo() {
+        // AAC-LC (object_type=2), freq_idx=3 (48 kHz), channels=2.
+        // Packed into 2 bytes: 0001_0001 1001_0000 = (0x11, 0x90).
+        let asc = [0x11u8, 0x90];
+        let parsed = parse_aac_asc(&asc).expect("2-byte ASC parses");
+        assert_eq!(parsed, (2, 48_000, 2));
+    }
+
+    #[test]
+    fn parse_aac_asc_aac_lc_44100_stereo_matches_flv_test_fixture() {
+        // Byte layout identical to `flv_audio_seq_header` in the
+        // rtmp_hls_e2e test: object_type=2, freq_idx=4 (44100),
+        // channels=2. Packed: (0x12, 0x10).
+        let asc = [0x12u8, 0x10];
+        let parsed = parse_aac_asc(&asc).expect("2-byte ASC parses");
+        assert_eq!(parsed, (2, 44_100, 2));
+    }
+
+    #[test]
+    fn parse_aac_asc_returns_none_for_short_input() {
+        assert!(parse_aac_asc(&[]).is_none());
+        assert!(parse_aac_asc(&[0x11]).is_none());
+    }
+
+    #[test]
+    fn aac_freq_index_to_hz_known_values() {
+        assert_eq!(aac_freq_index_to_hz(0), 96_000);
+        assert_eq!(aac_freq_index_to_hz(3), 48_000);
+        assert_eq!(aac_freq_index_to_hz(4), 44_100);
+        assert_eq!(aac_freq_index_to_hz(7), 22_050);
+        assert_eq!(aac_freq_index_to_hz(12), 7_350);
+        // Out-of-table values fall back to 44.1 kHz.
+        assert_eq!(aac_freq_index_to_hz(13), 44_100);
+        assert_eq!(aac_freq_index_to_hz(15), 44_100);
+    }
+
+    #[tokio::test]
+    async fn on_audio_config_aac_does_not_panic_and_survives_drop() {
+        // Integration-lite: call on_audio_config with a real
+        // FLV-shaped AAC ASC against a live session handle. Without
+        // the `aac-opus` feature the poll loop drops the
+        // SessionMsg::AudioConfig on arrival; the test is about
+        // proving the handle path parses the bytes + forwards the
+        // message without panicking and that the session still
+        // shuts down cleanly afterwards.
+        let answerer = Str0mAnswerer::new(Str0mConfig::default());
+        let (handle, _answer) = answerer
+            .create_session("live/test", CHROME_AUDIO_OFFER.as_bytes())
+            .expect("chrome offer accepted");
+
+        // AAC-LC 44.1 kHz stereo ASC from the RTMP test fixture.
+        handle.on_audio_config("1.mp4", MediaCodec::Aac, &[0x12, 0x10]);
+        // Degenerate empty config is tolerated (warn-and-drop
+        // inside on_audio_config).
+        handle.on_audio_config("1.mp4", MediaCodec::Aac, &[]);
+        // Non-AAC codec flows through the early-return branch.
+        handle.on_audio_config("1.mp4", MediaCodec::Opus, &[0x00, 0x00]);
+
         tokio::time::sleep(Duration::from_millis(20)).await;
         drop(handle);
         tokio::time::sleep(Duration::from_millis(20)).await;

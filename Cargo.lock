@@ -3149,6 +3149,7 @@ dependencies = [
  "serde",
  "serde_json",
  "srt-tokio",
+ "str0m",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",

@@ -150,3 +150,7 @@ tempfile = "3"
 lvqr-cluster = { workspace = true }
 moq-native = { workspace = true }
 url = { workspace = true }
+# Session 114 row 1: WHIP->HLS E2E test drives a real str0m client
+# against the CLI-hosted WHIP surface. Dev-only; matches the pin in
+# `lvqr-whep`'s dependency graph (0.18).
+str0m = "0.18"
