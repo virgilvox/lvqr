@@ -51,6 +51,7 @@ pub struct TestServerConfig {
     srt_enabled: bool,
     rtsp_enabled: bool,
     whip_enabled: bool,
+    whep_enabled: bool,
     #[cfg(feature = "c2pa")]
     c2pa: Option<lvqr_archive::provenance::C2paConfig>,
     #[cfg(feature = "whisper")]
@@ -209,6 +210,15 @@ impl TestServerConfig {
         self
     }
 
+    /// Enable the WHEP egress HTTP surface. Needed for cross-protocol
+    /// integration tests that exercise the `POST /whep/{broadcast}`
+    /// signaling path. Session 115 added this builder to support the
+    /// RTMP-to-WHEP audio E2E test.
+    pub fn with_whep(mut self) -> Self {
+        self.whep_enabled = true;
+        self
+    }
+
     /// Install a WASM fragment filter from a file path before
     /// any ingest listener starts. The server holds the
     /// `WasmFilterBridgeHandle` on `ServerHandle`; tests read
@@ -281,7 +291,7 @@ impl TestServer {
             hls_dvr_window_secs: 120,
             hls_target_duration_secs: 2,
             hls_part_target_ms: 200,
-            whep_addr: None,
+            whep_addr: if config.whep_enabled { Some(ephemeral) } else { None },
             whip_addr: if config.whip_enabled { Some(ephemeral) } else { None },
             dash_addr: if config.dash_enabled { Some(ephemeral) } else { None },
             rtsp_addr: if config.rtsp_enabled { Some(ephemeral) } else { None },
@@ -375,6 +385,13 @@ impl TestServer {
         self.handle
             .whip_addr()
             .expect("WHIP ingest not enabled on this TestServer; call with_whip() to enable")
+    }
+
+    /// Bound WHEP egress HTTP address. Panics if WHEP was not enabled.
+    pub fn whep_addr(&self) -> SocketAddr {
+        self.handle
+            .whep_addr()
+            .expect("WHEP egress not enabled on this TestServer; call with_whep() to enable")
     }
 
     /// WASM filter tap handle (read-only). Returns `None` when
