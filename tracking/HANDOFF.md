@@ -1,8 +1,81 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C: row 117 SHIPPED (session 118) + Range + tier4-demos CI follow-ups SHIPPED (session 119) + CLI C2PA wiring row 117-C SHIPPED (session 120) + C2PA integration test audit + demo C2PA opt-in row 117-D SHIPPED (session 121).** 965 workspace tests on the default gate + 1 Playwright E2E green on CI. 29 crates. Next: session 122 -- candidate phase-C rows are `@lvqr/core` admin-client completion + Vitest/pytest in CI (PLAN row 118), nightly 24h soak + feature matrix (PLAN row 119), authoritative DASH-IF container validator, OAuth2/JWKS (PLAN row 120), HMAC-signed playback URLs (PLAN row 121), shared-helpers refactor across 8+ integration tests.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C: row 117 SHIPPED (session 118) + Range + tier4-demos CI follow-ups SHIPPED (session 119) + CLI C2PA wiring row 117-C SHIPPED (session 120) + C2PA integration test audit + demo C2PA opt-in row 117-D SHIPPED (session 121) + SDK completion (JS admin client 9/9 + Vitest + pytest in CI) row 118-A SHIPPED (session 122).** 965 workspace tests on the default gate + 1 Playwright E2E + 10 Vitest + 8 pytest green on CI. 29 crates. Next: session 123 -- candidate phase-C rows are Python admin-client expansion (mirror JS 9/9), feature-flag CI matrix for `lvqr-cli --features {whisper,transcode,c2pa}`, nightly 24h soak (PLAN row 119), OAuth2/JWKS (PLAN row 120), HMAC-signed playback URLs (PLAN row 121), authoritative DASH-IF container validator, SDK reconnect/retry docs.
 
-**Last Updated**: 2026-04-22 (session 121 close). Local `main` is 2 commits ahead of `origin/main` (`5a2986b`) pending user push instruction. Session 121's commit pair (`feat(test): c2pa integration test audit + openssl recipe + demo-01 C2PA opt-in` + `docs: session 121 close + row 117-D SHIPPED`) rides on top of the session 120 chain (`035a4fc` + `5a2986b`).
+**Last Updated**: 2026-04-22 (session 122 close). Local `main` is 2 commits ahead of `origin/main` (`d4bb946`) pending user push instruction. Session 122's commit pair (`feat(sdk+ci): @lvqr/core admin client 9/9 routes + Vitest + pytest in CI` + `docs: session 122 close + PLAN row 118-A SHIPPED`) rides on top of the session 121 + reality-audit chain (`27bb458` + `4bce89b` + `d4bb946`).
+
+## Session 122 close (2026-04-22)
+
+**Shipped**: PLAN row 118 slice-A (SDK completion). User's "carry that work out" directive against the session-121 reality audit's Next Up #1 + #2. `@lvqr/core` admin client grows from 3 of 9 `/api/v1/*` routes to 9/9; new Vitest + pytest CI workflow runs both SDK test suites against a live `lvqr serve`. Closes two of the six Known-Limitations items the session-121 audit added to the README.
+
+### Deliverables
+
+1. **`@lvqr/core` admin client 9/9 route coverage.** `bindings/js/packages/core/src/admin.ts` grows from 95 LOC / 3 methods to 302 LOC / 9 methods. Every missing route gets a typed method:
+
+   * `mesh() -> MeshState`
+   * `slo() -> SloSnapshot` (shape `{ broadcasts: SloEntry[] }`)
+   * `clusterNodes() -> ClusterNodeView[]`
+   * `clusterBroadcasts() -> BroadcastSummary[]`
+   * `clusterConfig() -> ConfigEntry[]`
+   * `clusterFederation() -> FederationStatus` (shape `{ links: FederationLinkStatus[] }`)
+
+   Nine new TypeScript interfaces (`MeshState`, `SloEntry`, `SloSnapshot`, `NodeCapacity`, `ClusterNodeView`, `BroadcastSummary`, `ConfigEntry`, `FederationLinkStatus`, `FederationStatus`) + one union (`FederationConnectState = 'connecting' | 'connected' | 'failed'`) mirror the underlying Rust serde structs at `lvqr_admin::{MeshState, SloEntry}` + `lvqr_cluster::{BroadcastSummary, ConfigEntry, FederationLinkStatus, NodeCapacity, NodeId}` + `lvqr_admin::cluster_routes::{ClusterNodeView, FederationStatusView}`. `bindings/js/packages/core/src/index.ts` re-exports every new type alongside the existing surface.
+
+   New `LvqrAdminClientOptions.bearerToken` field: when set, every admin fetch emits `Authorization: Bearer <token>`. Closes the "only noop-auth deployments can actually use this client" gap.
+
+   Shared private `getJson<T>(path)` helper replaces the duplicated `resp.ok / resp.json()` boilerplate the original admin.ts repeated inline per method.
+
+2. **Vitest SDK smoke tests.** `bindings/js/vitest.config.ts` + `bindings/js/tests/sdk/admin-client.spec.ts` (+140 LOC, 10 tests). Each of the 9 admin methods is hit against a live `lvqr serve` at `LVQR_TEST_ADMIN_URL` (default `http://127.0.0.1:18090`); responses are shape-asserted against the declared TypeScript types. Plus one `fetchTimeoutMs aborts hung requests` test that points the client at TEST-NET-3 (`203.0.113.1:9`) + asserts the promise rejects within 5 s via the AbortController path. Completes in <250 ms end to end.
+
+   Added `vitest ^2.0.0` + `@types/node ^20.0.0` to `bindings/js` devDeps; added `test:sdk` script (`vitest run`) + `build` script (`npm --workspaces --if-present run build`) to the workspace root `package.json`.
+
+3. **`.github/workflows/sdk-tests.yml`.** New dedicated workflow mirroring `mesh-e2e.yml`'s pattern: Ubuntu runner, cargo + node + python toolchains, build `lvqr-cli` debug, install JS + Python deps, spawn `lvqr serve --admin-port 18090 --mesh-enabled --cluster-listen 127.0.0.1:18093 --no-auth-signal` in the background, poll `/healthz` for readiness (15 s budget), run `npm run test:sdk` (Vitest) + `python -m pytest -v` (pytest), kill lvqr, upload log artifact. `continue-on-error: true` initially per the same convention used by every new dedicated workflow since hls-conformance.yml.
+
+### Verification against a live lvqr
+
+Vitest suite: 10 / 0 / 0 in 246 ms on macOS against a debug `lvqr serve` with the exact flag set the workflow uses. Pytest suite: 8 / 0 / 0 in 160 ms. Both runs catch the admin client's runtime behavior against real server JSON, not mocked responses.
+
+### Key 122 design decisions baked in
+
+* **Python client expansion deferred, not done.** The user asked for the audit's #1 + #2 items; the JS admin client was #1 and Vitest/pytest CI was #2. Extending the Python client to match the JS 9/9 coverage is a natural follow-up but was not in the ranked list. Added as a new Known Limitations bullet + a pending Client-SDKs checklist item so operators see the asymmetry immediately.
+
+* **Vitest tests hit a real lvqr, not mocked fetch.** Mirrors the `CLAUDE.md` rule ("real integration tests with actual network connections, not mocks") even though that rule targets Rust. A mocked-fetch SDK test would catch TypeScript shape drift but not field-name drift on the server side; the extra 2-3 seconds of workflow time to boot a real lvqr is cheap insurance.
+
+* **`bearerToken` added to `LvqrAdminClientOptions`.** The pre-122 admin client sent unauthenticated requests; fine for Noop-provider deployments but the admin router returns 401 whenever a static-token or JWT provider is configured. Adding the option closes the gap in a single line per request.
+
+* **New `getJson<T>` private helper over keeping per-method duplicated fetch boilerplate.** Each of the 9 admin methods would otherwise repeat `const resp = await this.fetchWithTimeout(...); if (!resp.ok) throw new Error(...); return resp.json();`. One factored helper keeps the method bodies at one line each and makes future shape/auth changes a single-edit proposition.
+
+* **`FederationConnectState` as a TypeScript union type, not an enum.** `serde(rename_all = "lowercase")` on the Rust enum serializes as three exact strings; a TypeScript `enum` would not round-trip cleanly through JSON. The string union (`'connecting' | 'connected' | 'failed'`) exactly matches the on-wire shape + gives TypeScript users exhaustive-check safety.
+
+* **Vitest + pytest run under the SAME workflow, not separate workflows.** Both suites exercise the same `lvqr serve` instance; launching it twice (once per workflow) would double CI wall-clock for no signal benefit. Keeping them in one workflow also means a regression in a shared-config pattern surfaces on both at once.
+
+* **Workflow boots lvqr in the background + polls `/healthz`**, not via a Playwright `webServer` equivalent. Vitest has no webServer primitive; the simple bash-level spawn + nc-z / curl-health-check poll matches the shape `hls-conformance.yml` and `dash-conformance.yml` already use. Kept the stdout/stderr redirect + artifact upload so runner failures surface with a real log.
+
+* **`@lvqr/core` dist rebuilt in the workflow, not checked in.** Each workflow run runs `npm run build` under `bindings/js/packages/core/` so the Vitest suite loads the TypeScript types + compiled JS fresh. `dist/` is still committed for npm publish consumption, but CI builds its own copy so a forgotten local rebuild never masks a real TS compile failure.
+
+* **Python client expansion (mirror the 6 new JS methods) is an explicit follow-up**. The Python pytest suite today tests `healthz()`, `stats()`, and `list_streams()` via mocked httpx -- the three methods the client exposes. Adding the 6 missing methods is straightforward (mirror admin.ts against httpx); mocking against the same 9 routes is the natural Vitest-pytest symmetry. Added as Known Limitations bullet + Next Up item so the asymmetry is visible.
+
+### Ground truth (session 122 close)
+
+* **Head (pre-push)**: feat(sdk+ci) + this close-doc commit (pending). `origin/main` at `d4bb946` unchanged from the session-121 reality audit push.
+* **Tests**:
+  * Default workspace gate: **965** passed, 0 failed, 1 ignored (unchanged; no Rust code moved).
+  * `@lvqr/core` Vitest suite: **10** passed / 0 failed in 246 ms against a live `lvqr serve` on macOS.
+  * Python client pytest: **8** passed / 0 failed in 160 ms.
+* **CI gates locally clean**:
+  * `cargo fmt --all --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `cargo test --workspace` 965 / 0 / 1.
+  * `python3 -c 'import yaml; yaml.safe_load(open(".github/workflows/sdk-tests.yml"))'` parses cleanly.
+  * `npm run build` under `bindings/js/packages/core/` clean.
+* **`sdk-tests.yml` not run locally**. Workflow is CI-only; first GitHub Actions run on push carries the authoritative signal (soft-fail initial posture).
+
+### Known limitations / documented v1 shape (after 122 close)
+
+* **Python admin client still at 3/9**. JS expansion shipped; Python mirror is pending.
+* **SDK reconnect/retry docs still undocumented**. Behavior ships (`connectTimeoutMs`, `fetchTimeoutMs`, `bearerToken` now); docs at `docs/sdk/javascript.md` still silent. Follow-up row after Python expansion.
+* **Feature-flag CI matrix still incomplete** (session-121 audit Next Up #3). `lvqr-cli --features {whisper,transcode,c2pa}` still only exercised via the soft-fail `tier4-demos.yml`.
+* All other session 121 + earlier known limitations unchanged.
 
 ## Session 121 close (2026-04-22)
 

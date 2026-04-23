@@ -291,14 +291,20 @@ Ordering reflects a 2026-04-22 codebase audit against the v1.1
 plan. Higher items are smaller, closer to shippable, and close
 gaps explicitly named in Known v0.4.0 limitations.
 
-1. **Expand `@lvqr/core` admin client to cover the 6 missing
-   `/api/v1/*` routes** (`mesh`, `slo`, `cluster/nodes`,
-   `cluster/broadcasts`, `cluster/config`, `cluster/federation`).
-   Small, concrete, unblocks operator tooling + Vitest below.
-2. **Wire Vitest + pytest into CI.** `bindings/js` has no test
-   script today; `bindings/python/tests/` exists but is never
-   invoked by a workflow. Dedicated workflow mirroring
-   `mesh-e2e.yml`'s pattern.
+1. ~~**Expand `@lvqr/core` admin client to cover the 6 missing
+   `/api/v1/*` routes**.~~ **Shipped in session 122.** All 9
+   admin routes now ship on `LvqrAdminClient` (`healthz`,
+   `stats`, `listStreams`, `mesh`, `slo`, `clusterNodes`,
+   `clusterBroadcasts`, `clusterConfig`, `clusterFederation`),
+   each with a declared TypeScript response type. Lands on
+   npm at the next publish cycle.
+2. ~~**Wire Vitest + pytest into CI.**~~ **Shipped in session
+   122.** New `.github/workflows/sdk-tests.yml` runs the
+   `@lvqr/core` Vitest suite (10 admin-client shape tests
+   against a live `lvqr serve`) and the Python client pytest
+   suite (8 type + mocked-httpx tests) on every push + PR.
+   Soft-fail (`continue-on-error: true`) during its initial
+   weeks on `main`.
 3. **Feature-flag CI matrix.** Add explicit matrix cells for
    `lvqr-cli --features whisper` / `--features transcode` /
    `--features c2pa` so regressions in feature-gated paths
@@ -333,13 +339,23 @@ The list below groups the same remaining work by logical area.
 JavaScript (`@lvqr/core`, `@lvqr/player` at 0.3.1 on npm), Python
 (`lvqr` at 0.3.1 on PyPI, admin client only), and Rust
 (`lvqr-core` at 0.4.0 on crates.io) already ship. Remaining work:
-- [ ] **Expand `@lvqr/core` admin client** from 3 of 9
-  `/api/v1/*` routes (`healthz`, `stats`, `listStreams`) to all
-  9. Missing methods: `mesh()`, `slo()`, `clusterNodes()`,
-  `clusterBroadcasts()`, `clusterConfig()`, `clusterFederation()`.
-- [ ] Add Vitest to `bindings/js` + pytest invocation to CI so
-  SDK drift surfaces at PR time. `bindings/python/tests/` exists
-  but no workflow runs it; `bindings/js` has no test script.
+- [x] ~~**Expand `@lvqr/core` admin client** from 3 of 9
+  `/api/v1/*` routes to all 9.~~ Shipped in session 122:
+  `LvqrAdminClient` now exposes `mesh()`, `slo()`,
+  `clusterNodes()`, `clusterBroadcasts()`, `clusterConfig()`,
+  `clusterFederation()` alongside the existing `healthz()`,
+  `stats()`, `listStreams()`. TypeScript response types for
+  every route land at the next npm publish cycle.
+- [x] ~~**Vitest + pytest in CI.**~~ Shipped in session 122 as
+  [`sdk-tests.yml`](.github/workflows/sdk-tests.yml): boots
+  `lvqr serve` with `--mesh-enabled` + `--cluster-listen`,
+  then runs `@lvqr/core`'s Vitest suite
+  ([10 admin-client shape tests](bindings/js/tests/sdk/admin-client.spec.ts))
+  and the Python client's existing pytest suite
+  ([8 type + mocked-httpx tests](bindings/python/tests/test_client.py)).
+- [ ] **Expand Python admin client** from 3 of 9 routes to all
+  9 (same methods the JS client just grew). `bindings/python/python/lvqr/client.py`
+  covers `healthz` / `stats` / `list_streams` today.
 - [ ] Document reconnect + retry semantics in
   [`docs/sdk/javascript.md`](docs/sdk/javascript.md) (currently
   silent on reconnect; `connectTimeoutMs` + `fetchTimeoutMs`
@@ -514,13 +530,13 @@ published crate.
   feature combination should run `cargo test -p lvqr-cli
   --features <combo>` locally. A phase-C row adds explicit
   matrix cells.
-- **`@lvqr/core` admin client covers 3 of 9 `/api/v1/*` routes.**
-  `healthz`, `stats`, and `listStreams` ship today; the admin
-  client does not yet expose `mesh`, `slo`, `cluster/nodes`,
-  `cluster/broadcasts`, `cluster/config`, or
-  `cluster/federation`. Operators needing those routes from JS
-  today call `fetch` directly against the admin base URL. A
-  phase-C row fills in the remaining six methods.
+- **Python admin client covers 3 of 9 `/api/v1/*` routes.**
+  The JS `@lvqr/core` admin client reached 9/9 coverage in
+  session 122 (`mesh`, `slo`, `clusterNodes`,
+  `clusterBroadcasts`, `clusterConfig`, `clusterFederation`
+  joined the already-shipped `healthz`, `stats`,
+  `listStreams`). The Python `lvqr` package is still at the
+  original 3. A follow-up row mirrors the JS expansion.
 - **SDK reconnect + retry semantics are undocumented.**
   `@lvqr/core`'s `LvqrClient` + `LvqrAdminClient` ship
   `connectTimeoutMs` / `fetchTimeoutMs` on `main` (both land at
