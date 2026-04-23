@@ -1,8 +1,77 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 / 121-B + SDK-docs-reconnect all SHIPPED**. **984** workspace tests on the default gate (+15 over 968 from session 128's new `signed_url::tests` + `live_signed_url_e2e.rs`) + 14 lvqr-auth jwks-feature-gated tests + 5 CLI jwks-feature-gated unit tests + 1 Playwright E2E + 10 Vitest + 21 pytest green. 29 crates. HMAC signed URLs now honored on all three playback route trees (`/playback/*` from session 124, `/hls/*` + `/dash/*` from session 128). Next: session 129 -- remaining phase-C rows are authoritative DASH-IF container validator, shared-helpers refactor across 9+ integration tests, npm + PyPI publish cycle carrying the 9/9 admin surface + JWKS public API + new `sign_live_url` helper.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 / 121-B / 122-A + SDK-docs-reconnect all SHIPPED**. **984** workspace tests on the default gate (unchanged; session 129 was a pure code-dedup refactor) + 14 lvqr-auth jwks-feature-gated tests + 5 CLI jwks-feature-gated unit tests + 1 Playwright E2E + 10 Vitest + 21 pytest green. 29 crates. `lvqr_test_utils::http` module centralizes the HTTP GET integration-test primitive; 4 of the 9+ listed test files migrated off their local duplicates. Next: session 130 -- remaining phase-C rows are authoritative DASH-IF container validator, migrate the remaining 13 integration tests off their local `http_get` duplicates (optional; low-risk chip-away work), factor the FLV tag builders + RTMP handshake helper that ~10 tests still reimplement, npm + PyPI publish cycle carrying the 9/9 admin + JWKS + sign_live_url public APIs.
 
-**Last Updated**: 2026-04-22 (session 128 close). Local `main` is 2 commits ahead of `origin/main` (`8c48caf`) pending user push instruction. Session 128's commit pair (`feat(auth): HMAC signed URLs on live /hls + /dash routes` + `docs: session 128 close`) rides on top of the session 127 chain (`2851dcf` + `8c48caf`).
+**Last Updated**: 2026-04-22 (session 129 close). Local `main` is 2 commits ahead of `origin/main` (`52abd21`) pending user push instruction. Session 129's commit pair (`refactor(tests): factor http_get into lvqr-test-utils::http` + `docs: session 129 close`) rides on top of the session 128 chain (`78b5f06` + `52abd21`).
+
+## Session 129 close (2026-04-22)
+
+**Shipped**: PLAN row 122-A (first slice of the shared-helpers refactor). No new feature signal; pure code-dedup hygiene. Default-gate workspace count unchanged at **984**.
+
+### Deliverables
+
+1. **`crates/lvqr-test-utils/src/http.rs`** (~160 LOC) -- new module registered as `pub mod http` in `lvqr-test-utils/src/lib.rs`. Centralizes the raw-TCP HTTP/1.1 GET primitive every integration-test file had reimplemented: `HttpResponse { status, headers, body }` with `header()` case-insensitive lookup and `body_text()` lossy-utf8 view; `HttpGetOptions { bearer, range, extra_headers, timeout }` with `Default` (5 s timeout) + `with_bearer(token)` + `with_range(spec)` constructors; `http_get(addr, path)` / `http_get_with(addr, path, opts)` / `http_get_status(addr, path)` entry points. Raw-TCP stays -- the alternative (reqwest or hyper client) would pull a full TLS + HTTP stack into `lvqr-test-utils` which is `publish = false` but part of the default-feature build graph.
+
+2. **Migrated 4 test files** to consume the shared helper:
+   * `crates/lvqr-cli/tests/live_signed_url_e2e.rs` (session 128) -- removed local `HttpResponse` + `http_get` + `TIMEOUT` constant + `TcpStream` imports; every test now calls `http_get_status(addr, path)` from the shared module directly. Still passes 7 / 7.
+   * `crates/lvqr-cli/tests/hls_live_auth_e2e.rs` (session 112) -- removed ~45 LOC of duplicated `http_get` + `Response` struct. New 10-line local `status_with_bearer` wrapper dispatches to `http_get_with(HttpGetOptions::with_bearer(...))` or `http_get_status(...)` depending on whether a bearer is present. Still passes 7 / 7.
+   * `crates/lvqr-cli/tests/playback_signed_url_e2e.rs` (session 124) -- removed ~40 LOC of duplicated `HttpResponse` struct + `http_get_with_bearer` body. New 7-line `http_get_with_bearer` wrapper forwards into `http_get_with(HttpGetOptions { bearer, timeout: TIMEOUT, ..default })`. Preserves the test's 10-second TIMEOUT for RTMP-publish-adjacent routes. Still passes 3 / 3.
+   * `crates/lvqr-cli/tests/archive_dvr_read_e2e.rs` (session 118) -- removed ~60 LOC of duplicated `HttpResponse` struct + `header()` impl + `http_get_with_range` body. Two local wrappers (`http_get` / `http_get_with_range`) preserve the 10-second TIMEOUT this test needs for its live-DVR scrub scenario. Still passes 4 / 4.
+
+3. **`tracking/PLAN_V1.1.md`** row 122-A marked SHIPPED with the design-decision list inline.
+
+4. **README.md + `docs/auth.md` unchanged** -- the refactor is pure internal hygiene; no operator-facing surface moved.
+
+### Key 129 design decisions baked in
+
+* **Factor `http_get`, not FLV / RTMP helpers.** Three distinct duplication surfaces showed up in the file inventory: (a) raw-TCP HTTP GET in 19 test files; (b) FLV tag builders in ~10 RTMP-ingest tests; (c) RTMP handshake wrapper in ~10 RTMP-ingest tests. The HTTP GET helpers are the most uniform across files (every file's version does essentially the same thing), so factoring that first minimizes regression risk. FLV builders and the RTMP handshake have subtle per-file variance -- different buffer sizes, different error-handling semantics, different `ClientSessionEvent` filters -- so those need a more careful migration pass per file. Scoping to just the HTTP helper for this session keeps the blast radius small.
+
+* **4 files migrated, 13 left.** The remaining 13 (`rtmp_archive_e2e`, `rtmp_hls_e2e`, `rtmp_dash_e2e`, etc.) can adopt the shared helper incrementally without disturbing the module's API. The 4 migrated here are the recent / high-turn-over test files where future edits are most likely; locking in the pattern there means new tests authored downstream of them inherit the shared helper by default. Mass-migration across all 19 in one session would inflate the diff size + regression surface for marginal additional value.
+
+* **`http_get_status` as a separate function**, not an alias for `http_get(...).await.status`. The new helper takes a step beyond what the duplicated code had -- every caller that only cared about the status code would still have had to construct the body + headers vectors. `http_get_status` avoids the allocations (cheap but non-zero) and gives a cleaner call site.
+
+* **`HttpGetOptions<'a>` rather than a builder.** The options struct fields are all `Option` / `Vec`, so a `..Default::default()` struct update is natural. A builder pattern (`HttpGetOptions::new().bearer(...).range(...).build()`) would add another ~30 LOC to the module without making the call sites any more readable. The two convenience constructors (`with_bearer` / `with_range`) cover the 90% cases where only one option is set.
+
+* **Raw-TCP, not reqwest / hyper client.** Pulling a proper HTTP client into `lvqr-test-utils` would introduce a significant transitive-dep surface for every consumer. The current raw-TCP approach works because every integration-test route accepts `Connection: close` and reads-to-EOF naturally; adding a full client would be feature creep for no signal gain. The module doc comment names this trade-off explicitly so future contributors do not second-guess the decision.
+
+* **`TIMEOUT` stays a local test constant**, not a module-level default. `lvqr-test-utils::http` defaults to 5 s because that is reasonable for snappy auth-only routes (hls_live_auth_e2e). Tests that drive RTMP publishers into the admin HTTP surface (playback_signed_url_e2e, archive_dvr_read_e2e) need 10 s and override via `HttpGetOptions::timeout`. A global default of 10 s would slow down every fast test's timeout path; a global default of 5 s would flake the slow tests. Per-test override is the right middle ground.
+
+* **Wrappers preserved where the call pattern needed bearer/range dispatch.** Each of the 4 migrated files ended up with a small (5-10 line) local wrapper around the shared helper. Callers that dispatched on `Option<&str>` bearer / range keep that dispatch at the callsite layer so their test bodies do not change. The wrappers explicitly avoid replicating any of the HMAC / header parsing / EOF detection logic; that lives in the shared module.
+
+* **Default-gate workspace count unchanged (984 / 0 / 3).** The briefing asked to "prove the factor-out by asserting the default-gate test count stays at 968" -- updated to 984 after session 128's new tests. The refactor is pure code reorganization; no tests added or removed; every migrated file re-verified passing before the commit.
+
+### Ground truth (session 129 close)
+
+* **Head (pre-push)**: `refactor(tests)` + this close-doc commit (pending). `origin/main` at `52abd21` unchanged from session 128 push.
+* **Tests**:
+  * Default workspace gate: **984** passed / 0 failed / 3 ignored (unchanged from session 128).
+  * Per-file re-runs after migration: `live_signed_url_e2e` 7/0/0, `hls_live_auth_e2e` 7/0/0, `playback_signed_url_e2e` 3/0/0, `archive_dvr_read_e2e` 4/0/0.
+* **CI gates locally clean**:
+  * `cargo fmt --all --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `cargo test --workspace` 984 / 0 / 3.
+* **Workspace**: **29 crates**, unchanged.
+
+### Audit trail (session 129)
+
+Post-migration grep for remaining `fn http_get` / `async fn http_get` in `crates/lvqr-cli/tests/*.rs`:
+
+* `live_signed_url_e2e.rs`: 0 local http_get (fully migrated to shared helper)
+* `hls_live_auth_e2e.rs`: 0 local http_get (uses `status_with_bearer` wrapper over shared helper)
+* `playback_signed_url_e2e.rs`: 1 local http_get_with_bearer (thin wrapper over shared helper)
+* `archive_dvr_read_e2e.rs`: 2 local (http_get + http_get_with_range, both thin wrappers)
+* 13 other files: still carry their own http_get duplicates (future session work)
+
+Every wrapper left in the migrated files is under 10 LOC and forwards directly into the shared module, so future edits pick up the shared semantics.
+
+### Known limitations / documented v1 shape (after 129 close)
+
+* **13 test files still carry local `http_get` duplicates.** Future session work; no behavior difference from the 4 migrated. The migration is incremental-safe; each file can adopt the shared helper independently.
+* **FLV tag builders + RTMP handshake helper not yet factored.** Multiple RTMP-ingest tests still reimplement `flv_video_nalu` + `flv_video_seq_header` + `rtmp_client_handshake`. A later session can factor those into `lvqr-test-utils::flv` + `lvqr-test-utils::rtmp` if the subtle per-file variance can be reconciled.
+* **Authoritative DASH-IF container validator deferred**; GPAC MP4Box remains the primary validator.
+* **npm + PyPI publish cycle** still pending; both published builds at 0.3.1 are behind on admin coverage + miss the session 126 JWKS + session 128 sign_live_url public APIs.
+* All other session 128 + earlier known limitations unchanged.
+
 
 ## Session 128 close (2026-04-22)
 
