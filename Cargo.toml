@@ -126,6 +126,18 @@ base64 = "0.22"
 # Authentication
 jsonwebtoken = "9"
 
+# HTTP client for JWKS dynamic key discovery (PLAN row 120). Default features
+# disabled so we avoid the openssl + native-tls + gzip + blocking-runtime surface
+# we do not need; rustls-tls + json are the only bits the JWKS refresher touches.
+# Shares the ring crypto provider already pulled in by `rustls`/`jsonwebtoken`,
+# so there is no extra TLS backend in the link graph. Workspace-pinned so only
+# lvqr-auth under `--features jwks` pulls it in; default builds never link it.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# JWKS tests (and future HTTP-mocking tests) use wiremock for a real localhost
+# HTTP server returning scripted responses. Dev-only; no release-build impact.
+wiremock = "0.6"
+
 # HMAC-SHA256 for signed playback URLs. `sha2` is the hash backend;
 # `subtle` gives the constant-time comparison that prevents timing
 # oracles on signature verification. All three already appear in the

@@ -1,5 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
+#[cfg(feature = "jwks")]
+use lvqr_auth::{JwksAuthConfig, JwksAuthProvider};
 use lvqr_auth::{JwtAuthConfig, JwtAuthProvider, NoopAuthProvider, SharedAuth, StaticAuthConfig, StaticAuthProvider};
 #[cfg(feature = "transcode")]
 use lvqr_cli::parse_transcode_renditions;
@@ -383,9 +385,30 @@ struct ServeArgs {
     jwt_issuer: Option<String>,
 
     /// Expected `aud` claim for JWT validation. When unset, audience is not
-    /// checked. Only meaningful with `--jwt-secret`.
+    /// checked. Only meaningful with `--jwt-secret` or `--jwks-url`; both
+    /// auth paths honor this flag when present.
     #[arg(long, env = "LVQR_JWT_AUDIENCE")]
     jwt_audience: Option<String>,
+
+    /// JWKS endpoint URL (e.g. `https://idp.example.com/.well-known/jwks.json`)
+    /// enabling dynamic asymmetric-key JWT authentication. When set, the JWKS
+    /// provider replaces HS256 entirely and every auth surface validates
+    /// bearer tokens via RS256 / ES256 / EdDSA signatures against keys fetched
+    /// from this URL. `--jwt-secret` is mutually exclusive with this flag;
+    /// `--jwt-issuer` and `--jwt-audience` still apply (they constrain the
+    /// expected `iss` / `aud` claim on the JWT regardless of signing method).
+    /// Requires the `jwks` Cargo feature (included in `--features full`).
+    /// PLAN row 120.
+    #[cfg(feature = "jwks")]
+    #[arg(long, env = "LVQR_JWKS_URL")]
+    jwks_url: Option<String>,
+
+    /// Background refresh interval for the JWKS cache, in seconds. Minimum
+    /// 10 s (rejected below that so a misconfigured deployment cannot DDoS
+    /// the IdP). Defaults to 300 s. Only meaningful with `--jwks-url`.
+    #[cfg(feature = "jwks")]
+    #[arg(long, env = "LVQR_JWKS_REFRESH_INTERVAL_SECONDS", default_value_t = 300)]
+    jwks_refresh_interval_seconds: u64,
 
     /// Cluster gossip bind address (`ip:port`). When set, this node
     /// joins an LVQR cluster over chitchat gossip; when unset, it
@@ -462,42 +485,43 @@ async fn serve_from_args(
     args: ServeArgs,
     otel_metrics_recorder: Option<lvqr_observability::OtelMetricsRecorder>,
 ) -> Result<()> {
-    // Build auth provider from CLI/env. JWT takes precedence when
-    // `--jwt-secret` is set; otherwise fall back to the static-token
-    // provider when any individual token is configured; otherwise open
-    // access (`NoopAuthProvider`).
-    let auth: SharedAuth = if let Some(secret) = args.jwt_secret.clone() {
-        tracing::info!(
-            issuer = args.jwt_issuer.is_some(),
-            audience = args.jwt_audience.is_some(),
-            "auth: JWT provider enabled"
-        );
-        let provider = JwtAuthProvider::new(JwtAuthConfig {
-            secret,
-            issuer: args.jwt_issuer.clone(),
-            audience: args.jwt_audience.clone(),
-        })
-        .map_err(|e| anyhow::anyhow!("failed to init JWT auth provider: {e}"))?;
-        Arc::new(provider) as SharedAuth
-    } else {
-        let auth_config = StaticAuthConfig {
-            admin_token: args.admin_token.clone(),
-            publish_key: args.publish_key.clone(),
-            subscribe_token: args.subscribe_token.clone(),
-        };
-        if auth_config.has_any() {
+    // Build auth provider from CLI/env. Order of precedence:
+    //   1. `--jwks-url` (PLAN row 120) -- dynamic asymmetric JWTs.
+    //   2. `--jwt-secret` -- HS256 static secret.
+    //   3. `--admin-token` / `--publish-key` / `--subscribe-token` -- static-token provider.
+    //   4. Otherwise open access (`NoopAuthProvider`).
+    // `--jwks-url` and `--jwt-secret` are mutually exclusive: running both
+    // at once would be ambiguous and hide a misconfiguration, so reject at
+    // startup rather than silently preferring one.
+    #[cfg(feature = "jwks")]
+    let auth: SharedAuth = {
+        check_jwks_flag_combination(&args)?;
+        if let Some(jwks_url) = args.jwks_url.clone() {
             tracing::info!(
-                admin = auth_config.admin_token.is_some(),
-                publish = auth_config.publish_key.is_some(),
-                subscribe = auth_config.subscribe_token.is_some(),
-                "auth: static-token provider enabled"
+                url = %jwks_url,
+                issuer = args.jwt_issuer.is_some(),
+                audience = args.jwt_audience.is_some(),
+                refresh_interval_s = args.jwks_refresh_interval_seconds,
+                "auth: JWKS provider enabled"
             );
-            Arc::new(StaticAuthProvider::new(auth_config)) as SharedAuth
+            let cfg = JwksAuthConfig {
+                jwks_url,
+                issuer: args.jwt_issuer.clone(),
+                audience: args.jwt_audience.clone(),
+                refresh_interval: std::time::Duration::from_secs(args.jwks_refresh_interval_seconds),
+                fetch_timeout: std::time::Duration::from_secs(10),
+                allowed_algs: JwksAuthConfig::default_allowed_algs(),
+            };
+            let provider = JwksAuthProvider::new(cfg)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to init JWKS auth provider: {e}"))?;
+            Arc::new(provider) as SharedAuth
         } else {
-            tracing::info!("auth: open access (no tokens configured)");
-            Arc::new(NoopAuthProvider) as SharedAuth
+            build_static_or_jwt_auth(&args)?
         }
     };
+    #[cfg(not(feature = "jwks"))]
+    let auth: SharedAuth = build_static_or_jwt_auth(&args)?;
 
     let hls_addr = if args.hls_port == 0 {
         None
@@ -598,6 +622,59 @@ async fn serve_from_args(
     }
 
     handle.shutdown().await
+}
+
+/// Reject the combination of `--jwks-url` + `--jwt-secret`. Running both
+/// is ambiguous -- they choose different signing strategies and the
+/// fall-through would silently prefer one over the other. Factored out of
+/// `serve_from_args` so the check is unit-testable without booting a runtime.
+#[cfg(feature = "jwks")]
+fn check_jwks_flag_combination(args: &ServeArgs) -> Result<()> {
+    if args.jwks_url.is_some() && args.jwt_secret.is_some() {
+        return Err(anyhow::anyhow!(
+            "--jwks-url and --jwt-secret are mutually exclusive; pick one signing strategy"
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the non-JWKS auth provider from CLI/env: JWT HS256 if
+/// `--jwt-secret` is set, otherwise the static-token provider if any
+/// individual token is configured, otherwise open access. Factored out so
+/// the JWKS branch in `serve_from_args` can fall through to the same
+/// resolution when `--jwks-url` is unset.
+fn build_static_or_jwt_auth(args: &ServeArgs) -> Result<SharedAuth> {
+    if let Some(secret) = args.jwt_secret.clone() {
+        tracing::info!(
+            issuer = args.jwt_issuer.is_some(),
+            audience = args.jwt_audience.is_some(),
+            "auth: JWT provider enabled"
+        );
+        let provider = JwtAuthProvider::new(JwtAuthConfig {
+            secret,
+            issuer: args.jwt_issuer.clone(),
+            audience: args.jwt_audience.clone(),
+        })
+        .map_err(|e| anyhow::anyhow!("failed to init JWT auth provider: {e}"))?;
+        return Ok(Arc::new(provider) as SharedAuth);
+    }
+    let auth_config = StaticAuthConfig {
+        admin_token: args.admin_token.clone(),
+        publish_key: args.publish_key.clone(),
+        subscribe_token: args.subscribe_token.clone(),
+    };
+    if auth_config.has_any() {
+        tracing::info!(
+            admin = auth_config.admin_token.is_some(),
+            publish = auth_config.publish_key.is_some(),
+            subscribe = auth_config.subscribe_token.is_some(),
+            "auth: static-token provider enabled"
+        );
+        Ok(Arc::new(StaticAuthProvider::new(auth_config)) as SharedAuth)
+    } else {
+        tracing::info!("auth: open access (no tokens configured)");
+        Ok(Arc::new(NoopAuthProvider) as SharedAuth)
+    }
 }
 
 /// Resolve `--c2pa-signing-cert` / `--c2pa-signing-key` + siblings
@@ -793,5 +870,79 @@ mod c2pa_cli_tests {
         let err = build_c2pa_config(&a).unwrap_err().to_string();
         assert!(err.contains("--c2pa-trust-anchor"), "err: {err}");
         assert!(err.contains("/nonexistent/path/to/anchor.pem"), "err: {err}");
+    }
+}
+
+#[cfg(all(test, feature = "jwks"))]
+mod jwks_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> ServeArgs {
+        match Cli::parse_from(args) {
+            Cli::Serve(a) => a,
+        }
+    }
+
+    #[test]
+    fn jwks_url_unset_passes_combination_check() {
+        let a = parse(&["lvqr", "serve"]);
+        assert!(a.jwks_url.is_none());
+        assert_eq!(a.jwks_refresh_interval_seconds, 300);
+        check_jwks_flag_combination(&a).expect("no flags should be fine");
+    }
+
+    #[test]
+    fn jwks_url_flag_parses() {
+        let a = parse(&["lvqr", "serve", "--jwks-url", "https://idp.example.com/jwks.json"]);
+        assert_eq!(a.jwks_url.as_deref(), Some("https://idp.example.com/jwks.json"));
+        check_jwks_flag_combination(&a).expect("jwks alone is fine");
+    }
+
+    #[test]
+    fn jwks_url_plus_jwt_secret_is_mutex_error() {
+        let a = parse(&[
+            "lvqr",
+            "serve",
+            "--jwks-url",
+            "https://idp.example.com/jwks.json",
+            "--jwt-secret",
+            "hunter2",
+        ]);
+        let err = check_jwks_flag_combination(&a).unwrap_err().to_string();
+        assert!(err.contains("--jwks-url"), "err: {err}");
+        assert!(err.contains("--jwt-secret"), "err: {err}");
+        assert!(err.contains("mutually exclusive"), "err: {err}");
+    }
+
+    #[test]
+    fn jwks_refresh_interval_override_applies() {
+        let a = parse(&[
+            "lvqr",
+            "serve",
+            "--jwks-url",
+            "https://idp.example.com/jwks.json",
+            "--jwks-refresh-interval-seconds",
+            "60",
+        ]);
+        assert_eq!(a.jwks_refresh_interval_seconds, 60);
+    }
+
+    #[test]
+    fn jwt_issuer_audience_still_apply_under_jwks() {
+        // The JWKS branch reuses --jwt-issuer and --jwt-audience so operators
+        // do not learn two parallel claim-binding vocabularies.
+        let a = parse(&[
+            "lvqr",
+            "serve",
+            "--jwks-url",
+            "https://idp.example.com/jwks.json",
+            "--jwt-issuer",
+            "https://idp.example.com/",
+            "--jwt-audience",
+            "lvqr-prod",
+        ]);
+        assert_eq!(a.jwt_issuer.as_deref(), Some("https://idp.example.com/"));
+        assert_eq!(a.jwt_audience.as_deref(), Some("lvqr-prod"));
     }
 }

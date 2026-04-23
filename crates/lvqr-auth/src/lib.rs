@@ -28,6 +28,9 @@ mod static_provider;
 #[cfg(feature = "jwt")]
 mod jwt_provider;
 
+#[cfg(feature = "jwks")]
+mod jwks_provider;
+
 pub use error::AuthError;
 pub use noop::NoopAuthProvider;
 pub use provider::{AuthContext, AuthDecision, AuthProvider, AuthScope, SharedAuth};
@@ -35,3 +38,6 @@ pub use static_provider::{StaticAuthConfig, StaticAuthProvider};
 
 #[cfg(feature = "jwt")]
 pub use jwt_provider::{JwtAuthConfig, JwtAuthProvider, JwtClaims};
+
+#[cfg(feature = "jwks")]
+pub use jwks_provider::{JwksAuthConfig, JwksAuthProvider};

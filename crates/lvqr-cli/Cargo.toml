@@ -20,7 +20,12 @@ path = "src/main.rs"
 
 [features]
 default = ["rtmp", "quinn-transport", "cluster"]
-full = ["rtmp", "quinn-transport", "cluster", "c2pa", "whisper", "transcode"]
+full = ["rtmp", "quinn-transport", "cluster", "c2pa", "whisper", "transcode", "jwks"]
+# PLAN row 120: JWKS dynamic key discovery. Adds `--jwks-url` + companion
+# flags to `lvqr serve` and pulls reqwest + tokio::spawn into the auth
+# layer via `lvqr-auth/jwks`. Off by default so `cargo install lvqr-cli`
+# stays lean; operators opt in via `--features jwks` or `--features full`.
+jwks = ["lvqr-auth/jwks"]
 rtmp = ["lvqr-ingest/rtmp"]
 quinn-transport = ["lvqr-relay/quinn-transport"]
 # Enables cluster-mode CLI flags + bootstrap in `start()`. Disabled
