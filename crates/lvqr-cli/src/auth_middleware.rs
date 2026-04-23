@@ -23,24 +23,43 @@
 //! Configured deployments (static subscribe-token, JWT) get the
 //! gate automatically.
 
+use std::sync::Arc;
+
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use lvqr_auth::{AuthContext, AuthDecision, SharedAuth};
 
+use crate::signed_url::{LiveScheme, SignedUrlCheck, verify_live_signed_url};
+
 // =====================================================================
-// Live HLS + DASH subscribe auth middleware (session 112)
+// Live HLS + DASH subscribe auth middleware (session 112 + session 128)
 // =====================================================================
 
 /// State for the live-playback auth middleware. Clones are cheap
-/// (one `Arc` and a `'static` label).
+/// (one `Arc` + enum + `'static` label).
 #[derive(Clone)]
 pub(crate) struct LivePlaybackAuthState {
     pub(crate) auth: SharedAuth,
     /// Metric label for `lvqr_auth_failures_total{entry}` and the
     /// structured log line. Expected values: `"hls_live"`, `"dash_live"`.
     pub(crate) entry: &'static str,
+    /// Route-tree scheme tag used to construct the HMAC input for
+    /// signed-URL verification. `LiveScheme::Hls` for routers mounted
+    /// under `/hls/*`; `LiveScheme::Dash` for `/dash/*`. The scheme is
+    /// baked into the signed input string so an HLS-minted sig cannot
+    /// be replayed against the DASH route tree.
+    pub(crate) scheme: LiveScheme,
+    /// Operator-configured HMAC-SHA256 secret for signed URLs (session
+    /// 128). When `None`, the middleware never attempts signed-URL
+    /// verification + always falls through to the subscribe-token gate.
+    /// When `Some`, a request that presents `?sig=...&exp=...` is
+    /// verified first; a valid signature short-circuits the
+    /// subscribe-token gate. An invalid (tampered / expired) signature
+    /// returns 403 Forbidden (not 401) so clients can distinguish
+    /// missing auth from wrong auth.
+    pub(crate) hmac_secret: Option<Arc<[u8]>>,
 }
 
 /// Tower middleware that applies the subscribe-auth gate to live HLS
@@ -75,6 +94,29 @@ pub(crate) async fn live_playback_auth_middleware(
         return next.run(request).await;
     };
 
+    // Session 128: signed-URL short-circuit. When the operator has
+    // configured --hmac-playback-secret and the request carries both
+    // sig + exp, verify against the scheme+broadcast-scoped HMAC
+    // before consulting the subscribe-token provider. Allow skips
+    // the token gate; Deny returns a 403 body naming the failure;
+    // NotAttempted (no secret configured, or no sig+exp on the
+    // request) falls through to the existing subscribe-token path.
+    if state.hmac_secret.is_some() {
+        let sig = extract_query_param(&query, "sig");
+        let exp = extract_query_param(&query, "exp").and_then(|v| v.parse::<u64>().ok());
+        match verify_live_signed_url(
+            state.hmac_secret.as_deref(),
+            state.scheme,
+            &broadcast,
+            sig.as_deref(),
+            exp,
+        ) {
+            SignedUrlCheck::Allow => return next.run(request).await,
+            SignedUrlCheck::Deny(resp) => return resp,
+            SignedUrlCheck::NotAttempted => {}
+        }
+    }
+
     let token = extract_live_playback_token(request.headers(), &query);
 
     let decision = state.auth.check(&AuthContext::Subscribe {
@@ -94,6 +136,20 @@ pub(crate) async fn live_playback_auth_middleware(
             (StatusCode::UNAUTHORIZED, reason).into_response()
         }
     }
+}
+
+/// Extract the first non-empty value of `?<key>=` from a URL query string.
+/// Returns `None` when the key is absent or its value is empty.
+fn extract_query_param(query: &str, key: &str) -> Option<String> {
+    for kv in query.split('&') {
+        if let Some((k, v)) = kv.split_once('=')
+            && k == key
+            && !v.is_empty()
+        {
+            return Some(v.to_string());
+        }
+    }
+    None
 }
 
 /// Extract the broadcast name from an `/hls/{broadcast}/<tail>` or

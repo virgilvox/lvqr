@@ -16,7 +16,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Body;
@@ -25,7 +24,6 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use base64::Engine;
-use hmac::{Hmac, Mac};
 #[cfg(feature = "c2pa")]
 use lvqr_archive::provenance::{C2paConfig, finalize_broadcast_signed};
 #[cfg(feature = "c2pa")]
@@ -35,9 +33,9 @@ use lvqr_archive::{RedbSegmentIndex, SegmentIndex, SegmentRef};
 use lvqr_auth::{AuthContext, AuthDecision, SharedAuth};
 use lvqr_fragment::{FragmentBroadcasterRegistry, FragmentStream};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use subtle::ConstantTimeEq;
 use tokio::runtime::Handle;
+
+use crate::signed_url::{SignedUrlCheck, compute_signature, verify_signed_url_generic};
 
 /// Broadcaster-native archive indexer. Session 59 consumer-side
 /// switchover: replaces [`IndexingFragmentObserver`]'s
@@ -484,86 +482,31 @@ fn playback_auth_gate(auth: &SharedAuth, broadcast: &str, token: Option<String>)
     None
 }
 
-/// Outcome of checking the signed-URL auth path. `Allow` means the
-/// signature verified; `Deny(resp)` returns an already-built 403
-/// response; `NotAttempted` means the client did not present sig+exp
-/// or the server has no HMAC secret configured, so the caller
-/// should fall through to the normal [`playback_auth_gate`].
-enum SignedUrlCheck {
-    Allow,
-    Deny(Response),
-    NotAttempted,
-}
-
-/// Verify a `?sig=...&exp=...` pair against the configured HMAC
-/// secret. `request_path` is the URL path component excluding the
-/// query string (e.g. `"/playback/live/dvr"`). The signature input
-/// is `"<request_path>?exp=<exp>"` so signatures are path-and-
-/// expiry-specific.
+/// Verify a `?sig=...&exp=...` pair on a `/playback/*` URL against the
+/// configured HMAC secret. `request_path` is the URL path component
+/// excluding the query string (e.g. `"/playback/live/dvr"`). The
+/// signature input is `"<request_path>?exp=<exp>"` so signatures are
+/// path-and-expiry-specific.
 ///
-/// Returns:
-/// * [`SignedUrlCheck::NotAttempted`] when the server has no
-///   secret configured OR the client did not present both
-///   `sig` and `exp` -- the handler falls through to the
-///   subscribe-token gate.
-/// * [`SignedUrlCheck::Deny`] with a 403 Forbidden when the
-///   signature or expiry fails verification. 403 (not 401)
-///   because the client did present credentials; they are
-///   just wrong or stale. Clients can distinguish "no auth"
-///   from "bad auth" on status code alone.
-/// * [`SignedUrlCheck::Allow`] when both checks pass. The
-///   caller skips the subscribe-token gate.
+/// Thin wrapper around [`verify_signed_url_generic`] that builds the
+/// playback-shape signature input and labels the failure metric with
+/// `entry="playback_signed_url"`. Live HLS / DASH routes use their own
+/// wrapper in `crate::signed_url` with `entry="hls_signed_url"` /
+/// `"dash_signed_url"` so the three counters are distinct.
 fn verify_signed_url(
     hmac_secret: Option<&[u8]>,
     request_path: &str,
     sig: Option<&str>,
     exp: Option<u64>,
 ) -> SignedUrlCheck {
-    let Some(secret) = hmac_secret else {
-        return SignedUrlCheck::NotAttempted;
-    };
-    let (sig, exp) = match (sig, exp) {
-        (Some(s), Some(e)) => (s, e),
-        _ => return SignedUrlCheck::NotAttempted,
-    };
-
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if exp <= now_secs {
-        metrics::counter!("lvqr_auth_failures_total", "entry" => "playback_signed_url").increment(1);
-        return SignedUrlCheck::Deny((StatusCode::FORBIDDEN, "signed URL expired").into_response());
-    }
-
-    let expected = compute_playback_signature(secret, request_path, exp);
-    // `constant_time_eq` on byte slices. Decoding the provided
-    // base64 first and comparing bytes keeps the comparison
-    // length-stable; comparing as strings would leak via early
-    // exit on length mismatch.
-    let provided = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig.as_bytes()) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            metrics::counter!("lvqr_auth_failures_total", "entry" => "playback_signed_url").increment(1);
-            return SignedUrlCheck::Deny((StatusCode::FORBIDDEN, "signed URL malformed").into_response());
-        }
-    };
-    if provided.len() != expected.len() || !bool::from(provided.ct_eq(&expected)) {
-        metrics::counter!("lvqr_auth_failures_total", "entry" => "playback_signed_url").increment(1);
-        return SignedUrlCheck::Deny((StatusCode::FORBIDDEN, "signed URL signature invalid").into_response());
-    }
-    SignedUrlCheck::Allow
-}
-
-/// Compute the HMAC-SHA256 of `"<request_path>?exp=<exp>"` under
-/// the supplied secret. Pure helper, shared by the verifier and
-/// the operator-facing [`sign_playback_url`] generator so the two
-/// paths cannot drift.
-fn compute_playback_signature(secret: &[u8], request_path: &str, exp: u64) -> Vec<u8> {
-    let input = format!("{request_path}?exp={exp}");
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(input.as_bytes());
-    mac.finalize().into_bytes().to_vec()
+    let signed_input = exp.map(|e| format!("{request_path}?exp={e}"));
+    verify_signed_url_generic(
+        hmac_secret,
+        signed_input.as_deref().unwrap_or(""),
+        sig,
+        exp,
+        "playback_signed_url",
+    )
 }
 
 /// Generate a signed playback URL query suffix for the operator's
@@ -581,7 +524,8 @@ fn compute_playback_signature(secret: &[u8], request_path: &str, exp: u64) -> Ve
 /// // url -> "https://relay.example:8080/playback/live/dvr?exp=1760000000&sig=<base64url>"
 /// ```
 pub fn sign_playback_url(secret: &[u8], request_path: &str, exp_unix: u64) -> String {
-    let sig_bytes = compute_playback_signature(secret, request_path, exp_unix);
+    let signed_input = format!("{request_path}?exp={exp_unix}");
+    let sig_bytes = compute_signature(secret, &signed_input);
     let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sig_bytes);
     format!("exp={exp_unix}&sig={sig_b64}")
 }

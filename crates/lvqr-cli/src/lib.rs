@@ -19,6 +19,7 @@ pub mod cluster_claim;
 mod config;
 mod handle;
 mod hls;
+mod signed_url;
 mod ws;
 
 pub use archive::sign_playback_url;
@@ -30,6 +31,7 @@ pub use handle::ServerHandle;
 /// (`lvqr-test-utils`, integration tests) do not need to pull
 /// `lvqr-admin` in as a direct dep. Tier 4 item 4.7 session A.
 pub use lvqr_admin::{LatencyTracker, SloEntry};
+pub use signed_url::{LiveScheme, sign_live_url};
 
 use anyhow::Result;
 use axum::middleware::from_fn_with_state;
@@ -794,6 +796,15 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         .route("/ingest/{*broadcast}", get(ws_ingest_handler))
         .with_state(ws_state);
 
+    // PLAN v1.1 row 121 + session 128: when `ServeConfig.hmac_playback_secret`
+    // is set, every playback surface accepts `?sig=...&exp=...` as an
+    // alternative auth path that short-circuits the `SharedAuth`
+    // subscribe gate. Wrap the secret in `Arc<[u8]>` so every handler
+    // and middleware clone shares one copy. Hoisted above the
+    // `combined_router` block so the downstream HLS + DASH spawn
+    // blocks can also capture it into their `LivePlaybackAuthState`.
+    let hmac_playback_secret: Option<Arc<[u8]>> = config.hmac_playback_secret.as_ref().map(|s| Arc::from(s.as_bytes()));
+
     let combined_router = {
         let admin_router = if let Some(mesh) = mesh_coordinator.clone() {
             let mesh_for_cb = mesh.clone();
@@ -925,15 +936,6 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         };
 
         let combined = admin_router.merge(ws_router);
-        // PLAN v1.1 row 121: when `ServeConfig.hmac_playback_secret`
-        // is set, the playback router accepts `?sig=...&exp=...` as
-        // an alternative auth path that short-circuits the
-        // `SharedAuth` subscribe gate. Wrap the secret in
-        // `Arc<[u8]>` so every handler clone shares one copy.
-        let hmac_playback_secret: Option<Arc<[u8]>> = config
-            .hmac_playback_secret
-            .as_ref()
-            .map(|s| Arc::from(s.as_bytes()));
         let combined = if let Some((ref dir, ref index)) = archive_index {
             combined.merge(playback_router(
                 dir.clone(),
@@ -1020,6 +1022,10 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         let shutdown_on_exit_hls = bg_shutdown_for_task.clone();
         let hls_auth = auth.clone();
         let hls_auth_disabled = config.no_auth_live_playback;
+        // PLAN v1.1 session 128: share the same HMAC secret with the
+        // live HLS + DASH auth middleware so one --hmac-playback-secret
+        // configuration mints signed URLs across all three route trees.
+        let hls_hmac_secret = hmac_playback_secret.clone();
         let hls_fut = async move {
             let Some((listener, server)) = hls_router_pair else {
                 return;
@@ -1036,6 +1042,8 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                 let state = LivePlaybackAuthState {
                     auth: hls_auth,
                     entry: "hls_live",
+                    scheme: crate::signed_url::LiveScheme::Hls,
+                    hmac_secret: hls_hmac_secret,
                 };
                 router = router.layer(from_fn_with_state(state, live_playback_auth_middleware));
             }
@@ -1052,6 +1060,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         let shutdown_on_exit_dash = bg_shutdown_for_task.clone();
         let dash_auth = auth.clone();
         let dash_auth_disabled = config.no_auth_live_playback;
+        let dash_hmac_secret = hmac_playback_secret.clone();
         let dash_fut = async move {
             let Some((listener, server)) = dash_router_pair else {
                 return;
@@ -1061,6 +1070,8 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                 let state = LivePlaybackAuthState {
                     auth: dash_auth,
                     entry: "dash_live",
+                    scheme: crate::signed_url::LiveScheme::Dash,
+                    hmac_secret: dash_hmac_secret,
                 };
                 router = router.layer(from_fn_with_state(state, live_playback_auth_middleware));
             }
