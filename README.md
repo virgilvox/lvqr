@@ -326,18 +326,15 @@ gaps explicitly named in Known v0.4.0 limitations.
    returns 403 (not 401) so clients can distinguish missing auth
    from wrong auth. Operator helper `lvqr_cli::sign_playback_url`
    generates the query suffix from a secret + path + expiry.
-5. **Nightly 24h soak CI job** (PLAN row 119). Scheduled
-   workflow running `lvqr-soak` for a full day, scoped
-   soft-fail for the first week.
-6. **Mesh data-plane phase D**: actual-vs-intended offload
+5. **Mesh data-plane phase D**: actual-vs-intended offload
    reporting, per-peer capacity advertisement, TURN deployment
    recipe, three-peer Playwright E2E. Unblocks flipping
    `docs/mesh.md` to IMPLEMENTED.
-7. **One hardware encoder backend** (VideoToolbox on macOS or
+6. **One hardware encoder backend** (VideoToolbox on macOS or
    NVENC on Linux). The three others stay deferred to v1.2.
-8. **Stream-modifying WASM filter chains** (multi-filter
+7. **Stream-modifying WASM filter chains** (multi-filter
    composition). v1 single-filter drop + rewrite ships today.
-9. **Webhook auth provider**, **stream-key CRUD admin API**,
+8. **Webhook auth provider**, **stream-key CRUD admin API**,
    **hot config reload**, **dedicated DVR scrub web UI**,
    **SCTE-35 passthrough** -- smaller or more-speculative items;
    pick based on operator demand.
@@ -550,9 +547,19 @@ published crate.
 - **No admission control.** The SLO tracker measures latency and
   fires alerts; it does not refuse new subscribers when the SLO
   is already burning.
-- **No nightly 24h soak in CI.** `lvqr-soak` has a fast-path
-  smoke test; the long-duration soak job is on the v1.1
-  checklist.
+- **Nightly long-run soak in CI.** **Fixed on `main`** in
+  session 127: a new
+  [`soak-scheduled.yml`](.github/workflows/soak-scheduled.yml)
+  workflow runs `lvqr-soak` against a daily cron (07:23 UTC)
+  for a 60-minute duration with 10 concurrent RTSP subscribers
+  at 30 Hz fragments; the report (RSS + FD + CPU drift, RTP /
+  RTCP per-subscriber counts) uploads as an artifact with
+  30-day retention. The PLAN row name said "24 h" but a true
+  24 h run exceeds the 6 h GitHub-hosted job ceiling; 60 min
+  daily surfaces the same linear-drift signals within a 24 h
+  discovery window. `continue-on-error: true` initially; a
+  self-hosted-runner variant for true 24 h runs is a v1.2
+  follow-up.
 - **Feature-flag CI matrix initially soft-fail.**
   [`feature-matrix.yml`](.github/workflows/feature-matrix.yml)
   ships as of session 123 with dedicated jobs for the `c2pa`,

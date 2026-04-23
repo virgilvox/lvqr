@@ -1,8 +1,62 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 120 / 121 + SDK-docs-reconnect all SHIPPED**. 968 workspace tests on the default gate + 14 lvqr-auth jwks-feature-gated tests + 5 CLI jwks-feature-gated unit tests + 1 Playwright E2E + 10 Vitest + 21 pytest green. 29 crates. Next: session 127 -- remaining phase-C rows are nightly 24h soak (the distinct-from-whisper leg of PLAN row 119), authoritative DASH-IF container validator, HMAC extension to `/hls/*` + `/dash/*`, shared-helpers refactor across 9+ integration tests, npm + PyPI publish cycle carrying the 9/9 admin surface + the new JWKS-feature public surface.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 + SDK-docs-reconnect all SHIPPED**. 968 workspace tests on the default gate + 14 lvqr-auth jwks-feature-gated tests + 5 CLI jwks-feature-gated unit tests + 1 Playwright E2E + 10 Vitest + 21 pytest green. 29 crates. PLAN row 119 now fully closed across three scheduled workflows (feature-matrix.yml + whisper-scheduled.yml + soak-scheduled.yml). Next: session 128 -- remaining phase-C rows are authoritative DASH-IF container validator, HMAC extension to `/hls/*` + `/dash/*`, shared-helpers refactor across 9+ integration tests, npm + PyPI publish cycle carrying the 9/9 admin surface + the new JWKS-feature public surface.
 
-**Last Updated**: 2026-04-22 (session 126 close). Local `main` is 2 commits ahead of `origin/main` (`cae6b74`) pending user push instruction. Session 126's commit pair (`feat(auth): JWKS dynamic key discovery + --jwks-url CLI` + `docs: session 126 close`) rides on top of the session 125 chain (`9b37225` + `cae6b74`).
+**Last Updated**: 2026-04-22 (session 127 close). Local `main` is 2 commits ahead of `origin/main` (`033740b`) pending user push instruction. Session 127's commit pair (`feat(ci): soak-scheduled.yml nightly lvqr-soak workflow` + `docs: session 127 close`) rides on top of the session 126 chain (`1a53f92` + `033740b`).
+
+## Session 127 close (2026-04-22)
+
+**Shipped**: PLAN row 119-C (nightly-soak leg). Last remaining leg of the three-way split of PLAN row 119 the prior sessions opened (feature-matrix workflow shipped in session 123 as 118-B/119-A; whisper-scheduled workflow shipped in session 125 as 119-B). No Rust code moved; default-gate workspace count unchanged at 968 / 0 / 2.
+
+### Deliverables
+
+1. **`.github/workflows/soak-scheduled.yml`** -- new scheduled workflow that runs `lvqr-soak` daily on GitHub-hosted `ubuntu-latest`. Cron `23 7 * * *` (daily at 07:23 UTC, offset from `whisper-scheduled.yml`'s 05:23 cron to avoid runner-slot contention). `workflow_dispatch` for manual reruns. 60-minute duration (`--duration-secs 3600`), 10 concurrent RTSP subscribers at 30 Hz, 30-second metrics sampling cadence. Release build via `cargo build -p lvqr-soak --release` so the soaked binary shape matches what operators deploy. stdout + tracing output captured via `tee` into `soak-artifacts/soak-report.txt`, uploaded via `actions/upload-artifact@v4` with `name: soak-report-${{ github.run_id }}` + 30-day retention. `Swatinem/rust-cache@v2` with a namespaced `prefix-key: soak-scheduled-v1` so the release-profile cache does not collide with the default-gate debug-profile cache. `continue-on-error: true` initial posture (standard for every dedicated workflow in this repo); promotes to a required check after the first clean run. `timeout-minutes: 80` gives comfortable headroom for the 60 min soak + warm-cache build + toolchain + artifact upload within the 360 min GH-hosted job ceiling.
+
+2. **`tracking/PLAN_V1.1.md`** -- row 119 annotated with the three-legged split + row 119-C marked **SHIPPED** with the full design decisions list.
+
+3. **`README.md`** -- the "No nightly 24h soak in CI" Known Limitations bullet flipped to "Nightly long-run soak in CI. **Fixed on `main`** in session 127" with the workflow link + the 60 min / 24 h deviation documented. Next Up list renumbered (the soak row removed; mesh data-plane becomes #5 instead of #6).
+
+### Key 127 design decisions baked in
+
+* **60-minute duration, not 24 hours.** The PLAN scope line named "nightly 24h" but GitHub-hosted runners cap at 360 min per job. Options considered: (a) 60 min daily on GH-hosted -- chosen; (b) 4 h weekly on GH-hosted -- rejected because weekly discovery windows dilute the regression-catch signal; (c) 24 h on self-hosted -- rejected because introducing self-hosted-runner infrastructure is its own session of work, not a row-closure. The soak driver's drift metrics (RSS, FD, CPU) are linear-in-time; 60 min is long enough past any startup transient to surface any regression that would also surface at 24 h. 10 subscribers * 30 Hz * 3600 s = 1.08 M RTP packets per run, well into steady-state territory. The documentation is explicit about the deviation so operators reading the README do not expect a true 24 h run.
+
+* **Daily cron, not weekly.** Matches the whisper-scheduled.yml cadence decision (session 125): 24 h discovery vs 7 d discovery meaningfully affects how quickly a regression lands in a developer's face. The runner cost of 60 min * 30 runs/month = ~30 h/month of GH-hosted CI is within the free-tier budget the project already uses for feature-matrix + whisper + audit workflows combined.
+
+* **07:23 UTC schedule, offset from 05:23 UTC whisper cron.** Three scheduled workflows (audit, whisper-scheduled, soak-scheduled) now run on daily cadences; staggering their start times by ~2 h each keeps any one day's runner-slot contention manageable on the shared free-tier queue.
+
+* **Release profile, not debug.** Debug builds carry the `overflow-checks` + debug-assertion surface that real operators do not deploy. A soak run that exercises release codegen matches the production shape and avoids false signals (e.g. "cpu over window" numbers that are 3x real-world because debug iterators are slower).
+
+* **Namespaced Swatinem cache key.** The default-gate CI builds debug; soak-scheduled builds release. Sharing one `Swatinem/rust-cache@v2` key between them would constantly thrash (each run would invalidate the other's cache). `prefix-key: soak-scheduled-v1` isolates the two caches.
+
+* **Tee-capture of stdout + tracing into one artifact file.** `set -o pipefail` ensures a non-zero exit from `lvqr-soak` propagates even through `tee`. The live workflow-log stream stays populated so a developer watching the run does not have to download the artifact to see progress; `if: always()` on the upload step guarantees the report ships even when the soak fails.
+
+* **`lvqr_soak`'s internal pass/fail logic is the authoritative gate.** The workflow does not add any secondary assertions. The binary already asserts on RTP threshold per subscriber, RTCP SR threshold per subscriber, and reports RSS / FD / CPU drift in the summary block. Adding a second assertion layer in the workflow YAML would duplicate the pass-fail surface with a worse expression language; the binary is the single source of truth.
+
+* **`continue-on-error: true` initial posture.** Matches every dedicated workflow since `hls-conformance.yml`. Scheduled workflows surface environmental flake (upstream DNS blips, apt cache eviction, runner-slot contention) that a CI team needs a few weeks to triage before promoting to a required check. Session notes explicitly track the promotion pending first clean run.
+
+* **No self-hosted-runner variant in this session.** Introducing self-hosted infrastructure (authentication, lifecycle, security surface) is outside the scope of closing the v1.1 PLAN row. The 24 h variant is documented as a v1.2 follow-up in both the workflow header comment and the README Known-Limitations bullet.
+
+### Ground truth (session 127 close)
+
+* **Head (pre-push)**: `feat(ci)` + this close-doc commit (pending). `origin/main` at `033740b` unchanged from session 126 push.
+* **Tests**: default workspace gate **968** passed / 0 failed / 2 ignored (unchanged; the session adds a workflow YAML + docs only, no Rust).
+* **CI gates locally clean**:
+  * `cargo fmt --all --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95 (no Rust moved).
+  * `cargo test --workspace` 968 / 0 / 2.
+  * `python3 -c 'import yaml; yaml.safe_load(open(".github/workflows/soak-scheduled.yml"))'` parses cleanly.
+* **Workspace**: **29 crates**, unchanged.
+* **`soak-scheduled.yml` not exercised locally.** CI-only; first cron fire or manual `workflow_dispatch` trigger carries the authoritative signal.
+
+### Known limitations / documented v1 shape (after 127 close)
+
+* **60-minute soak, not true 24 h.** Documented in the workflow header + README. A true 24 h nightly requires a self-hosted runner; tracked as a v1.2 follow-up.
+* **HMAC gated on `/playback/*` only**; extension to `/hls/*` + `/dash/*` is the next phase-C follow-up.
+* **Authoritative DASH-IF container validator deferred**; GPAC MP4Box remains the primary validator.
+* **Shared-helpers refactor across 9+ integration tests** still queued.
+* **npm + PyPI publish cycle** still pending; both published builds at 0.3.1 are 3/9 admin coverage.
+* All other session 126 + earlier known limitations unchanged.
+
 
 ## Session 126 close (2026-04-22)
 
