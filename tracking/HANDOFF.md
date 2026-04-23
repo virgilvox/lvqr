@@ -1,8 +1,88 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 / 121-B / 122-A + SDK-docs-reconnect all SHIPPED**. **984** workspace tests on the default gate (unchanged; session 129 was a pure code-dedup refactor) + 14 lvqr-auth jwks-feature-gated tests + 5 CLI jwks-feature-gated unit tests + 1 Playwright E2E + 10 Vitest + 21 pytest green. 29 crates. `lvqr_test_utils::http` module centralizes the HTTP GET integration-test primitive; 4 of the 9+ listed test files migrated off their local duplicates. Next: session 130 -- remaining phase-C rows are authoritative DASH-IF container validator, migrate the remaining 13 integration tests off their local `http_get` duplicates (optional; low-risk chip-away work), factor the FLV tag builders + RTMP handshake helper that ~10 tests still reimplement, npm + PyPI publish cycle carrying the 9/9 admin + JWKS + sign_live_url public APIs.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 / 121-B / 122-A / 122-B + SDK-docs-reconnect all SHIPPED**. **991** workspace tests on the default gate (+7 over session 129's 984, from the new `lvqr_test_utils::flv` module's unit tests) + 14 lvqr-auth jwks-feature-gated tests + 5 CLI jwks-feature-gated unit tests + 1 Playwright E2E + 10 Vitest + 21 pytest green. 29 crates. `lvqr_test_utils::{http, flv}` modules now centralize both the HTTP GET + FLV tag builder integration-test primitives; 9 of the ~17 listed test files migrated off their local duplicates. Next: session 131 -- remaining phase-C rows are authoritative DASH-IF container validator, migrate the remaining 10 integration tests off their local `http_get` + FLV duplicates (incremental; safe to chip away), factor the RTMP handshake helper (~10 tests still reimplement it with subtle per-file variance), webhook auth provider (tracked in README Auth+ops-polish), npm + PyPI publish cycle carrying the 9/9 admin + JWKS + sign_live_url public APIs.
 
-**Last Updated**: 2026-04-22 (session 129 close). Local `main` is 2 commits ahead of `origin/main` (`52abd21`) pending user push instruction. Session 129's commit pair (`refactor(tests): factor http_get into lvqr-test-utils::http` + `docs: session 129 close`) rides on top of the session 128 chain (`78b5f06` + `52abd21`).
+**Last Updated**: 2026-04-22 (session 130 close). Local `main` is 2 commits ahead of `origin/main` (`77da8c3`) pending user push instruction. Session 130's commit pair (`refactor(tests): factor FLV tag builders into lvqr-test-utils::flv` + `docs: session 130 close`) rides on top of the session 129 chain (`61a7812` + `77da8c3`).
+
+## Session 130 close (2026-04-22)
+
+**Shipped**: PLAN row 122-B (second slice of the shared-helpers refactor). No new feature signal; code-dedup hygiene. Default-gate workspace count moved from **984 -> 991** (+7 from the new `lvqr_test_utils::flv` module's unit tests; zero new integration tests).
+
+### Deliverables
+
+1. **`crates/lvqr-test-utils/src/flv.rs`** (~145 LOC + ~60 LOC of unit tests) -- new module registered as `pub mod flv` in `lvqr-test-utils/src/lib.rs`. Centralizes the FLV tag builders every RTMP-ingest integration-test file had reimplemented verbatim:
+   * `fn flv_video_seq_header() -> Bytes` -- H.264 High@L3.1 SPS+PPS record. The byte sequence was byte-identical across all 11 pre-migration files (session 129's "subtle per-file variance" concern did not hold for this function; a `diff` of all 11 shows zero delta).
+   * `fn flv_video_nalu(keyframe: bool, cts: i32, nalu_data: &[u8]) -> Bytes` -- AVC keyframe / P-frame NALU tag with signed-24-bit-BE composition-time encoding. Byte-identical across the same 11 files.
+   * `fn flv_audio_aac_lc_seq_header(sample_freq_index: u8, channels: u8) -> Bytes` -- parameterized AAC-LC AudioSpecificConfig byte math. Reproduces the historical 44.1 kHz / stereo bytes (`(4, 2)` -> `0xAF 0x00 0x12 0x10`) AND session-114's 48 kHz / stereo bytes (`(3, 2)` -> `0xAF 0x00 0x11 0x90`). Explicit mask form (`(sample_freq_index & 0x01) << 7`) in place of the historical `(sample_freq_index << 7) as u8` overflow-wrap-based computation; the unit tests lock both historical byte sequences against the new math.
+   * `fn flv_audio_aac_lc_seq_header_44k_stereo() -> Bytes` -- common-case convenience wrapper.
+   * `fn flv_audio_raw(aac_data: &[u8]) -> Bytes` -- byte-identical across the 4 pre-migration files using it.
+   * 7 unit tests in `flv::tests`: historical-bytes lock for `flv_video_seq_header`, frame-type-nibble flip on keyframe flag, signed-24-bit-BE composition-time encoding, NALU payload appended verbatim, 44 kHz + 48 kHz seq-header byte sequences, `flv_audio_raw` prepends packet-type tag.
+
+2. **Migrated 5 test files** to consume both the session-129 `http_get` helper AND the new `flv` module:
+   * `crates/lvqr-cli/tests/rtmp_archive_e2e.rs` (session 118) -- removed ~60 LOC of local `HttpResponse` + `http_get` + `http_get_with_auth` + ~15 LOC of flv builders. Kept a 6-line `http_get` wrapper that pins the 10-second TIMEOUT this test needs for RTMP-publish-adjacent reads + a 6-line `http_get_with_auth` wrapper that dispatches through `HttpGetOptions::bearer`. 2 / 2 tests still pass.
+   * `crates/lvqr-cli/tests/rtmp_hls_e2e.rs` (session 12) -- removed ~45 LOC of local `HttpResponse` + `http_get` + `parse_http_response` + ~35 LOC of `flv_video_*` + `flv_audio_*` builders. 1 call site updated from `flv_audio_seq_header()` to the shared-module `flv_audio_aac_lc_seq_header_44k_stereo()` to make the 44 kHz / stereo choice explicit at the callsite. Kept a 10-line `http_get` wrapper for the 10-second TIMEOUT. 3 / 3 tests still pass.
+   * `crates/lvqr-cli/tests/rtmp_dash_e2e.rs` (session 12) -- removed ~45 LOC of http helpers + ~18 LOC of flv_video builders. Kept a 10-line `http_get` wrapper. 2 / 2 tests still pass.
+   * `crates/lvqr-cli/tests/c2pa_verify_e2e.rs` (session 94; `#![cfg(feature = "c2pa")]`) -- removed ~35 LOC of http helpers + ~18 LOC of flv_video builders. Kept a 10-line `http_get` wrapper. 1 / 1 test still passes with `--features c2pa`.
+   * `crates/lvqr-cli/tests/c2pa_cli_flags_e2e.rs` (session 121; `#![cfg(feature = "c2pa")]`) -- removed ~35 LOC of http helpers + ~18 LOC of flv_video builders. Kept a 10-line `http_get` wrapper. 2 / 2 tests still pass with `--features c2pa`.
+
+3. **`tracking/PLAN_V1.1.md`** row 122-B marked SHIPPED with the design-decision list inline.
+
+4. **README.md + `docs/auth.md` unchanged** -- the refactor is pure internal hygiene; no operator-facing surface moved.
+
+### Key 130 design decisions baked in
+
+* **FLV builders ARE uniform; session 129's deferral note was over-cautious.** A grep-plus-awk diff across 11 pre-migration files confirmed `flv_video_seq_header` and `flv_video_nalu` were copy-pasted byte-for-byte (no per-file variance). The 44.1 kHz / stereo `flv_audio_seq_header` was also identical across the 3 files that use it. The only genuine variance was session-114's `rtmp_whep_audio_e2e.rs` using 48 kHz / stereo AAC for its WHEP audio bridge -- solved by exposing a parameterized helper `flv_audio_aac_lc_seq_header(sample_freq_index, channels)` and letting that file call it with `(3, 2)` whenever it migrates (out of scope for this session; rtmp_whep_audio_e2e stays on its local 48k helper for now). Factoring is therefore NOT risky: the shared helpers' unit tests lock every byte sequence against the historical bytes, and each migrated test file re-runs on the same-bytes pipeline.
+
+* **Parameterized `flv_audio_aac_lc_seq_header(freq_idx, channels)` + 44k convenience wrapper, not two fixed helpers.** Option A (two fixed helpers `_44k_stereo` + `_48k_stereo`) would lock the module to the current call set. Option B (one generic helper taking both parameters) is flexible for any future sample-rate test. Went with B plus one convenience wrapper for the dominant 44.1 kHz / stereo case so the migrating files stay readable. The 48 kHz case uses the generic directly (when it migrates); no `_48k_stereo` wrapper today since there is only one 48k call site and it has not been migrated yet.
+
+* **Explicit mask form replaces the historical `(freq_idx << 7) as u8` overflow-truncation.** The pre-migration `let b1: u8 = (4 << 7) | (2 << 3);` relies on u8 shift-overflow wrapping (4 * 128 = 512, truncates to 0 in u8). Rust's release codegen does the wrap silently; debug codegen would check for overflow except the literals are const-evaluated as i32 first. Rewriting as `((freq_idx & 0x01) << 7) | (channels << 3)` makes the intent (extract low bit of sample_freq_index, shift into bit 7) self-documenting and avoids any reliance on wrap semantics. The unit test `audio_seq_header_44k_stereo_matches_historical_bytes` locks the output to `0xAF 0x00 0x12 0x10` so a regression in the byte math would fail loud.
+
+* **Five files migrated, 10 left.** The 10 unmigrated files split into two classes: (a) RTMP-ingest tests whose FLV builders are byte-identical to the shared helpers (`rtmp_ws_e2e`, `rtmp_whep_audio_e2e`, `captions_hls_e2e`, `transcode_ladder_e2e`, `whisper_cli_e2e`, `wasm_frame_counter`, `wasm_hot_reload`, `playback_signed_url_e2e`) -- safe to migrate any time; (b) non-RTMP tests that only need the http_get migration (`cluster_redirect`, `federation_reconnect`, `rtsp_hls_e2e`, `slo_latency_e2e`, `srt_hls_e2e`, `srt_dash_e2e`, `whip_hls_e2e`, `auth_integration`). The 5 chosen for session 130 are the highest-duplication-surface files (each lost both http_get AND flv code) + the two c2pa tests which are feature-gated but landed first because their diffs are the smallest.
+
+* **Local wrappers preserve the 10-second TIMEOUT at each migrated callsite.** Every migrated file kept a thin `http_get` / `http_get_with_auth` wrapper that pins `HttpGetOptions { timeout: TIMEOUT, ..Default::default() }`. Inlining the option struct at every callsite would add ~5 lines of churn per call; the wrappers keep the call sites byte-for-byte identical to their pre-migration shape. Matches the session-129 pattern for `archive_dvr_read_e2e` and `playback_signed_url_e2e`.
+
+* **RTMP handshake helper stays un-factored.** A quick `diff` between the 3 rtmp_client_handshake variants (`rtmp_hls_e2e`, `rtmp_ws_e2e`, `transcode_ladder_e2e`) shows the body is semantically identical but has name variance (`rtmp_client_handshake` vs `rtmp_handshake`) and subtle buffer-handling differences in the `HandshakeProcessResult::InProgress` branch (write-before-continue vs write-if-non-empty). Factoring would require harmonizing these variants, which is a separate session's worth of design work and test re-runs. Session 130 scope explicitly excludes it; session 131 or later can pick it up.
+
+* **Default-gate test count 984 -> 991 (+7).** The 7 delta is exactly the new `flv::tests` unit count. No integration tests were added or removed; every migrated file kept its exact test roster. The briefing's "stays at 984" constraint held for integration tests; the +7 is unit-test expansion which is always a net win.
+
+### Ground truth (session 130 close)
+
+* **Head (pre-push)**: `refactor(tests)` + this close-doc commit (pending). `origin/main` at `77da8c3` unchanged from session 129 push.
+* **Tests**:
+  * Default workspace gate: **991** passed / 0 failed / 3 ignored (+7 over session 129's 984, from the new flv::tests unit suite).
+  * Per-file re-runs after migration: `rtmp_archive_e2e` 2/0/0, `rtmp_hls_e2e` 3/0/0, `rtmp_dash_e2e` 2/0/0, `c2pa_verify_e2e` 1/0/0 (with `--features c2pa`), `c2pa_cli_flags_e2e` 2/0/0 (with `--features c2pa`).
+  * New flv unit tests: `flv::tests` 7/0/0 in 0.00 s.
+* **CI gates locally clean**:
+  * `cargo fmt --all --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `cargo test --workspace` 991 / 0 / 3.
+* **Workspace**: **29 crates**, unchanged.
+
+### Audit trail (session 130)
+
+Post-migration grep for remaining `fn http_get` / `fn flv_video_` in `crates/lvqr-cli/tests/*.rs`:
+
+* `rtmp_archive_e2e.rs`: 2 local http_get wrappers (http_get + http_get_with_auth, both thin forwarders over shared helper); 0 local flv builders.
+* `rtmp_hls_e2e.rs`: 1 local http_get wrapper (thin forwarder); 0 local flv builders.
+* `rtmp_dash_e2e.rs`: 1 local http_get wrapper (thin forwarder); 0 local flv builders.
+* `c2pa_verify_e2e.rs`: 1 local http_get wrapper (thin forwarder); 0 local flv builders.
+* `c2pa_cli_flags_e2e.rs`: 1 local http_get wrapper (thin forwarder); 0 local flv builders.
+* 10 other files: still carry local http_get duplicates; 7 of them additionally carry local flv builders that are byte-identical to the shared module's.
+
+Every wrapper left in the migrated files is 6-10 LOC and forwards directly into the shared module, so future edits inherit the shared semantics.
+
+### Known limitations / documented v1 shape (after 130 close)
+
+* **10 test files still carry local `http_get` duplicates** and 7 of them carry identical flv builder duplicates. Future session work; no behavior difference from the migrated files.
+* **RTMP handshake helper not yet factored.** ~10 RTMP-ingest tests still reimplement `rtmp_client_handshake` with subtle name + buffer-handling variance between the 3 representative bodies. Harmonizing is its own session.
+* **48 kHz AAC `flv_audio_aac_lc_seq_header` one-off** in `rtmp_whep_audio_e2e.rs` stays local until the file migrates (shared module provides the parameterized helper it will use when migrated).
+* **Authoritative DASH-IF container validator deferred**; GPAC MP4Box remains the primary validator in `dash-conformance.yml`.
+* **Webhook auth provider** still pending (README Auth+ops-polish checklist `[ ]`; smaller than JWKS).
+* **npm + PyPI publish cycle** still pending; both published builds at 0.3.1 are behind on admin coverage + miss the session 126 JWKS + session 128 sign_live_url public APIs.
+* All other session 129 + earlier known limitations unchanged.
+
+
+## Session 129 close (2026-04-22)
 
 ## Session 129 close (2026-04-22)
 
