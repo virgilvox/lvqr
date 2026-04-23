@@ -1,8 +1,80 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B + 119-A all SHIPPED** (archive READ DVR E2E + DASH conformance workflow + HTTP Range + tier4-demos CI + CLI C2PA wiring + C2PA integration test audit + demo C2PA opt-in + SDK JS admin 9/9 + Vitest/pytest in CI + SDK Python admin 9/9 + feature-flag CI matrix). 965 workspace tests on the default gate + 1 Playwright E2E + 10 Vitest + 21 pytest green. 29 crates. Next: session 124 -- remaining phase-C rows are SDK reconnect/retry docs, nightly 24h soak (PLAN row 119), OAuth2/JWKS (PLAN row 120), HMAC-signed playback URLs (PLAN row 121), authoritative DASH-IF container validator, scheduled whisper workflow with cached ggml model, shared-helpers refactor across 8+ integration tests.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B + 119-A / 121 all SHIPPED** (archive READ DVR E2E + DASH conformance + HTTP Range + tier4-demos CI + CLI C2PA wiring + C2PA integration-test audit + demo C2PA opt-in + SDK JS 9/9 + Vitest/pytest CI + SDK Python 9/9 + feature-flag CI matrix + HMAC-signed playback URLs). 968 workspace tests on the default gate + 1 Playwright E2E + 10 Vitest + 21 pytest green. 29 crates. Next: session 125 -- remaining phase-C rows are SDK reconnect/retry docs, nightly 24h soak (PLAN row 119 unshipped leg), OAuth2/JWKS (PLAN row 120), authoritative DASH-IF container validator, scheduled whisper workflow with cached ggml model, shared-helpers refactor across 9+ integration tests.
 
-**Last Updated**: 2026-04-22 (session 123 close). Local `main` is 2 commits ahead of `origin/main` (`6b90f15`) pending user push instruction. Session 123's commit pair (`feat(sdk+ci): Python admin client 9/9 + feature-matrix workflow` + `docs: session 123 close + PLAN row 118-B + 119-A SHIPPED`) rides on top of the session 122 chain (`ca1e9a9` + `6b90f15`).
+**Last Updated**: 2026-04-22 (session 124 close). Local `main` is 2 commits ahead of `origin/main` (`3bfc5ae`) pending user push instruction. Session 124's commit pair (`feat(auth): HMAC-signed playback URLs + sign_playback_url helper` + `docs: session 124 close + PLAN row 121 SHIPPED`) rides on top of the session 123 chain (`c6d7d50` + `3bfc5ae`).
+
+## Session 124 close (2026-04-22)
+
+**Shipped**: PLAN row 121 (HMAC-signed playback URLs). Next item on the session-121 audit queue after the SDK slice closed. Narrow but real operator feature: a short-circuit auth path on `/playback/*` so operators can mint one-off share links for third parties who cannot authenticate. Default-gate test count 965 -> 968.
+
+### Deliverables
+
+1. **`--hmac-playback-secret` CLI flag + `LVQR_HMAC_PLAYBACK_SECRET` env** on `lvqr serve`. Threaded into `ServeConfig.hmac_playback_secret: Option<String>`, which `start()` wraps into `Arc<[u8]>` and passes through `playback_router(dir, index, auth, hmac_secret)` to the `ArchiveState` carried by every handler. `TestServerConfig` gained a matching `with_hmac_playback_secret` builder + pass-through assignment so integration tests wire it up via the same programmatic path operators would use.
+
+2. **`crates/lvqr-cli/src/archive.rs` HMAC verification + signing helper** (~180 new LOC). Every `/playback/*` query struct (`PlaybackQuery`, `LatestQuery`, `FileQuery`) grew `sig: Option<String>` + `exp: Option<u64>` fields. New `SignedUrlCheck { Allow, Deny(Response), NotAttempted }` enum + `verify_signed_url()` free function implement the three-way outcome:
+   * `NotAttempted` -- fall through to the existing `playback_auth_gate` (no secret configured OR sig+exp not both present on the request).
+   * `Allow` -- signature verified + expiry valid; handler skips the subscribe-token gate.
+   * `Deny(Response)` -- 403 Forbidden with one of three body strings: `"signed URL expired"`, `"signed URL malformed"`, `"signed URL signature invalid"`. Explicitly 403 not 401 so clients can tell "no auth" from "wrong auth" on status code alone.
+
+   Constant-time compare via `subtle::ConstantTimeEq` on the decoded base64 bytes (not the string) so signature-length differences don't short-circuit via early return. Verification decodes the `sig` query param as base64url-no-pad; a decode error is itself a 403 outcome (malformed).
+
+   Metric: every 403 path bumps `lvqr_auth_failures_total{entry="playback_signed_url"}` so ops dashboards see the signed-URL failure rate distinctly from the existing `entry="playback"` subscribe-token failures.
+
+   The HMAC input is `"<request_path>?exp=<exp>"`, explicitly reconstructed per-handler from `format!("/playback/{broadcast}")`, `format!("/playback/latest/{broadcast}")`, or `format!("/playback/file/{rel}")`. Path reconstruction (not request-URI parsing) means the signed path is normalized against the route template, not whatever the client sent on the wire; a signed URL bound to `/playback/live/dvr` cannot be reused on `/playback/live/other` even if both broadcasts exist.
+
+   Pure `pub fn sign_playback_url(secret: &[u8], request_path: &str, exp_unix: u64) -> String` generates the query suffix `"exp=<ts>&sig=<b64url>"` that operators concatenate after `<path>?`. Re-exported from `lvqr_cli::sign_playback_url`. Shares a private `compute_playback_signature` helper with the verifier so the two paths cannot drift.
+
+3. **`crates/lvqr-cli/tests/playback_signed_url_e2e.rs`** (~400 LOC) with 3 `#[tokio::test]` functions:
+   * `sign_playback_url_matches_hand_rolled_hmac` -- unit test that re-implements the HMAC input format by hand with the `hmac` + `sha2` crates and asserts the signing helper's output decodes back to the expected 32-byte HMAC-SHA256 digest.
+   * `signed_url_grants_access_and_denies_tampering` -- full integration: boots `TestServer` with `subscribe_token: Some("cannot-use-without-bearer")` + an HMAC secret, publishes two RTMP keyframes, then runs SEVEN distinct assertions: (a) valid signed URL returns 200 without a bearer; (b) tampered sig returns 403; (c) expired URL returns 403; (d) no sig + no bearer returns 401; bonus: (e) `/playback/latest/` also accepts a signed URL; (f) bearer-token path still works when signed URL is absent; (g) cross-path signature (signed for `/playback/live/other`, GET on `/playback/live/dvr`) returns 403.
+   * `signed_url_works_on_file_route` -- separate test proving the `/playback/file/*` raw-bytes route also honors signed URLs. Fetches a real archived segment's bytes via a signed URL + asserts the `moof` prefix on the returned bytes.
+
+4. **Workspace-level Cargo.toml** gains direct `hmac = "0.12"` + `sha2 = "0.10"` + `subtle = "2"` entries alongside the existing `base64 = "0.22"`. `lvqr-cli/Cargo.toml` pulls all four into its dependencies. Every crate was already reachable transitively via `jsonwebtoken`; pinning them here makes the direct use explicit and stops a downstream dep bump from silently changing our version.
+
+5. **Docs**: `docs/auth.md` grows a full "Signed playback URLs" section with URL shape, semantics, operator helper example, and explicit scope-boundary list. README Next Up item #4 flipped to shipped. README Auth+ops-polish checklist item (HMAC URLs) flipped. README CLI reference gains the new flag block + env var.
+
+### Key 124 design decisions baked in
+
+* **HMAC covers path + exp only, not the full canonical query string.** Other query params (`track`, `from`, `to`, `token`) are explicitly excluded from the signature. A signed URL grants broadcast-path-scoped access; the recipient can freely scrub `from` / `to` within that broadcast. Operator use case is "share this DVR stream with a third party for an hour"; they get free scrub within the window. Tighter-constrained signatures (e.g. "only segments in [14:00, 15:00]") would add complexity without matching the expected use case. Documented as an explicit scope boundary in `docs/auth.md`.
+
+* **403 Forbidden on sig/expiry failure, 401 Unauthorized on missing auth.** RFC 7231 distinguishes "no auth presented" (401) from "auth presented but insufficient" (403). A tampered signature IS presented auth; returning 401 would invite clients to retry under the assumption they forgot to include a token. 403 is correct + the body string names which part failed.
+
+* **Constant-time compare on decoded bytes, not the base64 string.** `subtle::ConstantTimeEq` on the sig bytes after base64 decode. Comparing as strings before decode would leak length information through the early-exit in string-equality. The decoder itself is naturally variable-time on input but any malformed input is already a 403 with no further comparison, so that channel carries no useful signal.
+
+* **Signature is path-bound via explicit reconstruction, not request URI parsing.** Each handler computes `request_path = format!("/playback/{broadcast}")` (or similar) from its own route template. An attacker who obtains a signed URL for `/playback/live/dvr` cannot reuse it on `/playback/live/other` because the handler's reconstructed path is `/playback/live/other`, which produces a different HMAC input.
+
+* **`sign_playback_url` is a pure free function, not a method on `ServeConfig`.** Operators mint URLs server-side in their own admin service, typically with the secret loaded from env. A method-on-config shape would force them to construct a full `ServeConfig` just to sign a URL. The pure helper takes `(secret, path, exp)` directly.
+
+* **Secret is `Option<Arc<[u8]>>` threaded through handler state, not a module-level static.** Multiple tenants / test instances can each have their own secret. The `Arc<[u8]>` makes the secret cheap to clone into every request handler's state without copying the bytes.
+
+* **Metric name is `lvqr_auth_failures_total{entry="playback_signed_url"}`, not reusing the existing `entry="playback"`.** Operators need to distinguish "legitimate subscribers are failing auth" from "someone is brute-forcing signed URLs". Separate labels on the same counter keeps one dashboard row but split series.
+
+* **Three query params added to every query struct, not a new separate "signed-url" handler.** An alternative design was a parallel `/playback/signed/...` route tree. Rejected because it doubles the URL shape operators have to remember, doubles the route mount surface, and forces the client to know up-front whether it has a signed URL or a bearer (when actually both paths produce the same bytes on success). Query params let the same URL carry either form.
+
+* **No `--hmac-playback-secret` integration with `/hls/*` or `/dash/*` in this session.** Live HLS + DASH have their own `SubscribeAuth` middleware (session 112) and different playlist-URL shapes; extending signed URLs to them would need middleware-level work, not handler-level work. Documented as a follow-up. The dominant share-link use case is DVR scrub (which routes through `/playback/*`) anyway.
+
+### Ground truth (session 124 close)
+
+* **Head (pre-push)**: feat(auth) + this close-doc commit (pending). `origin/main` at `3bfc5ae` unchanged from session 123 push.
+* **Tests (default features gate)**: **968** passed, 0 failed, 2 ignored. **+3** over session 123's 965 (3 new signed-URL test functions; +1 ignored is an intentional `/// ```ignore` doc example on `sign_playback_url` that doesn't build an executable doctest).
+* **CI gates locally clean**:
+  * `cargo fmt --all --check` clean (after one auto-format pass on two-line `assert_eq!`s + the archive.rs imports list).
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `cargo test --workspace` 968 / 0 / 2.
+  * `cargo test -p lvqr-cli --test playback_signed_url_e2e` 3 / 0 / 0 in 1.23 s.
+* **Workspace**: **29 crates**, unchanged.
+* **crates.io**: unchanged. Session 124 adds a public function (`sign_playback_url`) + one optional ServeConfig field; both are additive. Next release cycle carries the public surface.
+
+### Known limitations / documented v1 shape (after 124 close)
+
+* **HMAC signed URLs gated on `/playback/*` only.** Live `/hls/*` and `/dash/*` routes do not honor the sig+exp query params. Extending is a phase-C follow-up.
+* **Signature covers path + exp only**, not other query params. Operators who need "signed URL + signed scrub window" need to layer additional auth.
+* **No token revocation list** -- rotating `--hmac-playback-secret` invalidates every outstanding URL at once. By design; matches the static-HS256-JWT posture.
+* **SDK reconnect/retry docs still undocumented** (session-121 audit carry-over).
+* **Nightly 24h soak still unshipped** (PLAN row 119 unshipped leg; the feature-matrix half landed in session 123).
+* **OAuth2/JWKS still unshipped** (PLAN row 120).
+* All other session 123 + earlier known limitations unchanged.
 
 ## Session 123 close (2026-04-22)
 

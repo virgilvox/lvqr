@@ -316,9 +316,14 @@ gaps explicitly named in Known v0.4.0 limitations.
    `#[ignore]` pending a cached-model workflow). Each cell
    explicitly lists every feature-gated test target so new ones
    get a visible cell to update.
-4. **HMAC-signed playback URLs** (PLAN row 121). Narrow auth
-   primitive for one-off share links; a few hundred LOC +
-   integration test.
+4. ~~**HMAC-signed playback URLs**~~ **Shipped in session 124.**
+   `--hmac-playback-secret` activates a short-circuit auth path
+   on every `/playback/*` route: `?exp=<unix_ts>&sig=<base64url>`
+   where `sig = HMAC-SHA256(secret, "<path>?exp=<ts>")`. Valid
+   signature grants access without a bearer; tampered / expired
+   returns 403 (not 401) so clients can distinguish missing auth
+   from wrong auth. Operator helper `lvqr_cli::sign_playback_url`
+   generates the query suffix from a secret + path + expiry.
 5. **OAuth2 / JWKS dynamic key discovery** (PLAN row 120).
    Larger auth surface than HMAC; adds operator-grade JWT
    flexibility alongside the existing static-secret HS256 path.
@@ -459,7 +464,12 @@ test.
 ### Auth + ops polish
 - [ ] **Webhook auth provider.**
 - [ ] **OAuth2 / JWKS dynamic key discovery.**
-- [ ] **HMAC-signed URLs** for one-off playback links.
+- [x] ~~**HMAC-signed URLs** for one-off playback links.~~
+  Shipped in session 124. `--hmac-playback-secret` enables a
+  short-circuit auth path on `/playback/*` via
+  `?exp=<unix_ts>&sig=<base64url>`; `lvqr_cli::sign_playback_url`
+  is the server-side helper for generating the query suffix.
+  See `docs/auth.md#signed-playback-urls`.
 - [ ] **Stream-key CRUD admin API.**
 - [ ] **Hot config reload.**
 - [ ] **Dedicated DVR scrub web UI.**
@@ -593,6 +603,17 @@ lvqr serve [OPTIONS]
   Storage:
   --record-dir <PATH>       fMP4 recording directory
   --archive-dir <PATH>      DVR archive dir, enables /playback/*
+  --hmac-playback-secret <SECRET>
+                            HMAC-SHA256 secret for signed
+                            playback URLs. When set, every
+                            /playback/* handler accepts
+                            ?exp=<ts>&sig=<b64url> as an
+                            alternative auth path that
+                            short-circuits the subscribe-token
+                            gate. See docs/auth.md for the URL
+                            shape + the `lvqr_cli::sign_playback_url`
+                            operator helper.
+                            Env: LVQR_HMAC_PLAYBACK_SECRET.
 
   WASM filter (read-only tap in v1):
   --wasm-filter <PATH>      Path to a .wasm module exporting
