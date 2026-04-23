@@ -1,8 +1,71 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C: row 117 SHIPPED (session 118) + Range + tier4-demos CI follow-ups SHIPPED (session 119) + CLI C2PA wiring row 117-C SHIPPED (session 120) + C2PA integration test audit + demo C2PA opt-in row 117-D SHIPPED (session 121) + SDK completion (JS admin client 9/9 + Vitest + pytest in CI) row 118-A SHIPPED (session 122).** 965 workspace tests on the default gate + 1 Playwright E2E + 10 Vitest + 8 pytest green on CI. 29 crates. Next: session 123 -- candidate phase-C rows are Python admin-client expansion (mirror JS 9/9), feature-flag CI matrix for `lvqr-cli --features {whisper,transcode,c2pa}`, nightly 24h soak (PLAN row 119), OAuth2/JWKS (PLAN row 120), HMAC-signed playback URLs (PLAN row 121), authoritative DASH-IF container validator, SDK reconnect/retry docs.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B + 119-A all SHIPPED** (archive READ DVR E2E + DASH conformance workflow + HTTP Range + tier4-demos CI + CLI C2PA wiring + C2PA integration test audit + demo C2PA opt-in + SDK JS admin 9/9 + Vitest/pytest in CI + SDK Python admin 9/9 + feature-flag CI matrix). 965 workspace tests on the default gate + 1 Playwright E2E + 10 Vitest + 21 pytest green. 29 crates. Next: session 124 -- remaining phase-C rows are SDK reconnect/retry docs, nightly 24h soak (PLAN row 119), OAuth2/JWKS (PLAN row 120), HMAC-signed playback URLs (PLAN row 121), authoritative DASH-IF container validator, scheduled whisper workflow with cached ggml model, shared-helpers refactor across 8+ integration tests.
 
-**Last Updated**: 2026-04-22 (session 122 close). Local `main` is 2 commits ahead of `origin/main` (`d4bb946`) pending user push instruction. Session 122's commit pair (`feat(sdk+ci): @lvqr/core admin client 9/9 routes + Vitest + pytest in CI` + `docs: session 122 close + PLAN row 118-A SHIPPED`) rides on top of the session 121 + reality-audit chain (`27bb458` + `4bce89b` + `d4bb946`).
+**Last Updated**: 2026-04-22 (session 123 close). Local `main` is 2 commits ahead of `origin/main` (`6b90f15`) pending user push instruction. Session 123's commit pair (`feat(sdk+ci): Python admin client 9/9 + feature-matrix workflow` + `docs: session 123 close + PLAN row 118-B + 119-A SHIPPED`) rides on top of the session 122 chain (`ca1e9a9` + `6b90f15`).
+
+## Session 123 close (2026-04-22)
+
+**Shipped**: two audit follow-throughs bundled -- Python admin client 3/9 -> 9/9 parity + feature-flag CI matrix. Closes the remaining items the session-121 / 122 audit queue ranked as small + ship-able. Both audit Known-Limitations bullets for SDK coverage asymmetry + incomplete feature-matrix CI are resolved.
+
+### Deliverables
+
+1. **Python admin client 9/9 route parity** (`bindings/python/python/lvqr/client.py`, `types.py`, `__init__.py`).
+
+   * `client.py` rewrite: 84 LOC -> 237 LOC, 2 public methods -> 8 public methods. New methods mirror the session-122 JS admin expansion 1:1: `mesh()`, `slo()`, `cluster_nodes()`, `cluster_broadcasts()`, `cluster_config()`, `cluster_federation()`.
+   * `types.py` grows 9 new dataclasses (`MeshState`, `SloEntry`, `SloSnapshot`, `NodeCapacity`, `ClusterNodeView`, `BroadcastSummary`, `ConfigEntry`, `FederationLinkStatus`, `FederationStatus`) + one `Literal["connecting", "connected", "failed"]` alias for `FederationConnectState`. Every dataclass mirrors the Rust serde struct on the server side; field names match JSON on-wire exactly so `**json.loads(body)` unpacks cleanly.
+   * New `bearer_token` kwarg on `LvqrClient.__init__`; when set, the underlying `httpx.Client` carries `Authorization: Bearer <token>` on every request. Parity with the JS `LvqrAdminClientOptions.bearerToken`.
+   * Shared private `_get_json(path)` helper replaces duplicated fetch + raise_for_status + json() across 8 methods; future shape / auth changes become single-edit.
+   * `__init__.py` re-exports every new dataclass alongside existing names so `from lvqr import FederationStatus` works out of the box.
+   * Pytest coverage grows 8 -> 21 tests (+13). Every new method gets a mocked-httpx test; `null`-capacity handling, populated-vs-empty SLO, populated-vs-empty federation, bearer-token header assertion, and 5 dataclass-default tests round it out. 21 / 0 / 0 in 210 ms locally.
+
+2. **`.github/workflows/feature-matrix.yml`** -- new dedicated workflow with three jobs, each exercising a distinct feature-gated surface that no existing workflow covers directly:
+
+   * **`c2pa`** cell (no runtime deps beyond default): `cargo clippy -p lvqr-cli --features c2pa --all-targets -- -D warnings` + `cargo test --test c2pa_verify_e2e` + `cargo test --test c2pa_cli_flags_e2e` (both rcgen + openssl test functions) + `cargo test -p lvqr-archive --features c2pa`. Installs `openssl` apt package for the session-121 openssl cert-generation test variant.
+   * **`transcode`** cell: apt-installs the full GStreamer plugin set + dev headers + ffmpeg + libclang, then runs `aac_opus_roundtrip` + `software_ladder` + `transcode_ladder_e2e` + `rtmp_whep_audio_e2e` under `--features transcode`. Every test target is listed explicitly so new ones must be added to the workflow on each landing, not silently adopted via the default `cargo test` glob.
+   * **`whisper`** cell: apt-installs `libclang-dev + cmake + build-essential` for whisper-rs's bindgen + whisper.cpp's internal build, runs `cargo clippy --features whisper` + `cargo test -p lvqr-agent-whisper --features whisper --test whisper_basic + --lib`. `whisper_cli_e2e` stays `#[ignore]` because it needs a ~78 MB ggml model on `WHISPER_MODEL_PATH`; promoting that to a scheduled workflow with a cached model download is the next whisper-scoped follow-up.
+
+   `continue-on-error: true` during the initial weeks on `main`, per the convention every new dedicated workflow in this repo follows. Promotes to a required check after first clean run.
+
+### Key 123 design decisions baked in
+
+* **Python expansion + feature-matrix bundled in one session.** Both are explicit Next Up items from the session-121 audit (#3 + the Python asymmetry bullet). Both are small enough that a single session can land them cleanly with real tests; splitting into two sessions would double the session-close overhead for no signal benefit.
+
+* **Python client mirrors the JS client 1:1 rather than pythonifying the surface.** `cluster_nodes` / `cluster_broadcasts` / `cluster_config` / `cluster_federation` use `snake_case` (Python convention) but otherwise every method name and dataclass shape lines up with the JS TypeScript interfaces. Operator tooling that transliterates one to the other doesn't have to translate field names.
+
+* **`FederationConnectState` as `Literal["connecting", "connected", "failed"]`** -- the Python equivalent of the JS union type. A Python `enum.Enum` would not round-trip cleanly through JSON; the Literal alias gives type-checkers the same exhaustiveness safety + matches `serde(rename_all = "lowercase")` on the Rust enum.
+
+* **Nullable optional fields use `Optional[T]` with dataclass `default=None`** rather than omitting the attribute. `NodeCapacity | None` on `ClusterNodeView.capacity`, `int | None` on `FederationLinkStatus.last_connected_at_ms`, `str | None` on `FederationLinkStatus.last_error`. Matches the JSON wire contract where the server emits `"capacity": null` until the first gossip round, not an absent key.
+
+* **`bearer_token` passed through to `httpx.Client.headers`**, not re-added on each call. The `httpx.Client` default-headers mechanism sends the header on every request automatically; repeating it per method would be redundant. The pytest `test_bearer_token_header` asserts the client's `headers["Authorization"]` is the expected shape to lock in the contract.
+
+* **Feature-matrix workflow explicitly lists every test target**, not `cargo test -p lvqr-cli --features X` globbing the workspace. Adding a new feature-gated test file then requires a conscious workflow edit rather than silently inheriting the default; the explicit list catches intent-drift. Cost: a few lines of YAML per new target. Benefit: each target stays an intentional cell in the matrix.
+
+* **`whisper_cli_e2e` deliberately stays `#[ignore]` in the CI matrix.** Running it in the workflow would mean downloading a 78 MB ggml file on every push to `main` + every PR. A scheduled workflow (daily or weekly) with an `actions/cache@v4`-backed model blob is the right place for it; added as an explicit Known Limitations follow-up so the gap is visible instead of hidden.
+
+* **Workflow mirrors `tier4-demos.yml`'s apt install list byte-for-byte** for the transcode cell. A fix in one workflow's GStreamer plugin set applies to the other automatically; drift between the two produces visible symmetry-break in the diff.
+
+### Ground truth (session 123 close)
+
+* **Head (pre-push)**: feat(sdk+ci) + this close-doc commit (pending). `origin/main` at `6b90f15` unchanged from the session 122 push.
+* **Tests**:
+  * Default workspace gate: **965** passed, 0 failed, 1 ignored (unchanged; no Rust code moved this session).
+  * `@lvqr/core` Vitest suite: unchanged at 10 / 0 / 0 (no JS changes).
+  * Python client pytest: **21** passed / 0 failed in 210 ms (+13 over session 122's 8, all from new admin-method tests).
+* **CI gates locally clean**:
+  * `cargo fmt --all --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `cargo clippy -p lvqr-cli --features c2pa --all-targets -- -D warnings` clean (previews the c2pa cell of the new workflow).
+  * `cargo test --workspace` 965 / 0 / 1.
+  * `python3 -c 'import yaml; yaml.safe_load(open(".github/workflows/feature-matrix.yml"))'` parses cleanly.
+* **`feature-matrix.yml` not run locally.** Workflow is CI-only; first GitHub Actions run on push carries the authoritative signal. The `c2pa` cell is the most tractable of the three to land clean; `transcode` has the widest apt-install surface so first-run flakiness is likely; `whisper` has the smallest footprint of the three because it only runs compile-check + basic unit tests.
+
+### Known limitations / documented v1 shape (after 123 close)
+
+* **Published npm + PyPI builds at 0.3.1 still ship the 3-method surface.** The 9-method surface lands for consumers at the next publish cycle. Both the JS and Python packages will ship together to keep operator tooling symmetrical.
+* **`whisper_cli_e2e` remains `#[ignore]` in the feature-matrix workflow.** A scheduled workflow with a cached 78 MB ggml model would exercise the full caption-generation path; that is tracked as an explicit phase-C follow-up.
+* **SDK reconnect/retry docs still undocumented** (session-121 audit gap carried over; untouched by sessions 122 + 123). `connectTimeoutMs` / `fetchTimeoutMs` / `bearer_token` ship on both clients but `docs/sdk/javascript.md` is silent on when to reconnect. Natural next-session target.
+* All other session 122 + earlier known limitations unchanged.
 
 ## Session 122 close (2026-04-22)
 

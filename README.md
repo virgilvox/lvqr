@@ -305,11 +305,17 @@ gaps explicitly named in Known v0.4.0 limitations.
    suite (8 type + mocked-httpx tests) on every push + PR.
    Soft-fail (`continue-on-error: true`) during its initial
    weeks on `main`.
-3. **Feature-flag CI matrix.** Add explicit matrix cells for
-   `lvqr-cli --features whisper` / `--features transcode` /
-   `--features c2pa` so regressions in feature-gated paths
-   surface directly, not only through the soft-fail
-   `tier4-demos.yml`.
+3. ~~**Feature-flag CI matrix.**~~ **Shipped in session 123.**
+   New [`feature-matrix.yml`](.github/workflows/feature-matrix.yml)
+   has three jobs: `c2pa` (runs `c2pa_verify_e2e` +
+   `c2pa_cli_flags_e2e` + `lvqr-archive --features c2pa`),
+   `transcode` (installs GStreamer + ffmpeg, runs `aac_opus_roundtrip`
+   + `software_ladder` + `transcode_ladder_e2e` +
+   `rtmp_whep_audio_e2e`), and `whisper` (compile-check +
+   `whisper_basic` unit tests; full `whisper_cli_e2e` remains
+   `#[ignore]` pending a cached-model workflow). Each cell
+   explicitly lists every feature-gated test target so new ones
+   get a visible cell to update.
 4. **HMAC-signed playback URLs** (PLAN row 121). Narrow auth
    primitive for one-off share links; a few hundred LOC +
    integration test.
@@ -353,9 +359,14 @@ JavaScript (`@lvqr/core`, `@lvqr/player` at 0.3.1 on npm), Python
   ([10 admin-client shape tests](bindings/js/tests/sdk/admin-client.spec.ts))
   and the Python client's existing pytest suite
   ([8 type + mocked-httpx tests](bindings/python/tests/test_client.py)).
-- [ ] **Expand Python admin client** from 3 of 9 routes to all
-  9 (same methods the JS client just grew). `bindings/python/python/lvqr/client.py`
-  covers `healthz` / `stats` / `list_streams` today.
+- [x] ~~**Expand Python admin client** from 3 of 9 routes to
+  all 9.~~ Shipped in session 123:
+  `bindings/python/python/lvqr/client.py` now mirrors the JS
+  admin client 1:1 (`mesh`, `slo`, `cluster_nodes`,
+  `cluster_broadcasts`, `cluster_config`, `cluster_federation`)
+  with matching dataclasses + an optional `bearer_token` kwarg.
+  Pytest coverage grows from 8 to 21 tests. Lands on PyPI at
+  the next publish cycle.
 - [ ] Document reconnect + retry semantics in
   [`docs/sdk/javascript.md`](docs/sdk/javascript.md) (currently
   silent on reconnect; `connectTimeoutMs` + `fetchTimeoutMs`
@@ -520,23 +531,25 @@ published crate.
 - **No nightly 24h soak in CI.** `lvqr-soak` has a fast-path
   smoke test; the long-duration soak job is on the v1.1
   checklist.
-- **Feature-flag CI matrix is incomplete.** `.github/workflows/ci.yml`
-  exercises `lvqr-archive --features io-uring` and
-  `lvqr-archive --features c2pa`, but the `lvqr-cli` features
-  `whisper`, `transcode`, and `c2pa` have no dedicated matrix
-  cells. The `transcode` path is exercised end-to-end only by
-  `tier4-demos.yml`, which is `continue-on-error: true` soft-fail
-  during its initial weeks. Operators relying on a specific
-  feature combination should run `cargo test -p lvqr-cli
-  --features <combo>` locally. A phase-C row adds explicit
-  matrix cells.
-- **Python admin client covers 3 of 9 `/api/v1/*` routes.**
-  The JS `@lvqr/core` admin client reached 9/9 coverage in
-  session 122 (`mesh`, `slo`, `clusterNodes`,
-  `clusterBroadcasts`, `clusterConfig`, `clusterFederation`
-  joined the already-shipped `healthz`, `stats`,
-  `listStreams`). The Python `lvqr` package is still at the
-  original 3. A follow-up row mirrors the JS expansion.
+- **Feature-flag CI matrix initially soft-fail.**
+  [`feature-matrix.yml`](.github/workflows/feature-matrix.yml)
+  ships as of session 123 with dedicated jobs for the `c2pa`,
+  `transcode`, and `whisper` features on `lvqr-cli` (covering
+  every feature-gated integration test target explicitly); the
+  workflow is `continue-on-error: true` during its first weeks
+  on `main` per the convention every other new dedicated
+  workflow in this repo has followed. Promotion to a required
+  check after the first clean run. `whisper_cli_e2e` remains
+  `#[ignore]` because it needs a ~78 MB ggml model download;
+  a scheduled-workflow follow-up will cache the model + flip it
+  on.
+- **Client SDK admin coverage at 9/9 on `main`, 3/9 on the
+  last publish.** Both `@lvqr/core` (session 122) and the
+  Python `lvqr` package (session 123) now cover every
+  `/api/v1/*` route the admin router mounts. The published
+  npm + PyPI builds at 0.3.1 still ship the 3-method surface;
+  the 9-method surface lands for consumers at the next publish
+  cycle.
 - **SDK reconnect + retry semantics are undocumented.**
   `@lvqr/core`'s `LvqrClient` + `LvqrAdminClient` ship
   `connectTimeoutMs` / `fetchTimeoutMs` on `main` (both land at
