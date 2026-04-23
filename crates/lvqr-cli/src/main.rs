@@ -223,6 +223,22 @@ struct ServeArgs {
     #[arg(long, env = "LVQR_ARCHIVE_DIR")]
     archive_dir: Option<PathBuf>,
 
+    /// HMAC signing secret for short-lived playback URLs (PLAN v1.1
+    /// row 121). When set, every `/playback/*` handler accepts an
+    /// alternative auth path: a `?exp=<unix_ts>&sig=<base64url>`
+    /// pair where `sig = HMAC-SHA256(secret, "<path>?exp=<ts>")`.
+    /// A valid signature short-circuits the normal subscribe-token
+    /// check so operators can mint one-off share links for third
+    /// parties who cannot authenticate. Tampered or expired
+    /// signatures return 403 (NOT 401) so clients can distinguish
+    /// missing auth from wrong auth. Use a long, high-entropy
+    /// secret (32+ random bytes); rotating it invalidates every
+    /// outstanding signed URL. Omit to disable the signed-URL
+    /// path; all playback routes fall back to their existing
+    /// subscribe-token gate.
+    #[arg(long, env = "LVQR_HMAC_PLAYBACK_SECRET")]
+    hmac_playback_secret: Option<String>,
+
     /// Path to a PEM-encoded C2PA signing certificate chain (leaf
     /// first, then CA). When set together with
     /// `--c2pa-signing-key`, every broadcast that terminates via
@@ -539,6 +555,7 @@ async fn serve_from_args(
         auth: Some(auth),
         record_dir: args.record_dir,
         archive_dir: args.archive_dir,
+        hmac_playback_secret: args.hmac_playback_secret,
         #[cfg(feature = "c2pa")]
         c2pa: c2pa_config,
         #[cfg(feature = "whisper")]

@@ -120,11 +120,20 @@ h264-reader = "0.7"
 # Random
 rand = "0.8"
 
-# Base64 (SDP sprop-parameter-sets encoding)
+# Base64 (SDP sprop-parameter-sets encoding + HMAC URL signatures)
 base64 = "0.22"
 
 # Authentication
 jsonwebtoken = "9"
+
+# HMAC-SHA256 for signed playback URLs. `sha2` is the hash backend;
+# `subtle` gives the constant-time comparison that prevents timing
+# oracles on signature verification. All three already appear in the
+# workspace graph transitively; pinning them here makes the direct
+# use in lvqr-cli explicit.
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
 
 # Metrics
 metrics = "0.24"

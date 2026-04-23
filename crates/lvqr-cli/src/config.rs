@@ -95,6 +95,18 @@ pub struct ServeConfig {
     /// `SegmentRef` against the index. The index + segment files
     /// back the DVR scrub / time-range playback surface (Tier 2.4).
     pub archive_dir: Option<PathBuf>,
+    /// Optional HMAC signing secret for short-lived playback URLs
+    /// (PLAN v1.1 row 121). When set, every `/playback/*` handler
+    /// accepts an alternative auth path: a `?exp=<unix_ts>&sig=
+    /// <base64url>` pair where `sig = HMAC-SHA256(secret, "<path>
+    /// ?exp=<ts>")`. A valid signature short-circuits the normal
+    /// subscribe-token check so an operator can mint a one-off
+    /// share link for a third party who cannot authenticate. An
+    /// expired or tampered signature returns 403 (NOT 401) so the
+    /// client can distinguish missing auth from wrong auth. When
+    /// unset, all playback routes fall back to their existing
+    /// `SubscribeAuth` gate.
+    pub hmac_playback_secret: Option<String>,
     /// Optional C2PA provenance configuration. When set, every
     /// `(broadcast, track)` drained by the archive indexer runs the
     /// broadcast-end finalize path on drain termination (the moment
@@ -282,6 +294,7 @@ impl ServeConfig {
             auth: None,
             record_dir: None,
             archive_dir: None,
+            hmac_playback_secret: None,
             #[cfg(feature = "c2pa")]
             c2pa: None,
             #[cfg(feature = "whisper")]

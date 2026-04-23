@@ -45,6 +45,7 @@ pub struct TestServerConfig {
     auth: Option<SharedAuth>,
     record_dir: Option<PathBuf>,
     archive_dir: Option<PathBuf>,
+    hmac_playback_secret: Option<String>,
     wasm_filter: Option<PathBuf>,
     hls_disabled: bool,
     dash_enabled: bool,
@@ -98,6 +99,18 @@ impl TestServerConfig {
     /// into `<dir>/<broadcast>/<track>/<seq>.m4s` as they arrive.
     pub fn with_archive_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.archive_dir = Some(dir.into());
+        self
+    }
+
+    /// Install an HMAC signing secret for short-lived playback
+    /// URLs (PLAN v1.1 row 121). When set, every `/playback/*`
+    /// handler accepts an alternative auth path via
+    /// `?exp=<ts>&sig=<b64url>` query params that short-circuits
+    /// the `SharedAuth` subscribe gate. Used by the signed-URL
+    /// integration tests to exercise the valid / tampered /
+    /// expired / missing-sig scenarios.
+    pub fn with_hmac_playback_secret(mut self, secret: impl Into<String>) -> Self {
+        self.hmac_playback_secret = Some(secret.into());
         self
     }
 
@@ -301,6 +314,7 @@ impl TestServer {
             auth: config.auth,
             record_dir: config.record_dir,
             archive_dir: config.archive_dir,
+            hmac_playback_secret: config.hmac_playback_secret,
             #[cfg(feature = "c2pa")]
             c2pa: config.c2pa,
             #[cfg(feature = "whisper")]

@@ -21,6 +21,7 @@ mod handle;
 mod hls;
 mod ws;
 
+pub use archive::sign_playback_url;
 pub use config::ServeConfig;
 #[cfg(feature = "transcode")]
 pub use config::{parse_one_transcode_rendition, parse_transcode_renditions};
@@ -924,8 +925,22 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         };
 
         let combined = admin_router.merge(ws_router);
+        // PLAN v1.1 row 121: when `ServeConfig.hmac_playback_secret`
+        // is set, the playback router accepts `?sig=...&exp=...` as
+        // an alternative auth path that short-circuits the
+        // `SharedAuth` subscribe gate. Wrap the secret in
+        // `Arc<[u8]>` so every handler clone shares one copy.
+        let hmac_playback_secret: Option<Arc<[u8]>> = config
+            .hmac_playback_secret
+            .as_ref()
+            .map(|s| Arc::from(s.as_bytes()));
         let combined = if let Some((ref dir, ref index)) = archive_index {
-            combined.merge(playback_router(dir.clone(), Arc::clone(index), auth.clone()))
+            combined.merge(playback_router(
+                dir.clone(),
+                Arc::clone(index),
+                auth.clone(),
+                hmac_playback_secret.clone(),
+            ))
         } else {
             combined
         };

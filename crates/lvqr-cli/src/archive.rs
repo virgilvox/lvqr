@@ -16,6 +16,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Body;
@@ -23,6 +24,8 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
+use base64::Engine;
+use hmac::{Hmac, Mac};
 #[cfg(feature = "c2pa")]
 use lvqr_archive::provenance::{C2paConfig, finalize_broadcast_signed};
 #[cfg(feature = "c2pa")]
@@ -32,6 +35,8 @@ use lvqr_archive::{RedbSegmentIndex, SegmentIndex, SegmentRef};
 use lvqr_auth::{AuthContext, AuthDecision, SharedAuth};
 use lvqr_fragment::{FragmentBroadcasterRegistry, FragmentStream};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use tokio::runtime::Handle;
 
 /// Broadcaster-native archive indexer. Session 59 consumer-side
@@ -396,7 +401,12 @@ impl From<SegmentRef> for PlaybackSegment {
 /// defaults to `0.mp4` (video) so a caller who only wants the
 /// video rendition can omit it; `from` defaults to `0` and `to`
 /// to `u64::MAX` so omitting both returns every recorded segment
-/// for the stream.
+/// for the stream. `sig` + `exp` activate the signed-URL auth
+/// path (PLAN row 121); either alone is ignored. Other query
+/// params (`track`, `from`, `to`, `token`) are NOT covered by
+/// the signature -- the signed URL grants access, then the
+/// other params shape what the scan returns within the granted
+/// broadcast.
 #[derive(Debug, Deserialize)]
 pub(crate) struct PlaybackQuery {
     #[serde(default)]
@@ -407,21 +417,32 @@ pub(crate) struct PlaybackQuery {
     pub to: Option<u64>,
     #[serde(default)]
     pub token: Option<String>,
+    #[serde(default)]
+    pub sig: Option<String>,
+    #[serde(default)]
+    pub exp: Option<u64>,
 }
 
 /// Router state shared between the three `/playback/*` handlers.
 /// Carries a canonicalized copy of the archive directory so the
 /// `file` handler can reject path traversal in constant time,
 /// the shared [`SharedAuth`] provider so every handler honors
-/// the same subscribe-token semantics the WS relay uses, and
-/// the shared `RedbSegmentIndex` handle so the sync scans do
-/// not race redb's exclusive-file lock against the writer.
+/// the same subscribe-token semantics the WS relay uses, the
+/// shared `RedbSegmentIndex` handle so the sync scans do not
+/// race redb's exclusive-file lock against the writer, and an
+/// optional HMAC secret for signed-URL short-circuits.
 #[derive(Clone)]
 pub(crate) struct ArchiveState {
     pub dir: Arc<PathBuf>,
     pub canonical_dir: Arc<PathBuf>,
     pub index: Arc<RedbSegmentIndex>,
     pub auth: SharedAuth,
+    /// Optional HMAC signing secret (PLAN row 121). When `Some`,
+    /// every playback handler accepts a `?exp=<ts>&sig=<b64url>`
+    /// pair as an alternative auth path that short-circuits the
+    /// [`SharedAuth`] subscribe gate. `None` falls back to the
+    /// normal gate unchanged.
+    pub hmac_secret: Option<Arc<[u8]>>,
 }
 
 /// Extract a bearer token from an incoming request. Two
@@ -463,15 +484,129 @@ fn playback_auth_gate(auth: &SharedAuth, broadcast: &str, token: Option<String>)
     None
 }
 
+/// Outcome of checking the signed-URL auth path. `Allow` means the
+/// signature verified; `Deny(resp)` returns an already-built 403
+/// response; `NotAttempted` means the client did not present sig+exp
+/// or the server has no HMAC secret configured, so the caller
+/// should fall through to the normal [`playback_auth_gate`].
+enum SignedUrlCheck {
+    Allow,
+    Deny(Response),
+    NotAttempted,
+}
+
+/// Verify a `?sig=...&exp=...` pair against the configured HMAC
+/// secret. `request_path` is the URL path component excluding the
+/// query string (e.g. `"/playback/live/dvr"`). The signature input
+/// is `"<request_path>?exp=<exp>"` so signatures are path-and-
+/// expiry-specific.
+///
+/// Returns:
+/// * [`SignedUrlCheck::NotAttempted`] when the server has no
+///   secret configured OR the client did not present both
+///   `sig` and `exp` -- the handler falls through to the
+///   subscribe-token gate.
+/// * [`SignedUrlCheck::Deny`] with a 403 Forbidden when the
+///   signature or expiry fails verification. 403 (not 401)
+///   because the client did present credentials; they are
+///   just wrong or stale. Clients can distinguish "no auth"
+///   from "bad auth" on status code alone.
+/// * [`SignedUrlCheck::Allow`] when both checks pass. The
+///   caller skips the subscribe-token gate.
+fn verify_signed_url(
+    hmac_secret: Option<&[u8]>,
+    request_path: &str,
+    sig: Option<&str>,
+    exp: Option<u64>,
+) -> SignedUrlCheck {
+    let Some(secret) = hmac_secret else {
+        return SignedUrlCheck::NotAttempted;
+    };
+    let (sig, exp) = match (sig, exp) {
+        (Some(s), Some(e)) => (s, e),
+        _ => return SignedUrlCheck::NotAttempted,
+    };
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if exp <= now_secs {
+        metrics::counter!("lvqr_auth_failures_total", "entry" => "playback_signed_url").increment(1);
+        return SignedUrlCheck::Deny((StatusCode::FORBIDDEN, "signed URL expired").into_response());
+    }
+
+    let expected = compute_playback_signature(secret, request_path, exp);
+    // `constant_time_eq` on byte slices. Decoding the provided
+    // base64 first and comparing bytes keeps the comparison
+    // length-stable; comparing as strings would leak via early
+    // exit on length mismatch.
+    let provided = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            metrics::counter!("lvqr_auth_failures_total", "entry" => "playback_signed_url").increment(1);
+            return SignedUrlCheck::Deny((StatusCode::FORBIDDEN, "signed URL malformed").into_response());
+        }
+    };
+    if provided.len() != expected.len() || !bool::from(provided.ct_eq(&expected)) {
+        metrics::counter!("lvqr_auth_failures_total", "entry" => "playback_signed_url").increment(1);
+        return SignedUrlCheck::Deny((StatusCode::FORBIDDEN, "signed URL signature invalid").into_response());
+    }
+    SignedUrlCheck::Allow
+}
+
+/// Compute the HMAC-SHA256 of `"<request_path>?exp=<exp>"` under
+/// the supplied secret. Pure helper, shared by the verifier and
+/// the operator-facing [`sign_playback_url`] generator so the two
+/// paths cannot drift.
+fn compute_playback_signature(secret: &[u8], request_path: &str, exp: u64) -> Vec<u8> {
+    let input = format!("{request_path}?exp={exp}");
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(input.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Generate a signed playback URL query suffix for the operator's
+/// server-side helper code. Returns the full query string
+/// `"exp=<exp>&sig=<b64url>"` that the caller concatenates after
+/// `<request_path>?`. The caller chooses `exp_unix` (typically
+/// `now + share_duration`); short-lived is preferred (minutes,
+/// not days).
+///
+/// # Example
+///
+/// ```ignore
+/// let suffix = sign_playback_url(b"secret-key", "/playback/live/dvr", 1_760_000_000);
+/// let url = format!("https://relay.example:8080/playback/live/dvr?{suffix}");
+/// // url -> "https://relay.example:8080/playback/live/dvr?exp=1760000000&sig=<base64url>"
+/// ```
+pub fn sign_playback_url(secret: &[u8], request_path: &str, exp_unix: u64) -> String {
+    let sig_bytes = compute_playback_signature(secret, request_path, exp_unix);
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sig_bytes);
+    format!("exp={exp_unix}&sig={sig_b64}")
+}
+
 async fn playback_handler(
     State(state): State<ArchiveState>,
     headers: HeaderMap,
     AxumPath(broadcast): AxumPath<String>,
     Query(params): Query<PlaybackQuery>,
 ) -> Response {
-    let token = extract_bearer(&headers, &params.token);
-    if let Some(resp) = playback_auth_gate(&state.auth, &broadcast, token) {
-        return resp;
+    let request_path = format!("/playback/{broadcast}");
+    match verify_signed_url(
+        state.hmac_secret.as_deref(),
+        &request_path,
+        params.sig.as_deref(),
+        params.exp,
+    ) {
+        SignedUrlCheck::Allow => {}
+        SignedUrlCheck::Deny(resp) => return resp,
+        SignedUrlCheck::NotAttempted => {
+            let token = extract_bearer(&headers, &params.token);
+            if let Some(resp) = playback_auth_gate(&state.auth, &broadcast, token) {
+                return resp;
+            }
+        }
     }
 
     let track = params.track.as_deref().unwrap_or("0.mp4");
@@ -510,6 +645,10 @@ pub(crate) struct LatestQuery {
     pub track: Option<String>,
     #[serde(default)]
     pub token: Option<String>,
+    #[serde(default)]
+    pub sig: Option<String>,
+    #[serde(default)]
+    pub exp: Option<u64>,
 }
 
 async fn latest_handler(
@@ -518,9 +657,21 @@ async fn latest_handler(
     AxumPath(broadcast): AxumPath<String>,
     Query(params): Query<LatestQuery>,
 ) -> Response {
-    let token = extract_bearer(&headers, &params.token);
-    if let Some(resp) = playback_auth_gate(&state.auth, &broadcast, token) {
-        return resp;
+    let request_path = format!("/playback/latest/{broadcast}");
+    match verify_signed_url(
+        state.hmac_secret.as_deref(),
+        &request_path,
+        params.sig.as_deref(),
+        params.exp,
+    ) {
+        SignedUrlCheck::Allow => {}
+        SignedUrlCheck::Deny(resp) => return resp,
+        SignedUrlCheck::NotAttempted => {
+            let token = extract_bearer(&headers, &params.token);
+            if let Some(resp) = playback_auth_gate(&state.auth, &broadcast, token) {
+                return resp;
+            }
+        }
     }
 
     let track = params.track.as_deref().unwrap_or("0.mp4").to_string();
@@ -543,13 +694,18 @@ async fn latest_handler(
     }
 }
 
-/// Query parameters for `GET /playback/file/{*rel}`. The only
-/// field today is the token fallback; `rel` itself is the URL
+/// Query parameters for `GET /playback/file/{*rel}`. Besides
+/// the bearer-token fallback, accepts the `sig` + `exp`
+/// signed-URL pair (PLAN row 121). `rel` itself is the URL
 /// path component.
 #[derive(Debug, Deserialize)]
 pub(crate) struct FileQuery {
     #[serde(default)]
     pub token: Option<String>,
+    #[serde(default)]
+    pub sig: Option<String>,
+    #[serde(default)]
+    pub exp: Option<u64>,
 }
 
 /// Serve an archived fragment file by relative path, e.g.
@@ -575,10 +731,22 @@ async fn file_handler(
     AxumPath(rel): AxumPath<String>,
     Query(params): Query<FileQuery>,
 ) -> Response {
-    let token = extract_bearer(&headers, &params.token);
-    let broadcast_for_auth = broadcast_from_rel(&rel);
-    if let Some(resp) = playback_auth_gate(&state.auth, broadcast_for_auth, token) {
-        return resp;
+    let request_path = format!("/playback/file/{rel}");
+    match verify_signed_url(
+        state.hmac_secret.as_deref(),
+        &request_path,
+        params.sig.as_deref(),
+        params.exp,
+    ) {
+        SignedUrlCheck::Allow => {}
+        SignedUrlCheck::Deny(resp) => return resp,
+        SignedUrlCheck::NotAttempted => {
+            let token = extract_bearer(&headers, &params.token);
+            let broadcast_for_auth = broadcast_from_rel(&rel);
+            if let Some(resp) = playback_auth_gate(&state.auth, broadcast_for_auth, token) {
+                return resp;
+            }
+        }
     }
 
     let joined = state.dir.join(&rel);
@@ -877,13 +1045,19 @@ fn broadcast_from_rel(rel: &str) -> &str {
 /// The `latest` and `file` routes are declared first so axum's
 /// more-specific match wins over the trailing catch-all on
 /// `{*broadcast}`.
-pub(crate) fn playback_router(dir: PathBuf, index: Arc<RedbSegmentIndex>, auth: SharedAuth) -> Router {
+pub(crate) fn playback_router(
+    dir: PathBuf,
+    index: Arc<RedbSegmentIndex>,
+    auth: SharedAuth,
+    hmac_secret: Option<Arc<[u8]>>,
+) -> Router {
     let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
     let state = ArchiveState {
         dir: Arc::new(dir),
         canonical_dir: Arc::new(canonical_dir),
         index,
         auth,
+        hmac_secret,
     };
     Router::new()
         .route("/playback/latest/{*broadcast}", get(latest_handler))
