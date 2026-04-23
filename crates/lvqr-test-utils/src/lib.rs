@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use std::net::TcpListener;
 
+pub mod http;
 mod test_server;
 pub use test_server::{TestServer, TestServerConfig};
 

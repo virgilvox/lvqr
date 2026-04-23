@@ -78,49 +78,15 @@ fn flv_video_nalu(keyframe: bool, cts: i32, nalu_data: &[u8]) -> Bytes {
     Bytes::from(tag)
 }
 
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
-async fn http_get(addr: SocketAddr, path: &str) -> HttpResponse {
-    http_get_with_bearer(addr, path, None).await
-}
+use lvqr_test_utils::http::{HttpGetOptions, HttpResponse, http_get, http_get_with};
 
 async fn http_get_with_bearer(addr: SocketAddr, path: &str, bearer: Option<&str>) -> HttpResponse {
-    let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
-        .await
-        .expect("connect timed out")
-        .expect("connect failed");
-    let auth_header = match bearer {
-        Some(t) => format!("Authorization: Bearer {t}\r\n"),
-        None => String::new(),
+    let mut opts = HttpGetOptions {
+        timeout: TIMEOUT,
+        ..HttpGetOptions::default()
     };
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Connection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut buf = Vec::new();
-    tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut buf))
-        .await
-        .expect("read timed out")
-        .expect("read failed");
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("missing terminator");
-    let header_text = std::str::from_utf8(&buf[..split]).expect("utf-8 headers");
-    let status: u16 = header_text
-        .lines()
-        .next()
-        .unwrap()
-        .split_whitespace()
-        .nth(1)
-        .unwrap()
-        .parse()
-        .unwrap();
-    HttpResponse {
-        status,
-        body: buf[split + 4..].to_vec(),
-    }
+    opts.bearer = bearer;
+    http_get_with(addr, path, opts).await
 }
 
 async fn rtmp_handshake(stream: &mut TcpStream) -> Vec<u8> {

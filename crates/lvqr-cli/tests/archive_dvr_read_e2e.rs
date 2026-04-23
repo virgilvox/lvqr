@@ -78,66 +78,19 @@ fn flv_video_nalu(keyframe: bool, cts: i32, nalu_data: &[u8]) -> Bytes {
 // HTTP/1.1 `Connection: close` GET client, with header capture.
 // =====================================================================
 
-struct HttpResponse {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl HttpResponse {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-    }
-}
+use lvqr_test_utils::http::{HttpGetOptions, HttpResponse, http_get_with};
 
 async fn http_get(addr: SocketAddr, path: &str) -> HttpResponse {
     http_get_with_range(addr, path, None).await
 }
 
 async fn http_get_with_range(addr: SocketAddr, path: &str, range: Option<&str>) -> HttpResponse {
-    let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
-        .await
-        .expect("http GET connect timed out")
-        .expect("http GET connect failed");
-    let range_header = match range {
-        Some(r) => format!("Range: {r}\r\n"),
-        None => String::new(),
+    let mut opts = HttpGetOptions {
+        timeout: TIMEOUT,
+        ..HttpGetOptions::default()
     };
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{range_header}Connection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut buf = Vec::new();
-    tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut buf))
-        .await
-        .expect("http GET read timed out")
-        .expect("http GET read failed");
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("http response missing header terminator");
-    let header_text = std::str::from_utf8(&buf[..split]).expect("http headers are not utf-8");
-    let mut lines = header_text.lines();
-    let status_line = lines.next().expect("http response missing status line");
-    let mut parts = status_line.splitn(3, ' ');
-    let _http_version = parts.next();
-    let status: u16 = parts
-        .next()
-        .expect("status line missing code")
-        .parse()
-        .expect("status code is not numeric");
-    let headers: Vec<(String, String)> = lines
-        .filter_map(|line| {
-            let (k, v) = line.split_once(':')?;
-            Some((k.trim().to_string(), v.trim().to_string()))
-        })
-        .collect();
-    HttpResponse {
-        status,
-        headers,
-        body: buf[split + 4..].to_vec(),
-    }
+    opts.range = range;
+    http_get_with(addr, path, opts).await
 }
 
 // =====================================================================

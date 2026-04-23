@@ -24,44 +24,15 @@
 //!   subscribe-token gate; the short-circuit is additive, not
 //!   replacing).
 
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use lvqr_auth::{SharedAuth, StaticAuthConfig, StaticAuthProvider};
 use lvqr_cli::{LiveScheme, sign_live_url};
+use lvqr_test_utils::http::http_get_status;
 use lvqr_test_utils::{TestServer, TestServerConfig};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
-const TIMEOUT: Duration = Duration::from_secs(5);
 const SECRET: &[u8] = b"live-signed-url-test-secret";
-
-struct HttpResponse {
-    status: u16,
-}
-
-async fn http_get(addr: SocketAddr, path: &str) -> HttpResponse {
-    let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
-        .await
-        .expect("connect timed out")
-        .expect("connect failed");
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).await.expect("http write");
-    let mut raw = Vec::with_capacity(4096);
-    let _ = tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut raw))
-        .await
-        .expect("http read timed out")
-        .expect("http read");
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let first_line = text.lines().next().unwrap_or_default();
-    let status: u16 = first_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("could not parse status line: {first_line:?}"));
-    HttpResponse { status }
-}
 
 fn subscribe_auth(token: &str) -> SharedAuth {
     Arc::new(StaticAuthProvider::new(StaticAuthConfig {
@@ -99,16 +70,14 @@ async fn hls_signed_url_grants_access_without_bearer() {
     let suffix = sign_live_url(SECRET, LiveScheme::Hls, "live/demo", exp);
     let path = format!("/hls/live/demo/playlist.m3u8?{suffix}");
 
-    let resp = http_get(addr, &path).await;
+    let status = http_get_status(addr, &path).await;
     assert_ne!(
-        resp.status, 401,
-        "valid HLS signed URL should short-circuit the subscribe gate; got {}",
-        resp.status
+        status, 401,
+        "valid HLS signed URL should short-circuit the subscribe gate; got {status}"
     );
     assert_ne!(
-        resp.status, 403,
-        "valid HLS signed URL should not be forbidden; got {}",
-        resp.status
+        status, 403,
+        "valid HLS signed URL should not be forbidden; got {status}"
     );
 
     server.shutdown().await.expect("shutdown");
@@ -123,16 +92,14 @@ async fn dash_signed_url_grants_access_without_bearer() {
     let suffix = sign_live_url(SECRET, LiveScheme::Dash, "live/demo", exp);
     let path = format!("/dash/live/demo/manifest.mpd?{suffix}");
 
-    let resp = http_get(addr, &path).await;
+    let status = http_get_status(addr, &path).await;
     assert_ne!(
-        resp.status, 401,
-        "valid DASH signed URL should short-circuit the subscribe gate; got {}",
-        resp.status
+        status, 401,
+        "valid DASH signed URL should short-circuit the subscribe gate; got {status}"
     );
     assert_ne!(
-        resp.status, 403,
-        "valid DASH signed URL should not be forbidden; got {}",
-        resp.status
+        status, 403,
+        "valid DASH signed URL should not be forbidden; got {status}"
     );
 
     server.shutdown().await.expect("shutdown");
@@ -151,12 +118,8 @@ async fn tampered_hls_sig_returns_403() {
     suffix.push(flipped);
     let path = format!("/hls/live/demo/playlist.m3u8?{suffix}");
 
-    let resp = http_get(addr, &path).await;
-    assert_eq!(
-        resp.status, 403,
-        "tampered HLS sig must return 403; got {}",
-        resp.status
-    );
+    let status = http_get_status(addr, &path).await;
+    assert_eq!(status, 403, "tampered HLS sig must return 403; got {status}");
 
     server.shutdown().await.expect("shutdown");
 }
@@ -174,8 +137,8 @@ async fn expired_hls_url_returns_403() {
     let suffix = sign_live_url(SECRET, LiveScheme::Hls, "live/demo", exp);
     let path = format!("/hls/live/demo/playlist.m3u8?{suffix}");
 
-    let resp = http_get(addr, &path).await;
-    assert_eq!(resp.status, 403, "expired HLS URL must return 403; got {}", resp.status);
+    let status = http_get_status(addr, &path).await;
+    assert_eq!(status, 403, "expired HLS URL must return 403; got {status}");
 
     server.shutdown().await.expect("shutdown");
 }
@@ -193,12 +156,8 @@ async fn hls_sig_rejected_on_dash_route() {
     let suffix = sign_live_url(SECRET, LiveScheme::Hls, "live/demo", exp);
     let path = format!("/dash/live/demo/manifest.mpd?{suffix}");
 
-    let resp = http_get(dash_addr, &path).await;
-    assert_eq!(
-        resp.status, 403,
-        "HLS-minted sig on DASH must return 403; got {}",
-        resp.status
-    );
+    let status = http_get_status(dash_addr, &path).await;
+    assert_eq!(status, 403, "HLS-minted sig on DASH must return 403; got {status}");
 
     server.shutdown().await.expect("shutdown");
 }
@@ -213,11 +172,10 @@ async fn hls_sig_rejected_on_wrong_broadcast() {
     let suffix = sign_live_url(SECRET, LiveScheme::Hls, "live/broadcast-a", exp);
     let path = format!("/hls/live/broadcast-b/playlist.m3u8?{suffix}");
 
-    let resp = http_get(addr, &path).await;
+    let status = http_get_status(addr, &path).await;
     assert_eq!(
-        resp.status, 403,
-        "broadcast-A sig on broadcast-B must return 403; got {}",
-        resp.status
+        status, 403,
+        "broadcast-A sig on broadcast-B must return 403; got {status}"
     );
 
     server.shutdown().await.expect("shutdown");
@@ -229,11 +187,10 @@ async fn missing_sig_falls_through_to_subscribe_gate() {
     let addr = server.hls_addr();
 
     // No sig + no bearer -> 401 from the subscribe-token gate.
-    let resp = http_get(addr, "/hls/live/demo/playlist.m3u8").await;
+    let status = http_get_status(addr, "/hls/live/demo/playlist.m3u8").await;
     assert_eq!(
-        resp.status, 401,
-        "no sig + no bearer should fall through to the subscribe-token gate and 401; got {}",
-        resp.status
+        status, 401,
+        "no sig + no bearer should fall through to the subscribe-token gate and 401; got {status}"
     );
 
     server.shutdown().await.expect("shutdown");

@@ -35,45 +35,20 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use lvqr_auth::{SharedAuth, StaticAuthConfig, StaticAuthProvider};
+use lvqr_test_utils::http::{HttpGetOptions, http_get_status, http_get_with};
 use lvqr_test_utils::{TestServer, TestServerConfig};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
-const TIMEOUT: Duration = Duration::from_secs(5);
-
-struct Response {
-    status: u16,
-}
-
-async fn http_get(addr: SocketAddr, path: &str, bearer: Option<&str>) -> Response {
-    let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
-        .await
-        .expect("connect timed out")
-        .expect("connect failed");
-    let mut req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
-    if let Some(token) = bearer {
-        req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+async fn status_with_bearer(addr: SocketAddr, path: &str, bearer: Option<&str>) -> u16 {
+    match bearer {
+        Some(token) => {
+            http_get_with(addr, path, HttpGetOptions::with_bearer(token))
+                .await
+                .status
+        }
+        None => http_get_status(addr, path).await,
     }
-    req.push_str("\r\n");
-    stream.write_all(req.as_bytes()).await.expect("http write");
-
-    let mut raw = Vec::with_capacity(4096);
-    let _ = tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut raw))
-        .await
-        .expect("http read timed out")
-        .expect("http read");
-
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let first_line = text.lines().next().unwrap_or_default();
-    let status: u16 = first_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("could not parse status line: {first_line:?}"));
-    Response { status }
 }
 
 fn static_subscribe_auth(token: &str) -> SharedAuth {
@@ -91,8 +66,8 @@ async fn authed_hls_rejects_missing_token() {
         .expect("TestServer::start");
     let addr = server.hls_addr();
 
-    let resp = http_get(addr, "/hls/live/demo/playlist.m3u8", None).await;
-    assert_eq!(resp.status, 401, "expected 401 without bearer; got {}", resp.status);
+    let status = status_with_bearer(addr, "/hls/live/demo/playlist.m3u8", None).await;
+    assert_eq!(status, 401, "expected 401 without bearer; got {status}");
 
     server.shutdown().await.expect("shutdown");
 }
@@ -104,8 +79,8 @@ async fn authed_hls_accepts_bearer_header() {
         .expect("TestServer::start");
     let addr = server.hls_addr();
 
-    let resp = http_get(addr, "/hls/live/demo/playlist.m3u8", Some("viewer-secret")).await;
-    assert_ne!(resp.status, 401, "auth gate should have allowed the bearer through");
+    let status = status_with_bearer(addr, "/hls/live/demo/playlist.m3u8", Some("viewer-secret")).await;
+    assert_ne!(status, 401, "auth gate should have allowed the bearer through");
 
     server.shutdown().await.expect("shutdown");
 }
@@ -117,8 +92,8 @@ async fn authed_hls_accepts_query_token() {
         .expect("TestServer::start");
     let addr = server.hls_addr();
 
-    let resp = http_get(addr, "/hls/live/demo/playlist.m3u8?token=viewer-secret", None).await;
-    assert_ne!(resp.status, 401, "query token should have allowed the request through");
+    let status = http_get_status(addr, "/hls/live/demo/playlist.m3u8?token=viewer-secret").await;
+    assert_ne!(status, 401, "query token should have allowed the request through");
 
     server.shutdown().await.expect("shutdown");
 }
@@ -130,8 +105,8 @@ async fn authed_hls_rejects_wrong_token() {
         .expect("TestServer::start");
     let addr = server.hls_addr();
 
-    let resp = http_get(addr, "/hls/live/demo/playlist.m3u8", Some("wrong-token")).await;
-    assert_eq!(resp.status, 401, "wrong bearer should be rejected; got {}", resp.status);
+    let status = status_with_bearer(addr, "/hls/live/demo/playlist.m3u8", Some("wrong-token")).await;
+    assert_eq!(status, 401, "wrong bearer should be rejected; got {status}");
 
     server.shutdown().await.expect("shutdown");
 }
@@ -147,18 +122,14 @@ async fn authed_dash_rejects_missing_token() {
     .expect("TestServer::start");
     let addr = server.dash_addr();
 
-    let resp = http_get(addr, "/dash/live/demo/manifest.mpd", None).await;
+    let status_no_bearer = status_with_bearer(addr, "/dash/live/demo/manifest.mpd", None).await;
     assert_eq!(
-        resp.status, 401,
-        "expected 401 without bearer on DASH; got {}",
-        resp.status
+        status_no_bearer, 401,
+        "expected 401 without bearer on DASH; got {status_no_bearer}"
     );
 
-    let resp_ok = http_get(addr, "/dash/live/demo/manifest.mpd", Some("viewer-secret")).await;
-    assert_ne!(
-        resp_ok.status, 401,
-        "DASH auth gate should have allowed the bearer through"
-    );
+    let status_ok = status_with_bearer(addr, "/dash/live/demo/manifest.mpd", Some("viewer-secret")).await;
+    assert_ne!(status_ok, 401, "DASH auth gate should have allowed the bearer through");
 
     server.shutdown().await.expect("shutdown");
 }
@@ -174,11 +145,10 @@ async fn escape_hatch_disables_live_auth() {
     .expect("TestServer::start");
     let addr = server.hls_addr();
 
-    let resp = http_get(addr, "/hls/live/demo/playlist.m3u8", None).await;
+    let status = status_with_bearer(addr, "/hls/live/demo/playlist.m3u8", None).await;
     assert_ne!(
-        resp.status, 401,
-        "escape hatch should have disabled the live-playback auth gate; got {}",
-        resp.status
+        status, 401,
+        "escape hatch should have disabled the live-playback auth gate; got {status}"
     );
 
     server.shutdown().await.expect("shutdown");
@@ -195,12 +165,8 @@ async fn noop_provider_never_gates() {
         .expect("TestServer::start");
     let addr = server.hls_addr();
 
-    let resp = http_get(addr, "/hls/live/demo/playlist.m3u8", None).await;
-    assert_ne!(
-        resp.status, 401,
-        "noop provider must allow unauthed live HLS; got {}",
-        resp.status
-    );
+    let status = status_with_bearer(addr, "/hls/live/demo/playlist.m3u8", None).await;
+    assert_ne!(status, 401, "noop provider must allow unauthed live HLS; got {status}");
 
     server.shutdown().await.expect("shutdown");
 }
