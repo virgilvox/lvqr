@@ -862,12 +862,14 @@ cargo bench -p lvqr-rtsp
 cargo bench -p lvqr-cmaf
 ```
 
-As of the latest close on `main`: 941 workspace tests passing,
-0 failing, 1 ignored (pre-existing `moq_sink` doctest), plus a
-Playwright browser E2E (`bindings/js/tests/e2e/mesh/`) running
-via a dedicated `mesh-e2e.yml` CI workflow. Every close must be
-green on fmt + clippy + workspace test; session deltas are
-tracked in [`tracking/HANDOFF.md`](tracking/HANDOFF.md).
+As of the latest close on `main`: 991 workspace tests passing,
+0 failing, 3 ignored (the `moq_sink`, `sign_playback_url`, and
+`sign_live_url` doctests, all of which need a running-server
+fixture they do not bring up), plus a Playwright browser E2E
+(`bindings/js/tests/e2e/mesh/`) running via a dedicated
+`mesh-e2e.yml` CI workflow. Every close must be green on fmt +
+clippy + workspace test; session deltas are tracked in
+[`tracking/HANDOFF.md`](tracking/HANDOFF.md).
 
 Feature flags and Docker recipes are in
 [`docs/deployment.md`](docs/deployment.md).
