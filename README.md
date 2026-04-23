@@ -94,8 +94,10 @@ in-process AI agents, cross-cluster federation, peer mesh).
   programmatically through `ServeConfig.c2pa`.
 
 ### Auth
-- Pluggable: noop, static tokens, or HS256 JWT with `iss` + `aud`
-  validation.
+- Pluggable: noop, static tokens, HS256 JWT with `iss` + `aud`
+  validation, or dynamic asymmetric JWT (RS256 / ES256 / EdDSA)
+  with keys discovered from a JWKS endpoint (`--jwks-url`,
+  `--features jwks`).
 - **One token, every ingest.** The same JWT admits a publisher
   across RTMP (stream key IS the JWT), WHIP
   (`Authorization: Bearer`), SRT (`streamid=m=publish,r=<broadcast>,t=<jwt>`),
@@ -324,25 +326,21 @@ gaps explicitly named in Known v0.4.0 limitations.
    returns 403 (not 401) so clients can distinguish missing auth
    from wrong auth. Operator helper `lvqr_cli::sign_playback_url`
    generates the query suffix from a secret + path + expiry.
-5. **OAuth2 / JWKS dynamic key discovery** (PLAN row 120).
-   Larger auth surface than HMAC; adds operator-grade JWT
-   flexibility alongside the existing static-secret HS256 path.
-6. **Nightly 24h soak CI job** (PLAN row 119). Scheduled
+5. **Nightly 24h soak CI job** (PLAN row 119). Scheduled
    workflow running `lvqr-soak` for a full day, scoped
    soft-fail for the first week.
-7. **Mesh data-plane phase D**: actual-vs-intended offload
+6. **Mesh data-plane phase D**: actual-vs-intended offload
    reporting, per-peer capacity advertisement, TURN deployment
    recipe, three-peer Playwright E2E. Unblocks flipping
    `docs/mesh.md` to IMPLEMENTED.
-8. **One hardware encoder backend** (VideoToolbox on macOS or
+7. **One hardware encoder backend** (VideoToolbox on macOS or
    NVENC on Linux). The three others stay deferred to v1.2.
-9. **Stream-modifying WASM filter chains** (multi-filter
+8. **Stream-modifying WASM filter chains** (multi-filter
    composition). v1 single-filter drop + rewrite ships today.
-10. **SDK reconnect / retry docs**, **webhook auth provider**,
-    **stream-key CRUD admin API**, **hot config reload**,
-    **dedicated DVR scrub web UI**, **SCTE-35 passthrough** --
-    smaller or more-speculative items; pick based on operator
-    demand.
+9. **Webhook auth provider**, **stream-key CRUD admin API**,
+   **hot config reload**, **dedicated DVR scrub web UI**,
+   **SCTE-35 passthrough** -- smaller or more-speculative items;
+   pick based on operator demand.
 
 The list below groups the same remaining work by logical area.
 
@@ -468,7 +466,16 @@ test.
 
 ### Auth + ops polish
 - [ ] **Webhook auth provider.**
-- [ ] **OAuth2 / JWKS dynamic key discovery.**
+- [x] ~~**OAuth2 / JWKS dynamic key discovery.**~~ Shipped in
+  session 126. `--jwks-url <URL>` on `lvqr serve` enables a new
+  `JwksAuthProvider` (feature-gated on `jwks`; included in
+  `--features full`) that fetches a JWKS endpoint, caches public
+  keys by `kid`, and validates incoming JWTs against RS256 / ES256
+  / EdDSA signatures. Background refresh on a configurable
+  interval plus kick-on-miss when a token carries an unknown
+  `kid`. HS256 tokens are rejected on this path (symmetric secrets
+  cannot safely be distributed via JWKS). Mutually exclusive with
+  `--jwt-secret`. See `docs/auth.md#jwks-dynamic-key-discovery`.
 - [x] ~~**HMAC-signed URLs** for one-off playback links.~~
   Shipped in session 124. `--hmac-playback-secret` enables a
   short-circuit auth path on `/playback/*` via
@@ -604,6 +611,15 @@ lvqr serve [OPTIONS]
   --jwt-secret <S>          Enable HS256 JWT (replaces static tokens)
   --jwt-issuer <I>          Expected iss claim
   --jwt-audience <A>        Expected aud claim
+  --jwks-url <URL>          Enable JWKS dynamic key discovery
+                            (RS256/ES256/EdDSA). Requires
+                            --features jwks at build. Mutex
+                            with --jwt-secret.
+                            Env: LVQR_JWKS_URL.
+  --jwks-refresh-interval-seconds <S>
+                            JWKS cache refresh cadence
+                            [default: 300; minimum 10].
+                            Env: LVQR_JWKS_REFRESH_INTERVAL_SECONDS.
 
   Storage:
   --record-dir <PATH>       fMP4 recording directory

@@ -1,8 +1,100 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 121 + SDK-docs-reconnect all SHIPPED**. 968 workspace tests on the default gate + 1 Playwright E2E + 10 Vitest + 21 pytest green, plus one new scheduled workflow (`whisper-scheduled.yml`) driving `whisper_cli_e2e` daily with a cached ggml model. 29 crates. Next: session 126 -- remaining phase-C rows are nightly 24h soak (the distinct-from-whisper leg of PLAN row 119), OAuth2/JWKS (PLAN row 120), authoritative DASH-IF container validator, HMAC extension to `/hls/*` + `/dash/*`, shared-helpers refactor across 9+ integration tests, npm + PyPI publish cycle carrying the 9/9 admin surface.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 120 / 121 + SDK-docs-reconnect all SHIPPED**. 968 workspace tests on the default gate + 14 lvqr-auth jwks-feature-gated tests + 5 CLI jwks-feature-gated unit tests + 1 Playwright E2E + 10 Vitest + 21 pytest green. 29 crates. Next: session 127 -- remaining phase-C rows are nightly 24h soak (the distinct-from-whisper leg of PLAN row 119), authoritative DASH-IF container validator, HMAC extension to `/hls/*` + `/dash/*`, shared-helpers refactor across 9+ integration tests, npm + PyPI publish cycle carrying the 9/9 admin surface + the new JWKS-feature public surface.
 
-**Last Updated**: 2026-04-22 (session 125 close). Local `main` is 2 commits ahead of `origin/main` (`c0fca09`) pending user push instruction. Session 125's commit pair (`feat(ci+docs): whisper-scheduled.yml + SDK reconnect docs` + `docs: session 125 close`) rides on top of the session 124 chain (`a7b8eae` + `c0fca09`).
+**Last Updated**: 2026-04-22 (session 126 close). Local `main` is 2 commits ahead of `origin/main` (`cae6b74`) pending user push instruction. Session 126's commit pair (`feat(auth): JWKS dynamic key discovery + --jwks-url CLI` + `docs: session 126 close`) rides on top of the session 125 chain (`9b37225` + `cae6b74`).
+
+## Session 126 close (2026-04-22)
+
+**Shipped**: PLAN row 120 (OAuth2 / JWKS dynamic key discovery). Largest remaining v1.1 auth item; closes the README `[ ] OAuth2 / JWKS dynamic key discovery` Known-Limitations checkbox that has been open since Tier 4. Default-gate workspace test count unchanged at 968; the new provider + integration tests live behind the off-by-default `jwks` Cargo feature so `cargo install lvqr-cli` stays lean.
+
+### Deliverables
+
+1. **`crates/lvqr-auth/src/jwks_provider.rs`** (~470 LOC + ~410 LOC of tests) -- new `JwksAuthProvider` + `JwksAuthConfig`. Async `new(config)` validates the URL scheme + refresh interval + allowed-algorithm set, performs an initial synchronous JWKS fetch (fail-fast on unreachable endpoints or empty/malformed responses), then spawns a `tokio::spawn` refresh task. The cache is `Arc<SharedState { cache: RwLock<HashMap<String, CacheEntry>>, refresh_notify: Notify }>`; `CacheEntry` holds `(DecodingKey, Algorithm)`. Sync `check()` calls `jsonwebtoken::decode_header`, checks the alg against `config.allowed_algs` (default `RS256` + `ES256` + `EdDSA`), looks up the `kid`, runs `decode::<JwtClaims>` with the correct `Validation`, then applies the same scope-hierarchy + broadcast-binding logic as `JwtAuthProvider`. `Drop` aborts the refresh `JoinHandle`. Unknown `kid` denies and calls `refresh_notify.notify_one()` so the refresh task picks up the new JWKS shape. Missing `kid` is accepted only when the JWKS has exactly one key (OIDC single-key convention). HS256 in the allowed set is rejected at `validate_config` time to prevent the public-key-as-HMAC-secret downgrade attack.
+
+2. **`crates/lvqr-auth/Cargo.toml`** -- new `jwks` feature (`jwks = ["jwt", "dep:reqwest", "dep:tokio", "dep:url"]`). Optional deps added. Dev-deps: `wiremock`, `rcgen`, `base64`, `tokio` (with `macros` + `rt` + `rt-multi-thread` + `time` features for integration tests).
+
+3. **Workspace `Cargo.toml`** -- `reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }` (shares the ring crypto provider the rest of the graph uses, so no extra TLS backend in the link graph) and `wiremock = "0.6"`. Both are workspace-pinned so future version bumps are a single-file change.
+
+4. **`crates/lvqr-auth/src/lib.rs`** -- gated `mod jwks_provider` + `pub use jwks_provider::{JwksAuthConfig, JwksAuthProvider}` behind `#[cfg(feature = "jwks")]`.
+
+5. **`crates/lvqr-cli/Cargo.toml`** -- new `jwks` feature (`jwks = ["lvqr-auth/jwks"]`) threaded into `full`. Default builds still do not link reqwest.
+
+6. **`crates/lvqr-cli/src/main.rs`** -- feature-gated `jwks_url: Option<String>` + `jwks_refresh_interval_seconds: u64` fields on `ServeArgs` with `LVQR_JWKS_URL` / `LVQR_JWKS_REFRESH_INTERVAL_SECONDS` env equivalents. `check_jwks_flag_combination(&args)` helper rejects the `--jwks-url` + `--jwt-secret` combination at startup. Auth resolution in `serve_from_args` factored into three layers: JWKS (when `--jwks-url` is set + feature on), JWT HS256 (when `--jwt-secret` set), static-token provider (when any individual token set), `NoopAuthProvider`. The existing `--jwt-issuer` / `--jwt-audience` flags are reused on the JWKS path so operators learn one claim-binding vocabulary rather than two.
+
+7. **Integration test coverage in `jwks_provider::tests`** (9 `#[tokio::test]` functions + 5 sync unit tests, 14 total):
+   * `config_default_algs_excludes_hs`
+   * `validate_config_rejects_empty_url`, `validate_config_rejects_non_http_scheme`, `validate_config_rejects_hmac_algs`, `validate_config_rejects_short_refresh_interval`, `validate_config_accepts_sensible_values`
+   * `happy_path_accepts_signed_ed25519_token` -- wiremock + rcgen Ed25519 keypair + jsonwebtoken `EncodingKey::from_ed_der` driving the full fetch-then-decode path.
+   * `unknown_kid_denies_and_kicks_refresh`
+   * `tampered_token_denied`
+   * `scope_enforcement_matches_jwt_provider` -- subscribe-scoped token denied for publish context; broadcast claim enforced.
+   * `hs256_header_rejected_pre_signature_check` -- hand-crafted token with a forged HS256 header + junk signature proves the allowed-algs gate trips before signature verification.
+   * `key_rotation_refresh_picks_up_new_kid` -- dynamic wiremock responder returns different JWKS on first-hit vs follow-ups; first request with the new kid denies + kicks, second request after the refresh lands passes.
+   * `missing_kid_with_single_key_accepts` -- OIDC single-key convention.
+   * `initial_fetch_failure_surfaces_error` -- pointing at a closed port proves `new()` does not silently start with an empty cache.
+
+8. **CLI parse tests in `main.rs::jwks_cli_tests`** (5 functions, feature-gated on `jwks`):
+   * `jwks_url_unset_passes_combination_check`
+   * `jwks_url_flag_parses`
+   * `jwks_url_plus_jwt_secret_is_mutex_error`
+   * `jwks_refresh_interval_override_applies`
+   * `jwt_issuer_audience_still_apply_under_jwks`
+
+9. **Docs + README + PLAN**: `docs/auth.md` grows a full "JWKS dynamic key discovery" section (enablement, accepted algorithms, key-selection rules, JWK shape, operational notes, Anti-scope line on webhook providers refreshed). README Known-Limitations checklist flips `[ ] OAuth2 / JWKS dynamic key discovery` to `[x]` with session-126 deliverables inline. README Auth summary line expanded to name the four provider variants. README CLI reference block gains `--jwks-url` + `--jwks-refresh-interval-seconds`. README Next Up list re-numbered (OAuth2/JWKS removed as a pending item). `tracking/PLAN_V1.1.md` row 120 marked **SHIPPED** with the full deliverable list.
+
+### Key 126 design decisions baked in
+
+* **JWKS synchronous initial fetch + async periodic refresh.** The `AuthProvider::check` trait is synchronous because every other provider does pure CPU work; adding JWKS needed a way to do network I/O without breaking the contract. Solution: async `new()` does the initial fetch before returning (so startup fails loud on misconfiguration), then spawns a `tokio::spawn` task that runs `tokio::select!` on a periodic `Interval::tick()` and a `Notify::notified()` for on-demand refresh. `check()` reads the cache under a `RwLock` and signals the background task via `notify_one()` on cache miss. Considered alternatives: (a) `block_in_place` + `Handle::current().block_on` for synchronous fetch inside `check()` -- rejected because it ties the request latency to the IdP and assumes a multi-threaded runtime; (b) pre-populate once and never refresh -- rejected because IdPs rotate keys; (c) block the first unknown-kid request while a refresh completes -- rejected because a sync `check()` cannot `.await` without changing the trait.
+
+* **HS256 explicitly rejected in the default allowed-algs set.** A JWKS distributes public keys. If the allowed set included HS256 and an attacker presented `Header { alg: HS256, kid: <valid-rsa-kid> }`, a naive implementation would try to use the RSA public key as an HMAC secret + verify the attacker's signature. Guarding at the allowed-algs layer (not just relying on `DecodingKey::from_jwk` ignoring HS256) keeps the surface explicit. `validate_config` surfaces this at startup as an `AuthError::InvalidConfig` rather than tripping at request time.
+
+* **`kid` lookup with single-key fallback.** OIDC 5.2 says the `kid` header "SHOULD" be present but clients may omit it when the JWKS has exactly one key. The cache lookup follows that: `Some(kid) -> cache.get(kid)`, `None` with `cache.len() == 1 -> cache.values().next()`, `None` with multiple keys -> deny. This matches what Auth0, Okta, Keycloak, and similar IdPs emit when they publish only their current signing key.
+
+* **Kick-on-miss refresh, not block-on-miss.** When an unknown `kid` arrives, `check()` denies the request and calls `refresh_notify.notify_one()`. The first request after a key rotation fails, subsequent requests after the refresh lands pass. Rationale: blocking the request thread on a remote HTTP call couples request latency to IdP availability + requires an async runtime in a sync trait method. Documenting the behavior as "IdPs should publish new keys BEFORE presenting tokens signed with them" is honest about the trade-off; the kick-on-miss path still handles the race where rotation and traffic arrive in the opposite order.
+
+* **Refresh interval minimum of 10 seconds.** `validate_config` rejects anything lower. Rationale: a misconfigured deployment setting the interval to `1` would hammer the IdP with thousands of requests per minute across a multi-instance LVQR fleet. 10 s is aggressive enough for a test harness but slow enough that no real IdP notices the load. Operators can still go lower in integration tests by building `JwksAuthConfig` programmatically, but the CLI flag clamps.
+
+* **`--jwks-url` + `--jwt-secret` are mutually exclusive.** Both select a JWT-validation strategy. Running both would be ambiguous (silent fall-through picks one; the other is dead code). The `check_jwks_flag_combination` helper rejects the combination at startup with a message naming both flags. Factored out so the check is unit-testable without booting the runtime; matches the session-120 `build_c2pa_config` pattern exactly.
+
+* **Reusing `--jwt-issuer` / `--jwt-audience` on the JWKS path.** Operators already know these flags. A parallel `--jwks-issuer` / `--jwks-audience` pair would double the CLI surface for identical semantics. The help text on `--jwt-audience` is updated to name both auth paths.
+
+* **`jwks` is an opt-in feature, not default.** `cargo install lvqr-cli` does not pull reqwest + the full HTTP client stack. Operators who need JWKS explicitly opt in via `--features jwks` or `--features full`. Matches the c2pa / whisper / transcode precedent: every feature that introduces a significant dep graph is opt-in.
+
+* **`reqwest` configured with `default-features = false, features = ["rustls-tls", "json"]`.** The default feature set pulls `native-tls` (which means OpenSSL on Linux) + `cookies` + `gzip` + `brotli` + `zstd` + a blocking-runtime module. None of those are needed for a JWKS fetch. Explicitly enabling `rustls-tls` reuses the `ring` crypto provider already pulled in by `rustls` and `jsonwebtoken`, so there is no second TLS backend in the link graph.
+
+* **Ed25519 as the test-side signing algorithm.** rcgen produces Ed25519 keypairs via `PKCS_ED25519`; `public_key_raw()` returns the 32 bytes that go into the JWK `x` field directly; `serialize_der()` gives PKCS8 DER that `jsonwebtoken::EncodingKey::from_ed_der` consumes directly. ECDSA P-256 would have worked too but would require manually splitting the SPKI DER to extract `x` + `y` coordinates. RSA key generation is heavier + slower. Ed25519 keeps every test under 300 ms total.
+
+* **No dedicated lvqr-cli integration test.** The 9 wiremock tests in `jwks_provider` already exercise the full JWKS provider end-to-end against a real HTTP mock. The SharedAuth-over-axum path is already covered for JWT by `auth_integration.rs`. Adding a duplicate server-boot JWKS test would mean pulling wiremock into `lvqr-cli`'s dev-deps for marginal extra signal. Skipped.
+
+### Ground truth (session 126 close)
+
+* **Head (pre-push)**: `feat(auth)` + this close-doc commit (pending). `origin/main` at `cae6b74` unchanged from session 125 push.
+* **Tests**:
+  * Default workspace gate: **968** passed, 0 failed, 2 ignored (unchanged; all new tests live behind the off-by-default `jwks` feature).
+  * `cargo test -p lvqr-auth --features jwks`: **43** passed / 0 failed / 0 ignored in 0.05 s (29 pre-existing + 14 new jwks tests).
+  * `cargo test -p lvqr-cli --features jwks --bin lvqr`: **13** passed / 0 failed / 0 ignored (8 pre-existing + 5 new jwks CLI unit tests).
+* **CI gates locally clean**:
+  * `cargo fmt --all --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `cargo clippy -p lvqr-auth --features jwks --all-targets -- -D warnings` clean.
+  * `cargo clippy -p lvqr-cli --features jwks --all-targets -- -D warnings` clean.
+  * `cargo test --workspace` 968 / 0 / 2.
+* **Workspace**: **29 crates**, unchanged.
+* **crates.io**: unchanged. Session 126 adds a new public type (`JwksAuthConfig`, `JwksAuthProvider`) + two new optional ServeArgs fields; all additive. `lvqr-auth 0.4.1` at the next release cycle will carry the public surface behind the `jwks` feature.
+
+### Known limitations / documented v1 shape (after 126 close)
+
+* **No webhook auth provider yet.** Tracked as a remaining v1.1 item; the JWKS provider is the biggest auth-surface expansion this cycle.
+* **JWKS `kid` rotation race.** A token signed with a freshly-rotated key whose JWKS update has not reached the provider will fail once; the kick-on-miss path ensures the next request succeeds. IdPs that publish new keys BEFORE minting tokens against them sidestep the race entirely.
+* **No JWKS signature caching beyond decoded keys.** Every incoming token re-runs the `jsonwebtoken::decode::<JwtClaims>` verification. For HS256 this was already true; for RSA/EC/Ed25519 the per-request crypto cost is higher but still fast enough (under 100 us on modern hardware). A future sess could add a per-signature LRU if needed.
+* **Nightly 24h soak still unshipped** (PLAN row 119 second leg).
+* **HMAC gated on `/playback/*` only**; extension to `/hls/*` + `/dash/*` is a focused phase-C follow-up.
+* **Authoritative DASH-IF container validator deferred**; GPAC MP4Box remains the primary validator.
+* **Shared-helpers refactor across 9+ integration tests** still queued.
+* **npm + PyPI publish cycle** still pending; both published builds at 0.3.1 are 3/9 admin coverage.
+* All other session 125 + earlier known limitations unchanged.
+
 
 ## Session 125 close (2026-04-22)
 

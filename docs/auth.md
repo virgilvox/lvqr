@@ -21,6 +21,7 @@ Three built-in providers are available:
 | `NoopAuthProvider` | Open access. The default when no other provider is configured. |
 | `StaticAuthProvider` | Short single-tenant deployments. Env-configured publish / subscribe / admin tokens. |
 | `JwtAuthProvider` (feature `jwt`) | Multi-tenant or time-bound access. HS256 tokens with a shared secret. |
+| `JwksAuthProvider` (feature `jwks`) | Multi-tenant or SSO deployments with an existing identity provider. Dynamic asymmetric JWTs (RS256 / ES256 / EdDSA) validated against public keys fetched from a JWKS endpoint. |
 
 Custom providers implement the `AuthProvider` trait; the `check`
 method receives an `AuthContext` and returns `AuthDecision::Allow` or
@@ -301,8 +302,100 @@ any context without a running LVQR server.
   the live egress routes; for one-off share links the DVR
   path is the intended use case.
 
+## JWKS dynamic key discovery
+
+`JwksAuthProvider` (behind the `jwks` Cargo feature on `lvqr-auth` and
+`lvqr-cli`; pulled in by `--features full`) lets operators validate JWTs
+against a remote JWKS (JSON Web Key Set) endpoint instead of distributing
+a shared HS256 secret. Keys are fetched at server startup, cached by
+`kid`, refreshed on a configurable timer, and re-fetched on demand when
+an incoming token carries an unknown `kid`.
+
+### Enabling
+
+```bash
+lvqr serve \
+  --jwks-url https://idp.example.com/.well-known/jwks.json \
+  --jwks-refresh-interval-seconds 300 \
+  --jwt-issuer https://idp.example.com/ \
+  --jwt-audience lvqr-prod
+```
+
+Flags (env equivalents in parentheses):
+
+* `--jwks-url <URL>` (`LVQR_JWKS_URL`) -- JWKS endpoint. Required to
+  activate this provider. Must be `http` or `https`.
+* `--jwks-refresh-interval-seconds <SECS>`
+  (`LVQR_JWKS_REFRESH_INTERVAL_SECONDS`) -- background refresh cadence.
+  Defaults to `300`. The minimum accepted value is `10` (lower values
+  are rejected so a misconfigured deployment cannot hammer the IdP).
+* `--jwt-issuer <ISS>` (`LVQR_JWT_ISSUER`) and `--jwt-audience <AUD>`
+  (`LVQR_JWT_AUDIENCE`) are reused from the HS256 path. When set,
+  tokens are rejected if their `iss` / `aud` claims do not match.
+
+`--jwks-url` is mutually exclusive with `--jwt-secret`; setting both
+is rejected at startup. The JWKS fetch at startup is synchronous, so
+a misconfigured URL fails fast instead of silently starting with an
+empty cache.
+
+### Accepted algorithms
+
+Default: `RS256`, `ES256`, `EdDSA`. The token's `alg` header is
+checked against this allow-list BEFORE signature verification.
+
+HS256 (and every other HS* variant) is explicitly rejected. A JWKS
+publishes public keys; accepting symmetric algorithms on the same
+provider would invite a downgrade attack where an attacker forges
+tokens by treating the public key as an HMAC secret.
+
+### Key selection
+
+* When a JWT carries `kid` in its header, the provider looks up that
+  exact key in the cache.
+* When `kid` is absent AND the JWKS has exactly one key, that key is
+  used (matches the OIDC "single key" convention).
+* When `kid` is absent AND the JWKS has multiple keys, the token is
+  rejected.
+* When `kid` does not match any cached key, the request is denied and
+  the background refresh task is kicked. The next request carrying
+  the same `kid` succeeds if the refresh pulls a new JWKS shape.
+
+### JWK shape
+
+The provider consumes standard RFC 7517 JWKs. Each key must carry:
+
+* `kid` (for lookup),
+* `kty` (`RSA`, `EC`, or `OKP`),
+* The algorithm-specific parameters (`n` + `e` for RSA, `crv` + `x`
+  + `y` for EC, `crv` + `x` for OKP), and
+* An `alg` hint matching one of the accepted algorithms.
+
+Keys lacking a `kid`, using an unsupported curve, or using a
+symmetric `kty` are skipped at cache-load time.
+
+### Claim shape
+
+Identical to the HS256 path: `sub`, `exp`, `scope`, optional `iss`,
+`aud`, and `broadcast`. Every per-protocol carrier (RTMP stream key,
+WHIP/RTSP bearer, SRT streamid, WS ingest subprotocol, WS subscribe
+query) works unchanged; only the signature verification path is
+different.
+
+### Operational notes
+
+* **Startup failure is loud**: if the initial JWKS fetch fails
+  (connection refused, 4xx/5xx response, malformed JSON), `lvqr serve`
+  exits with an error instead of starting with an empty cache.
+* **Refresh failure is soft**: once the cache is populated, later
+  refresh failures leave the cached keys in place and log a warning.
+  Operators should monitor the `tracing` logs for `jwks refresh
+  failed` to catch IdP outages before existing keys expire.
+* **Background task cleanup** happens on `Drop`; the refresh task is
+  aborted when the provider is dropped. `lvqr serve` holds the
+  provider for the full server lifetime.
+
 ## Anti-scope
 
-* No OAuth2 or JWKS key rotation. Static HS256 is the supported path.
 * No revocation list. Token validity depends on `exp`.
 * No per-protocol claim differences. The claim surface is flat.
+* No webhook auth provider yet (tracked as a v1.1 follow-up).
