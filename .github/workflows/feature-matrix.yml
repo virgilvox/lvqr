@@ -1,0 +1,145 @@
+name: Feature matrix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Exercises the feature-gated integration test targets that the
+# default `cargo test --workspace` run can't reach. Closes the
+# session-121 / 122 audit gap:
+#
+#   * `lvqr-cli --features c2pa` gates the C2PA finalize + verify
+#     integration tests (c2pa_verify_e2e, c2pa_cli_flags_e2e).
+#     These exercise the on-disk CertKeyFiles signer path + the
+#     programmatic Custom(Arc<dyn Signer>) path through the
+#     archive drain-termination hook. Without this workflow the
+#     c2pa code path is only smoke-tested via the soft-fail
+#     tier4-demos.yml.
+#
+#   * `lvqr-cli --features transcode` gates the GStreamer-backed
+#     ABR ladder + AAC-to-Opus encoder tests (transcode_ladder_e2e,
+#     rtmp_whep_audio_e2e, aac_opus_roundtrip, software_ladder).
+#     Needs apt install of gstreamer1.0-* plugin sets + libgstreamer
+#     dev headers for the gstreamer-rs build.
+#
+#   * `lvqr-cli --features whisper` gates the WhisperCaptionsAgent
+#     wiring. The integration test `whisper_cli_e2e` is `#[ignore]`
+#     by default (needs a ~78 MB ggml model on WHISPER_MODEL_PATH)
+#     so this cell runs a compile-check + unit tests only. Adding
+#     a model-download + full-run scheduled workflow is a separate
+#     follow-up.
+#
+# Posture mirrors every other dedicated workflow since
+# hls-conformance.yml: `continue-on-error: true` during the
+# initial weeks on `main`, then promotion to a required check
+# once a clean run lands.
+
+jobs:
+  c2pa:
+    name: Feature `c2pa`
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: feature-matrix-c2pa-v1
+      # c2pa-rs pulls no runtime deps beyond what `cargo test`
+      # already carries for the default build (rustls + openssl-rs
+      # handle the crypto). No apt install needed.
+      - name: Install openssl CLI (for c2pa_cli_flags_e2e openssl variant)
+        run: |
+          which openssl || sudo apt-get update && sudo apt-get install -y openssl
+          openssl version
+      - name: Clippy with c2pa feature
+        run: cargo clippy -p lvqr-cli --features c2pa --all-targets -- -D warnings
+      - name: Test lvqr-cli with c2pa feature
+        # Run every c2pa-gated integration target explicitly.
+        # `--test X` runs the target; default `cargo test -p
+        # lvqr-cli --features c2pa` would include them but this
+        # form is more robust against future CLI test additions
+        # because new c2pa-gated targets get a visible cell to
+        # update rather than silently landing on the default.
+        run: |
+          cargo test -p lvqr-cli --features c2pa --test c2pa_verify_e2e
+          cargo test -p lvqr-cli --features c2pa --test c2pa_cli_flags_e2e
+      - name: Test lvqr-archive c2pa unit tests
+        run: cargo test -p lvqr-archive --features c2pa
+
+  transcode:
+    name: Feature `transcode`
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: feature-matrix-transcode-v1
+      - name: Install GStreamer runtime + dev headers + ffmpeg
+        # Mirrors tier4-demos.yml's install block exactly so a
+        # fix for missing plugins applies to both workflows.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg \
+            gstreamer1.0-tools \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libclang-dev
+      - name: Clippy with transcode feature
+        run: cargo clippy -p lvqr-cli --features transcode --all-targets -- -D warnings
+      - name: Test lvqr-transcode aac_opus_roundtrip
+        run: cargo test -p lvqr-transcode --features transcode --test aac_opus_roundtrip
+      - name: Test lvqr-transcode software_ladder
+        run: cargo test -p lvqr-transcode --features transcode --test software_ladder
+      - name: Test lvqr-cli transcode_ladder_e2e
+        run: cargo test -p lvqr-cli --features transcode --test transcode_ladder_e2e
+      - name: Test lvqr-cli rtmp_whep_audio_e2e
+        run: cargo test -p lvqr-cli --features transcode --test rtmp_whep_audio_e2e
+
+  whisper:
+    name: Feature `whisper` (compile + unit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: feature-matrix-whisper-v1
+      - name: Install whisper.cpp build prereqs
+        # whisper-rs builds whisper.cpp via bindgen, which needs
+        # libclang at build time. cmake for whisper.cpp's own build.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libclang-dev \
+            cmake \
+            build-essential
+      - name: Clippy with whisper feature
+        run: cargo clippy -p lvqr-cli --features whisper --all-targets -- -D warnings
+      - name: Test lvqr-agent-whisper whisper_basic
+        # whisper_basic covers the factory + ASC parse paths
+        # without needing a ggml model on disk. The full
+        # whisper_cli_e2e test is #[ignore] because it needs
+        # WHISPER_MODEL_PATH; running it with a cached model
+        # download is a separate scheduled-workflow follow-up.
+        run: cargo test -p lvqr-agent-whisper --features whisper --test whisper_basic
+      - name: Test lvqr-agent-whisper unit tests
+        run: cargo test -p lvqr-agent-whisper --features whisper --lib
