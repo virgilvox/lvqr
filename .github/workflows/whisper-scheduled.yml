@@ -1,0 +1,119 @@
+name: Whisper scheduled
+
+on:
+  # Daily is the right cadence for a slow-moving integration
+  # test that depends on an external asset download: the model
+  # is cached so most runs are fast, but a cache eviction
+  # (after 7 days of no use) triggers a re-download. A weekly
+  # schedule would be equally defensible; daily is chosen so
+  # any regression in the whisper wiring surfaces within 24
+  # hours regardless of commit cadence.
+  schedule:
+    - cron: '23 5 * * *'
+  # Manual trigger so a developer can force a run after a
+  # whisper-adjacent change without waiting for the cron tick.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Closes the session-121 / 123 Known Limitations bullet:
+# `whisper_cli_e2e` has been `#[ignore]` by default since it
+# needs a real whisper.cpp ggml model on disk. The
+# `feature-matrix.yml` workflow (session 123) runs only the
+# whisper compile-check + `whisper_basic` unit tests because
+# downloading a ~78 MB model on every PR + push is the wrong
+# cost/benefit trade. This scheduled workflow fills the gap:
+# runs daily, caches the model by hash, and exercises the
+# full RTMP -> WhisperCaptionsAgent wiring via the existing
+# `--ignored` test target.
+#
+# Posture: `continue-on-error: true` during the first weeks
+# on main, promotes to a required check after first clean
+# run. Matches every other dedicated workflow since
+# hls-conformance.yml.
+
+jobs:
+  whisper-cli-e2e:
+    name: whisper_cli_e2e with cached ggml model
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: whisper-scheduled-v1
+
+      - name: Install whisper.cpp build prereqs
+        # Same set feature-matrix.yml's whisper cell installs.
+        # libclang-dev feeds whisper-rs's bindgen; cmake drives
+        # whisper.cpp's internal build; build-essential supplies
+        # the host C++ toolchain.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libclang-dev \
+            cmake \
+            build-essential
+
+      - name: Cache whisper ggml-tiny.en.bin
+        id: whisper_model_cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/lvqr-whisper-model
+          # Key on the model URL. If the URL ever changes (e.g. a
+          # newer ggml release swaps in a different fixture), the
+          # cache miss triggers a re-download. 78 MB is well under
+          # the 10 GB repo cache quota so even an uncached run is
+          # cheap.
+          key: whisper-ggml-tiny-en-v1-hf-ggerganov-whisper.cpp-main
+
+      - name: Download ggml-tiny.en.bin on cache miss
+        if: steps.whisper_model_cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/lvqr-whisper-model
+          # Hugging Face hosts the canonical whisper.cpp ggml
+          # fixtures. Using `resolve/main` pins to the current
+          # HEAD of the model repo; a specific revision could be
+          # pinned if fixture drift becomes a concern. Retries on
+          # transient network blips because CI runners sometimes
+          # hit upstream rate limits on cold cache.
+          for i in 1 2 3; do
+            if curl -fSL \
+              -o /tmp/lvqr-whisper-model/ggml-tiny.en.bin \
+              https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin; then
+              break
+            fi
+            echo "download attempt $i failed; retrying"
+            sleep 10
+          done
+          # Sanity-check: the model file is a ~78 MB binary. Fail
+          # fast if we got an HTML error page or a partial file.
+          actual_size=$(stat -c '%s' /tmp/lvqr-whisper-model/ggml-tiny.en.bin)
+          if [ "$actual_size" -lt 70000000 ]; then
+            echo "ggml-tiny.en.bin is only $actual_size bytes; expected ~77 MB" >&2
+            exit 1
+          fi
+          echo "ggml-tiny.en.bin: $actual_size bytes"
+
+      - name: Confirm model on disk
+        run: |
+          ls -la /tmp/lvqr-whisper-model
+          file /tmp/lvqr-whisper-model/ggml-tiny.en.bin
+
+      - name: Build lvqr-cli with whisper feature
+        run: cargo build -p lvqr-cli --features whisper
+
+      - name: Run whisper_cli_e2e with --ignored
+        # Exports WHISPER_MODEL_PATH so `whisper_cli_flag_wires_
+        # factory_through_start` lifts its own skip-path guard and
+        # runs the full RTMP publish -> AgentRunnerHandle.
+        # fragments_seen assertion.
+        env:
+          WHISPER_MODEL_PATH: /tmp/lvqr-whisper-model/ggml-tiny.en.bin
+        run: |
+          cargo test -p lvqr-cli --features whisper \
+            --test whisper_cli_e2e -- --ignored --nocapture
