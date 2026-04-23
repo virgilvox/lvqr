@@ -318,14 +318,20 @@ gaps explicitly named in Known v0.4.0 limitations.
    `#[ignore]` pending a cached-model workflow). Each cell
    explicitly lists every feature-gated test target so new ones
    get a visible cell to update.
-4. ~~**HMAC-signed playback URLs**~~ **Shipped in session 124.**
-   `--hmac-playback-secret` activates a short-circuit auth path
-   on every `/playback/*` route: `?exp=<unix_ts>&sig=<base64url>`
-   where `sig = HMAC-SHA256(secret, "<path>?exp=<ts>")`. Valid
-   signature grants access without a bearer; tampered / expired
-   returns 403 (not 401) so clients can distinguish missing auth
-   from wrong auth. Operator helper `lvqr_cli::sign_playback_url`
-   generates the query suffix from a secret + path + expiry.
+4. ~~**HMAC-signed playback URLs**~~ **Shipped in session 124**
+   (DVR `/playback/*`) **and session 128** (live `/hls/*` +
+   `/dash/*`). `--hmac-playback-secret` activates a
+   short-circuit auth path on every playback route via
+   `?exp=<unix_ts>&sig=<base64url>`; tampered / expired returns
+   403 (not 401). Operator helpers `lvqr_cli::sign_playback_url`
+   (DVR) and `lvqr_cli::sign_live_url(secret, LiveScheme::Hls|Dash,
+   broadcast, exp)` (live) generate the query suffix. Live
+   signatures are broadcast-scoped -- one sig grants access to
+   the master playlist + every numbered / partial segment under
+   the broadcast -- because LL-HLS partial URIs roll over every
+   200 ms. Scheme tag (`hls:` / `dash:`) is baked into the
+   signed input so a sig minted for HLS cannot be replayed
+   against DASH.
 5. **Mesh data-plane phase D**: actual-vs-intended offload
    reporting, per-peer capacity advertisement, TURN deployment
    recipe, three-peer Playwright E2E. Unblocks flipping
@@ -474,11 +480,19 @@ test.
   cannot safely be distributed via JWKS). Mutually exclusive with
   `--jwt-secret`. See `docs/auth.md#jwks-dynamic-key-discovery`.
 - [x] ~~**HMAC-signed URLs** for one-off playback links.~~
-  Shipped in session 124. `--hmac-playback-secret` enables a
-  short-circuit auth path on `/playback/*` via
-  `?exp=<unix_ts>&sig=<base64url>`; `lvqr_cli::sign_playback_url`
-  is the server-side helper for generating the query suffix.
-  See `docs/auth.md#signed-playback-urls`.
+  Shipped in session 124 (`/playback/*`) and extended to live
+  `/hls/*` + `/dash/*` in session 128. `--hmac-playback-secret`
+  enables a short-circuit auth path on every playback route
+  via `?exp=<unix_ts>&sig=<base64url>`; a single secret mints
+  URLs across all three route trees. `lvqr_cli::sign_playback_url`
+  generates DVR suffixes; `lvqr_cli::sign_live_url(secret,
+  LiveScheme::Hls|Dash, broadcast, exp)` mints live-tree
+  suffixes where one signed URL grants access to the master
+  playlist + every numbered / partial segment under that
+  broadcast (path-bound sigs are impractical for LL-HLS
+  partials that roll over every 200 ms).
+  See `docs/auth.md#signed-playback-urls` and
+  `docs/auth.md#live-hls-+-dash-signed-urls`.
 - [ ] **Stream-key CRUD admin API.**
 - [ ] **Hot config reload.**
 - [ ] **Dedicated DVR scrub web UI.**

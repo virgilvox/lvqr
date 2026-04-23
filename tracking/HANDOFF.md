@@ -1,8 +1,73 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 + SDK-docs-reconnect all SHIPPED**. 968 workspace tests on the default gate + 14 lvqr-auth jwks-feature-gated tests + 5 CLI jwks-feature-gated unit tests + 1 Playwright E2E + 10 Vitest + 21 pytest green. 29 crates. PLAN row 119 now fully closed across three scheduled workflows (feature-matrix.yml + whisper-scheduled.yml + soak-scheduled.yml). Next: session 128 -- remaining phase-C rows are authoritative DASH-IF container validator, HMAC extension to `/hls/*` + `/dash/*`, shared-helpers refactor across 9+ integration tests, npm + PyPI publish cycle carrying the 9/9 admin surface + the new JWKS-feature public surface.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 / 121-B + SDK-docs-reconnect all SHIPPED**. **984** workspace tests on the default gate (+15 over 968 from session 128's new `signed_url::tests` + `live_signed_url_e2e.rs`) + 14 lvqr-auth jwks-feature-gated tests + 5 CLI jwks-feature-gated unit tests + 1 Playwright E2E + 10 Vitest + 21 pytest green. 29 crates. HMAC signed URLs now honored on all three playback route trees (`/playback/*` from session 124, `/hls/*` + `/dash/*` from session 128). Next: session 129 -- remaining phase-C rows are authoritative DASH-IF container validator, shared-helpers refactor across 9+ integration tests, npm + PyPI publish cycle carrying the 9/9 admin surface + JWKS public API + new `sign_live_url` helper.
 
-**Last Updated**: 2026-04-22 (session 127 close). Local `main` is 2 commits ahead of `origin/main` (`033740b`) pending user push instruction. Session 127's commit pair (`feat(ci): soak-scheduled.yml nightly lvqr-soak workflow` + `docs: session 127 close`) rides on top of the session 126 chain (`1a53f92` + `033740b`).
+**Last Updated**: 2026-04-22 (session 128 close). Local `main` is 2 commits ahead of `origin/main` (`8c48caf`) pending user push instruction. Session 128's commit pair (`feat(auth): HMAC signed URLs on live /hls + /dash routes` + `docs: session 128 close`) rides on top of the session 127 chain (`2851dcf` + `8c48caf`).
+
+## Session 128 close (2026-04-22)
+
+**Shipped**: PLAN row 121-B (HMAC extension to live `/hls/*` + `/dash/*`). Closes the session-124 Known Limitation "HMAC gated on `/playback/*` only". Default-gate workspace count moved from **968 -> 984** (+15: 8 new `signed_url::tests` unit tests + 7 new `live_signed_url_e2e.rs` integration tests). Shares one `--hmac-playback-secret` across all three playback route trees; the scheme tag baked into the signed input prevents cross-scheme replay.
+
+### Deliverables
+
+1. **New `crates/lvqr-cli/src/signed_url.rs`** (~280 LOC + ~120 LOC tests) -- shared HMAC-SHA256 signed-URL primitives. `SignedUrlCheck` enum (`Allow` / `Deny(Response)` / `NotAttempted`) + `verify_signed_url_generic(hmac_secret, signed_input, sig, exp, metric_entry) -> SignedUrlCheck` take arbitrary signed-input strings so playback + live paths share one primitive. `compute_signature(secret, input) -> Vec<u8>` is the single HMAC-SHA256 call both the sign and verify halves route through. New `LiveScheme { Hls, Dash }` enum with `as_str()` helper; `fn live_signed_input(scheme, broadcast, exp)` produces `"<scheme>:<broadcast>?exp=<exp>"`. Public `pub fn sign_live_url(secret, scheme, broadcast, exp_unix) -> String` returns the same `"exp=<exp>&sig=<b64url>"` query suffix shape as `sign_playback_url`. Private `verify_live_signed_url` wraps the generic verifier with the correct metric labels (`"hls_signed_url"` / `"dash_signed_url"`).
+
+2. **`crates/lvqr-cli/src/archive.rs` refactor** (~100 LOC simpler) -- the private `SignedUrlCheck` + `verify_signed_url` + `compute_playback_signature` + the direct `hmac` / `sha2` / `subtle` / `SystemTime` imports are replaced with thin delegations to the shared `signed_url` module. `sign_playback_url` (still publicly exported) now builds `format!("{request_path}?exp={exp_unix}")` + calls `compute_signature` so playback and live paths cannot drift on the HMAC primitive.
+
+3. **`crates/lvqr-cli/src/auth_middleware.rs`** -- `LivePlaybackAuthState` grew a `scheme: LiveScheme` + `hmac_secret: Option<Arc<[u8]>>` field. The existing session-112 `live_playback_auth_middleware` pre-checks `verify_live_signed_url` before consulting the subscribe-token provider. New private `extract_query_param(query, key)` helper reads `sig` and `exp` from the URL query. Allow short-circuits the subscribe-token gate; Deny returns the already-built 403; NotAttempted falls through to the existing bearer-token check.
+
+4. **`crates/lvqr-cli/src/lib.rs`** -- hoisted the `hmac_playback_secret: Option<Arc<[u8]>>` declaration above the `combined_router` block so both the HLS + DASH spawn closures can capture it into their `LivePlaybackAuthState`. Each spawn block declares a local `hls_hmac_secret` / `dash_hmac_secret` clone so the `move` closure owns the Arc. New `pub use signed_url::{LiveScheme, sign_live_url};` re-export from the crate root.
+
+5. **Integration test coverage** in `crates/lvqr-cli/tests/live_signed_url_e2e.rs` (7 `#[tokio::test]` functions): valid HLS signed URL returns not-401 without a bearer; valid DASH signed URL returns not-401 without a bearer; tampered HLS sig returns 403; expired HLS URL returns 403; HLS-minted sig on DASH route returns 403 (cross-scheme replay prevented); sig minted for broadcast A on broadcast B returns 403 (cross-broadcast replay prevented); no sig + no bearer returns 401 (fall-through to subscribe-token gate works). Bootstraps `TestServer::new().with_dash().with_auth(...).with_hmac_playback_secret(...)` in every test.
+
+6. **Unit tests in `signed_url::tests`** (8 sync tests): signature scheme-bound / broadcast-bound / expiry-bound; `sign_live_url` round-trip verifies via `verify_live_signed_url`; cross-scheme tamper deny; cross-broadcast tamper deny; expired URL deny; no-secret and no-sig both return `NotAttempted`.
+
+7. **Docs + PLAN + README**: `docs/auth.md` gains a dedicated "Live HLS + DASH signed URLs" subsection with design rationale, signature input shape, operator helper example, and metric labels. The existing Scope bullet updated to note path-bound (playback) vs broadcast-scoped (live). README Next Up #4 updated to name both sessions 124 + 128. README Auth+ops-polish checklist item flipped to name both `sign_playback_url` and `sign_live_url`. `tracking/PLAN_V1.1.md` new row 121-B marked SHIPPED with design decisions.
+
+### Key 128 design decisions baked in
+
+* **Broadcast-scoped signatures, not path-bound.** A session-124-style path-bound signature (`"<path>?exp=<exp>"`) works for DVR because the paths are stable -- one URL per segment, the operator mints a share link once. For live HLS the playlist references partial URIs like `part-video-42.m4s` that roll over every 200 ms; minting a new URL per partial is impractical. Broadcast-scoped (`"<scheme>:<broadcast>?exp=<exp>"`) gives one sig that admits every URL under the broadcast's live tree until expiry. The briefing explicitly recommended this shape.
+
+* **Scheme tag baked into the signed input.** `"hls:<broadcast>?exp=<exp>"` vs `"dash:<broadcast>?exp=<exp>"` produce different HMACs even for the same broadcast + exp. A sig minted for HLS cannot be replayed against DASH -- the middleware reconstructs the signed input from its own `LivePlaybackAuthState::scheme`, not from the client request, so the attacker cannot trick the verifier. The unit test `signature_is_scheme_bound` + integration test `hls_sig_rejected_on_dash_route` lock this into place.
+
+* **One `--hmac-playback-secret` across all three route trees.** Forcing operators to manage a separate secret per scheme would double the configuration surface without meaningful security benefit (the scheme tag already prevents cross-scheme replay). Reusing the session-124 flag keeps operator mental model simple; docs explicitly name the single-secret convention.
+
+* **Factored-out shared primitive, not duplicated HMAC code.** Session 124's original `compute_playback_signature` and the new `compute_live_signature` would both need to hash byte strings through the same `Hmac<Sha256>` code. Duplicating that would create drift risk (base64 engine change, constant-time-compare rewrite, metric-label bug only caught on one path). Factoring into `signed_url::compute_signature(secret, input)` + `verify_signed_url_generic(..., metric_entry)` means there is one HMAC call and one verify call; both playback and live wrappers build their signed-input string and pass it in.
+
+* **Pre-gate short-circuit order: signed URL first, subscribe-token second.** When both a signed URL AND a bearer are presented, the signed URL wins (the short-circuit returns before the bearer check runs). This matches session 124's semantics on `/playback/*`. Rationale: a client that mints a signed URL is explicitly claiming "I do not have a bearer, here is a pre-shared one-off grant"; short-circuiting avoids the redundant scope check against the `SharedAuth` provider that does not know about the signed grant anyway.
+
+* **`LivePlaybackAuthState` grew two fields, not a new parallel middleware.** An alternative was a second `live_signed_url_middleware` layered on top of the existing `live_playback_auth_middleware`. Rejected because tower middleware ordering is position-dependent and easy to get wrong on future refactors; one state + one middleware with branching inside keeps the layering trivial. The NotAttempted branch preserves every byte of session-112 behavior when the operator has not set `--hmac-playback-secret`.
+
+* **`hmac_playback_secret` hoisted above `combined_router`.** The `Arc<[u8]>` was previously declared inside the block that builds the admin router; moving it above lets both the admin-side `playback_router(..., hmac_playback_secret.clone())` call AND the spawn closures for HLS / DASH capture it. The existing call site on the admin side is unchanged; the two new `hls_hmac_secret = hmac_playback_secret.clone()` / `dash_hmac_secret = hmac_playback_secret.clone()` lines give the `move` closures owned Arc clones.
+
+* **Public helper named `sign_live_url`, not `sign_hls_playback_url` / `sign_dash_playback_url`.** A single function with a `LiveScheme` parameter is less surface area than two. Operators pick `LiveScheme::Hls` or `LiveScheme::Dash` once at the call site; the scheme tag flows through the signed input automatically. The alternative (`sign_hls_playback_url`, `sign_dash_playback_url`) would require operators to choose twice (function name + Cargo feature) and double the rustdoc surface.
+
+* **Default-gate test count intentionally bumped.** The session-124 integration tests live in the default feature gate; for symmetry session 128's `live_signed_url_e2e.rs` also runs on every PR. The 7 integration tests + 8 unit tests run in under 1 second combined -- no meaningful CI-time cost.
+
+* **No change to the session-124 `/playback/*` wire contract.** The playback signature input remains `"<path>?exp=<exp>"`. Any existing signed URL minted by an operator via the session-124 `sign_playback_url` helper continues to verify. The refactor to delegate into `signed_url::verify_signed_url_generic` preserves the exact byte sequence + metric label (`entry="playback_signed_url"`), and the existing `playback_signed_url_e2e.rs` tests pass unchanged.
+
+### Ground truth (session 128 close)
+
+* **Head (pre-push)**: `feat(auth)` + this close-doc commit (pending). `origin/main` at `8c48caf` unchanged from session 127 push.
+* **Tests**:
+  * Default workspace gate: **984** passed / 0 failed / 3 ignored (+15 over session 127's 968, from 8 new `signed_url::tests` + 7 new `live_signed_url_e2e.rs`).
+  * `cargo test -p lvqr-cli --test playback_signed_url_e2e` still 3 / 0 / 0 (session-124 regression check).
+  * `cargo test -p lvqr-cli --test live_signed_url_e2e` 7 / 0 / 0 in 0.17 s.
+* **CI gates locally clean**:
+  * `cargo fmt --all --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `cargo test --workspace` 984 / 0 / 3.
+* **Workspace**: **29 crates**, unchanged.
+* **crates.io**: unchanged. Session 128 adds public types (`LiveScheme`, `sign_live_url`) to `lvqr-cli` + two new `LivePlaybackAuthState` fields. All additive; published surface moves at the next release cycle.
+
+### Known limitations / documented v1 shape (after 128 close)
+
+* **Signed-URL revocation still requires rotating the shared secret.** Same constraint as session 124; a per-URL revocation list is explicitly anti-scope.
+* **Authoritative DASH-IF container validator deferred**; GPAC MP4Box remains the primary validator in `dash-conformance.yml`.
+* **Shared-helpers refactor across 9+ integration tests** still queued (scope grew with the new `live_signed_url_e2e.rs`).
+* **npm + PyPI publish cycle** still pending; both published builds at 0.3.1 are 3/9 admin coverage + miss the new JWKS + sign_live_url public APIs.
+* All other session 127 + earlier known limitations unchanged.
+
 
 ## Session 127 close (2026-04-22)
 

@@ -283,9 +283,11 @@ any context without a running LVQR server.
 
 ### Scope
 
-* **Path-bound**: a signature for `/playback/live/a` cannot be
-  reused on `/playback/live/b`. The broadcast is baked into the
-  signed input via the path.
+* **Path-bound (playback)** / **broadcast-scoped (live)**: a
+  signature for `/playback/live/a` cannot be reused on
+  `/playback/live/b`; similarly an `hls:live/a` sig cannot be
+  reused for `hls:live/b` or for any DASH URL. The broadcast
+  and scheme are baked into the signed input.
 * **Expiry-bound**: a client cannot extend the expiry without
   re-signing against the secret.
 * **No revocation list**: rotating `--hmac-playback-secret`
@@ -296,11 +298,63 @@ any context without a running LVQR server.
   tighter constraints (e.g. "only the 14:00-15:00 window"),
   scope the broadcast at the archive level or add additional
   auth in front of LVQR.
-* **`/playback/*` only**. Live `/hls/*` and `/dash/*` routes
-  use their own `SubscribeAuth` middleware and do not honor
-  signed-URL params today. A follow-up could extend this to
-  the live egress routes; for one-off share links the DVR
-  path is the intended use case.
+* **Live `/hls/*` and `/dash/*` also honor signed URLs**
+  (session 128, see next subsection). The same
+  `--hmac-playback-secret` mints URLs across all three route
+  trees; the signature input carries a scheme tag
+  (`hls:` / `dash:` / the `/playback/` path prefix) so a sig
+  minted for one tree cannot be replayed against another.
+
+### Live HLS + DASH signed URLs
+
+Session 128 extends the primitive to `/hls/<broadcast>/*` and
+`/dash/<broadcast>/*`. The signature grants **broadcast-scoped**
+access: one `?exp=<exp>&sig=<b64url>` pair admits every URL
+under the broadcast's live tree -- master playlist, media
+playlist, init segments, numbered segments, partial segments.
+Path-bound signatures do not work for live because LL-HLS
+playlists reference segment URIs that roll over every 200 ms;
+minting a new URL per partial is impractical.
+
+* **Signature input**: `"hls:<broadcast>?exp=<exp>"` for HLS,
+  `"dash:<broadcast>?exp=<exp>"` for DASH. The scheme prefix
+  is baked into the HMAC so a signed HLS URL cannot be replayed
+  against the DASH route tree (the middleware reconstructs the
+  input string from its own scheme state, not from the client).
+* **Operator helper**: `lvqr_cli::sign_live_url(secret, scheme, broadcast, exp_unix)`
+  where `scheme` is `LiveScheme::Hls` or `LiveScheme::Dash`.
+  Returns the same `"exp=<exp>&sig=<b64url>"` query suffix
+  shape as `sign_playback_url` for tooling symmetry.
+* **Metric labels**: `lvqr_auth_failures_total{entry="hls_signed_url"}`
+  and `entry="dash_signed_url"` so operators can distinguish
+  live signed-URL failures from the `entry="playback_signed_url"`
+  counter session 124 added for DVR routes.
+* **Scope boundaries**: broadcast-scoped + expiry-bound +
+  scheme-bound. The recipient of a live signed URL gets access
+  to every segment under that broadcast until `exp_unix`
+  elapses; a revocation requires rotating the secret (same as
+  the `/playback/*` path).
+
+Example server-side minting:
+
+```rust
+use lvqr_cli::{sign_live_url, LiveScheme};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+let secret = b"operator-secret-bytes";
+let exp = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap()
+    .as_secs()
+    + 3600; // 1 hour from now
+let suffix = sign_live_url(secret, LiveScheme::Hls, "live/cam1", exp);
+
+// One URL grants every segment under /hls/live/cam1/:
+let master = format!("https://relay.example:8888/hls/live/cam1/master.m3u8?{suffix}");
+let playlist = format!("https://relay.example:8888/hls/live/cam1/playlist.m3u8?{suffix}");
+// Native <video> can fetch the playlist + every partial URL it
+// references using the same sig + exp pair.
+```
 
 ## JWKS dynamic key discovery
 
