@@ -23,7 +23,10 @@
 //! duration at 90 kHz) closes one full segment after the second
 //! keyframe.
 
-use bytes::Bytes;
+use lvqr_test_utils::flv::{
+    flv_audio_aac_lc_seq_header_44k_stereo, flv_audio_raw, flv_video_nalu, flv_video_seq_header,
+};
+use lvqr_test_utils::http::{HttpGetOptions, HttpResponse, http_get_with};
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
@@ -36,45 +39,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-
-// =====================================================================
-// FLV tag helpers (mirror crates/lvqr-cli/tests/rtmp_ws_e2e.rs)
-// =====================================================================
-
-fn flv_video_seq_header() -> Bytes {
-    let sps = [0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9];
-    let pps = [0x68, 0xEE, 0x3C, 0x80];
-    let mut tag = vec![0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1];
-    tag.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&sps);
-    tag.push(0x01);
-    tag.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&pps);
-    Bytes::from(tag)
-}
-
-fn flv_video_nalu(keyframe: bool, cts: i32, nalu_data: &[u8]) -> Bytes {
-    let frame_type = if keyframe { 0x17 } else { 0x27 };
-    let mut tag = vec![frame_type, 0x01, (cts >> 16) as u8, (cts >> 8) as u8, cts as u8];
-    tag.extend_from_slice(nalu_data);
-    Bytes::from(tag)
-}
-
-/// FLV AAC sequence header: codec id 10 (AAC), packet type 0, followed
-/// by a minimal AudioSpecificConfig for AAC-LC 44100 Hz stereo.
-fn flv_audio_seq_header() -> Bytes {
-    // AAC-LC (obj=2), sampling_frequency_index=4 (44100), channel=2
-    let b0: u8 = (2 << 3) | (4 >> 1);
-    let b1: u8 = (4 << 7) | (2 << 3);
-    Bytes::from(vec![0xAF, 0x00, b0, b1])
-}
-
-/// FLV AAC raw frame: codec id 10 (AAC), packet type 1, payload bytes.
-fn flv_audio_raw(aac_data: &[u8]) -> Bytes {
-    let mut tag = vec![0xAF, 0x01];
-    tag.extend_from_slice(aac_data);
-    Bytes::from(tag)
-}
 
 // =====================================================================
 // RTMP publish helpers (copied from rtmp_ws_e2e.rs verbatim)
@@ -190,57 +154,22 @@ async fn connect_and_publish(addr: SocketAddr, app: &str, stream_key: &str) -> (
 }
 
 // =====================================================================
-// Minimal raw-TCP HTTP/1.1 GET client.
-//
-// We deliberately avoid pulling in `reqwest` or `hyper-util` as a
-// dev-dep just for two GETs. The HLS server speaks plain HTTP/1.1
-// `Connection: close` perfectly well, so a 30-line client is enough.
+// Thin wrapper over lvqr-test-utils::http that pins a 10-second
+// timeout so this test tolerates RTMP-publish-adjacent read paths
+// (the HLS playlist can lag several hundred ms behind the fragment
+// landing on disk while MediaMuxer flushes).
 // =====================================================================
 
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
 async fn http_get(addr: SocketAddr, path: &str) -> HttpResponse {
-    let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
-        .await
-        .expect("http GET connect timed out")
-        .expect("http GET connect failed");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut buf = Vec::new();
-    tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut buf))
-        .await
-        .expect("http GET read timed out")
-        .expect("http GET read failed");
-    parse_http_response(&buf)
-}
-
-fn parse_http_response(bytes: &[u8]) -> HttpResponse {
-    // Locate the end-of-headers marker (CRLF CRLF).
-    let split = bytes
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("http response missing header terminator");
-    let header_block = &bytes[..split];
-    let body_block = &bytes[split + 4..];
-
-    let header_text = std::str::from_utf8(header_block).expect("http headers are not utf-8");
-    let mut header_lines = header_text.lines();
-    let status_line = header_lines.next().expect("http response missing status line");
-    let mut status_parts = status_line.splitn(3, ' ');
-    let _http_version = status_parts.next();
-    let status: u16 = status_parts
-        .next()
-        .expect("status line missing code")
-        .parse()
-        .expect("status code is not numeric");
-
-    HttpResponse {
-        status,
-        body: body_block.to_vec(),
-    }
+    http_get_with(
+        addr,
+        path,
+        HttpGetOptions {
+            timeout: TIMEOUT,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 // =====================================================================
@@ -455,7 +384,7 @@ async fn publish_video_with_audio(addr: SocketAddr, app: &str, key: &str) -> (Tc
     // segment, and fires the HLS bridge's `on_init` hook with
     // track id `1.mp4`, which in turn calls `ensure_audio(broadcast)`
     // and registers the audio `HlsServer` on the `MultiHlsServer`.
-    let aseq = flv_audio_seq_header();
+    let aseq = flv_audio_aac_lc_seq_header_44k_stereo();
     let r = session.publish_audio_data(aseq, RtmpTimestamp::new(0), false).unwrap();
     send_result(&mut rtmp_stream, &r).await;
 

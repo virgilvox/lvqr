@@ -15,6 +15,8 @@
 
 use lvqr_archive::{RedbSegmentIndex, SegmentIndex};
 use lvqr_auth::{SharedAuth, StaticAuthConfig, StaticAuthProvider};
+use lvqr_test_utils::flv::{flv_video_nalu, flv_video_seq_header};
+use lvqr_test_utils::http::{HttpGetOptions, HttpResponse, http_get_with};
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
@@ -28,78 +30,37 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use bytes::Bytes;
-
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-fn flv_video_seq_header() -> Bytes {
-    let sps = [0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9];
-    let pps = [0x68, 0xEE, 0x3C, 0x80];
-    let mut tag = vec![0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1];
-    tag.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&sps);
-    tag.push(0x01);
-    tag.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&pps);
-    Bytes::from(tag)
-}
-
-fn flv_video_nalu(keyframe: bool, cts: i32, nalu_data: &[u8]) -> Bytes {
-    let frame_type = if keyframe { 0x17 } else { 0x27 };
-    let mut tag = vec![frame_type, 0x01, (cts >> 16) as u8, (cts >> 8) as u8, cts as u8];
-    tag.extend_from_slice(nalu_data);
-    Bytes::from(tag)
-}
-
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
-/// Minimal raw-TCP HTTP/1.1 `Connection: close` GET client. Avoids
-/// pulling `reqwest` / `hyper-util` in as a dev-dep for a handful
-/// of test reads. Mirrors the helper in `rtmp_hls_e2e.rs`.
+/// Thin wrapper over the shared [`http_get_with`] that pins the
+/// 10-second timeout this test needs for RTMP-publish-adjacent
+/// reads. Session 129 factored the primitive into `lvqr-test-utils`;
+/// this file continues to expose its local name so the call sites
+/// below stay byte-identical.
 async fn http_get(addr: SocketAddr, path: &str) -> HttpResponse {
-    http_get_with_auth(addr, path, None).await
+    http_get_with(
+        addr,
+        path,
+        HttpGetOptions {
+            timeout: TIMEOUT,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
-/// Variant of `http_get` that optionally sends an
-/// `Authorization: Bearer <token>` header. Used by the
-/// auth-gate test to exercise the header-based token path
-/// alongside the `?token=` query-string fallback.
+/// Variant of [`http_get`] that optionally sends an
+/// `Authorization: Bearer <token>` header. Dispatches into the
+/// shared helper's [`HttpGetOptions::with_bearer`] constructor when
+/// a token is present, preserving the 10-second timeout in both
+/// branches.
 async fn http_get_with_auth(addr: SocketAddr, path: &str, bearer: Option<&str>) -> HttpResponse {
-    let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
-        .await
-        .expect("http GET connect timed out")
-        .expect("http GET connect failed");
-    let auth_header = match bearer {
-        Some(tok) => format!("Authorization: Bearer {tok}\r\n"),
-        None => String::new(),
+    let opts = HttpGetOptions {
+        bearer,
+        timeout: TIMEOUT,
+        ..Default::default()
     };
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Connection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut buf = Vec::new();
-    tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut buf))
-        .await
-        .expect("http GET read timed out")
-        .expect("http GET read failed");
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("http response missing header terminator");
-    let header_text = std::str::from_utf8(&buf[..split]).expect("http headers are not utf-8");
-    let status_line = header_text.lines().next().expect("http response missing status line");
-    let mut parts = status_line.splitn(3, ' ');
-    let _http_version = parts.next();
-    let status: u16 = parts
-        .next()
-        .expect("status line missing code")
-        .parse()
-        .expect("status code is not numeric");
-    HttpResponse {
-        status,
-        body: buf[split + 4..].to_vec(),
-    }
+    http_get_with(addr, path, opts).await
 }
 
 async fn rtmp_client_handshake(stream: &mut TcpStream) -> Vec<u8> {
