@@ -1,0 +1,104 @@
+name: Soak scheduled
+
+on:
+  # Daily at 07:23 UTC. Offset from `whisper-scheduled.yml` (05:23)
+  # and `audit.yml` so the three scheduled workflows do not compete
+  # for runner slots on the free-tier queue. "Nightly" in the PLAN
+  # row name; the soak driver is deterministic enough that a daily
+  # discovery window catches slow-drift regressions (RSS creep, FD
+  # leaks, CPU saturation) within 24 hours of the commit that
+  # introduces them.
+  schedule:
+    - cron: '23 7 * * *'
+  # Manual trigger so a developer can force a run after touching
+  # lvqr-soak or any of its transitive deps (lvqr-rtsp, lvqr-cmaf,
+  # lvqr-fragment) without waiting for the cron tick.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Closes PLAN row 119's distinct soak leg (the feature-matrix leg
+# shipped in session 123; the whisper-scheduled leg shipped in
+# session 125). The briefing's PLAN scope line names this as a
+# "nightly 24 h soak"; GitHub-hosted runners cap at 6 h per job,
+# so the CI-pragmatic shape is a 60-minute soak run daily. The
+# duration is long enough to surface linear RSS creep and FD
+# leaks at the default 30 Hz fragment rate (10 subscribers *
+# 30 fragments/s * 3600 s = 1.08 M RTP packets on the egress
+# side, well past any startup transient). A true 24 h nightly
+# run requires a self-hosted runner and is tracked as a v1.2
+# follow-up.
+#
+# Posture: `continue-on-error: true` during the first weeks on
+# `main`; promotes to a required check after one clean run.
+# Matches every dedicated workflow since `hls-conformance.yml`.
+
+jobs:
+  soak:
+    name: lvqr-soak 60-minute RTSP PLAY soak
+    runs-on: ubuntu-latest
+    # 60 min soak + ~15 min for warm-cache build + ~5 min for
+    # toolchain setup + artifact upload. 80 min is comfortable
+    # headroom below the 360 min GH-hosted job ceiling.
+    timeout-minutes: 80
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Namespaced cache key so the scheduled workflow does not
+          # share its cache with default-gate CI (different build
+          # profile: release vs debug). Release-profile binaries
+          # are what real operators run, so the soak exercises
+          # the same codegen the production binary ships.
+          prefix-key: soak-scheduled-v1
+          cache-on-failure: true
+
+      - name: Build lvqr-soak release
+        # Release build matches the binary shape operators deploy
+        # and avoids debug-assert overhead that would otherwise
+        # skew CPU-saturation numbers in the soak report.
+        run: cargo build -p lvqr-soak --release
+
+      - name: Prepare artifact directory
+        run: mkdir -p soak-artifacts
+
+      - name: Run 60-minute soak
+        env:
+          # Structured logs at `info` level so the uploaded artifact
+          # captures per-sample metrics + any error-level events
+          # from the publisher or subscriber loops. `LVQR_LOG` is
+          # the crate's `tracing-subscriber` env filter.
+          LVQR_LOG: info
+        run: |
+          # Capture both the structured summary and any tracing
+          # output into one file so the artifact is self-contained.
+          # `tee` keeps the live workflow-log stream populated so
+          # a developer watching the run can see progress in real
+          # time without downloading the artifact.
+          set -o pipefail
+          ./target/release/lvqr-soak \
+            --duration-secs 3600 \
+            --subscribers 10 \
+            --fragment-hz 30 \
+            --metrics-interval-secs 30 \
+            --broadcast live/soak-ci \
+            2>&1 | tee soak-artifacts/soak-report.txt
+
+      - name: Upload soak report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # Run-id suffix so a developer pulling artifacts for a
+          # regression investigation does not have to guess which
+          # run the report came from.
+          name: soak-report-${{ github.run_id }}
+          path: soak-artifacts/
+          # 30 days covers a full weekly-drift investigation window
+          # without exceeding the repo's free-tier artifact quota.
+          retention-days: 30
