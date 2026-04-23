@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use lvqr_cli::{ServeConfig, start};
 use lvqr_cluster::NodeEndpoints;
+use lvqr_test_utils::http::http_get;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -133,37 +134,14 @@ where
 }
 
 /// Send an HTTP/1.1 GET to `addr` for `path` and return
-/// `(status, location_header)`. `Connection: close` so the server
-/// closes immediately and we can read until EOF.
+/// `(status, location_header)`. Thin wrapper over the shared
+/// `lvqr_test_utils::http::http_get` that projects the header view
+/// this test needs -- only the `Location` header matters for the
+/// redirect assertions here.
 async fn http_get_raw(addr: SocketAddr, path: &str) -> (u16, Option<String>) {
-    let mut stream = TcpStream::connect(addr).await.expect("tcp connect");
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
-        host = addr,
-    );
-    stream.write_all(req.as_bytes()).await.expect("write req");
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await.expect("read resp");
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines = text.split("\r\n");
-    let status_line = lines.next().unwrap_or_default();
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let mut location: Option<String> = None;
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(": ") {
-            if k.eq_ignore_ascii_case("location") {
-                location = Some(v.to_string());
-            }
-        }
-    }
-    (status, location)
+    let resp = http_get(addr, path).await;
+    let location = resp.header("location").map(|v| v.to_string());
+    (resp.status, location)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

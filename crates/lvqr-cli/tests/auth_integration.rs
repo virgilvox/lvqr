@@ -24,17 +24,16 @@ use jsonwebtoken::{EncodingKey, Header, encode};
 use lvqr_auth::{
     AuthScope, JwtAuthConfig, JwtAuthProvider, JwtClaims, SharedAuth, StaticAuthConfig, StaticAuthProvider,
 };
+use lvqr_test_utils::http::{HttpGetOptions, http_get_with};
 use lvqr_test_utils::{TestServer, TestServerConfig};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 // =====================================================================
-// Minimal HTTP/1.1 client: just enough to drive GET requests and parse
-// a status line plus body off the admin listener. Hand-rolled to avoid
-// pulling reqwest into lvqr-cli's dev-deps; the admin API surface is
-// small and the parser only needs to handle single-response conns.
+// Thin wrapper over `lvqr_test_utils::http::http_get_with`. Preserves
+// this file's historical `body: String` shape (the admin router emits
+// JSON, which is always valid UTF-8 here), its 5-second TIMEOUT, and
+// the bearer-dispatch signature the JWT-path tests rely on.
 // =====================================================================
 
 struct HttpResponse {
@@ -43,43 +42,15 @@ struct HttpResponse {
 }
 
 async fn http_get(addr: std::net::SocketAddr, path: &str, bearer: Option<&str>) -> HttpResponse {
-    let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
-        .await
-        .expect("admin connect timed out")
-        .expect("admin connect failed");
-    let mut req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n",
-        path = path,
-        host = addr,
-    );
-    if let Some(token) = bearer {
-        req.push_str(&format!("Authorization: Bearer {token}\r\n"));
-    }
-    req.push_str("\r\n");
-    stream.write_all(req.as_bytes()).await.expect("http write");
-
-    let mut raw = Vec::with_capacity(4096);
-    let _ = tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut raw))
-        .await
-        .expect("http read timed out")
-        .expect("http read");
-
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
-    let first_line = head.lines().next().unwrap_or_default();
-    let status: u16 = first_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("could not parse status line: {first_line:?}"));
-
-    // The admin router serves responses with `Content-Length`, so the
-    // body after the first blank line is the full payload. For
-    // chunked responses (which admin does not emit) we would need a
-    // parser; asserting Content-Length presence here would be noise.
+    let opts = HttpGetOptions {
+        bearer,
+        timeout: TIMEOUT,
+        ..Default::default()
+    };
+    let resp = http_get_with(addr, path, opts).await;
     HttpResponse {
-        status,
-        body: body.to_string(),
+        status: resp.status,
+        body: String::from_utf8_lossy(&resp.body).into_owned(),
     }
 }
 

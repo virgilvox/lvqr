@@ -15,11 +15,10 @@
 
 use bytes::Bytes;
 use futures_util::SinkExt;
+use lvqr_test_utils::http::{HttpGetOptions, HttpResponse, http_get_with};
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const SYNC_BYTE: u8 = 0x47;
@@ -113,44 +112,20 @@ fn h264_pes(pts_90k: u64, keyframe: bool) -> Vec<u8> {
 }
 
 // =====================================================================
-// HTTP helper (mirror crates/lvqr-cli/tests/rtmp_dash_e2e.rs)
+// HTTP helper now lives in `lvqr_test_utils::http`; the 10s timeout
+// wrapper below matches the one in `rtmp_dash_e2e.rs`.
 // =====================================================================
 
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
 async fn http_get(addr: SocketAddr, path: &str) -> HttpResponse {
-    let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
-        .await
-        .expect("http connect timed out")
-        .expect("http connect failed");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut buf = Vec::new();
-    tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut buf))
-        .await
-        .expect("http read timed out")
-        .expect("http read failed");
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("missing header terminator");
-    let header_text = std::str::from_utf8(&buf[..split]).unwrap();
-    let status: u16 = header_text
-        .lines()
-        .next()
-        .unwrap()
-        .split(' ')
-        .nth(1)
-        .unwrap()
-        .parse()
-        .unwrap();
-    HttpResponse {
-        status,
-        body: buf[split + 4..].to_vec(),
-    }
+    http_get_with(
+        addr,
+        path,
+        HttpGetOptions {
+            timeout: TIMEOUT,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// Real end-to-end: one SRT caller publishes H.264 over MPEG-TS ->

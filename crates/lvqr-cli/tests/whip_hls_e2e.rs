@@ -19,6 +19,7 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use lvqr_test_utils::http::{HttpGetOptions, HttpResponse, http_get_with};
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use str0m::change::SdpAnswer;
 use str0m::format::Codec;
@@ -33,35 +34,23 @@ const MAX_POLL_SLEEP: Duration = Duration::from_millis(50);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 // =====================================================================
-// HTTP helper (mirrors crates/lvqr-cli/tests/rtmp_hls_e2e.rs)
+// HTTP helpers. `http_get` forwards to the shared
+// `lvqr_test_utils::http::http_get_with`; `http_post_sdp` stays
+// local because the shared module is GET-only, but it returns the
+// shared `HttpResponse` shape via a local `parse_http_response`
+// helper kept narrowly scoped to the POST path.
 // =====================================================================
 
-struct HttpResponse {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-fn find_header<'a>(resp: &'a HttpResponse, name: &str) -> Option<&'a str> {
-    resp.headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
-}
-
 async fn http_get(addr: SocketAddr, path: &str) -> HttpResponse {
-    let mut stream = tokio::time::timeout(HTTP_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .expect("http connect timed out")
-        .expect("http connect failed");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut buf = Vec::new();
-    tokio::time::timeout(HTTP_TIMEOUT, stream.read_to_end(&mut buf))
-        .await
-        .expect("http read timed out")
-        .expect("http read failed");
-    parse_http_response(&buf)
+    http_get_with(
+        addr,
+        path,
+        HttpGetOptions {
+            timeout: HTTP_TIMEOUT,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 async fn http_post_sdp(addr: SocketAddr, path: &str, body: &[u8]) -> HttpResponse {
@@ -200,7 +189,9 @@ async fn whip_publish_reaches_hls_playlist() {
         resp.status,
         std::str::from_utf8(&resp.body).unwrap_or("<binary>"),
     );
-    let location = find_header(&resp, "location").expect("WHIP answer must include Location header");
+    let location = resp
+        .header("location")
+        .expect("WHIP answer must include Location header");
     assert!(
         location.starts_with("/whip/live/test/"),
         "Location header must point at the new session resource: {location}",

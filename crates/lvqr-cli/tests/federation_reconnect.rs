@@ -35,12 +35,11 @@
 
 use lvqr_auth::{SharedAuth, StaticAuthConfig, StaticAuthProvider};
 use lvqr_cluster::{FederationConnectState, FederationLink};
+use lvqr_test_utils::http::{HttpGetOptions, http_get_with};
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 const CONNECTED_TIMEOUT: Duration = Duration::from_secs(15);
 const FAILED_TIMEOUT: Duration = Duration::from_secs(15);
@@ -52,39 +51,21 @@ struct HttpResponse {
     body: String,
 }
 
-/// Minimal HTTP/1.1 GET client. Hand-rolled to avoid pulling
-/// `reqwest` into `lvqr-cli`'s dev-deps just for a couple of
-/// requests; matches the pattern already established in
-/// `auth_integration.rs`.
+/// Thin wrapper over `lvqr_test_utils::http::http_get_with`.
+/// Preserves this file's `body: String` shape (the admin router's
+/// federation response is JSON, always UTF-8), its 5-second
+/// HTTP_TIMEOUT, and the bearer-dispatch signature the tests rely
+/// on.
 async fn http_get(addr: SocketAddr, path: &str, bearer: Option<&str>) -> HttpResponse {
-    let mut stream = tokio::time::timeout(HTTP_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .expect("admin connect timed out")
-        .expect("admin connect failed");
-    let mut req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
-    if let Some(token) = bearer {
-        req.push_str(&format!("Authorization: Bearer {token}\r\n"));
-    }
-    req.push_str("\r\n");
-    stream.write_all(req.as_bytes()).await.expect("http write");
-
-    let mut raw = Vec::with_capacity(4096);
-    let _ = tokio::time::timeout(HTTP_TIMEOUT, stream.read_to_end(&mut raw))
-        .await
-        .expect("http read timed out")
-        .expect("http read");
-
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
-    let first_line = head.lines().next().unwrap_or_default();
-    let status: u16 = first_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("could not parse status line: {first_line:?}"));
+    let opts = HttpGetOptions {
+        bearer,
+        timeout: HTTP_TIMEOUT,
+        ..Default::default()
+    };
+    let resp = http_get_with(addr, path, opts).await;
     HttpResponse {
-        status,
-        body: body.to_string(),
+        status: resp.status,
+        body: String::from_utf8_lossy(&resp.body).into_owned(),
     }
 }
 

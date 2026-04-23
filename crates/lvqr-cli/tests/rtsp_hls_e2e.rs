@@ -4,6 +4,7 @@
 //! handshake, then pushes interleaved RTP frames containing H.264
 //! parameter sets + IDR slices. Verifies the HLS playlist appears.
 
+use lvqr_test_utils::http::{HttpGetOptions, HttpResponse, http_get_with};
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -12,41 +13,16 @@ use tokio::net::TcpStream;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
 async fn http_get(addr: SocketAddr, path: &str) -> HttpResponse {
-    let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
-        .await
-        .expect("http connect timed out")
-        .expect("http connect failed");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut buf = Vec::new();
-    tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut buf))
-        .await
-        .expect("http read timed out")
-        .expect("http read failed");
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("missing header terminator");
-    let header_text = std::str::from_utf8(&buf[..split]).unwrap();
-    let status: u16 = header_text
-        .lines()
-        .next()
-        .unwrap()
-        .split(' ')
-        .nth(1)
-        .unwrap()
-        .parse()
-        .unwrap();
-    HttpResponse {
-        status,
-        body: buf[split + 4..].to_vec(),
-    }
+    http_get_with(
+        addr,
+        path,
+        HttpGetOptions {
+            timeout: TIMEOUT,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// Build a minimal RTP packet with the given payload.

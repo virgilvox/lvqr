@@ -23,11 +23,10 @@
 
 use bytes::Bytes;
 use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta};
+use lvqr_test_utils::http::{HttpGetOptions, http_get_with};
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -72,29 +71,21 @@ fn moof_mdat_fragment(seq: u64, ingest_time_ms: u64) -> Fragment {
     .with_ingest_time_ms(ingest_time_ms)
 }
 
+/// Thin wrapper over `lvqr_test_utils::http::http_get_with` that
+/// preserves this file's `(status, body)` tuple shape. Every call
+/// site destructures into a local let binding; a tuple return keeps
+/// those bindings unchanged.
 async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
-    let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
-        .await
-        .expect("connect timeout")
-        .expect("connect failed");
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).await.expect("write");
-    let mut buf = Vec::new();
-    tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut buf))
-        .await
-        .expect("read timeout")
-        .expect("read");
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("response terminator");
-    let header = std::str::from_utf8(&buf[..split]).expect("headers utf8");
-    let mut lines = header.lines();
-    let status_line = lines.next().expect("status line");
-    let mut parts = status_line.splitn(3, ' ');
-    let _ = parts.next();
-    let status: u16 = parts.next().expect("code").parse().expect("numeric status");
-    (status, buf[split + 4..].to_vec())
+    let resp = http_get_with(
+        addr,
+        path,
+        HttpGetOptions {
+            timeout: TIMEOUT,
+            ..Default::default()
+        },
+    )
+    .await;
+    (resp.status, resp.body)
 }
 
 fn unix_now_ms() -> u64 {
