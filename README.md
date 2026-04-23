@@ -430,18 +430,15 @@ published crate.
   offers a software x264 pipeline (behind the `transcode` Cargo
   feature). NVENC, VideoToolbox, VAAPI, and QSV backends are
   on the v1.1 and v1.2 roadmap.
-- **C2PA signing happy-path integration test uses `c2pa::EphemeralSigner`
-  only.** The on-disk `C2paSignerSource::CertKeyFiles` path ships with
-  a CLI surface (`--c2pa-signing-cert` + siblings, see
-  [CLI reference](#cli-reference)) and with the same
-  `ServeConfig.c2pa` construction proved by unit tests, but the
-  repository does not yet ship an integration test that generates
-  C2PA-spec-compliant cert material + boots lvqr with it end to end.
-  `crates/lvqr-cli/tests/c2pa_verify_e2e.rs` covers the equivalent
-  `Custom(Arc<dyn Signer>)` path via `c2pa::EphemeralSigner`. A
-  follow-up row will pre-stage a PEM fixture (or wire c2pa-rs's own
-  test helpers) so the file-based signer path has happy-path test
-  coverage too.
+- **C2PA signer paths are covered by two integration tests.**
+  `crates/lvqr-cli/tests/c2pa_cli_flags_e2e.rs` exercises the
+  on-disk `C2paSignerSource::CertKeyFiles` path through both
+  rcgen and openssl cert generation; `c2pa_verify_e2e.rs` covers
+  the programmatic `Custom(Arc<dyn Signer>)` path via
+  `c2pa::EphemeralSigner`. Any operator using a common PEM
+  layout (CA + leaf with `digitalSignature` KU,
+  `emailProtection` EKU, `CN` + `O` in the subject DN,
+  `AuthorityKeyIdentifier` on the leaf) hits the tested surface.
 - **Pure MoQ subscribers do not contribute to the latency SLO
   histogram.** LL-HLS, MPEG-DASH, WebSocket fMP4, and WHEP are
   instrumented; MoQ subscribers are not, by design (the

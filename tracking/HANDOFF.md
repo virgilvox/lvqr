@@ -1,8 +1,83 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C: row 117 SHIPPED (session 118) + HTTP Range + tier4-demos CI follow-ups SHIPPED (session 119) + CLI C2PA wiring (row 117-C) SHIPPED (session 120).** 963 workspace tests on the default gate + 1 Playwright E2E green on CI. 29 crates. Next: session 121 -- candidate phase-C rows are `@lvqr/core` admin-client completion + Vitest/pytest in CI (PLAN row 118), nightly 24h soak + feature matrix (PLAN row 119), authoritative DASH-IF container validator, OAuth2/JWKS (PLAN row 120), HMAC-signed playback URLs (PLAN row 121), shared-helpers refactor across 8+ integration tests, on-disk CertKeyFiles happy-path integration test.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C: row 117 SHIPPED (session 118) + Range + tier4-demos CI follow-ups SHIPPED (session 119) + CLI C2PA wiring row 117-C SHIPPED (session 120) + C2PA integration test audit + demo C2PA opt-in row 117-D SHIPPED (session 121).** 965 workspace tests on the default gate + 1 Playwright E2E green on CI. 29 crates. Next: session 122 -- candidate phase-C rows are `@lvqr/core` admin-client completion + Vitest/pytest in CI (PLAN row 118), nightly 24h soak + feature matrix (PLAN row 119), authoritative DASH-IF container validator, OAuth2/JWKS (PLAN row 120), HMAC-signed playback URLs (PLAN row 121), shared-helpers refactor across 8+ integration tests.
 
-**Last Updated**: 2026-04-22 (session 120 close). Local `main` is 2 commits ahead of `origin/main` (`e6e21d0`) pending user push instruction. Session 120's commit pair (`feat(cli): C2PA signing flags` + `docs: session 120 close + row 117-C SHIPPED`) rides on top of the session 119 chain (`fd1a3bc` + `d3e78de` + `e6e21d0`).
+**Last Updated**: 2026-04-22 (session 121 close). Local `main` is 2 commits ahead of `origin/main` (`5a2986b`) pending user push instruction. Session 121's commit pair (`feat(test): c2pa integration test audit + openssl recipe + demo-01 C2PA opt-in` + `docs: session 121 close + row 117-D SHIPPED`) rides on top of the session 120 chain (`035a4fc` + `5a2986b`).
+
+## Session 121 close (2026-04-22)
+
+**Shipped**: audit + fix for the session-120 deferred C2PA integration test, plus demo-01.sh `LVQR_DEMO_C2PA=1` opt-in using the proven openssl recipe. The user's push-back ("fix the things rather than just deleting") triggered a source-level audit of c2pa-rs that identified TWO issues the initial session-120 draft missed. Default-gate test count 963 -> 965.
+
+### The audit: two bugs, one generic error message
+
+Session 120 gave up on the integration test after one error ("c2pa error: sign: the certificate is invalid") and scoped it out as "c2pa-rs cert-profile requirements are stricter than documented". The user pushed back. A source-level read of c2pa-rs (`crates/c2pa-0.80.0/src/crypto/cose/certificate_profile.rs` + `crypto/cose/verifier.rs`) traced the failure to TWO distinct issues, both of which c2pa-rs folds into the same generic error:
+
+1. **Missing `AuthorityKeyIdentifier` extension on the leaf.** `check_certificate_profile` (line 485) requires `aki_good && ski_good && key_usage_good && extended_key_usage_good && handled_all_critical`. `aki_good` flips true only when the leaf cert has an `AuthorityKeyIdentifier` extension (verified via `ParsedExtension::AuthorityKeyIdentifier(_)` on line 419). rcgen 0.13's `CertificateParams::default()` sets `use_authority_key_identifier_extension: false` (`rcgen-0.13.2/src/certificate.rs:111`), so the extension is elided by default. c2pa-rs rejects the cert with "the certificate is invalid" -- generic, never names the missing AKI.
+
+2. **Missing `Organization` (O) attribute in the subject DN.** AFTER the signature itself validates successfully, c2pa-rs's COSE verifier at `verifier.rs:159-166` extracts the org attribute for the `CertificateInfo::issuer_org` field: `sign_cert.subject().iter_organization().last().ok_or(CoseError::MissingSigningCertificateChain)?`. Without O, the extraction fails, `MissingSigningCertificateChain` bubbles up, and `claim.rs:3023` folds it into "claim signature is not valid" with a NULL signer in the verify response -- again generic, even though the signature itself was fine.
+
+### Fixes
+
+* Leaf params in `mint_c2pa_test_pki`: `leaf_params.use_authority_key_identifier_extension = true;`
+* Leaf DN: `leaf_dn.push(DnType::OrganizationName, "LVQR Test Operator");`
+
+Both fixes are one-liners. The audit is the load-bearing contribution -- the session-120 deferral was avoidable with 30 more minutes of source reading.
+
+### Deliverables
+
+1. **`crates/lvqr-cli/tests/c2pa_cli_flags_e2e.rs`** re-added, fixed, and extended with TWO test functions:
+
+   * `certkeyfiles_signer_source_yields_valid_c2pa_manifest` -- the rcgen-based test from session 120, now fixed with the two one-liners above. Passes in ~1.2 s.
+   * `openssl_generated_certkeyfiles_also_yields_valid_manifest` -- NEW companion test that shells out to `openssl ecparam` / `req` / `x509` to mint the CA + leaf + PKCS#8 key via the same recipe `demo-01.sh --c2pa` uses. Skips gracefully when openssl is not on `$PATH`. Passes in ~0.1 s. The openssl flow is functionally equivalent to the rcgen flow -- same `critical BasicConstraints: CA:FALSE`, `critical KeyUsage: digitalSignature`, `extendedKeyUsage: emailProtection`, `SubjectKeyIdentifier: hash`, `AuthorityKeyIdentifier: keyid:always`, CN + O in subject.
+
+   The openssl test exists specifically to lock the demo's code path into CI. Any future divergence between rcgen output and operators' typical openssl-produced PEMs would surface here, not at a user's first try.
+
+2. **`examples/tier4-demos/demo-01.sh`** extended with `LVQR_DEMO_C2PA=1` opt-in:
+
+   * Prereq probe: `openssl` + CLI `--c2pa-signing-cert` flag (fails fast on an underfeatured `lvqr` binary).
+   * Cert minting: writes `$SCRATCH/ca.cfg`, `leaf.cfg`, then runs `openssl ecparam` + `req` + `x509` + `pkcs8` to produce `signing.pem` (leaf-first chain) + `signing.key` (PKCS#8). The openssl commands are byte-for-byte the ones the CI test verifies.
+   * CLI wiring: new `C2PA_ARGS=(--c2pa-signing-cert ... --c2pa-signing-key ... --c2pa-signing-alg es256 --c2pa-assertion-creator "LVQR demo-01.sh")` appended to `lvqr serve`.
+   * Summary probe: polls `/playback/verify/live/demo` and prints `valid=<bool> state=<str> signer="<str>"`. Replaces the session-117 "c2pa sign+verify: not wired on the CLI today" stub that was stale after session 120 shipped the flags.
+   * Documentation: `examples/tier4-demos/README.md` rewritten -- strikes "on the phase-C roadmap" language, documents the opt-in + the CI-locked recipe, updates the Tier 4 coverage table to flip row 4.3 from "no" to "yes, opt-in via LVQR_DEMO_C2PA=1".
+
+3. **`README.md`** Known Limitations rewrite. The session-120 "on-disk CertKeyFiles integration test is future work" bullet gets replaced with a shorter "both signer paths covered by two integration tests" bullet that names the shipped tests + the typical operator cert-material layout (`CN + O`, `AKI`, `digitalSignature KU`, `emailProtection EKU`).
+
+4. **Drive-by clippy fix.** The session-120 `c2pa_cli_tests::no_c2pa_flags_yields_none` test used `assert_eq!(..., true)` which trips `clippy::bool_assert_comparison` on Rust 1.95. Rewrote to `assert!(...)`. Slipped past session 120's clippy gate because the lint fires on the BINARY's test target (the unit-test module is in main.rs), and our session-120 clippy invocation + the Rust-version combo apparently didn't gate it until session 121's rerun.
+
+### Key 121 design decisions baked in
+
+* **Audit the source, don't trust the error message**. c2pa-rs's error reporting folds multiple distinct failures into the same generic strings ("certificate is invalid", "claim signature is not valid"). The user-visible error does not name the missing AKI or the missing Organization DN. Reading `certificate_profile.rs` end to end and tracing every field the final gate checks surfaced both issues in under 20 minutes. Deferring after one error was the wrong call.
+
+* **Ship both rcgen AND openssl integration tests, not one or the other**. rcgen is the in-process test path; openssl is the operator path. They produce functionally equivalent PEMs but through very different code. Locking both into CI guarantees a regression in either ecosystem surfaces fast; shipping only one would leave the demo script's openssl commands unchecked by CI.
+
+* **openssl test uses `have_openssl()` probe + graceful skip, not `#[ignore]`**. The test SHOULD run by default on developer machines (openssl is near-universally installed); marking it `#[ignore]` would hide failures. The probe + skip lets it run everywhere openssl is available without breaking hosts where it isn't.
+
+* **Demo writes all openssl artifacts into the SCRATCH dir, not a separate tempdir**. When `LVQR_DEMO_SCRATCH` is set, the scratch dir is retained on exit; all cert material ends up alongside lvqr.log + ffmpeg.log for post-mortem. A separate tempdir would make "why did C2PA verify fail" harder to debug.
+
+* **`--c2pa-assertion-creator "LVQR demo-01.sh"`** is hardcoded in the demo rather than the default `"lvqr"`. Helps operators inspecting a signed manifest differentiate demo-generated content from real signing pipelines.
+
+* **README Known Limitations bullet rewritten rather than struck entirely**. Some operators bring their own PEM layouts; naming the tested layout (`CN + O`, `AKI`, `digitalSignature`, `emailProtection`) tells them what shape c2pa-rs is verified against without implying every OpenSSL config works.
+
+### Ground truth (session 121 close)
+
+* **Head (pre-push)**: feat(test) + this close-doc commit (pending). `origin/main` at `5a2986b` unchanged from session 120 push.
+* **Tests (default features gate)**: **965** passed, 0 failed, 1 ignored on macOS. **+2** over session 120's 963 -- both new integration test functions. The 1 ignored is still the pre-existing `moq_sink` doctest.
+* **CI gates locally clean**:
+  * `cargo fmt --all --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95 (after fixing the session-120 `bool_assert_comparison` lint slip).
+  * `cargo test --workspace` 965 / 0 / 1.
+  * `cargo test -p lvqr-cli --features c2pa --test c2pa_cli_flags_e2e` 2 / 0 / 0 in 1.3 s.
+  * `bash -n examples/tier4-demos/demo-01.sh` clean.
+* **Demo C2PA opt-in not end-to-end run locally** -- still requires GStreamer at runtime, same posture as the rest of demo-01. The cert-generation leg alone is fully exercised by the openssl integration test.
+
+### Known limitations / documented v1 shape (after 121 close)
+
+* All session 120 known limitations RESOLVED for the C2PA line (integration test now ships for both signer paths; demo cover C2PA end-to-end).
+* Multi-range `multipart/byteranges` still deferred (session 119 call; principled).
+* Authoritative DASH-IF container validator still deferred (session 118 call; REST-API integration is a day's work on its own).
+* Shared-helpers refactor across 8+ integration tests still deferred (scope).
+* Whisper-enabled scheduled demo workflow still deferred (78 MB model download on every PR is a poor cost/benefit trade).
+* All other session 118 + 119 + 120 known limitations unchanged.
 
 ## Session 120 close (2026-04-22)
 
