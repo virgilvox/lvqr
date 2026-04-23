@@ -871,6 +871,21 @@ fixture they do not bring up), plus a Playwright browser E2E
 clippy + workspace test; session deltas are tracked in
 [`tracking/HANDOFF.md`](tracking/HANDOFF.md).
 
+Integration tests share two helper modules rather than
+reimplementing primitives per file:
+[`crates/lvqr-test-utils/src/http.rs`](crates/lvqr-test-utils/src/http.rs)
+(raw-TCP HTTP/1.1 GET with `HttpGetOptions::bearer` / `range` /
+`timeout` + `HttpResponse::header` case-insensitive lookup) and
+[`crates/lvqr-test-utils/src/flv.rs`](crates/lvqr-test-utils/src/flv.rs)
+(FLV video seq-header + NALU tag builders + parameterized AAC-LC
+`flv_audio_aac_lc_seq_header(freq_idx, channels)` with a 44.1 kHz
+stereo convenience wrapper). New integration tests should adopt
+both rather than copy-paste the byte math. The `TestServer`
+harness in `lvqr-test-utils` exposes every `lvqr serve` surface
+(RTMP, SRT, RTSP, WHIP, WHEP, HLS, DASH, WS, admin, cluster,
+archive, mesh `/signal`) on ephemeral loopback ports so tests
+run without port contention.
+
 Feature flags and Docker recipes are in
 [`docs/deployment.md`](docs/deployment.md).
 

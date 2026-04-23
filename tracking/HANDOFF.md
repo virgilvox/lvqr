@@ -2,7 +2,7 @@
 
 ## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 / 121-B / 122-A / 122-B / 122-C / 122-D + SDK-docs-reconnect all SHIPPED**. **991** workspace tests on the default gate (unchanged across sessions 131 + 132; both were pure code-dedup refactors). 29 crates. `lvqr_test_utils::{http, flv}` modules are now the sole source of HTTP GET + FLV tag primitive code in `crates/lvqr-cli/tests/*.rs`. Zero local http_get bodies, zero local FLV definitions. Remaining phase-C work: RTMP handshake helper factor (PLAN 122-E; subtle per-file variance wants a dedicated session) + authoritative DASH-IF container validator + webhook auth provider + npm + PyPI publish cycle carrying the 9/9 admin + JWKS + sign_live_url public APIs.
 
-**Last Updated**: 2026-04-23 (session 132 close). Local `main` is 2 commits ahead of `origin/main` (`c882da1`) pending user push instruction. Session 132's commit pair (`refactor(tests): drain http_get from 8 non-RTMP test files` + `docs: session 132 close`) rides on top of the session 131 chain.
+**Last Updated**: 2026-04-23 (session 132 close). Session 132's commit pair (`refactor(tests): drain http_get from 8 non-RTMP test files` + `docs: session 132 close`) rides on top of the session-131 + README chain at `c882da1`; the full chain `cc1f560..ebf1b1d` lands on `origin/main` on 2026-04-23.
 
 ## Session 132 close (2026-04-23)
 
