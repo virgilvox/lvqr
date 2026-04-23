@@ -1,8 +1,79 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 / 121-B / 122-A / 122-B / 122-C + SDK-docs-reconnect all SHIPPED**. **991** workspace tests on the default gate (unchanged from session 130; session 131 was a pure code-dedup refactor). 29 crates. `lvqr_test_utils::{http, flv}` modules centralize both the HTTP GET + FLV tag builder integration-test primitives; 14 of the 14 RTMP-class test files in `crates/lvqr-cli/tests/` are FLV-migration-complete (zero remaining local FLV definitions). 8 non-RTMP test files still carry local `http_get` duplicates; remaining slices are RTMP-handshake-helper factor + http_get drain on the non-RTMP cohort + authoritative DASH-IF container validator + webhook auth provider + npm + PyPI publish cycle carrying the 9/9 admin + JWKS + sign_live_url public APIs.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 / 121-B / 122-A / 122-B / 122-C / 122-D + SDK-docs-reconnect all SHIPPED**. **991** workspace tests on the default gate (unchanged across sessions 131 + 132; both were pure code-dedup refactors). 29 crates. `lvqr_test_utils::{http, flv}` modules are now the sole source of HTTP GET + FLV tag primitive code in `crates/lvqr-cli/tests/*.rs`. Zero local http_get bodies, zero local FLV definitions. Remaining phase-C work: RTMP handshake helper factor (PLAN 122-E; subtle per-file variance wants a dedicated session) + authoritative DASH-IF container validator + webhook auth provider + npm + PyPI publish cycle carrying the 9/9 admin + JWKS + sign_live_url public APIs.
 
-**Last Updated**: 2026-04-23 (session 131 close). Local `main` is 4 commits ahead of `origin/main` (`77da8c3`) pending user push instruction. Session 131's commit pair (`refactor(tests): drain FLV duplicates from 9 more test files` + `docs: session 131 close`) rides on top of the session 130 chain (`a01560f` + `454fe6f`).
+**Last Updated**: 2026-04-23 (session 132 close). Local `main` is 2 commits ahead of `origin/main` (`c882da1`) pending user push instruction. Session 132's commit pair (`refactor(tests): drain http_get from 8 non-RTMP test files` + `docs: session 132 close`) rides on top of the session 131 chain.
+
+## Session 132 close (2026-04-23)
+
+**Shipped**: PLAN row 122-D (fourth slice of the shared-helpers refactor; drains the `http_get` duplication surface across the 8 non-RTMP test files). No new shared module; no new feature signal. Default-gate workspace count unchanged at **991 / 0 / 3**.
+
+### Deliverables
+
+1. **8 test files migrated** off local `http_get` onto `lvqr_test_utils::http::{HttpGetOptions, http_get_with}` (a subset also consume the shared `HttpResponse`):
+
+   * `crates/lvqr-cli/tests/auth_integration.rs` -- kept the local `HttpResponse { status, body: String }` struct because every call site reads `resp.body` as a `String` (the admin router emits JSON; assumption is honest for the JWT-path tests that parse it). 10-line wrapper runs `String::from_utf8_lossy(&resp.body).into_owned()` to adapt the shared helper's `Vec<u8>` body shape. Bearer-dispatch + 5-second TIMEOUT preserved. 6 / 6 tests pass.
+   * `crates/lvqr-cli/tests/cluster_redirect.rs` (#![cfg(feature = "cluster")]) -- the pre-migration `http_get_raw(addr, path) -> (u16, Option<String>)` was a ~30-line raw-TCP + hand-rolled header parse whose only job was projecting the Location header out as an Option<String>. Replaced with a 4-line wrapper that calls the shared `http_get(addr, path)` and runs `resp.header("location").map(|v| v.to_string())`. 3 / 3 tests pass. Tokio imports dropped since the file had no other need for them.
+   * `crates/lvqr-cli/tests/federation_reconnect.rs` -- same shape as auth_integration (bearer-dispatch + body: String); same thin wrapper. 5-second HTTP_TIMEOUT preserved. 1 / 1 test passes.
+   * `crates/lvqr-cli/tests/rtsp_hls_e2e.rs` -- standard 2-arg http_get; dropped local `HttpResponse` struct + parse. Consumes the shared `HttpResponse` directly. 1 / 1 test passes.
+   * `crates/lvqr-cli/tests/slo_latency_e2e.rs` -- `http_get(addr, path) -> (u16, Vec<u8>)` tuple signature preserved at the call-site ergonomics layer via a 12-line wrapper that destructures `resp.status` + `resp.body` from the shared helper. 10-second TIMEOUT preserved. 3 / 3 tests pass.
+   * `crates/lvqr-cli/tests/srt_hls_e2e.rs` -- standard 2-arg http_get; dropped local `HttpResponse` struct + parse + the now-unused tokio TcpStream + AsyncRead/WriteExt imports (`bytes::Bytes` stays; the SRT caller's `send((now, Bytes::from(ts_data)))` call sites still need it). 2 / 2 tests pass.
+   * `crates/lvqr-cli/tests/srt_dash_e2e.rs` -- mirror of srt_hls_e2e's shape. 1 / 1 test passes.
+   * `crates/lvqr-cli/tests/whip_hls_e2e.rs` -- dropped local `HttpResponse` + `find_header` + the http_get branch of `parse_http_response`; http_get now forwards to the shared module. `http_post_sdp` stays local because the shared module is GET-only, but its internal parse now constructs the shared `HttpResponse`. 1 callsite swap from `find_header(&resp, "location")` to `resp.header("location")`. 1 / 1 test passes.
+
+   Aggregate per-file re-runs: 6 + 3 + 1 + 1 + 3 + 2 + 1 + 1 = **18 integration tests green**; zero regressions. Total dropped: ~270 LOC of duplicated http_get bodies, hand-rolled status-line parsers, and local `HttpResponse` structs. Total added: ~75 LOC of thin wrappers + module imports.
+
+2. **`tracking/PLAN_V1.1.md`** row 122-D marked SHIPPED with the per-file detail list inline.
+
+3. **README.md + `docs/auth.md` unchanged** -- the refactor is pure internal hygiene; no operator-facing surface moved.
+
+### Key 132 design decisions baked in
+
+* **Keep local wrappers over the shared helper where call-site ergonomics differ.** Three files (`auth_integration`, `federation_reconnect`, `slo_latency_e2e`) used non-standard return shapes (body-as-String tuple; status + body tuple) at every call site. Converting those to the shared `HttpResponse { status, headers, body: Vec<u8> }` would have touched dozens of call sites in each file. The 8-12 LOC wrapper per file keeps the shared module canonical while the local call sites stay byte-identical. This is exactly the session-129 pattern for `archive_dvr_read_e2e` and `playback_signed_url_e2e`; applied here to the non-RTMP cohort.
+
+* **`cluster_redirect`'s `http_get_raw` wrapper shrinks to a 4-line projection.** The historical helper's only job was to extract the Location header out of the response; all other fields were discarded. With the shared `HttpResponse::header()` method the entire helper collapses to `let resp = http_get(addr, path).await; (resp.status, resp.header("location").map(|v| v.to_string()))`. Good signal for how much the shared module earns when the project uses it seriously.
+
+* **No mass conversion of call-site ergonomics.** Each of the 8 files kept its historical call-site signature. I could have changed every `let (status, loc) = http_get_raw(...)` to `let resp = http_get(...); (resp.status, resp.header("location"))` inline across the file, but that would be ~20-30 unrelated call-site edits per file for zero behavior change. Minimum-touch is the right target for a pure code-dedup refactor.
+
+* **`whip_hls_e2e`'s `parse_http_response` stays local.** The shared module is GET-only by design (pulling a POST / DELETE / PATCH surface into `lvqr-test-utils` is feature creep for the 2 files that need it). The WHIP / WHEP signaling exchange POSTs an SDP offer; `http_post_sdp` keeps the POST logic local but its body-parse now constructs the shared `HttpResponse` so downstream call sites see one canonical response type. Same pattern as session 131's `rtmp_whep_audio_e2e`.
+
+* **RTMP handshake helper explicitly OUT of scope.** The 3 representative handshake bodies (in `rtmp_hls_e2e`, `rtmp_ws_e2e`, `transcode_ladder_e2e`) show semantic equivalence but name variance (`rtmp_client_handshake` vs `rtmp_handshake`) and subtle branch handling in the `InProgress` arm (one writes-if-non-empty, another always-writes). Harmonizing is its own slice (PLAN 122-E). Session 132 scoping ruled it out so the commit's diff stays a single-purpose code-dedup, not a mixed dedup + semantic-harmonization change.
+
+* **Default-gate test count unchanged at 991/0/3.** The session adds zero tests + removes zero tests. Same behavior, fewer LOC.
+
+### Ground truth (session 132 close)
+
+* **Head (pre-push)**: `refactor(tests)` + this close-doc commit (pending). `origin/main` at `c882da1` unchanged from session 131 + README push.
+* **Tests**:
+  * Default workspace gate: **991** passed / 0 failed / 3 ignored (unchanged from session 131).
+  * Per-file re-runs after migration: auth_integration 6/0/0, cluster_redirect 3/0/0 (--features cluster), federation_reconnect 1/0/0, rtsp_hls_e2e 1/0/0, slo_latency_e2e 3/0/0, srt_hls_e2e 2/0/0, srt_dash_e2e 1/0/0, whip_hls_e2e 1/0/0.
+* **CI gates locally clean**:
+  * `cargo fmt --all --check` clean (rustfmt applied one `.header("location").expect(...)` chain split, same as session 131's `rtmp_whep_audio`).
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `cargo test --workspace` 991 / 0 / 3.
+* **Workspace**: **29 crates**, unchanged.
+
+### Audit trail (session 132)
+
+Post-migration grep for local `http_get` function definitions in `crates/lvqr-cli/tests/*.rs`:
+
+* Files with substantial local `http_get` body: **0**.
+* Files with thin `http_get` wrappers forwarding into the shared module: 16 (all RTMP-class + non-RTMP files).
+* Files with no local http_get at all (call the shared module directly, or do not do HTTP): the rest.
+
+The `http_get` duplication surface in the CLI integration test directory is now zero. Sessions 129+130+131+132 together touched the four primary duplication surfaces identified in session 129's triage: HTTP GET (closed 129+130+131+132), FLV tag builders (closed 130+131), and the RTMP handshake helper (still deferred).
+
+### Known limitations / documented v1 shape (after 132 close)
+
+* **RTMP handshake helper not yet factored.** ~10 RTMP-ingest tests still reimplement `rtmp_client_handshake` / `rtmp_handshake` with subtle variance. PLAN 122-E (dedicated session).
+* **`http_post_sdp` local in `whip_hls_e2e` + `rtmp_whep_audio_e2e`.** Shared module is GET-only. The POST duplication across these 2 files is ~25 LOC; a future session could add `http_post_sdp` (or `http_post`) to the shared module if a 3rd POST-using test appears.
+* **Authoritative DASH-IF container validator deferred**; GPAC MP4Box remains primary.
+* **Webhook auth provider** still pending (README Auth+ops-polish checklist `[ ]`).
+* **npm + PyPI publish cycle** still pending.
+* All other session 131 + earlier known limitations unchanged.
+
+
+## Session 131 close (2026-04-23)
 
 ## Session 131 close (2026-04-23)
 
