@@ -11,6 +11,45 @@ use std::sync::Arc;
 #[cfg(feature = "transcode")]
 use clap::ArgAction;
 
+#[cfg(feature = "c2pa")]
+use clap::ValueEnum;
+
+/// Clap-facing enum over the digital-signature algorithms c2pa-rs
+/// accepts for on-disk PKCS#8 keys. 1:1 with
+/// [`lvqr_archive::provenance::C2paSigningAlg`]; the indirection
+/// keeps clap's `ValueEnum` derive away from the `lvqr-archive`
+/// crate so the `c2pa` Cargo feature stays the single gate on
+/// every provenance-adjacent dep. Rendered lowercase on the CLI
+/// (`--c2pa-signing-alg es256`).
+#[cfg(feature = "c2pa")]
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[clap(rename_all = "lower")]
+enum C2paAlgArg {
+    Es256,
+    Es384,
+    Es512,
+    Ps256,
+    Ps384,
+    Ps512,
+    Ed25519,
+}
+
+#[cfg(feature = "c2pa")]
+impl C2paAlgArg {
+    fn to_archive_alg(self) -> lvqr_archive::provenance::C2paSigningAlg {
+        use lvqr_archive::provenance::C2paSigningAlg;
+        match self {
+            Self::Es256 => C2paSigningAlg::Es256,
+            Self::Es384 => C2paSigningAlg::Es384,
+            Self::Es512 => C2paSigningAlg::Es512,
+            Self::Ps256 => C2paSigningAlg::Ps256,
+            Self::Ps384 => C2paSigningAlg::Ps384,
+            Self::Ps512 => C2paSigningAlg::Ps512,
+            Self::Ed25519 => C2paSigningAlg::Ed25519,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "lvqr", version, about = "Live Video QUIC Relay")]
 enum Cli {
@@ -183,6 +222,72 @@ struct ServeArgs {
     /// Enables DVR scrub / time-range playback (Tier 2.4). Omit to disable.
     #[arg(long, env = "LVQR_ARCHIVE_DIR")]
     archive_dir: Option<PathBuf>,
+
+    /// Path to a PEM-encoded C2PA signing certificate chain (leaf
+    /// first, then CA). When set together with
+    /// `--c2pa-signing-key`, every broadcast that terminates via
+    /// drain produces a signed `finalized.mp4` + `finalized.c2pa`
+    /// pair in the archive, and `GET /playback/verify/{broadcast}`
+    /// returns a JSON manifest-validation report. Requires
+    /// `--archive-dir` to be set (signing runs on the archive
+    /// drain-termination hook). Leaf EKU MUST be from c2pa-rs's
+    /// allow-list (`emailProtection`, `documentSigning`,
+    /// `timeStamping`, `OCSPSigning`, MS C2PA 1.3.6.1.4.1.311.76.59.1.9,
+    /// or C2PA 1.3.6.1.4.1.62558.2.1) + the `digitalSignature`
+    /// key-usage bit; c2pa-rs rejects self-signed leaves per
+    /// C2PA spec section 14.5.1. Requires the `c2pa` Cargo
+    /// feature; without it the flag is absent from the CLI.
+    /// Tier 4 item 4.3.
+    #[cfg(feature = "c2pa")]
+    #[arg(long, env = "LVQR_C2PA_SIGNING_CERT")]
+    c2pa_signing_cert: Option<PathBuf>,
+
+    /// Path to the PEM-encoded PKCS#8 private key matching the
+    /// leaf cert's subject public key. Must be set whenever
+    /// `--c2pa-signing-cert` is set; either flag alone is a
+    /// configuration error.
+    #[cfg(feature = "c2pa")]
+    #[arg(long, env = "LVQR_C2PA_SIGNING_KEY")]
+    c2pa_signing_key: Option<PathBuf>,
+
+    /// Digital signature algorithm matching the private key.
+    /// `es256` + ECDSA P-256, `ed25519` + Ed25519, etc. Defaults
+    /// to `es256` which matches rcgen's default P-256 output and
+    /// the most common C2PA operator-managed key shape.
+    #[cfg(feature = "c2pa")]
+    #[arg(long, env = "LVQR_C2PA_SIGNING_ALG", default_value = "es256", value_enum)]
+    c2pa_signing_alg: C2paAlgArg,
+
+    /// Human-readable creator name embedded in the
+    /// `stds.schema-org.CreativeWork` author assertion on every
+    /// signed asset. Typical value is the operator's org name or
+    /// a broadcast identifier. Defaults to `"lvqr"`.
+    #[cfg(feature = "c2pa")]
+    #[arg(long, env = "LVQR_C2PA_ASSERTION_CREATOR", default_value = "lvqr")]
+    c2pa_assertion_creator: String,
+
+    /// Path to a PEM-encoded trust-anchor bundle surfaced to
+    /// `c2pa::Context::with_settings({"trust": {"user_anchors":
+    /// ...}})` so c2pa-rs's chain validator accepts certs issued
+    /// by this CA. Required for any deployment using a private
+    /// CA; leave unset when the leaf chains to a public C2PA
+    /// trust anchor. When unset and signing with an unknown CA,
+    /// `/playback/verify` reports `validation_state = "Valid"`
+    /// (crypto integrity passes) rather than `"Trusted"` (CA in
+    /// the trust list).
+    #[cfg(feature = "c2pa")]
+    #[arg(long, env = "LVQR_C2PA_TRUST_ANCHOR")]
+    c2pa_trust_anchor: Option<PathBuf>,
+
+    /// Optional RFC 3161 Timestamp Authority URL. When set, the
+    /// signer contacts the TSA during every sign call so the
+    /// signing moment is countersigned by the TSA and survives
+    /// cert expiry. Leave unset for internal archives; set for
+    /// evidentiary-grade signing where the signing time must
+    /// remain verifiable after the leaf cert expires.
+    #[cfg(feature = "c2pa")]
+    #[arg(long, env = "LVQR_C2PA_TIMESTAMP_AUTHORITY")]
+    c2pa_timestamp_authority: Option<String>,
 
     /// Path to a WASM fragment filter module. When set, `serve`
     /// loads + compiles the module via `lvqr_wasm::WasmFilter::load`
@@ -402,6 +507,12 @@ async fn serve_from_args(
         Some(([0, 0, 0, 0], args.dash_port).into())
     };
 
+    // Build the C2PA config before the ServeConfig literal starts
+    // moving fields out of `args`; the helper needs to read
+    // multiple c2pa-related fields so it cannot share the move.
+    #[cfg(feature = "c2pa")]
+    let c2pa_config = build_c2pa_config(&args)?;
+
     let config = ServeConfig {
         relay_addr: ([0, 0, 0, 0], args.port).into(),
         rtmp_addr: ([0, 0, 0, 0], args.rtmp_port).into(),
@@ -429,7 +540,7 @@ async fn serve_from_args(
         record_dir: args.record_dir,
         archive_dir: args.archive_dir,
         #[cfg(feature = "c2pa")]
-        c2pa: None,
+        c2pa: c2pa_config,
         #[cfg(feature = "whisper")]
         whisper_model: args.whisper_model,
         #[cfg(feature = "transcode")]
@@ -470,4 +581,200 @@ async fn serve_from_args(
     }
 
     handle.shutdown().await
+}
+
+/// Resolve `--c2pa-signing-cert` / `--c2pa-signing-key` + siblings
+/// into an optional [`lvqr_archive::provenance::C2paConfig`].
+///
+/// Three outcomes:
+///
+/// * **Neither flag set** -> returns `Ok(None)`; signing stays off
+///   and the archive finalize path runs without a signer.
+/// * **Both flags set** -> returns `Ok(Some(C2paConfig { .. }))`
+///   with [`C2paSignerSource::CertKeyFiles`] carrying the paths +
+///   algorithm + optional TSA, plus the assertion creator and the
+///   trust-anchor PEM (file contents read eagerly so the error
+///   surfaces at CLI time rather than at the first finalize).
+/// * **Only one of the two set** -> returns `Err(anyhow)` with a
+///   message naming the missing flag. Either flag alone has no
+///   defined behavior (a cert without a matching key cannot sign,
+///   and a key without a cert leaves the signer without a chain
+///   to advertise), so loud failure is safer than silent drop.
+#[cfg(feature = "c2pa")]
+fn build_c2pa_config(args: &ServeArgs) -> Result<Option<lvqr_archive::provenance::C2paConfig>> {
+    use lvqr_archive::provenance::{C2paConfig, C2paSignerSource};
+    match (&args.c2pa_signing_cert, &args.c2pa_signing_key) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(anyhow::anyhow!(
+            "--c2pa-signing-cert was set but --c2pa-signing-key is missing; both flags must appear together"
+        )),
+        (None, Some(_)) => Err(anyhow::anyhow!(
+            "--c2pa-signing-key was set but --c2pa-signing-cert is missing; both flags must appear together"
+        )),
+        (Some(cert_path), Some(key_path)) => {
+            let trust_anchor_pem =
+                match &args.c2pa_trust_anchor {
+                    None => None,
+                    Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
+                        anyhow::anyhow!("failed to read --c2pa-trust-anchor at {}: {e}", path.display())
+                    })?),
+                };
+            Ok(Some(C2paConfig {
+                signer_source: C2paSignerSource::CertKeyFiles {
+                    signing_cert_path: cert_path.clone(),
+                    private_key_path: key_path.clone(),
+                    signing_alg: args.c2pa_signing_alg.to_archive_alg(),
+                    timestamp_authority_url: args.c2pa_timestamp_authority.clone(),
+                },
+                assertion_creator: args.c2pa_assertion_creator.clone(),
+                trust_anchor_pem,
+            }))
+        }
+    }
+}
+
+#[cfg(all(test, feature = "c2pa"))]
+mod c2pa_cli_tests {
+    use super::*;
+    use clap::Parser;
+    use lvqr_archive::provenance::{C2paSignerSource, C2paSigningAlg};
+
+    fn parse(args: &[&str]) -> ServeArgs {
+        match Cli::parse_from(args) {
+            Cli::Serve(a) => a,
+        }
+    }
+
+    #[test]
+    fn no_c2pa_flags_yields_none() {
+        let a = parse(&["lvqr", "serve"]);
+        assert!(a.c2pa_signing_cert.is_none());
+        assert!(a.c2pa_signing_key.is_none());
+        assert_eq!(build_c2pa_config(&a).unwrap().is_none(), true);
+    }
+
+    #[test]
+    fn cert_without_key_is_configuration_error() {
+        let a = parse(&["lvqr", "serve", "--c2pa-signing-cert", "/tmp/cert.pem"]);
+        let err = build_c2pa_config(&a).unwrap_err().to_string();
+        assert!(err.contains("--c2pa-signing-cert"), "err: {err}");
+        assert!(err.contains("--c2pa-signing-key"), "err: {err}");
+    }
+
+    #[test]
+    fn key_without_cert_is_configuration_error() {
+        let a = parse(&["lvqr", "serve", "--c2pa-signing-key", "/tmp/key.pem"]);
+        let err = build_c2pa_config(&a).unwrap_err().to_string();
+        assert!(err.contains("--c2pa-signing-cert"), "err: {err}");
+        assert!(err.contains("--c2pa-signing-key"), "err: {err}");
+    }
+
+    #[test]
+    fn both_flags_yields_certkeyfiles_source() {
+        let a = parse(&[
+            "lvqr",
+            "serve",
+            "--c2pa-signing-cert",
+            "/tmp/cert.pem",
+            "--c2pa-signing-key",
+            "/tmp/key.pem",
+        ]);
+        let cfg = build_c2pa_config(&a).unwrap().expect("config populated");
+        match cfg.signer_source {
+            C2paSignerSource::CertKeyFiles {
+                signing_cert_path,
+                private_key_path,
+                signing_alg,
+                timestamp_authority_url,
+            } => {
+                assert_eq!(signing_cert_path.to_string_lossy(), "/tmp/cert.pem");
+                assert_eq!(private_key_path.to_string_lossy(), "/tmp/key.pem");
+                // Default alg is Es256.
+                assert!(matches!(signing_alg, C2paSigningAlg::Es256));
+                assert!(timestamp_authority_url.is_none());
+            }
+            other => panic!("expected CertKeyFiles, got {other:?}"),
+        }
+        // Defaults for assertion creator + trust anchor.
+        assert_eq!(cfg.assertion_creator, "lvqr");
+        assert!(cfg.trust_anchor_pem.is_none());
+    }
+
+    #[test]
+    fn alg_flag_maps_to_archive_enum() {
+        let a = parse(&[
+            "lvqr",
+            "serve",
+            "--c2pa-signing-cert",
+            "/tmp/cert.pem",
+            "--c2pa-signing-key",
+            "/tmp/key.pem",
+            "--c2pa-signing-alg",
+            "ed25519",
+        ]);
+        let cfg = build_c2pa_config(&a).unwrap().unwrap();
+        match cfg.signer_source {
+            C2paSignerSource::CertKeyFiles { signing_alg, .. } => {
+                assert!(matches!(signing_alg, C2paSigningAlg::Ed25519));
+            }
+            other => panic!("expected CertKeyFiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assertion_creator_override_lands_on_config() {
+        let a = parse(&[
+            "lvqr",
+            "serve",
+            "--c2pa-signing-cert",
+            "/tmp/cert.pem",
+            "--c2pa-signing-key",
+            "/tmp/key.pem",
+            "--c2pa-assertion-creator",
+            "Example Broadcaster",
+        ]);
+        let cfg = build_c2pa_config(&a).unwrap().unwrap();
+        assert_eq!(cfg.assertion_creator, "Example Broadcaster");
+    }
+
+    #[test]
+    fn timestamp_authority_flag_lands_on_certkeyfiles() {
+        let a = parse(&[
+            "lvqr",
+            "serve",
+            "--c2pa-signing-cert",
+            "/tmp/cert.pem",
+            "--c2pa-signing-key",
+            "/tmp/key.pem",
+            "--c2pa-timestamp-authority",
+            "https://tsa.example.invalid",
+        ]);
+        let cfg = build_c2pa_config(&a).unwrap().unwrap();
+        match cfg.signer_source {
+            C2paSignerSource::CertKeyFiles {
+                timestamp_authority_url,
+                ..
+            } => {
+                assert_eq!(timestamp_authority_url.as_deref(), Some("https://tsa.example.invalid"));
+            }
+            other => panic!("expected CertKeyFiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_trust_anchor_file_surfaces_as_configuration_error() {
+        let a = parse(&[
+            "lvqr",
+            "serve",
+            "--c2pa-signing-cert",
+            "/tmp/cert.pem",
+            "--c2pa-signing-key",
+            "/tmp/key.pem",
+            "--c2pa-trust-anchor",
+            "/nonexistent/path/to/anchor.pem",
+        ]);
+        let err = build_c2pa_config(&a).unwrap_err().to_string();
+        assert!(err.contains("--c2pa-trust-anchor"), "err: {err}");
+        assert!(err.contains("/nonexistent/path/to/anchor.pem"), "err: {err}");
+    }
 }
