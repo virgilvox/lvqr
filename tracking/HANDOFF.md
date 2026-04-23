@@ -1,8 +1,59 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B + 119-A / 121 all SHIPPED** (archive READ DVR E2E + DASH conformance + HTTP Range + tier4-demos CI + CLI C2PA wiring + C2PA integration-test audit + demo C2PA opt-in + SDK JS 9/9 + Vitest/pytest CI + SDK Python 9/9 + feature-flag CI matrix + HMAC-signed playback URLs). 968 workspace tests on the default gate + 1 Playwright E2E + 10 Vitest + 21 pytest green. 29 crates. Next: session 125 -- remaining phase-C rows are SDK reconnect/retry docs, nightly 24h soak (PLAN row 119 unshipped leg), OAuth2/JWKS (PLAN row 120), authoritative DASH-IF container validator, scheduled whisper workflow with cached ggml model, shared-helpers refactor across 9+ integration tests.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 121 + SDK-docs-reconnect all SHIPPED**. 968 workspace tests on the default gate + 1 Playwright E2E + 10 Vitest + 21 pytest green, plus one new scheduled workflow (`whisper-scheduled.yml`) driving `whisper_cli_e2e` daily with a cached ggml model. 29 crates. Next: session 126 -- remaining phase-C rows are nightly 24h soak (the distinct-from-whisper leg of PLAN row 119), OAuth2/JWKS (PLAN row 120), authoritative DASH-IF container validator, HMAC extension to `/hls/*` + `/dash/*`, shared-helpers refactor across 9+ integration tests, npm + PyPI publish cycle carrying the 9/9 admin surface.
 
-**Last Updated**: 2026-04-22 (session 124 close). Local `main` is 2 commits ahead of `origin/main` (`3bfc5ae`) pending user push instruction. Session 124's commit pair (`feat(auth): HMAC-signed playback URLs + sign_playback_url helper` + `docs: session 124 close + PLAN row 121 SHIPPED`) rides on top of the session 123 chain (`c6d7d50` + `3bfc5ae`).
+**Last Updated**: 2026-04-22 (session 125 close). Local `main` is 2 commits ahead of `origin/main` (`c0fca09`) pending user push instruction. Session 125's commit pair (`feat(ci+docs): whisper-scheduled.yml + SDK reconnect docs` + `docs: session 125 close`) rides on top of the session 124 chain (`a7b8eae` + `c0fca09`).
+
+## Session 125 close (2026-04-22)
+
+**Shipped**: two small audit carry-overs bundled. Both close explicit Known Limitations bullets; neither touches Rust code, so the workspace-gate signal is unchanged at 968/0/2.
+
+### Deliverables
+
+1. **`.github/workflows/whisper-scheduled.yml`** -- new scheduled workflow that promotes `whisper_cli_e2e` from `#[ignore]` to CI. Daily cron (`23 5 * * *`), `workflow_dispatch` for manual reruns. `actions/cache@v4` memoizes the ~78 MB `ggml-tiny.en.bin` from Hugging Face (`https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin`) under a stable cache key; cache miss triggers a `curl` with retry loop + a 70 MB minimum-size sanity check (fails fast on an HTML error page or partial download). Installs `libclang-dev` + `cmake` + `build-essential` for whisper-rs's bindgen + whisper.cpp's internal build (same set `feature-matrix.yml`'s whisper cell uses). Sets `WHISPER_MODEL_PATH` to the cached file before invoking `cargo test -p lvqr-cli --features whisper --test whisper_cli_e2e -- --ignored --nocapture`. `continue-on-error: true` soft-fail initial posture per convention.
+
+   Closes the session-121 audit + session-123 Known Limitations bullet: "`whisper_cli_e2e` stays `#[ignore]` because it needs a ~78 MB ggml model; promoting that to a scheduled workflow with an `actions/cache@v4`-backed model blob is the right place for it."
+
+2. **`docs/sdk/javascript.md` expanded 105 -> 307 lines** with every section the session-121 audit named as missing:
+   * Full method reference for the 9 admin methods the session-122 expansion landed (`healthz` / `stats` / `listStreams` / `mesh` / `slo` / `clusterNodes` / `clusterBroadcasts` / `clusterConfig` / `clusterFederation`), including the cluster-gate caveat.
+   * Complete TypeScript response type reference (all 9 interfaces + the `FederationConnectState` union) directly copyable into operator code.
+   * New "Timeouts + reconnect" section documenting `LvqrClient.connectTimeoutMs`, `LvqrAdminClient.fetchTimeoutMs`, `LvqrAdminClientOptions.bearerToken` + a canonical jittered-exponential-backoff reconnect loop for `LvqrClient.connect/subscribe` + an admin-side retry recipe with error discrimination on `AbortError`.
+   * `MeshPeer` section with `pushFrame` + `onChildOpen` documented (both shipped to `main` in sessions 115 + 116 post-close but never surfaced in the SDK docs).
+
+3. **`docs/sdk/python.md` expanded 62 -> 215 lines** with the Python mirror of every new JS section:
+   * Full 9-method reference with cluster-gate caveat.
+   * All 12 dataclass definitions + the `FederationConnectState` `Literal` union matching the typecheck surface.
+   * "Timeouts + retries" section documenting httpx's `timeout=` semantics, `bearer_token=` kwarg, and a capped-exponential-backoff retry recipe with httpx exception discrimination (`httpx.ReadTimeout` vs `httpx.ConnectTimeout` vs `httpx.ConnectError`).
+   * New "Migrating from `0.3.1` to `main`" section naming the published-vs-main version skew + a `hasattr` probe for code that runs against both.
+   * Explicit "Python client is admin-only; streaming uses ffmpeg-python or av" section so adopters do not fish for a subscribe API that does not exist.
+
+### Key 125 design decisions baked in
+
+* **Daily cron not weekly** for the whisper workflow. A weekly schedule would be cheaper but leaves a ~7-day blast radius for any regression in the whisper wiring. Daily runs give 24-hour discovery; the cache makes the model download nearly free after the first hit. 10 GB repo cache quota trivially accommodates a 78 MB blob.
+* **Cache key is URL-stable, not revision-pinned**. The Hugging Face `resolve/main` URL tracks the current HEAD of the model repo; if upstream ever swaps the file, cache-miss triggers a re-download. Alternative (pinning to a specific revision) was rejected because whisper.cpp's model revisions are not operator-visible and the current file has been stable for years.
+* **70 MB minimum-size sanity check**. The expected model is ~77 MB. Hugging Face sometimes returns HTML error pages when their CDN has transient issues; without the size check an empty or truncated file would reach `whisper_cli_e2e` and produce a confusing whisper-rs panic rather than a clear "download failed" error.
+* **JS docs include both `connectTimeoutMs` AND `fetchTimeoutMs`** in the same section. The two are named distinctly because they apply to distinct surfaces (WT/WS connect vs admin HTTP fetch); lumping them into one paragraph would be cleaner prose but more confusing for adopters who only use one of the two clients.
+* **Reconnect recipe is the SDK's problem, not library-level**. The canonical recipe shows jittered exponential backoff with a 30 s ceiling; operators can copy + adjust to their environment. Baking reconnect into `LvqrClient.connect()` was rejected because real deployments have wildly varying reconnect preferences (CI wants bounded retries, public apps want aggressive but capped backoff, embedded viewers might want linear steps); the library staying agnostic is the defensible default.
+* **Python retry recipe handles `httpx.ConnectError` alongside the timeout variants**. `ConnectError` is the one-off "TCP refused" variant that is not a timeout; a retry loop that only caught timeouts would not recover from "the server blipped for 2 seconds". Matching the JS `withRetry` helper's error surface keeps the two languages symmetrical.
+* **Migration section added to Python docs, not JS docs**. The JS publish skew is the same (`main` has 9/9 admin; `@lvqr/core 0.3.1` has 3/9) but JS developers tend to reach for `@latest` tags; the explicit `hasattr` probe is more important in Python where `pip install lvqr==0.3.1` is a common pin in requirements files. JS docs handle the skew implicitly through the version-note header.
+
+### Ground truth (session 125 close)
+
+* **Head (pre-push)**: feat(ci+docs) + this close-doc commit (pending). `origin/main` at `c0fca09` unchanged from the session 124 push.
+* **Rust workspace**: no source moved. `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95; `cargo test --workspace` unchanged at 968 / 0 / 2 from session 124's close.
+* **Docs line counts**: `docs/sdk/javascript.md` 105 -> 307; `docs/sdk/python.md` 62 -> 215. Pure additive; every existing section preserved with the same anchor structure.
+* **YAML**: `python3 -c 'import yaml; yaml.safe_load(open(".github/workflows/whisper-scheduled.yml"))'` parses cleanly.
+* **`whisper-scheduled.yml` not exercised locally**. CI-only; first scheduled run will carry the authoritative signal (the manual `workflow_dispatch` trigger lets a developer force-run after landing).
+
+### Known limitations / documented v1 shape (after 125 close)
+
+* **Nightly 24h soak still unshipped** (PLAN row 119 had two legs: feature-matrix shipped in session 123, soak is the remaining leg).
+* **OAuth2/JWKS still unshipped** (PLAN row 120). Largest remaining phase-C row.
+* **HMAC gated on `/playback/*` only**; extension to `/hls/*` + `/dash/*` is a focused phase-C follow-up.
+* **Authoritative DASH-IF container validator deferred**; GPAC MP4Box remains the primary validator in `dash-conformance.yml`.
+* **Shared-helpers refactor across 9+ integration tests** still queued; the scope has grown with each new test file (now 9: `rtmp_archive_e2e`, `rtmp_hls_e2e`, `rtmp_dash_e2e`, `rtmp_ws_e2e`, `rtmp_whep_audio_e2e`, `c2pa_verify_e2e`, `c2pa_cli_flags_e2e`, `archive_dvr_read_e2e`, `playback_signed_url_e2e`).
+* **npm + PyPI publish cycle** still pending; both published builds at `0.3.1` are 3/9 admin coverage.
+* All other session 124 + earlier known limitations unchanged.
 
 ## Session 124 close (2026-04-22)
 

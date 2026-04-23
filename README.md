@@ -372,10 +372,15 @@ JavaScript (`@lvqr/core`, `@lvqr/player` at 0.3.1 on npm), Python
   with matching dataclasses + an optional `bearer_token` kwarg.
   Pytest coverage grows from 8 to 21 tests. Lands on PyPI at
   the next publish cycle.
-- [ ] Document reconnect + retry semantics in
-  [`docs/sdk/javascript.md`](docs/sdk/javascript.md) (currently
-  silent on reconnect; `connectTimeoutMs` + `fetchTimeoutMs`
-  shipped on `main` but not explained).
+- [x] ~~Document reconnect + retry semantics in the SDK docs.~~
+  Shipped in session 125.
+  [`docs/sdk/javascript.md`](docs/sdk/javascript.md) gains a
+  "Timeouts + reconnect" section documenting `connectTimeoutMs`,
+  `fetchTimeoutMs`, `bearerToken`, a canonical jittered-
+  exponential-backoff reconnect loop, and an admin-side retry
+  recipe. [`docs/sdk/python.md`](docs/sdk/python.md) mirrors
+  with httpx-specific retry patterns + a `bearer_token` kwarg
+  reference + a `0.3.1` -> `main` migration section.
 - [x] ~~First `examples/tier4-demos/` public demo script.~~ Shipped
   in session 117 as
   [`examples/tier4-demos/demo-01.sh`](examples/tier4-demos/demo-01.sh),
