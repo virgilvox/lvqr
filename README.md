@@ -277,27 +277,81 @@ criterion -- a working
 [`examples/tier4-demos/`](examples/tier4-demos/) public demo
 script -- landed on `main` post-v0.4.0 in session 117
 (`demo-01.sh` chains WASM filter + whisper captions + ABR
-transcode + DVR archive end to end).
+transcode + DVR archive end to end; C2PA sign + verify is
+opt-in via `LVQR_DEMO_C2PA=1`).
 
 Full v1.1 phase plan with session-by-session sequencing lives in
-[`tracking/PLAN_V1.1.md`](tracking/PLAN_V1.1.md).
+[`tracking/PLAN_V1.1.md`](tracking/PLAN_V1.1.md). A 29-crate
+inventory + codebase reality audit anchors the current state in
+`tracking/HANDOFF.md` session-121 block.
 
-The remaining v1.1 checklist, ordered by phase:
+### Next up (ranked by impact / ship-ability)
+
+Ordering reflects a 2026-04-22 codebase audit against the v1.1
+plan. Higher items are smaller, closer to shippable, and close
+gaps explicitly named in Known v0.4.0 limitations.
+
+1. **Expand `@lvqr/core` admin client to cover the 6 missing
+   `/api/v1/*` routes** (`mesh`, `slo`, `cluster/nodes`,
+   `cluster/broadcasts`, `cluster/config`, `cluster/federation`).
+   Small, concrete, unblocks operator tooling + Vitest below.
+2. **Wire Vitest + pytest into CI.** `bindings/js` has no test
+   script today; `bindings/python/tests/` exists but is never
+   invoked by a workflow. Dedicated workflow mirroring
+   `mesh-e2e.yml`'s pattern.
+3. **Feature-flag CI matrix.** Add explicit matrix cells for
+   `lvqr-cli --features whisper` / `--features transcode` /
+   `--features c2pa` so regressions in feature-gated paths
+   surface directly, not only through the soft-fail
+   `tier4-demos.yml`.
+4. **HMAC-signed playback URLs** (PLAN row 121). Narrow auth
+   primitive for one-off share links; a few hundred LOC +
+   integration test.
+5. **OAuth2 / JWKS dynamic key discovery** (PLAN row 120).
+   Larger auth surface than HMAC; adds operator-grade JWT
+   flexibility alongside the existing static-secret HS256 path.
+6. **Nightly 24h soak CI job** (PLAN row 119). Scheduled
+   workflow running `lvqr-soak` for a full day, scoped
+   soft-fail for the first week.
+7. **Mesh data-plane phase D**: actual-vs-intended offload
+   reporting, per-peer capacity advertisement, TURN deployment
+   recipe, three-peer Playwright E2E. Unblocks flipping
+   `docs/mesh.md` to IMPLEMENTED.
+8. **One hardware encoder backend** (VideoToolbox on macOS or
+   NVENC on Linux). The three others stay deferred to v1.2.
+9. **Stream-modifying WASM filter chains** (multi-filter
+   composition). v1 single-filter drop + rewrite ships today.
+10. **SDK reconnect / retry docs**, **webhook auth provider**,
+    **stream-key CRUD admin API**, **hot config reload**,
+    **dedicated DVR scrub web UI**, **SCTE-35 passthrough** --
+    smaller or more-speculative items; pick based on operator
+    demand.
+
+The list below groups the same remaining work by logical area.
 
 ### Client SDKs (shipped; completion work pending)
 JavaScript (`@lvqr/core`, `@lvqr/player` at 0.3.1 on npm), Python
 (`lvqr` at 0.3.1 on PyPI, admin client only), and Rust
 (`lvqr-core` at 0.4.0 on crates.io) already ship. Remaining work:
-- [ ] Expand `@lvqr/core` admin client to cover every `/api/v1/*`
-  route (mesh, slo, cluster, federation).
-- [ ] Add Vitest + pytest to CI so SDK drift surfaces at PR time.
-- [ ] Document reconnect + retry semantics in the SDK README.
+- [ ] **Expand `@lvqr/core` admin client** from 3 of 9
+  `/api/v1/*` routes (`healthz`, `stats`, `listStreams`) to all
+  9. Missing methods: `mesh()`, `slo()`, `clusterNodes()`,
+  `clusterBroadcasts()`, `clusterConfig()`, `clusterFederation()`.
+- [ ] Add Vitest to `bindings/js` + pytest invocation to CI so
+  SDK drift surfaces at PR time. `bindings/python/tests/` exists
+  but no workflow runs it; `bindings/js` has no test script.
+- [ ] Document reconnect + retry semantics in
+  [`docs/sdk/javascript.md`](docs/sdk/javascript.md) (currently
+  silent on reconnect; `connectTimeoutMs` + `fetchTimeoutMs`
+  shipped on `main` but not explained).
 - [x] ~~First `examples/tier4-demos/` public demo script.~~ Shipped
   in session 117 as
   [`examples/tier4-demos/demo-01.sh`](examples/tier4-demos/demo-01.sh),
-  chaining the WASM filter, whisper captions, ABR transcode, and
-  DVR archive surfaces end to end. Closes the Tier 4 exit
-  criterion that was left open when Tier 4 was marked COMPLETE.
+  chaining the WASM filter, whisper captions, ABR transcode,
+  DVR archive surfaces end to end, plus opt-in C2PA sign +
+  verify via `LVQR_DEMO_C2PA=1` (session 121). Closes the
+  Tier 4 exit criterion that was left open when Tier 4 was
+  marked COMPLETE.
 
 ### Peer mesh data plane
 Topology planner, WebSocket signaling, `/api/v1/mesh` admin route,
@@ -450,6 +504,31 @@ published crate.
 - **No nightly 24h soak in CI.** `lvqr-soak` has a fast-path
   smoke test; the long-duration soak job is on the v1.1
   checklist.
+- **Feature-flag CI matrix is incomplete.** `.github/workflows/ci.yml`
+  exercises `lvqr-archive --features io-uring` and
+  `lvqr-archive --features c2pa`, but the `lvqr-cli` features
+  `whisper`, `transcode`, and `c2pa` have no dedicated matrix
+  cells. The `transcode` path is exercised end-to-end only by
+  `tier4-demos.yml`, which is `continue-on-error: true` soft-fail
+  during its initial weeks. Operators relying on a specific
+  feature combination should run `cargo test -p lvqr-cli
+  --features <combo>` locally. A phase-C row adds explicit
+  matrix cells.
+- **`@lvqr/core` admin client covers 3 of 9 `/api/v1/*` routes.**
+  `healthz`, `stats`, and `listStreams` ship today; the admin
+  client does not yet expose `mesh`, `slo`, `cluster/nodes`,
+  `cluster/broadcasts`, `cluster/config`, or
+  `cluster/federation`. Operators needing those routes from JS
+  today call `fetch` directly against the admin base URL. A
+  phase-C row fills in the remaining six methods.
+- **SDK reconnect + retry semantics are undocumented.**
+  `@lvqr/core`'s `LvqrClient` + `LvqrAdminClient` ship
+  `connectTimeoutMs` / `fetchTimeoutMs` on `main` (both land at
+  the next publish cycle), but the SDK docs at
+  [`docs/sdk/javascript.md`](docs/sdk/javascript.md) do not yet
+  explain when to reconnect, what the backoff should be, or how
+  to handle partial fetches. A phase-C row fills this in
+  alongside the admin-client expansion.
 
 ## CLI reference
 
@@ -619,7 +698,7 @@ Auth, storage, admin, signaling
   lvqr-record        -- fMP4 recorder subscribed to EventBus
   lvqr-archive       -- redb segment index + C2PA finalize/verify
   lvqr-signal        -- WebRTC signaling (mesh assignments)
-  lvqr-admin         -- /api/v1/*, /metrics, /healthz, /readyz
+  lvqr-admin         -- /api/v1/*, /metrics, /healthz
 
 Cluster + observability
   lvqr-cluster       -- chitchat + FederationRunner
@@ -668,7 +747,7 @@ list lives in [`tracking/ROADMAP.md`](tracking/ROADMAP.md).
 - [Cluster plane](docs/cluster.md) -- chitchat membership, ownership, redirect-to-owner
 - [Observability](docs/observability.md) -- OTLP export, Prometheus fanout
 - [Latency SLO](docs/slo.md) -- operator runbook + alert tuning
-- [Peer mesh](docs/mesh.md) -- topology planner (data plane on the roadmap)
+- [Peer mesh](docs/mesh.md) -- topology planner + WebSocket signaling + client-side MeshPeer relay (two-peer happy path verified; operator-grade completion on the phase-D roadmap)
 - [Roadmap](tracking/ROADMAP.md) -- the 18-24 month plan
 - [Handoff](tracking/HANDOFF.md) -- session-by-session log (current state)
 - [Test contract](tests/CONTRACT.md) -- the 5-artifact discipline per wire-format crate
