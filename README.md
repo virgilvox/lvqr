@@ -87,8 +87,11 @@ in-process AI agents, cross-cluster federation, peer mesh).
   `finalized.c2pa`. Admin route `GET /playback/verify/{*broadcast}`
   returns a JSON validation report
   (`{ signer, signed_at, valid, validation_state, errors }`).
-  Dual signer source: on-disk PEMs or a custom `Arc<dyn
-  c2pa::Signer>` for HSM/KMS-backed keys.
+  Dual signer source: on-disk PEMs via `--c2pa-signing-cert` +
+  `--c2pa-signing-key` (plus optional `--c2pa-signing-alg`,
+  `--c2pa-trust-anchor`, `--c2pa-timestamp-authority`) or a
+  custom `Arc<dyn c2pa::Signer>` for HSM/KMS-backed keys passed
+  programmatically through `ServeConfig.c2pa`.
 
 ### Auth
 - Pluggable: noop, static tokens, or HS256 JWT with `iss` + `aud`
@@ -427,17 +430,18 @@ published crate.
   offers a software x264 pipeline (behind the `transcode` Cargo
   feature). NVENC, VideoToolbox, VAAPI, and QSV backends are
   on the v1.1 and v1.2 roadmap.
-- **C2PA signing is programmatic-only.** `ServeConfig.c2pa` on
-  the `lvqr-cli` API accepts a `C2paConfig` (on-disk PEMs via
-  `C2paSignerSource::CertKeyFiles` or a caller-supplied signer
-  for HSM/KMS backends), and the drain-terminated finalize +
-  `/playback/verify/{broadcast}` verify route both work end to
-  end. What is missing is a CLI-flag surface
-  (`--c2pa-signing-cert`, `--c2pa-signing-key`, etc.). Operators
-  who want signed archives today call `lvqr_cli::start`
-  programmatically with a `C2paConfig`; see
-  `crates/lvqr-cli/tests/c2pa_verify_e2e.rs` for the end-to-end
-  fixture. CLI wiring is on the phase-C roadmap.
+- **C2PA signing happy-path integration test uses `c2pa::EphemeralSigner`
+  only.** The on-disk `C2paSignerSource::CertKeyFiles` path ships with
+  a CLI surface (`--c2pa-signing-cert` + siblings, see
+  [CLI reference](#cli-reference)) and with the same
+  `ServeConfig.c2pa` construction proved by unit tests, but the
+  repository does not yet ship an integration test that generates
+  C2PA-spec-compliant cert material + boots lvqr with it end to end.
+  `crates/lvqr-cli/tests/c2pa_verify_e2e.rs` covers the equivalent
+  `Custom(Arc<dyn Signer>)` path via `c2pa::EphemeralSigner`. A
+  follow-up row will pre-stage a PEM fixture (or wire c2pa-rs's own
+  test helpers) so the file-based signer path has happy-path test
+  coverage too.
 - **Pure MoQ subscribers do not contribute to the latency SLO
   histogram.** LL-HLS, MPEG-DASH, WebSocket fMP4, and WHEP are
   instrumented; MoQ subscribers are not, by design (the
@@ -495,6 +499,38 @@ lvqr serve [OPTIONS]
   --whisper-model <PATH>    Path to a whisper.cpp ggml model
                             file (e.g. ggml-tiny.en.bin).
                             Env: LVQR_WHISPER_MODEL.
+
+  C2PA signing (requires --features c2pa at build; needs
+  --archive-dir to be set because signing runs on the archive
+  drain-termination hook):
+  --c2pa-signing-cert <PATH>       PEM-encoded signing certificate
+                                   chain (leaf first, then CA).
+                                   Leaf EKU must be one of
+                                   emailProtection / documentSigning
+                                   / timeStamping / OCSPSigning /
+                                   MS C2PA / C2PA per c2pa-rs.
+                                   Env: LVQR_C2PA_SIGNING_CERT.
+  --c2pa-signing-key <PATH>        PKCS#8 private key matching
+                                   the leaf's subject public key.
+                                   Must be set together with
+                                   --c2pa-signing-cert.
+                                   Env: LVQR_C2PA_SIGNING_KEY.
+  --c2pa-signing-alg <ALG>         One of es256 / es384 / es512 /
+                                   ps256 / ps384 / ps512 / ed25519.
+                                   Defaults to es256.
+                                   Env: LVQR_C2PA_SIGNING_ALG.
+  --c2pa-assertion-creator <STR>   Creator name on the
+                                   schema-org CreativeWork
+                                   assertion. Defaults to "lvqr".
+                                   Env: LVQR_C2PA_ASSERTION_CREATOR.
+  --c2pa-trust-anchor <PATH>       PEM trust-anchor bundle for
+                                   private CAs; required when the
+                                   leaf does not chain to a
+                                   public C2PA trust root.
+                                   Env: LVQR_C2PA_TRUST_ANCHOR.
+  --c2pa-timestamp-authority <URL> RFC 3161 TSA URL for embedded
+                                   timestamp countersignatures.
+                                   Env: LVQR_C2PA_TIMESTAMP_AUTHORITY.
 
   Server-side transcoding (requires --features transcode at
   build; pulls gstreamer 0.23 + base/good/bad/ugly + gst-libav
