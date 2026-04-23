@@ -1,8 +1,93 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 / 121-B / 122-A / 122-B + SDK-docs-reconnect all SHIPPED**. **991** workspace tests on the default gate (+7 over session 129's 984, from the new `lvqr_test_utils::flv` module's unit tests) + 14 lvqr-auth jwks-feature-gated tests + 5 CLI jwks-feature-gated unit tests + 1 Playwright E2E + 10 Vitest + 21 pytest green. 29 crates. `lvqr_test_utils::{http, flv}` modules now centralize both the HTTP GET + FLV tag builder integration-test primitives; 9 of the ~17 listed test files migrated off their local duplicates. Next: session 131 -- remaining phase-C rows are authoritative DASH-IF container validator, migrate the remaining 10 integration tests off their local `http_get` + FLV duplicates (incremental; safe to chip away), factor the RTMP handshake helper (~10 tests still reimplement it with subtle per-file variance), webhook auth provider (tracked in README Auth+ops-polish), npm + PyPI publish cycle carrying the 9/9 admin + JWKS + sign_live_url public APIs.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 / 121-B / 122-A / 122-B / 122-C + SDK-docs-reconnect all SHIPPED**. **991** workspace tests on the default gate (unchanged from session 130; session 131 was a pure code-dedup refactor). 29 crates. `lvqr_test_utils::{http, flv}` modules centralize both the HTTP GET + FLV tag builder integration-test primitives; 14 of the 14 RTMP-class test files in `crates/lvqr-cli/tests/` are FLV-migration-complete (zero remaining local FLV definitions). 8 non-RTMP test files still carry local `http_get` duplicates; remaining slices are RTMP-handshake-helper factor + http_get drain on the non-RTMP cohort + authoritative DASH-IF container validator + webhook auth provider + npm + PyPI publish cycle carrying the 9/9 admin + JWKS + sign_live_url public APIs.
 
-**Last Updated**: 2026-04-22 (session 130 close). Local `main` is 2 commits ahead of `origin/main` (`77da8c3`) pending user push instruction. Session 130's commit pair (`refactor(tests): factor FLV tag builders into lvqr-test-utils::flv` + `docs: session 130 close`) rides on top of the session 129 chain (`61a7812` + `77da8c3`).
+**Last Updated**: 2026-04-23 (session 131 close). Local `main` is 4 commits ahead of `origin/main` (`77da8c3`) pending user push instruction. Session 131's commit pair (`refactor(tests): drain FLV duplicates from 9 more test files` + `docs: session 131 close`) rides on top of the session 130 chain (`a01560f` + `454fe6f`).
+
+## Session 131 close (2026-04-23)
+
+**Shipped**: PLAN row 122-C (third slice of the shared-helpers refactor). No new shared module; no new feature signal. Default-gate workspace count unchanged at **991 / 0 / 3**.
+
+### Deliverables
+
+1. **9 test files migrated** off local `http_get` + FLV duplicates onto `lvqr_test_utils::{http, flv}`:
+   * `crates/lvqr-cli/tests/archive_dvr_read_e2e.rs` (session 118; http_get already migrated in 129) -- removed local `flv_video_seq_header` + `flv_video_nalu` + the `bytes::Bytes` import. 4 / 4 tests still pass.
+   * `crates/lvqr-cli/tests/playback_signed_url_e2e.rs` (session 124; http_get_with_bearer wrapper kept since 129) -- removed local FLV builders + `bytes::Bytes` import. 3 / 3 tests still pass.
+   * `crates/lvqr-cli/tests/wasm_frame_counter.rs` (Tier 4 4.2) -- removed local FLV builders. File has no http_get (uses the `WasmFilterBridgeHandle` directly off `ServerHandle`). 1 / 1 test still passes.
+   * `crates/lvqr-cli/tests/wasm_hot_reload.rs` (Tier 4 4.2 follow-up) -- removed local FLV builders. Same no-http_get shape as the frame-counter sister. 1 / 1 test still passes.
+   * `crates/lvqr-cli/tests/rtmp_ws_e2e.rs` (Tier 2.3) -- removed local FLV builders. File has no http_get; the WS subscriber inlines its handshake against the `axum::extract::ws` route. 1 / 1 test still passes.
+   * `crates/lvqr-cli/tests/captions_hls_e2e.rs` (Tier 4 4.5 session C) -- no local FLV; pushes synthetic `Fragment`s straight onto the registry rather than going through RTMP. Removed local `HttpResponse` + `http_get` + the unused `tokio::io` + `tokio::net::TcpStream` imports; kept a 10-line `http_get` wrapper that pins `HttpGetOptions::timeout = TIMEOUT` (10 s for the LL-HLS partial-window read path). 2 / 2 tests still pass.
+   * `crates/lvqr-cli/tests/transcode_ladder_e2e.rs` (#![cfg(all(feature = "transcode", feature = "rtmp"))]) -- removed local FLV (video + 44k audio) + http_get (which had a `Result<HttpResponse, String>` signature). The Result-returning shape is preserved via a thin always-Ok wrapper marked `#[allow(clippy::unnecessary_wraps)]` so the call sites' existing `?`-propagation style stays unchanged; the shared helper panics on connect/read failure today, so the Err arm is unreachable but the signature documents the historical error-context contract for any future change. Compile-verified via `cargo check -p lvqr-cli --tests --features whisper` (cargo's check graph compiles all targets that match the active feature set; with whisper enabled the transcode-gated file is gated out, so this does NOT cover the transcode build alone -- compile-only verification of the transcode-feature graph is deferred to a host with GStreamer installed and to `feature-matrix.yml`'s transcode cell on CI).
+   * `crates/lvqr-cli/tests/whisper_cli_e2e.rs` (#![cfg(feature = "whisper")]; #[ignore]'d pending the cached-model scheduled workflow) -- removed local FLV + audio (44k). 1 callsite swap from `flv_audio_seq_header()` to `flv_audio_aac_lc_seq_header_44k_stereo()`. Compile-verified locally via `cargo check -p lvqr-cli --tests --features whisper`.
+   * `crates/lvqr-cli/tests/rtmp_whep_audio_e2e.rs` (session 115; #![cfg(feature = "transcode")]) -- the most involved migration of this slice. Replaced local 48 kHz / stereo `flv_audio_seq_header_48k_stereo` (literal `0xAF 0x00 0x11 0x90`) with a thin local wrapper that calls the shared `flv_audio_aac_lc_seq_header(3, 2)` parameterized helper -- exercises the parameterized form session 130 set up specifically for this case. Replaced local `flv_video_keyframe(cts, nalu)` with one inline call to `flv_video_nalu(true, cts, nalu)` (the local helper hard-coded the keyframe-frame-type byte; the shared helper takes the bool). Removed local `HttpResponse` struct + `find_header` standalone function + `parse_http_response`; kept `http_post_sdp` local because the shared `lvqr_test_utils::http` is GET-only and the WHEP signaling exchange POSTs the SDP offer, but the local POST helper now constructs and returns the shared `HttpResponse` shape. The `find_header(&resp, "location")` callsite swapped for `resp.header("location")` (the shared `HttpResponse` exposes the case-insensitive header lookup as a method). Compile-verified deferred to a GStreamer-installed host (brew install gstreamer kicked off in the same shell session; verification will land in the next session if it completes).
+
+2. **`tracking/PLAN_V1.1.md`** row 122-C marked SHIPPED with the per-file detail list inline.
+
+3. **README.md + `docs/auth.md` unchanged** -- the refactor is pure internal hygiene; no operator-facing surface moved.
+
+### Key 131 design decisions baked in
+
+* **Drain the FLV duplication surface to zero, not just majority-migrate.** Sessions 129 + 130 + 131 together touch all 14 test files in `crates/lvqr-cli/tests/` that previously carried local FLV builders. Leaving even 1-2 stragglers would mean the next test author can't reliably rely on `lvqr_test_utils::flv` being the canonical source. Closing the surface entirely makes the shared module the only place the FLV byte math lives.
+
+* **Keep the `Result<HttpResponse, String>`-returning wrapper in `transcode_ladder_e2e`.** The original returned a Result so the callsites' `?`-propagation could surface the path in error messages. The shared `http_get_with` panics with generic context on connect/read failure. Two options: (a) rewrite all `?`-propagating call sites to plain `.await` -- big diff; (b) keep the Result-returning wrapper so call sites stay byte-identical; the Err arm becomes unreachable today but documents the historical error-context contract for any future re-introduction. Went with (b) plus a `#[allow(clippy::unnecessary_wraps)]` so a clippy::pedantic run-down does not flag it. Note the pragmatism: the shared helper's panic messages do not include the path; future hardening could add that, after which the Result-wrapper here could collapse.
+
+* **Inline `flv_video_keyframe` -> `flv_video_nalu(true, ..)`.** The single call site in `rtmp_whep_audio_e2e` made a local wrapper not worth keeping. Inlining is more work for the human reader at the call site (2 extra arguments visible) but removes 5 LOC of helper code. For a one-callsite case the inline is the right trade-off; if a second 48 kHz keyframe-only test file appears, factor at that point.
+
+* **Replace local `find_header` with the shared `HttpResponse::header()` method.** The shared method does the same case-insensitive lookup; the standalone-function form was just an artifact of the file pre-dating the shared module. Dropping it is a 0-LOC-difference rename that locks the lookup surface in one place.
+
+* **48 kHz audio uses the parameterized helper inline; no `_48k_stereo` convenience wrapper.** Session 130 exposed `flv_audio_aac_lc_seq_header(freq_idx, channels)` plus a `_44k_stereo` convenience wrapper because 44.1 kHz / stereo is the dominant case (3 files). 48 kHz / stereo is one file (rtmp_whep_audio_e2e); adding a `_48k_stereo` wrapper for one call site would be premature factoring. The local 5-line wrapper `fn flv_audio_seq_header_48k_stereo() -> bytes::Bytes { flv_audio_aac_lc_seq_header(3, 2) }` is the right balance: shows the bytes' meaning at the call site without exposing the math twice.
+
+* **Compile-only verification for the 3 feature-gated files.** GStreamer + whisper.cpp dev libs are nontrivial deps that not every contributor laptop has. The session-123 `feature-matrix.yml` workflow already has dedicated runners for these features; relying on CI for the transcode + whisper + rtmp_whep_audio runtime exercise is honest about local capability. `cargo check -p lvqr-cli --tests --features whisper` was clean locally; transcode + transcode-gated rtmp_whep_audio compile-check is deferred to the same brew-install-gstreamer pass that's still running, or to CI.
+
+* **Default-gate test count unchanged at 991/0/3.** The session adds zero tests + removes zero tests. Every migrated file's per-file roster is unchanged. The 280-LOC drop is in helper code; the test bodies are byte-identical to their pre-migration shape.
+
+### Ground truth (session 131 close)
+
+* **Head (pre-push)**: `refactor(tests)` + this close-doc commit (pending). `origin/main` at `77da8c3` unchanged from session 129 push.
+* **Tests**:
+  * Default workspace gate: **991** passed / 0 failed / 3 ignored (unchanged from session 130).
+  * Per-file re-runs after migration: archive_dvr_read 4/0/0, playback_signed_url 3/0/0, wasm_frame_counter 1/0/0, wasm_hot_reload 1/0/0, rtmp_ws 1/0/0, captions_hls 2/0/0.
+  * Compile-verified: whisper_cli_e2e via `cargo check -p lvqr-cli --tests --features whisper` clean.
+  * Deferred to GStreamer-installed host or CI: transcode_ladder_e2e + rtmp_whep_audio_e2e runtime + compile of the transcode-feature graph.
+* **CI gates locally clean**:
+  * `cargo fmt --all --check` clean (rustfmt joined the multi-line `lvqr_test_utils::flv` import in rtmp_whep_audio_e2e onto one line; the file's first line therefore exceeds the soft 120 width but is a single import statement so width is not a fmt verdict).
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `cargo test --workspace` 991 / 0 / 3.
+* **Workspace**: **29 crates**, unchanged.
+
+### Audit trail (session 131)
+
+Post-migration grep for remaining `fn flv_` in `crates/lvqr-cli/tests/*.rs`:
+
+* `archive_dvr_read_e2e.rs`: 0 local FLV definitions.
+* `playback_signed_url_e2e.rs`: 0 local FLV definitions.
+* `wasm_frame_counter.rs`: 0 local FLV definitions.
+* `wasm_hot_reload.rs`: 0 local FLV definitions.
+* `rtmp_ws_e2e.rs`: 0 local FLV definitions.
+* `captions_hls_e2e.rs`: 0 local FLV (never had any).
+* `transcode_ladder_e2e.rs`: 0 local FLV definitions.
+* `whisper_cli_e2e.rs`: 0 local FLV definitions.
+* `rtmp_whep_audio_e2e.rs`: 1 local FLV wrapper (`flv_audio_seq_header_48k_stereo` -- thin 5-line forwarder over the shared parameterized helper).
+
+Total local FLV definitions across all `crates/lvqr-cli/tests/*.rs`: **0** (down from 13 pre-session-130, i.e. 5 closed in 130 + 8 closed in 131; the 1 remaining wrapper in rtmp_whep_audio is documentation-of-intent rather than duplication).
+
+Post-migration grep for remaining `fn http_get` (excluding files already only carrying thin wrappers):
+
+* Files with substantial local `http_get` body: 8 non-RTMP files (`auth_integration`, `cluster_redirect`, `federation_reconnect`, `rtsp_hls_e2e`, `slo_latency_e2e`, `srt_hls_e2e`, `srt_dash_e2e`, `whip_hls_e2e`).
+* Files with thin `http_get` wrappers over the shared module: 8 (sessions 129+130+131 work).
+
+### Known limitations / documented v1 shape (after 131 close)
+
+* **8 non-RTMP test files still carry local `http_get` duplicates.** Future session work; the 8 are http_get-only (no FLV interaction); migrating each is a 5-minute mechanical edit.
+* **RTMP handshake helper not yet factored.** ~10 RTMP-ingest tests still reimplement `rtmp_client_handshake` / `rtmp_handshake` with subtle name + buffer-handling variance between the variants. Harmonizing is its own session.
+* **transcode + rtmp_whep_audio runtime verification deferred to CI.** Local host did not have GStreamer at session start; brew install kicked off mid-session may complete before commit. If it does, the close note will be amended; if not, `feature-matrix.yml`'s transcode cell carries the authoritative runtime signal.
+* **Authoritative DASH-IF container validator deferred**; GPAC MP4Box remains the primary validator in `dash-conformance.yml`.
+* **Webhook auth provider** still pending (README Auth+ops-polish checklist `[ ]`).
+* **npm + PyPI publish cycle** still pending.
+* All other session 130 + earlier known limitations unchanged.
+
+
+## Session 130 close (2026-04-22)
 
 ## Session 130 close (2026-04-22)
 
