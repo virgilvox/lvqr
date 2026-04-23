@@ -35,7 +35,10 @@
 
 #![cfg(all(feature = "transcode", feature = "rtmp"))]
 
-use bytes::Bytes;
+use lvqr_test_utils::flv::{
+    flv_audio_aac_lc_seq_header_44k_stereo, flv_audio_raw, flv_video_nalu, flv_video_seq_header,
+};
+use lvqr_test_utils::http::{HttpGetOptions, HttpResponse, http_get_with};
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use lvqr_transcode::{RenditionSpec, SoftwareTranscoderFactory};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
@@ -70,42 +73,8 @@ fn skip_reason() -> Option<String> {
 }
 
 // =====================================================================
-// FLV tag helpers (mirror rtmp_hls_e2e.rs).
-// =====================================================================
-
-fn flv_video_seq_header() -> Bytes {
-    let sps = [0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9];
-    let pps = [0x68, 0xEE, 0x3C, 0x80];
-    let mut tag = vec![0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1];
-    tag.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&sps);
-    tag.push(0x01);
-    tag.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&pps);
-    Bytes::from(tag)
-}
-
-fn flv_video_nalu(keyframe: bool, cts: i32, nalu_data: &[u8]) -> Bytes {
-    let frame_type = if keyframe { 0x17 } else { 0x27 };
-    let mut tag = vec![frame_type, 0x01, (cts >> 16) as u8, (cts >> 8) as u8, cts as u8];
-    tag.extend_from_slice(nalu_data);
-    Bytes::from(tag)
-}
-
-fn flv_audio_seq_header() -> Bytes {
-    let b0: u8 = (2 << 3) | (4 >> 1);
-    let b1: u8 = (4 << 7) | (2 << 3);
-    Bytes::from(vec![0xAF, 0x00, b0, b1])
-}
-
-fn flv_audio_raw(aac_data: &[u8]) -> Bytes {
-    let mut tag = vec![0xAF, 0x01];
-    tag.extend_from_slice(aac_data);
-    Bytes::from(tag)
-}
-
-// =====================================================================
-// RTMP client helpers (same shape as rtmp_hls_e2e.rs).
+// RTMP client helpers (same shape as rtmp_hls_e2e.rs). FLV tag
+// builders + http_get now live in `lvqr_test_utils::{flv, http}`.
 // =====================================================================
 
 async fn rtmp_handshake(stream: &mut TcpStream) -> Vec<u8> {
@@ -217,51 +186,26 @@ async fn connect_and_publish(addr: SocketAddr, app: &str, key: &str) -> (TcpStre
 }
 
 // =====================================================================
-// Raw HTTP/1.1 GET client (same shape as rtmp_hls_e2e.rs).
+// Thin HTTP GET wrapper. The original returned `Result<HttpResponse,
+// String>` so callers could surface the path in error messages; the
+// shared helper panics with generic context on connect/read failure.
+// We preserve the Result-returning signature so the call sites'
+// existing `?`-propagation style stays unchanged; the shared helper
+// is fail-fast in practice so the Err arm is unreachable today.
 // =====================================================================
 
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
+#[allow(clippy::unnecessary_wraps)]
 async fn http_get(addr: SocketAddr, path: &str) -> Result<HttpResponse, String> {
-    let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|_| format!("http GET {path} connect timed out"))?
-        .map_err(|e| format!("http GET {path} connect failed: {e}"))?;
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    stream
-        .write_all(req.as_bytes())
-        .await
-        .map_err(|e| format!("write: {e}"))?;
-    let mut buf = Vec::new();
-    tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut buf))
-        .await
-        .map_err(|_| format!("http GET {path} read timed out"))?
-        .map_err(|e| format!("read: {e}"))?;
-    parse_http_response(&buf)
-}
-
-fn parse_http_response(bytes: &[u8]) -> Result<HttpResponse, String> {
-    let split = bytes
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "missing header terminator".to_string())?;
-    let header = std::str::from_utf8(&bytes[..split]).map_err(|e| e.to_string())?;
-    let mut lines = header.lines();
-    let status_line = lines.next().ok_or("no status line")?;
-    let mut parts = status_line.splitn(3, ' ');
-    let _ = parts.next();
-    let status: u16 = parts
-        .next()
-        .ok_or("no status code")?
-        .parse()
-        .map_err(|e: std::num::ParseIntError| e.to_string())?;
-    Ok(HttpResponse {
-        status,
-        body: bytes[split + 4..].to_vec(),
-    })
+    let resp = http_get_with(
+        addr,
+        path,
+        HttpGetOptions {
+            timeout: TIMEOUT,
+            ..Default::default()
+        },
+    )
+    .await;
+    Ok(resp)
 }
 
 fn extract_attr(line: &str, key: &str) -> Option<String> {
@@ -317,7 +261,7 @@ async fn publish_fixture(rtmp_addr: SocketAddr) -> (TcpStream, ClientSession) {
     let r = session.publish_video_data(vseq, RtmpTimestamp::new(0), false).unwrap();
     send_result(&mut stream, &r).await;
 
-    let aseq = flv_audio_seq_header();
+    let aseq = flv_audio_aac_lc_seq_header_44k_stereo();
     let r = session.publish_audio_data(aseq, RtmpTimestamp::new(0), false).unwrap();
     send_result(&mut stream, &r).await;
 

@@ -22,45 +22,21 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use lvqr_fragment::{Fragment, FragmentFlags, FragmentMeta};
+use lvqr_test_utils::http::{HttpGetOptions, HttpResponse, http_get_with};
 use lvqr_test_utils::{TestServer, TestServerConfig};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
 async fn http_get(addr: SocketAddr, path: &str) -> HttpResponse {
-    let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
-        .await
-        .expect("http connect timed out")
-        .expect("http connect failed");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut buf = Vec::new();
-    tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut buf))
-        .await
-        .expect("http read timed out")
-        .expect("http read failed");
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("http response missing header terminator");
-    let header_text = std::str::from_utf8(&buf[..split]).expect("http headers not utf-8");
-    let status_line = header_text.lines().next().expect("missing status line");
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .expect("status code missing")
-        .parse()
-        .expect("status code not numeric");
-    HttpResponse {
-        status,
-        body: buf[split + 4..].to_vec(),
-    }
+    http_get_with(
+        addr,
+        path,
+        HttpGetOptions {
+            timeout: TIMEOUT,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// Synthetic video fragment. The HLS bridge tries to push

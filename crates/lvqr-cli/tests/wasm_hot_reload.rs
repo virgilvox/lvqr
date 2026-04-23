@@ -18,7 +18,7 @@
 //! already exercises the tap on a static filter; this test
 //! covers the swap-at-runtime path the reloader adds.
 
-use bytes::Bytes;
+use lvqr_test_utils::flv::{flv_video_nalu, flv_video_seq_header};
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
@@ -58,29 +58,6 @@ fn replace_atomically(source: &Path, dest: &Path) {
     ));
     std::fs::copy(source, &tmp).expect("copy new filter into temp file");
     std::fs::rename(&tmp, dest).expect("rename temp file over filter path");
-}
-
-// =====================================================================
-// FLV tag helpers (shared with wasm_frame_counter.rs + rtmp_hls_e2e.rs).
-// =====================================================================
-
-fn flv_video_seq_header() -> Bytes {
-    let sps = [0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9];
-    let pps = [0x68, 0xEE, 0x3C, 0x80];
-    let mut tag = vec![0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1];
-    tag.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&sps);
-    tag.push(0x01);
-    tag.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&pps);
-    Bytes::from(tag)
-}
-
-fn flv_video_nalu(keyframe: bool, cts: i32, nalu_data: &[u8]) -> Bytes {
-    let frame_type = if keyframe { 0x17 } else { 0x27 };
-    let mut tag = vec![frame_type, 0x01, (cts >> 16) as u8, (cts >> 8) as u8, cts as u8];
-    tag.extend_from_slice(nalu_data);
-    Bytes::from(tag)
 }
 
 // =====================================================================

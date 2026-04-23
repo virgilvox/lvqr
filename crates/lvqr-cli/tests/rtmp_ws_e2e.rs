@@ -21,9 +21,9 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::Response;
 use axum::routing::get;
-use bytes::Bytes;
 use futures::StreamExt;
 use lvqr_moq::Track;
+use lvqr_test_utils::flv::{flv_video_nalu, flv_video_seq_header};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
@@ -36,29 +36,6 @@ use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_util::sync::CancellationToken;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-
-// =====================================================================
-// FLV helpers (mirror crates/lvqr-ingest/tests/rtmp_bridge_integration.rs)
-// =====================================================================
-
-fn flv_video_seq_header() -> Bytes {
-    let sps = [0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9];
-    let pps = [0x68, 0xEE, 0x3C, 0x80];
-    let mut tag = vec![0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1];
-    tag.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&sps);
-    tag.push(0x01);
-    tag.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&pps);
-    Bytes::from(tag)
-}
-
-fn flv_video_nalu(keyframe: bool, cts: i32, nalu_data: &[u8]) -> Bytes {
-    let frame_type = if keyframe { 0x17 } else { 0x27 };
-    let mut tag = vec![frame_type, 0x01, (cts >> 16) as u8, (cts >> 8) as u8, cts as u8];
-    tag.extend_from_slice(nalu_data);
-    Bytes::from(tag)
-}
 
 fn find_available_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")

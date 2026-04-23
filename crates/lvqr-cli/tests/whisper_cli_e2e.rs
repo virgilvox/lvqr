@@ -34,7 +34,9 @@
 
 #![cfg(feature = "whisper")]
 
-use bytes::Bytes;
+use lvqr_test_utils::flv::{
+    flv_audio_aac_lc_seq_header_44k_stereo, flv_audio_raw, flv_video_nalu, flv_video_seq_header,
+};
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
@@ -47,37 +49,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-
-fn flv_video_seq_header() -> Bytes {
-    let sps = [0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9];
-    let pps = [0x68, 0xEE, 0x3C, 0x80];
-    let mut tag = vec![0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1];
-    tag.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&sps);
-    tag.push(0x01);
-    tag.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&pps);
-    Bytes::from(tag)
-}
-
-fn flv_video_nalu(keyframe: bool, cts: i32, nalu_data: &[u8]) -> Bytes {
-    let frame_type = if keyframe { 0x17 } else { 0x27 };
-    let mut tag = vec![frame_type, 0x01, (cts >> 16) as u8, (cts >> 8) as u8, cts as u8];
-    tag.extend_from_slice(nalu_data);
-    Bytes::from(tag)
-}
-
-fn flv_audio_seq_header() -> Bytes {
-    let b0: u8 = (2 << 3) | (4 >> 1);
-    let b1: u8 = (4 << 7) | (2 << 3);
-    Bytes::from(vec![0xAF, 0x00, b0, b1])
-}
-
-fn flv_audio_raw(aac_data: &[u8]) -> Bytes {
-    let mut tag = vec![0xAF, 0x01];
-    tag.extend_from_slice(aac_data);
-    Bytes::from(tag)
-}
 
 async fn rtmp_client_handshake(stream: &mut TcpStream) -> Vec<u8> {
     let mut handshake = Handshake::new(PeerType::Client);
@@ -202,7 +173,7 @@ async fn publish_audio_burst(addr: SocketAddr, app: &str, key: &str) -> (TcpStre
     let r = session.publish_video_data(vseq, RtmpTimestamp::new(0), false).unwrap();
     send_result(&mut rtmp_stream, &r).await;
 
-    let aseq = flv_audio_seq_header();
+    let aseq = flv_audio_aac_lc_seq_header_44k_stereo();
     let r = session.publish_audio_data(aseq, RtmpTimestamp::new(0), false).unwrap();
     send_result(&mut rtmp_stream, &r).await;
 

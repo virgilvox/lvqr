@@ -22,7 +22,8 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use lvqr_test_utils::flv::{flv_audio_aac_lc_seq_header, flv_audio_raw, flv_video_nalu, flv_video_seq_header};
+use lvqr_test_utils::http::HttpResponse;
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use lvqr_transcode::AacToOpusEncoderFactory;
 use lvqr_transcode::test_support::generate_aac_access_units;
@@ -44,39 +45,14 @@ const OVERALL_DEADLINE: Duration = Duration::from_secs(20);
 const MAX_POLL_SLEEP: Duration = Duration::from_millis(50);
 
 // =====================================================================
-// FLV wrappers (aligned with rtmp_hls_e2e.rs + aac_opus_roundtrip.rs)
+// 48 kHz / stereo AAC-LC AudioSpecificConfig is what the WHEP audio
+// bridge expects; the shared flv module exposes a parameterized
+// helper rather than a per-rate convenience wrapper, so this test
+// pins the (freq_idx=3, channels=2) call here.
 // =====================================================================
 
-/// FLV video sequence header for a minimal AVC config (SPS + PPS).
-fn flv_video_seq_header() -> Bytes {
-    let sps = [0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9];
-    let pps = [0x68, 0xEE, 0x3C, 0x80];
-    let mut tag = vec![0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1];
-    tag.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&sps);
-    tag.push(0x01);
-    tag.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&pps);
-    Bytes::from(tag)
-}
-
-fn flv_video_keyframe(cts: i32, nalu_data: &[u8]) -> Bytes {
-    let mut tag = vec![0x17, 0x01, (cts >> 16) as u8, (cts >> 8) as u8, cts as u8];
-    tag.extend_from_slice(nalu_data);
-    Bytes::from(tag)
-}
-
-/// FLV AAC sequence header. AAC-LC 48 kHz stereo:
-/// object_type=2, freq_idx=3, channel_config=2 -> ASC [0x11, 0x90].
-/// Same bytes the AacToOpusEncoder unit tests expect in `aac_opus_roundtrip.rs`.
-fn flv_audio_seq_header_48k_stereo() -> Bytes {
-    Bytes::from(vec![0xAF, 0x00, 0x11, 0x90])
-}
-
-fn flv_audio_raw(aac_access_unit: &[u8]) -> Bytes {
-    let mut tag = vec![0xAF, 0x01];
-    tag.extend_from_slice(aac_access_unit);
-    Bytes::from(tag)
+fn flv_audio_seq_header_48k_stereo() -> bytes::Bytes {
+    flv_audio_aac_lc_seq_header(3, 2)
 }
 
 // =====================================================================
@@ -193,21 +169,10 @@ async fn connect_and_publish(addr: SocketAddr, app: &str, stream_key: &str) -> (
 }
 
 // =====================================================================
-// HTTP helpers (mirrors crates/lvqr-cli/tests/whip_hls_e2e.rs)
+// HTTP helpers. POST is not in `lvqr_test_utils::http` (which is
+// GET-only); the WHEP signaling exchange needs SDP POST so the
+// helper stays local but builds the shared `HttpResponse`.
 // =====================================================================
-
-struct HttpResponse {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-fn find_header<'a>(resp: &'a HttpResponse, name: &str) -> Option<&'a str> {
-    resp.headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
-}
 
 async fn http_post_sdp(addr: SocketAddr, path: &str, body: &[u8]) -> HttpResponse {
     let mut stream = tokio::time::timeout(HTTP_TIMEOUT, TcpStream::connect(addr))
@@ -296,7 +261,7 @@ async fn run_rtmp_publisher(rtmp_addr: SocketAddr, aac_access_units: Vec<Vec<u8>
     send_result(&mut stream, &r).await;
 
     let idr_nalu = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
-    let kf0 = flv_video_keyframe(0, &idr_nalu);
+    let kf0 = flv_video_nalu(true, 0, &idr_nalu);
     let r = session.publish_video_data(kf0, RtmpTimestamp::new(0), false).unwrap();
     send_result(&mut stream, &r).await;
 
@@ -409,7 +374,9 @@ async fn rtmp_aac_publish_reaches_whep_opus_subscriber() {
         resp.status,
         std::str::from_utf8(&resp.body).unwrap_or("<binary>"),
     );
-    let location = find_header(&resp, "location").expect("WHEP answer must include Location header");
+    let location = resp
+        .header("location")
+        .expect("WHEP answer must include Location header");
     assert!(
         location.starts_with("/whep/live/test/"),
         "Location header must point at the new session resource: {location}",
