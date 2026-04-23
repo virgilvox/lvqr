@@ -4,9 +4,13 @@
     "packages/*"
   ],
   "scripts": {
-    "test:e2e": "playwright test"
+    "build": "npm --workspaces --if-present run build",
+    "test:e2e": "playwright test",
+    "test:sdk": "vitest run"
   },
   "devDependencies": {
-    "@playwright/test": "^1.49.0"
+    "@playwright/test": "^1.49.0",
+    "@types/node": "^20.0.0",
+    "vitest": "^2.0.0"
   }
 }

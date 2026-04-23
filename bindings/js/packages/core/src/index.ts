@@ -21,7 +21,22 @@
  */
 
 export { LvqrClient, type LvqrClientOptions, type LvqrEvents } from './client';
-export { LvqrAdminClient, type StreamInfo, type RelayStats } from './admin';
+export {
+  LvqrAdminClient,
+  type LvqrAdminClientOptions,
+  type RelayStats,
+  type StreamInfo,
+  type MeshState,
+  type SloEntry,
+  type SloSnapshot,
+  type NodeCapacity,
+  type ClusterNodeView,
+  type BroadcastSummary,
+  type ConfigEntry,
+  type FederationConnectState,
+  type FederationLinkStatus,
+  type FederationStatus,
+} from './admin';
 export { detectTransport, type TransportType } from './transport';
 export { MoqSubscriber } from './moq';
 export { MeshPeer, type MeshConfig } from './mesh';

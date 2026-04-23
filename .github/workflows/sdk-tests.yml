@@ -1,0 +1,114 @@
+name: SDK tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Runs the `@lvqr/core` Vitest suite + the Python client pytest
+# against a real `lvqr serve` process. Closes the session-117 / 118
+# / 121 audit gap that flagged:
+#
+#   * `@lvqr/core` admin client only covering 3 of 9 `/api/v1/*`
+#     routes (fixed in session 122 alongside this workflow);
+#   * zero Vitest / pytest in any workflow.
+#
+# Posture: mirrors `mesh-e2e.yml`'s dedicated-workflow pattern.
+# Ubuntu runner, build lvqr-cli in debug, spawn it in the
+# background with `--mesh-enabled` + `--cluster-listen` so every
+# admin route (including the cluster-gated ones) answers 200,
+# then run each SDK test suite. `continue-on-error: true` for the
+# first weeks on `main` so setup fragility surfaces in artifacts
+# without blocking PRs.
+
+jobs:
+  sdk:
+    name: Vitest + pytest against a running lvqr
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: sdk-tests-v1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build lvqr-cli (debug)
+        run: cargo build -p lvqr-cli
+
+      - name: Install JS workspace deps
+        working-directory: bindings/js
+        run: npm ci --prefer-offline --no-audit --no-fund || npm install --prefer-offline --no-audit --no-fund
+
+      - name: Build @lvqr/core dist
+        working-directory: bindings/js
+        run: npm run build
+
+      - name: Install Python client + pytest
+        working-directory: bindings/python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Start lvqr in background
+        run: |
+          mkdir -p /tmp/sdk-tests-out
+          ./target/debug/lvqr serve \
+            --admin-port 18090 \
+            --hls-port 0 \
+            --rtmp-port 18091 \
+            --port 18092 \
+            --mesh-enabled \
+            --cluster-listen 127.0.0.1:18093 \
+            --no-auth-signal \
+            > /tmp/sdk-tests-out/lvqr.log 2>&1 &
+          echo $! > /tmp/lvqr.pid
+          # Wait up to 15 s for /healthz. Matches the Vitest
+          # beforeAll retry window + CI-runner cold-boot noise.
+          for i in $(seq 1 30); do
+            if curl -sfS -o /dev/null "http://127.0.0.1:18090/healthz"; then
+              echo "lvqr admin is up"
+              break
+            fi
+            sleep 0.5
+          done
+
+      - name: Run @lvqr/core Vitest suite
+        working-directory: bindings/js
+        env:
+          LVQR_TEST_ADMIN_URL: http://127.0.0.1:18090
+        run: npm run test:sdk
+
+      - name: Run Python client pytest
+        working-directory: bindings/python
+        run: python -m pytest -v
+
+      - name: Stop lvqr
+        if: always()
+        run: |
+          if [ -f /tmp/lvqr.pid ]; then
+            kill "$(cat /tmp/lvqr.pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload lvqr log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-tests-lvqr-log
+          path: /tmp/sdk-tests-out
+          if-no-files-found: warn
+          retention-days: 14
