@@ -137,19 +137,43 @@ Non-default ports keep the demo clear of a locally-running
 
 ## On C2PA provenance
 
-C2PA signing + verify ships today as a programmatic API on
-`ServeConfig.c2pa` (see
-`crates/lvqr-archive/src/provenance.rs` for the
-`C2paSignerSource` enum covering both on-disk PEMs and
-caller-supplied signers, and
-`crates/lvqr-cli/tests/c2pa_verify_e2e.rs` for the full
-RTMP-publish -> drain-finalize -> `/playback/verify/{broadcast}`
-integration fixture). CLI-flag wiring (`--c2pa-signing-cert`
-etc.) is on the phase-C roadmap.
+C2PA signing + verify is exposed on the CLI via
+`--c2pa-signing-cert` + `--c2pa-signing-key` (plus
+`--c2pa-signing-alg`, `--c2pa-assertion-creator`,
+`--c2pa-trust-anchor`, `--c2pa-timestamp-authority`); see the
+main [`README.md`](../../README.md#cli-reference) for the
+full CLI-reference block and
+`crates/lvqr-archive/src/provenance.rs` for the underlying
+`C2paSignerSource` enum (on-disk PEMs and caller-supplied
+signers).
 
-To exercise the programmatic sign + verify path end-to-end:
+The demo includes an opt-in for C2PA sign + verify via
+`LVQR_DEMO_C2PA=1`:
 
 ```bash
+LVQR_DEMO_C2PA=1 ./examples/tier4-demos/demo-01.sh
+```
+
+When enabled, the demo shells out to `openssl` to mint an
+ephemeral CA + leaf + PKCS#8 key in the scratch dir, passes
+the PEMs to `lvqr serve --c2pa-signing-cert` +
+`--c2pa-signing-key`, and after the publish curls
+`/playback/verify/live/demo` to print `valid` +
+`validation_state` + `signer`. The openssl recipe is locked
+into CI via `crates/lvqr-cli/tests/c2pa_cli_flags_e2e.rs`
+(`openssl_generated_certkeyfiles_also_yields_valid_manifest`),
+which mints the same material in-test and asserts
+c2pa-rs accepts it end to end.
+
+Two integration tests cover both operator-facing signer
+paths end-to-end:
+
+```bash
+# on-disk CertKeyFiles flow (this session's addition):
+cargo test -p lvqr-cli --features c2pa \
+  --test c2pa_cli_flags_e2e
+
+# programmatic Custom(Arc<dyn Signer>) flow via EphemeralSigner:
 cargo test -p lvqr-cli --features c2pa \
   --test c2pa_verify_e2e
 ```
@@ -203,7 +227,7 @@ Coverage by Tier 4 item:
 |---|---|---|
 | 4.1 WASM filters | `--wasm-filter` + `lvqr_wasm_fragments_total` | yes |
 | 4.2 io-uring archive | `--archive-dir` (Linux io-uring behind `io-uring` feature) | yes (archive finalize) |
-| 4.3 C2PA provenance | `ServeConfig.c2pa` (programmatic) | no (see "On C2PA provenance" above) |
+| 4.3 C2PA provenance | `--c2pa-signing-cert` + siblings | yes, opt-in via `LVQR_DEMO_C2PA=1` |
 | 4.4 Cross-cluster federation | `--cluster-listen` / `FederationLink` | out of scope for a single-node demo |
 | 4.5 AI agents | `--whisper-model` + captions rendition | yes (when model is provided) |
 | 4.6 ABR transcoding | `--transcode-rendition` + master playlist | yes |

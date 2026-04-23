@@ -650,7 +650,7 @@ mod c2pa_cli_tests {
         let a = parse(&["lvqr", "serve"]);
         assert!(a.c2pa_signing_cert.is_none());
         assert!(a.c2pa_signing_key.is_none());
-        assert_eq!(build_c2pa_config(&a).unwrap().is_none(), true);
+        assert!(build_c2pa_config(&a).unwrap().is_none());
     }
 
     #[test]

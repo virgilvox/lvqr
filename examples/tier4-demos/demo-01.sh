@@ -15,6 +15,15 @@
 #     720p + 480p + 240p renditions emitted alongside the source.
 #   * On-disk DVR archive (`--archive-dir`) producing a segment
 #     index + finalized MP4 per track on publisher disconnect.
+#   * C2PA sign + verify (`--c2pa-signing-cert` + sibling flags,
+#     opt-in via `LVQR_DEMO_C2PA=1`). When enabled, the demo
+#     mints an ephemeral CA + leaf + key via `openssl`, signs the
+#     finalized MP4 on broadcast end, and curls
+#     `/playback/verify/live/demo` to print the verification
+#     report. The openssl recipe is verified by
+#     `crates/lvqr-cli/tests/c2pa_cli_flags_e2e.rs` so the
+#     demo's cert material is guaranteed to match c2pa-rs's
+#     accept criteria.
 #
 # An ffmpeg publisher feeds a synthetic colour-bars + sine test
 # signal into the RTMP ingest for ~20 s. The script polls the
@@ -47,6 +56,17 @@
 #                        to the first of $PWD/target/release/lvqr,
 #                        $PWD/target/debug/lvqr, then `lvqr` on
 #                        PATH.
+#   LVQR_DEMO_C2PA       Set to `1` to enable C2PA signing +
+#                        verify. The demo shells out to `openssl`
+#                        to mint a CA + leaf + PKCS#8 key triple
+#                        in the scratch dir, passes the PEMs to
+#                        `lvqr serve --c2pa-signing-cert` +
+#                        `--c2pa-signing-key`, and after the
+#                        publish curls /playback/verify/live/demo
+#                        to print `valid` + `validation_state` +
+#                        `signer` + `errors`. Requires the `lvqr`
+#                        binary to be built with `--features
+#                        c2pa` (included in `--features full`).
 #
 # Prereqs (the script fails fast with a pointer to this README
 # when any is missing):
@@ -181,6 +201,87 @@ else
   log "captions: skipped (set LVQR_WHISPER_MODEL to enable)"
 fi
 
+# -----------------------------------------------------------------
+# Optional: mint ephemeral C2PA cert material + wire the signing
+# flags. See `crates/lvqr-cli/tests/c2pa_cli_flags_e2e.rs` for the
+# test that locks this recipe against c2pa-rs acceptance; the
+# openssl commands here mirror that helper verbatim.
+# -----------------------------------------------------------------
+
+C2PA_ARGS=()
+c2pa_pem="$SCRATCH/signing.pem"
+c2pa_key="$SCRATCH/signing.key"
+if [[ "${LVQR_DEMO_C2PA:-0}" == "1" ]]; then
+  need openssl
+
+  # Probe the CLI binary for --c2pa-signing-cert so the failure is
+  # named if the operator built lvqr without the c2pa feature.
+  if ! "$LVQR" serve --help 2>&1 | grep -q -- '--c2pa-signing-cert'; then
+    die "lvqr binary missing --c2pa-signing-cert flag. Rebuild with '--features full' (or at least 'c2pa')."
+  fi
+
+  log "c2pa: minting ephemeral cert material via openssl"
+
+  # Work in the scratch dir so every artifact ends up in the
+  # retained-on-LVQR_DEMO_SCRATCH directory for post-mortem.
+  ca_key="$SCRATCH/ca.key"
+  ca_pem="$SCRATCH/ca.pem"
+  ca_cfg="$SCRATCH/ca.cfg"
+  leaf_sec1="$SCRATCH/leaf.sec1.key"
+  leaf_csr="$SCRATCH/leaf.csr"
+  leaf_pem="$SCRATCH/leaf.pem"
+  leaf_cfg="$SCRATCH/leaf.cfg"
+
+  cat >"$ca_cfg" <<'EOF'
+[req]
+distinguished_name = req_dn
+x509_extensions = v3_ca
+prompt = no
+[req_dn]
+CN = LVQR Demo CA
+O = LVQR Demo
+[v3_ca]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+EOF
+
+  cat >"$leaf_cfg" <<'EOF'
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature
+extendedKeyUsage = emailProtection
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
+EOF
+
+  openssl ecparam -name prime256v1 -genkey -noout -out "$ca_key" >/dev/null 2>&1
+  openssl req -x509 -new -key "$ca_key" -out "$ca_pem" -days 30 \
+    -config "$ca_cfg" >/dev/null 2>&1
+  openssl ecparam -name prime256v1 -genkey -noout -out "$leaf_sec1" >/dev/null 2>&1
+  # c2pa-rs reads PKCS#8 keys only; the SEC1 output from ecparam
+  # must be wrapped.
+  openssl pkcs8 -topk8 -nocrypt -in "$leaf_sec1" -out "$c2pa_key" >/dev/null 2>&1
+  openssl req -new -key "$leaf_sec1" -out "$leaf_csr" \
+    -subj "/CN=lvqr demo signer/O=LVQR Demo Operator" >/dev/null 2>&1
+  openssl x509 -req -in "$leaf_csr" -CA "$ca_pem" -CAkey "$ca_key" \
+    -CAcreateserial -out "$leaf_pem" -days 30 \
+    -extfile "$leaf_cfg" >/dev/null 2>&1
+
+  # Leaf cert followed by CA cert; matches the operator-
+  # convention the c2pa-rs parser expects.
+  cat "$leaf_pem" "$ca_pem" >"$c2pa_pem"
+
+  C2PA_ARGS=(
+    --c2pa-signing-cert "$c2pa_pem"
+    --c2pa-signing-key "$c2pa_key"
+    --c2pa-signing-alg es256
+    --c2pa-assertion-creator "LVQR demo-01.sh"
+  )
+  log "c2pa: enabled (cert=$c2pa_pem)"
+else
+  log "c2pa: skipped (set LVQR_DEMO_C2PA=1 to enable)"
+fi
+
 log "boot: lvqr serve (admin=$ADMIN_PORT hls=$HLS_PORT rtmp=$RTMP_PORT moq=$MOQ_PORT)"
 
 "$LVQR" serve \
@@ -194,6 +295,7 @@ log "boot: lvqr serve (admin=$ADMIN_PORT hls=$HLS_PORT rtmp=$RTMP_PORT moq=$MOQ_
   --transcode-rendition 480p \
   --transcode-rendition 240p \
   "${WHISPER_ARGS[@]}" \
+  "${C2PA_ARGS[@]}" \
   >"$LVQR_LOG" 2>&1 &
 LVQR_PID=$!
 
@@ -343,6 +445,36 @@ if [[ ${#WHISPER_ARGS[@]} -gt 0 ]]; then
 fi
 
 # -----------------------------------------------------------------
+# C2PA verify probe (only when signing was enabled). The archive
+# finalize runs on publisher disconnect (handled above); the
+# manifest + signed asset should already exist by this point.
+# -----------------------------------------------------------------
+
+c2pa_status="skipped"
+if [[ ${#C2PA_ARGS[@]} -gt 0 ]]; then
+  verify_url="http://127.0.0.1:$ADMIN_PORT/playback/verify/${BROADCAST}"
+  # Poll briefly since the drain-terminated finalize runs on a
+  # spawn_blocking thread after the publisher drops; it typically
+  # completes in under a second but give it a few retries.
+  verify_body=""
+  for _ in 1 2 3 4 5 6 7 8; do
+    verify_body="$(curl -fsS "$verify_url" 2>/dev/null || true)"
+    if [[ -n "$verify_body" ]]; then
+      break
+    fi
+    sleep 0.5
+  done
+  if [[ -n "$verify_body" ]]; then
+    c2pa_valid="$(printf '%s' "$verify_body" | jq -r '.valid' 2>/dev/null || echo 'unknown')"
+    c2pa_state="$(printf '%s' "$verify_body" | jq -r '.validation_state' 2>/dev/null || echo 'unknown')"
+    c2pa_signer="$(printf '%s' "$verify_body" | jq -r '.signer' 2>/dev/null || echo 'unknown')"
+    c2pa_status="valid=$c2pa_valid state=$c2pa_state signer=\"$c2pa_signer\""
+  else
+    c2pa_status="verify probe returned empty body (see $LVQR_LOG)"
+  fi
+fi
+
+# -----------------------------------------------------------------
 # Summary. Keep it deliberately flat so the output parses at a
 # glance in CI logs.
 # -----------------------------------------------------------------
@@ -357,10 +489,7 @@ echo "  archive dir        : $ARCHIVE_BROADCAST_DIR"
 echo "  archive video      : $(ls -1 "$ARCHIVE_BROADCAST_DIR/0.mp4" 2>/dev/null | wc -l | tr -d ' ') file(s)"
 echo "  /api/v1/streams    : $stream_count entry(ies)"
 echo "  captions           : $caption_status"
-echo "  c2pa sign+verify   : not wired on the CLI today -- run"
-echo "                       'cargo test -p lvqr-cli --features c2pa \\"
-echo "                          --test c2pa_verify_e2e' for the"
-echo "                       programmatic end-to-end fixture."
+echo "  c2pa sign+verify   : $c2pa_status"
 echo "=================================================="
 echo
 
