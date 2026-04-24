@@ -283,9 +283,11 @@ transcode + DVR archive end to end; C2PA sign + verify is
 opt-in via `LVQR_DEMO_C2PA=1`).
 
 Full v1.1 phase plan with session-by-session sequencing lives in
-[`tracking/PLAN_V1.1.md`](tracking/PLAN_V1.1.md). A 29-crate
-inventory + codebase reality audit anchors the current state in
-`tracking/HANDOFF.md` session-121 block.
+[`tracking/PLAN_V1.1.md`](tracking/PLAN_V1.1.md). The 29-crate
+inventory was anchored in the session-121 close block; the
+[`tracking/HANDOFF.md`](tracking/HANDOFF.md) file's status header
+always names the latest shipped session and links the matching
+PLAN row state.
 
 ### Next up (ranked by impact / ship-ability)
 
@@ -593,14 +595,17 @@ published crate.
   npm + PyPI builds at 0.3.1 still ship the 3-method surface;
   the 9-method surface lands for consumers at the next publish
   cycle.
-- **SDK reconnect + retry semantics are undocumented.**
-  `@lvqr/core`'s `LvqrClient` + `LvqrAdminClient` ship
-  `connectTimeoutMs` / `fetchTimeoutMs` on `main` (both land at
-  the next publish cycle), but the SDK docs at
-  [`docs/sdk/javascript.md`](docs/sdk/javascript.md) do not yet
-  explain when to reconnect, what the backoff should be, or how
-  to handle partial fetches. A phase-C row fills this in
-  alongside the admin-client expansion.
+- **SDK reconnect + retry semantics are documented on `main`.**
+  **Fixed on `main`** in session 125:
+  [`docs/sdk/javascript.md`](docs/sdk/javascript.md) gains a
+  "Timeouts + reconnect" section covering `connectTimeoutMs`,
+  `fetchTimeoutMs`, `bearerToken`, and a canonical jittered-
+  exponential-backoff reconnect recipe + admin-side retry
+  recipe. [`docs/sdk/python.md`](docs/sdk/python.md) mirrors
+  with httpx-specific retry patterns + a `bearer_token` kwarg
+  reference + a `0.3.1` -> `main` migration section. The docs
+  + the `connectTimeoutMs` / `fetchTimeoutMs` knobs land for
+  consumers at the next npm + PyPI publish cycle.
 
 ## CLI reference
 
@@ -871,20 +876,25 @@ fixture they do not bring up), plus a Playwright browser E2E
 clippy + workspace test; session deltas are tracked in
 [`tracking/HANDOFF.md`](tracking/HANDOFF.md).
 
-Integration tests share two helper modules rather than
+Integration tests share three helper modules rather than
 reimplementing primitives per file:
 [`crates/lvqr-test-utils/src/http.rs`](crates/lvqr-test-utils/src/http.rs)
 (raw-TCP HTTP/1.1 GET with `HttpGetOptions::bearer` / `range` /
-`timeout` + `HttpResponse::header` case-insensitive lookup) and
+`timeout` + `HttpResponse::header` case-insensitive lookup),
 [`crates/lvqr-test-utils/src/flv.rs`](crates/lvqr-test-utils/src/flv.rs)
 (FLV video seq-header + NALU tag builders + parameterized AAC-LC
 `flv_audio_aac_lc_seq_header(freq_idx, channels)` with a 44.1 kHz
-stereo convenience wrapper). New integration tests should adopt
-both rather than copy-paste the byte math. The `TestServer`
-harness in `lvqr-test-utils` exposes every `lvqr serve` surface
-(RTMP, SRT, RTSP, WHIP, WHEP, HLS, DASH, WS, admin, cluster,
-archive, mesh `/signal`) on ephemeral loopback ports so tests
-run without port contention.
+stereo convenience wrapper), and
+[`crates/lvqr-test-utils/src/rtmp.rs`](crates/lvqr-test-utils/src/rtmp.rs)
+(`rtmp_client_handshake` panic-variant + `send_results` /
+`send_result` packet writers + `read_until(stream, session,
+timeout, predicate)` event-loop driver with `tokio::time::Instant`
++ `saturating_duration_since` deadline arithmetic). New
+integration tests should adopt all three rather than copy-paste
+the byte math. The `TestServer` harness in `lvqr-test-utils`
+exposes every `lvqr serve` surface (RTMP, SRT, RTSP, WHIP, WHEP,
+HLS, DASH, WS, admin, cluster, archive, mesh `/signal`) on
+ephemeral loopback ports so tests run without port contention.
 
 Feature flags and Docker recipes are in
 [`docs/deployment.md`](docs/deployment.md).
