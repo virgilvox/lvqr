@@ -31,6 +31,9 @@ mod jwt_provider;
 #[cfg(feature = "jwks")]
 mod jwks_provider;
 
+#[cfg(feature = "webhook")]
+mod webhook_provider;
+
 pub use error::AuthError;
 pub use noop::NoopAuthProvider;
 pub use provider::{AuthContext, AuthDecision, AuthProvider, AuthScope, SharedAuth};
@@ -41,3 +44,6 @@ pub use jwt_provider::{JwtAuthConfig, JwtAuthProvider, JwtClaims};
 
 #[cfg(feature = "jwks")]
 pub use jwks_provider::{JwksAuthConfig, JwksAuthProvider};
+
+#[cfg(feature = "webhook")]
+pub use webhook_provider::{WebhookAuthConfig, WebhookAuthProvider};

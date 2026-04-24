@@ -3,6 +3,8 @@ use clap::Parser;
 #[cfg(feature = "jwks")]
 use lvqr_auth::{JwksAuthConfig, JwksAuthProvider};
 use lvqr_auth::{JwtAuthConfig, JwtAuthProvider, NoopAuthProvider, SharedAuth, StaticAuthConfig, StaticAuthProvider};
+#[cfg(feature = "webhook")]
+use lvqr_auth::{WebhookAuthConfig, WebhookAuthProvider};
 #[cfg(feature = "transcode")]
 use lvqr_cli::parse_transcode_renditions;
 use lvqr_cli::{ServeConfig, start};
@@ -410,6 +412,39 @@ struct ServeArgs {
     #[arg(long, env = "LVQR_JWKS_REFRESH_INTERVAL_SECONDS", default_value_t = 300)]
     jwks_refresh_interval_seconds: u64,
 
+    /// Webhook auth endpoint URL. When set, every `AuthContext` decision
+    /// (publish / subscribe / admin) is cached and, on miss, delegated to
+    /// this endpoint via `POST` with a JSON body shaped `{op, ...}` (see
+    /// `docs/auth.md#webhook-auth-provider`). The endpoint must reply
+    /// `{"allow": bool, "reason": str?}` on a 2xx. Mutually exclusive with
+    /// `--jwks-url` and `--jwt-secret`. Requires the `webhook` Cargo
+    /// feature.
+    #[cfg(feature = "webhook")]
+    #[arg(long, env = "LVQR_WEBHOOK_AUTH_URL")]
+    webhook_auth_url: Option<String>,
+
+    /// How long an allow decision stays cached before the next check for
+    /// the same context re-consults the webhook. Defaults to 60 s. Minimum
+    /// 1 s so the webhook does not get hammered per request. Only
+    /// meaningful with `--webhook-auth-url`.
+    #[cfg(feature = "webhook")]
+    #[arg(long, env = "LVQR_WEBHOOK_AUTH_CACHE_TTL_SECONDS", default_value_t = 60)]
+    webhook_auth_cache_ttl_seconds: u64,
+
+    /// How long a deny decision (including failed-webhook-call denies) stays
+    /// cached. Defaults to 10 s. Kept shorter than the allow TTL by default
+    /// so transient webhook outages recover quickly; must be > 0 so a
+    /// flapping webhook is not re-hit on every request.
+    #[cfg(feature = "webhook")]
+    #[arg(long, env = "LVQR_WEBHOOK_AUTH_DENY_CACHE_TTL_SECONDS", default_value_t = 10)]
+    webhook_auth_deny_cache_ttl_seconds: u64,
+
+    /// Per-request HTTP timeout for the webhook POST, in seconds. Defaults
+    /// to 5 s. Only meaningful with `--webhook-auth-url`.
+    #[cfg(feature = "webhook")]
+    #[arg(long, env = "LVQR_WEBHOOK_AUTH_FETCH_TIMEOUT_SECONDS", default_value_t = 5)]
+    webhook_auth_fetch_timeout_seconds: u64,
+
     /// Cluster gossip bind address (`ip:port`). When set, this node
     /// joins an LVQR cluster over chitchat gossip; when unset, it
     /// runs standalone. Requires the `cluster` feature (default-on).
@@ -487,41 +522,14 @@ async fn serve_from_args(
 ) -> Result<()> {
     // Build auth provider from CLI/env. Order of precedence:
     //   1. `--jwks-url` (PLAN row 120) -- dynamic asymmetric JWTs.
-    //   2. `--jwt-secret` -- HS256 static secret.
-    //   3. `--admin-token` / `--publish-key` / `--subscribe-token` -- static-token provider.
-    //   4. Otherwise open access (`NoopAuthProvider`).
-    // `--jwks-url` and `--jwt-secret` are mutually exclusive: running both
-    // at once would be ambiguous and hide a misconfiguration, so reject at
-    // startup rather than silently preferring one.
-    #[cfg(feature = "jwks")]
-    let auth: SharedAuth = {
-        check_jwks_flag_combination(&args)?;
-        if let Some(jwks_url) = args.jwks_url.clone() {
-            tracing::info!(
-                url = %jwks_url,
-                issuer = args.jwt_issuer.is_some(),
-                audience = args.jwt_audience.is_some(),
-                refresh_interval_s = args.jwks_refresh_interval_seconds,
-                "auth: JWKS provider enabled"
-            );
-            let cfg = JwksAuthConfig {
-                jwks_url,
-                issuer: args.jwt_issuer.clone(),
-                audience: args.jwt_audience.clone(),
-                refresh_interval: std::time::Duration::from_secs(args.jwks_refresh_interval_seconds),
-                fetch_timeout: std::time::Duration::from_secs(10),
-                allowed_algs: JwksAuthConfig::default_allowed_algs(),
-            };
-            let provider = JwksAuthProvider::new(cfg)
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to init JWKS auth provider: {e}"))?;
-            Arc::new(provider) as SharedAuth
-        } else {
-            build_static_or_jwt_auth(&args)?
-        }
-    };
-    #[cfg(not(feature = "jwks"))]
-    let auth: SharedAuth = build_static_or_jwt_auth(&args)?;
+    //   2. `--webhook-auth-url` (PLAN Phase D) -- external HTTP decision oracle.
+    //   3. `--jwt-secret` -- HS256 static secret.
+    //   4. `--admin-token` / `--publish-key` / `--subscribe-token` -- static-token provider.
+    //   5. Otherwise open access (`NoopAuthProvider`).
+    // `--jwks-url`, `--webhook-auth-url`, and `--jwt-secret` are mutually
+    // exclusive: each picks a different signing or decision strategy, and a
+    // silent pick between them would hide a misconfiguration.
+    let auth: SharedAuth = build_auth(&args).await?;
 
     let hls_addr = if args.hls_port == 0 {
         None
@@ -624,17 +632,91 @@ async fn serve_from_args(
     handle.shutdown().await
 }
 
-/// Reject the combination of `--jwks-url` + `--jwt-secret`. Running both
-/// is ambiguous -- they choose different signing strategies and the
-/// fall-through would silently prefer one over the other. Factored out of
-/// `serve_from_args` so the check is unit-testable without booting a runtime.
-#[cfg(feature = "jwks")]
-fn check_jwks_flag_combination(args: &ServeArgs) -> Result<()> {
+/// Resolve the full auth-provider cascade, applying the precedence documented
+/// at the call site in `serve_from_args`. Factored out so each feature-gated
+/// branch stays local to one `#[cfg]` block without littering the caller.
+async fn build_auth(args: &ServeArgs) -> Result<SharedAuth> {
+    check_auth_flag_combinations(args)?;
+
+    #[cfg(feature = "jwks")]
+    if let Some(jwks_url) = args.jwks_url.clone() {
+        tracing::info!(
+            url = %jwks_url,
+            issuer = args.jwt_issuer.is_some(),
+            audience = args.jwt_audience.is_some(),
+            refresh_interval_s = args.jwks_refresh_interval_seconds,
+            "auth: JWKS provider enabled"
+        );
+        let cfg = JwksAuthConfig {
+            jwks_url,
+            issuer: args.jwt_issuer.clone(),
+            audience: args.jwt_audience.clone(),
+            refresh_interval: std::time::Duration::from_secs(args.jwks_refresh_interval_seconds),
+            fetch_timeout: std::time::Duration::from_secs(10),
+            allowed_algs: JwksAuthConfig::default_allowed_algs(),
+        };
+        let provider = JwksAuthProvider::new(cfg)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to init JWKS auth provider: {e}"))?;
+        return Ok(Arc::new(provider) as SharedAuth);
+    }
+
+    #[cfg(feature = "webhook")]
+    if let Some(webhook_url) = args.webhook_auth_url.clone() {
+        tracing::info!(
+            url = %webhook_url,
+            allow_ttl_s = args.webhook_auth_cache_ttl_seconds,
+            deny_ttl_s = args.webhook_auth_deny_cache_ttl_seconds,
+            fetch_timeout_s = args.webhook_auth_fetch_timeout_seconds,
+            "auth: webhook provider enabled"
+        );
+        let cfg = WebhookAuthConfig {
+            webhook_url,
+            allow_cache_ttl: std::time::Duration::from_secs(args.webhook_auth_cache_ttl_seconds),
+            deny_cache_ttl: std::time::Duration::from_secs(args.webhook_auth_deny_cache_ttl_seconds),
+            fetch_timeout: std::time::Duration::from_secs(args.webhook_auth_fetch_timeout_seconds),
+            cache_capacity: std::num::NonZeroUsize::new(4096).expect("4096 != 0"),
+        };
+        let provider = WebhookAuthProvider::new(cfg)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to init webhook auth provider: {e}"))?;
+        return Ok(Arc::new(provider) as SharedAuth);
+    }
+
+    build_static_or_jwt_auth(args)
+}
+
+/// Reject mutually-exclusive auth flag combinations. Each of `--jwks-url`,
+/// `--webhook-auth-url`, and `--jwt-secret` picks a distinct strategy; a
+/// silent fall-through between them would hide a misconfiguration. Factored
+/// out of `build_auth` so the check is unit-testable without booting a
+/// runtime, and gated on the union of feature flags that actually expose
+/// the relevant fields on `ServeArgs`.
+#[cfg(any(feature = "jwks", feature = "webhook"))]
+fn check_auth_flag_combinations(args: &ServeArgs) -> Result<()> {
+    #[cfg(feature = "jwks")]
     if args.jwks_url.is_some() && args.jwt_secret.is_some() {
         return Err(anyhow::anyhow!(
             "--jwks-url and --jwt-secret are mutually exclusive; pick one signing strategy"
         ));
     }
+    #[cfg(feature = "webhook")]
+    if args.webhook_auth_url.is_some() && args.jwt_secret.is_some() {
+        return Err(anyhow::anyhow!(
+            "--webhook-auth-url and --jwt-secret are mutually exclusive; pick one auth strategy"
+        ));
+    }
+    #[cfg(all(feature = "jwks", feature = "webhook"))]
+    if args.jwks_url.is_some() && args.webhook_auth_url.is_some() {
+        return Err(anyhow::anyhow!(
+            "--jwks-url and --webhook-auth-url are mutually exclusive; pick one auth strategy"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(feature = "jwks", feature = "webhook")))]
+fn check_auth_flag_combinations(_args: &ServeArgs) -> Result<()> {
     Ok(())
 }
 
@@ -889,14 +971,14 @@ mod jwks_cli_tests {
         let a = parse(&["lvqr", "serve"]);
         assert!(a.jwks_url.is_none());
         assert_eq!(a.jwks_refresh_interval_seconds, 300);
-        check_jwks_flag_combination(&a).expect("no flags should be fine");
+        check_auth_flag_combinations(&a).expect("no flags should be fine");
     }
 
     #[test]
     fn jwks_url_flag_parses() {
         let a = parse(&["lvqr", "serve", "--jwks-url", "https://idp.example.com/jwks.json"]);
         assert_eq!(a.jwks_url.as_deref(), Some("https://idp.example.com/jwks.json"));
-        check_jwks_flag_combination(&a).expect("jwks alone is fine");
+        check_auth_flag_combinations(&a).expect("jwks alone is fine");
     }
 
     #[test]
@@ -909,7 +991,7 @@ mod jwks_cli_tests {
             "--jwt-secret",
             "hunter2",
         ]);
-        let err = check_jwks_flag_combination(&a).unwrap_err().to_string();
+        let err = check_auth_flag_combinations(&a).unwrap_err().to_string();
         assert!(err.contains("--jwks-url"), "err: {err}");
         assert!(err.contains("--jwt-secret"), "err: {err}");
         assert!(err.contains("mutually exclusive"), "err: {err}");
@@ -944,5 +1026,86 @@ mod jwks_cli_tests {
         ]);
         assert_eq!(a.jwt_issuer.as_deref(), Some("https://idp.example.com/"));
         assert_eq!(a.jwt_audience.as_deref(), Some("lvqr-prod"));
+    }
+}
+
+#[cfg(all(test, feature = "webhook"))]
+mod webhook_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> ServeArgs {
+        match Cli::parse_from(args) {
+            Cli::Serve(a) => a,
+        }
+    }
+
+    #[test]
+    fn webhook_auth_url_unset_passes_combination_check() {
+        let a = parse(&["lvqr", "serve"]);
+        assert!(a.webhook_auth_url.is_none());
+        assert_eq!(a.webhook_auth_cache_ttl_seconds, 60);
+        assert_eq!(a.webhook_auth_deny_cache_ttl_seconds, 10);
+        assert_eq!(a.webhook_auth_fetch_timeout_seconds, 5);
+        check_auth_flag_combinations(&a).expect("no flags should be fine");
+    }
+
+    #[test]
+    fn webhook_auth_url_flag_parses() {
+        let a = parse(&["lvqr", "serve", "--webhook-auth-url", "https://auth.example.com/check"]);
+        assert_eq!(a.webhook_auth_url.as_deref(), Some("https://auth.example.com/check"));
+        check_auth_flag_combinations(&a).expect("webhook alone is fine");
+    }
+
+    #[test]
+    fn webhook_plus_jwt_secret_is_mutex_error() {
+        let a = parse(&[
+            "lvqr",
+            "serve",
+            "--webhook-auth-url",
+            "https://auth.example.com/check",
+            "--jwt-secret",
+            "hunter2",
+        ]);
+        let err = check_auth_flag_combinations(&a).unwrap_err().to_string();
+        assert!(err.contains("--webhook-auth-url"), "err: {err}");
+        assert!(err.contains("--jwt-secret"), "err: {err}");
+        assert!(err.contains("mutually exclusive"), "err: {err}");
+    }
+
+    #[cfg(feature = "jwks")]
+    #[test]
+    fn webhook_plus_jwks_is_mutex_error() {
+        let a = parse(&[
+            "lvqr",
+            "serve",
+            "--webhook-auth-url",
+            "https://auth.example.com/check",
+            "--jwks-url",
+            "https://idp.example.com/jwks.json",
+        ]);
+        let err = check_auth_flag_combinations(&a).unwrap_err().to_string();
+        assert!(err.contains("--jwks-url"), "err: {err}");
+        assert!(err.contains("--webhook-auth-url"), "err: {err}");
+        assert!(err.contains("mutually exclusive"), "err: {err}");
+    }
+
+    #[test]
+    fn webhook_ttl_override_applies() {
+        let a = parse(&[
+            "lvqr",
+            "serve",
+            "--webhook-auth-url",
+            "https://auth.example.com/check",
+            "--webhook-auth-cache-ttl-seconds",
+            "120",
+            "--webhook-auth-deny-cache-ttl-seconds",
+            "5",
+            "--webhook-auth-fetch-timeout-seconds",
+            "3",
+        ]);
+        assert_eq!(a.webhook_auth_cache_ttl_seconds, 120);
+        assert_eq!(a.webhook_auth_deny_cache_ttl_seconds, 5);
+        assert_eq!(a.webhook_auth_fetch_timeout_seconds, 3);
     }
 }

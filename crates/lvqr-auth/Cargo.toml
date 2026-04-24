@@ -19,6 +19,11 @@ jwt = ["dep:jsonwebtoken"]
 # tokio (for the periodic refresh task + Notify cache-miss kick) + url (for
 # validating the configured JWKS URL at provider construction).
 jwks = ["jwt", "dep:reqwest", "dep:tokio", "dep:url"]
+# Webhook auth provider (PLAN Phase D). Delegates every AuthContext decision
+# to an operator-configured HTTP endpoint. Shares the reqwest + tokio + url
+# stack with `jwks` without pulling `jsonwebtoken` since no JWT decoding
+# happens on this path.
+webhook = ["dep:reqwest", "dep:tokio", "dep:url"]
 
 [dependencies]
 serde = { workspace = true }
