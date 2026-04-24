@@ -57,6 +57,7 @@ mounts today.
 | `cluster_broadcasts()` | `GET /api/v1/cluster/broadcasts` | `list[BroadcastSummary]` |
 | `cluster_config()` | `GET /api/v1/cluster/config` | `list[ConfigEntry]` |
 | `cluster_federation()` | `GET /api/v1/cluster/federation` | `FederationStatus` |
+| `wasm_filter()` | `GET /api/v1/wasm-filter` | `WasmFilterState` |
 | `close()` | -- | `None` (closes the underlying httpx client) |
 
 Cluster-prefixed methods require the server to be built with
@@ -150,6 +151,20 @@ class FederationLinkStatus:
 @dataclass
 class FederationStatus:
     links: list[FederationLinkStatus]
+
+@dataclass
+class WasmFilterBroadcastStats:
+    broadcast: str          # "live/cam1"
+    track: str              # "0.mp4"
+    seen: int = 0           # kept + dropped
+    kept: int = 0           # survived every slot in the chain
+    dropped: int = 0        # a slot returned None (short-circuit)
+
+@dataclass
+class WasmFilterState:
+    enabled: bool = False   # mirrors whether --wasm-filter was configured
+    chain_length: int = 0   # constant for the server's lifetime
+    broadcasts: list[WasmFilterBroadcastStats] = field(default_factory=list)
 ```
 
 ## Timeouts + retries
@@ -245,12 +260,13 @@ integration point for monitoring and ops tooling.
 ## Migrating from `0.3.1` to `main`
 
 The package on PyPI at `0.3.1` ships three methods
-(`healthz`, `stats`, `list_streams`). `main` adds six more
+(`healthz`, `stats`, `list_streams`). `main` adds seven more
 (`mesh`, `slo`, `cluster_nodes`, `cluster_broadcasts`,
-`cluster_config`, `cluster_federation`) + a `bearer_token`
-kwarg + 11 new dataclasses. All additive; no breaking
-changes. When pinning to a specific release, test for
-method existence if your code runs against both versions:
+`cluster_config`, `cluster_federation`, `wasm_filter`) + a
+`bearer_token` kwarg + 13 new dataclasses. All additive; no
+breaking changes. When pinning to a specific release, test
+for method existence if your code runs against both
+versions:
 
 ```python
 from lvqr import LvqrClient

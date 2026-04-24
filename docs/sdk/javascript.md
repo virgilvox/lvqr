@@ -108,6 +108,7 @@ if (await admin.healthz()) {
 | `clusterBroadcasts()` | `GET /api/v1/cluster/broadcasts` | `Promise<BroadcastSummary[]>` | Active broadcast leases, non-expired, LWW winner per name. |
 | `clusterConfig()` | `GET /api/v1/cluster/config` | `Promise<ConfigEntry[]>` | Cluster-wide LWW config KV. |
 | `clusterFederation()` | `GET /api/v1/cluster/federation` | `Promise<FederationStatus>` | Wraps per-link status in `{ links: [...] }`. Empty list means "federation disabled OR no links configured" (the server collapses the distinction deliberately). |
+| `wasmFilter()` | `GET /api/v1/wasm-filter` | `Promise<WasmFilterState>` | Configured WASM filter chain shape + per-`(broadcast, track)` seen/kept/dropped counters. Returns `{enabled: false, chain_length: 0, broadcasts: []}` when `--wasm-filter` is unset (200 OK, not 404); tooling can poll unconditionally. |
 
 ### Response type reference
 
@@ -186,6 +187,20 @@ interface FederationLinkStatus {
 
 interface FederationStatus {
   links: FederationLinkStatus[];
+}
+
+interface WasmFilterBroadcastStats {
+  broadcast: string;      // "live/cam1"
+  track: string;          // "0.mp4"
+  seen: number;           // kept + dropped
+  kept: number;           // survived every slot in the chain
+  dropped: number;        // a slot returned None (short-circuit)
+}
+
+interface WasmFilterState {
+  enabled: boolean;       // mirrors whether --wasm-filter was configured
+  chain_length: number;   // constant for the server's lifetime
+  broadcasts: WasmFilterBroadcastStats[];
 }
 ```
 

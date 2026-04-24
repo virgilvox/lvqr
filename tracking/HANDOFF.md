@@ -1,8 +1,71 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D rows "webhook auth provider" (session 135) + "WASM filter chain composition" (session 136) SHIPPED**. **Session 137 (2026-04-24) added the `GET /api/v1/wasm-filter` admin route** completing the chain feature from an ops-observability perspective. **1008** workspace tests on the default gate (1003 -> 1008, +5 from session 137: 3 admin unit + 2 integration). 29 crates. Operators running a filter chain now get live HTTP introspection into `chain_length` + per-`(broadcast, track)` seen/kept/dropped counters without having to parse Prometheus counters. The `WasmFilterBridgeHandle` carries a new `chain_length()` accessor; `install_wasm_filter_bridge` grew a `chain_length: usize` parameter (single caller in `lvqr-cli::start()` passes `ChainFilter::len()`; in-crate tests pass 1). Remaining Phase D scope (after session 137): mesh data-plane completion, one hardware encoder backend, authoritative DASH-IF container validator, npm + PyPI publish cycle.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D rows "webhook auth provider" (session 135) + "WASM filter chain composition" (session 136) SHIPPED**. **Session 137 added `GET /api/v1/wasm-filter` admin route**. **Session 138 (2026-04-24) extended the JS + Python SDK admin clients with the new method** -- `@lvqr/core::LvqrAdminClient.wasmFilter()` + `lvqr.LvqrClient.wasm_filter()` both return a `WasmFilterState` mirroring the Rust shape; 4 new pytest cases + 1 new Vitest case against a live server. Default-gate Rust workspace unchanged at **1008/0/3** (this session touched only JS + Python bindings). Python `pytest` count 21 -> 25 (+4). 29 crates. Admin surface now at **10 routes** on both published language targets (previously 9/9 after session 123). Remaining Phase D scope: mesh data-plane completion, one hardware encoder backend, authoritative DASH-IF container validator, npm + PyPI publish cycle (now carries the session-135 webhook + 136 chain + 137 admin-route + 138 SDK bindings).
 
-**Last Updated**: 2026-04-24 (session 137 close). Local main is 7 ahead of `origin/main` at `c0d9198` (sessions 135+136+README-drift+137 pending user push).
+**Last Updated**: 2026-04-24 (session 138 close). Sessions 135-137 are pushed (`origin/main` now at `1a1667e`); session 138 commits the SDK feat + close-doc on top.
+
+## Session 138 close (2026-04-24)
+
+**Shipped**: JS `@lvqr/core::LvqrAdminClient.wasmFilter()` method + Python `lvqr.LvqrClient.wasm_filter()` method hitting session 137's `GET /api/v1/wasm-filter` admin route. Both SDKs gain matching `WasmFilterState` + `WasmFilterBroadcastStats` types/dataclasses mirroring `lvqr_admin`'s serde shape. Python pytest count **21 -> 25** (+4: 2 type-default tests + 2 client-mock tests). JS Vitest spec grows one live-server test against the new method. Rust workspace gate unchanged at 1008/0/3 (this session touched bindings only).
+
+### Deliverables
+
+1. **`bindings/js/packages/core/src/admin.ts`**:
+   * New `WasmFilterBroadcastStats` interface (`broadcast`, `track`, `seen`, `kept`, `dropped`).
+   * New `WasmFilterState` interface (`enabled`, `chain_length`, `broadcasts`).
+   * New `async wasmFilter(): Promise<WasmFilterState>` on `LvqrAdminClient` hitting `/api/v1/wasm-filter`.
+   * Class docstring updated: route list now reads `/api/v1/{stats,streams,mesh,slo,wasm-filter}`.
+2. **`bindings/js/packages/core/src/index.ts`** re-exports the two new interfaces alongside the existing admin types.
+3. **`bindings/js/tests/sdk/admin-client.spec.ts`** gains one new `#[it]` case asserting the `{enabled: false, chain_length: 0, broadcasts: []}` shape against the sdk-tests.yml harness (which boots lvqr without `--wasm-filter`).
+4. **`bindings/python/python/lvqr/types.py`**:
+   * New `@dataclass WasmFilterBroadcastStats` mirroring the Rust shape.
+   * New `@dataclass WasmFilterState` with `field(default_factory=list)` for `broadcasts`.
+5. **`bindings/python/python/lvqr/client.py`**:
+   * Imports the two new types.
+   * New `def wasm_filter(self) -> WasmFilterState` method that hits `/api/v1/wasm-filter` and builds the dataclass from the JSON body.
+   * Module docstring updated: route list now reads `/api/v1/{stats,streams,mesh,slo,wasm-filter}`.
+6. **`bindings/python/python/lvqr/__init__.py`** re-exports the two new types alongside the existing.
+7. **`bindings/python/tests/test_client.py`**:
+   * New `TestTypes::test_wasm_filter_state_defaults` + `test_wasm_filter_broadcast_stats_defaults` tests asserting the dataclass defaults.
+   * New `TestClient::test_wasm_filter_disabled` + `test_wasm_filter_populated` tests using `unittest.mock.patch` on `httpx.Client.get` to simulate both response shapes.
+8. **Docs**:
+   * `docs/sdk/javascript.md` method-reference table gains the `wasmFilter()` row; response-type reference gains the two TypeScript interfaces.
+   * `docs/sdk/python.md` method-reference table gains the `wasm_filter()` row; response-types code block gains the two `@dataclass` definitions.
+   * `docs/sdk/python.md` migration section updated: 3/9 -> 10 methods on main, 11 -> 13 new dataclasses.
+
+### Key 138 design decisions baked in
+
+* **SDK methods called `wasmFilter` (JS) / `wasm_filter` (Python).** Matches the per-language convention already established by `clusterNodes` vs `cluster_nodes`. Directly naming the server route.
+* **Return types named `WasmFilterState` + `WasmFilterBroadcastStats`** -- byte-for-byte match with the Rust `lvqr_admin::WasmFilterState` + `WasmFilterBroadcastStats` serde structs, and with the field set the session-137 `get_wasm_filter` route returns. Dataclass / interface field names use Rust-side `snake_case` (not JS `camelCase`) because the JSON-on-wire already is `snake_case`; keeping the client side matching avoids a rename layer.
+* **Defensive defaults on dataclass.** `WasmFilterState.enabled = False`, `chain_length = 0`, `broadcasts = []` matches the server's "disabled" body exactly so `WasmFilterState()` gives the same shape a disabled-server GET returns. Lets tests and operators synthesize a blank state without mocking the network.
+* **Python client constructs dataclasses field-by-field, not `**kwargs` unpack.** Matches the pattern the other methods already use (`cluster_federation` builds `FederationLinkStatus` kwarg-by-kwarg too). Guards against surprise fields on the wire and keeps the fallback-default behavior consistent.
+* **JS Vitest case asserts the disabled shape**, not the chain-configured shape, because the sdk-tests.yml harness boots lvqr with `--mesh-enabled` + `--cluster-listen` but NOT `--wasm-filter`. Chain-configured end-to-end coverage already exists at the Rust layer in session 137's `wasm_filter_admin_route.rs` integration test; the SDK Vitest just proves the route is reachable and parses into the declared shape.
+* **No sdk-tests.yml workflow change needed.** The workflow runs `vitest` + `pytest` against the test suites; both discover the new tests automatically.
+* **No Rust code touched this session.** Workspace tests unchanged at 1008/0/3. The SDK bindings are the single surface that needed to grow.
+
+### Ground truth (session 138 close)
+
+* **Head (pre-push)**: `feat(sdk)` + `docs` close-doc commit (pending). Sessions 135-137 are pushed; `origin/main` at `1a1667e`.
+* **Tests**:
+  * Rust workspace default gate: **1008** passed / 0 failed / 3 ignored (unchanged; no Rust code touched).
+  * `bindings/python pytest`: **25** passed / 0 failed (21 pre-existing + 4 new).
+  * `bindings/js @lvqr/core build:ts`: clean (new exports from index.ts compile).
+  * `bindings/js @lvqr/core/tests/sdk/admin-client.spec.ts`: runs against the sdk-tests.yml harness; the new `wasmFilter` case asserts the disabled shape.
+* **CI gates locally clean**:
+  * `cargo fmt --all -- --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `tsc` clean on both `@lvqr/core` + `@lvqr/player` packages.
+* **Workspace**: 29 Rust crates (unchanged), `@lvqr/core` + `@lvqr/player` TypeScript packages, `lvqr` Python package.
+
+### Known limitations / documented v1 shape (after 138 close)
+
+* **SDK clients on-registry still lag.** `@lvqr/core` + `@lvqr/player` at 0.3.1 on npm, `lvqr` at 0.3.1 on PyPI still ship the pre-session-122 admin surface (3/9 methods on Python, partial on JS). The publish cycle bundles session-122 9/9 admin expansion + session-126 JWKS public API + session-128 `sign_live_url` + session-137 admin route + session-138 SDK bindings. Needs npm + PyPI credentials.
+* **No CLI module** for the new route in the Python SDK; callers do `client.wasm_filter()` programmatically.
+* **No live-server integration test for the chain-configured shape on the SDK side.** The sdk-tests.yml harness is wasm-filter-unaware; a chain-configured variant would need either the existing harness to grow `--wasm-filter` args or a second harness invocation. Chain-configured end-to-end coverage already exists at the Rust layer.
+* All other session 137 + earlier known limitations unchanged.
+
+
+
 
 ## Session 137 close (2026-04-24)
 
