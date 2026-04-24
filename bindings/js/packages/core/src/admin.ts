@@ -174,10 +174,30 @@ export interface WasmFilterBroadcastStats {
 }
 
 /**
+ * Per-slot WASM filter counters. Mirrors
+ * `lvqr_admin::WasmFilterSlotStats`. `index` is the filter's
+ * position in the chain (0-based). `seen` / `kept` / `dropped`
+ * describe what THAT slot observed -- later slots in a chain show
+ * smaller `seen` counts when an earlier slot drops, because the
+ * chain short-circuits on the first `None`. PLAN Phase D session
+ * 140.
+ */
+export interface WasmFilterSlotStats {
+  /** 0-based position in the configured chain. */
+  index: number;
+  /** Fragments this slot observed (kept + dropped for this slot). */
+  seen: number;
+  /** Fragments this slot returned `Some` for. */
+  kept: number;
+  /** Fragments this slot returned `None` for (short-circuit drop). */
+  dropped: number;
+}
+
+/**
  * Shape of `GET /api/v1/wasm-filter`. Mirrors
  * `lvqr_admin::WasmFilterState`. When `--wasm-filter` is unset the
- * server returns `{ enabled: false, chain_length: 0, broadcasts: [] }`
- * rather than 404 so dashboards can pre-bake the shape.
+ * server returns `{ enabled: false, chain_length: 0, broadcasts: [],
+ * slots: [] }` rather than 404 so dashboards can pre-bake the shape.
  */
 export interface WasmFilterState {
   /** Whether `--wasm-filter` was configured on the server. */
@@ -189,6 +209,15 @@ export interface WasmFilterState {
   chain_length: number;
   /** Every `(broadcast, track)` pair the filter tap has observed. */
   broadcasts: WasmFilterBroadcastStats[];
+  /**
+   * Per-slot counters in insertion order. Contains `chain_length`
+   * entries when `enabled` is true; empty otherwise. Added in PLAN
+   * Phase D session 140; servers older than that version omit the
+   * field, so the type is optional-safe if you are polling a
+   * pre-session-140 deployment (TypeScript treats missing fields
+   * leniently on reads).
+   */
+  slots: WasmFilterSlotStats[];
 }
 
 export interface LvqrAdminClientOptions {

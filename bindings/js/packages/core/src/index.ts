@@ -37,6 +37,7 @@ export {
   type FederationLinkStatus,
   type FederationStatus,
   type WasmFilterBroadcastStats,
+  type WasmFilterSlotStats,
   type WasmFilterState,
 } from './admin';
 export { detectTransport, type TransportType } from './transport';

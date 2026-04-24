@@ -314,6 +314,76 @@ impl std::fmt::Debug for SharedFilter {
     }
 }
 
+/// Per-slot atomic counters that ride alongside each filter in a
+/// [`ChainFilter`]. Incremented on every `apply` invocation that
+/// reaches the slot; subsequent slots short-circuit if an earlier
+/// slot returned `None`, so counters on later slots naturally
+/// reflect "fragments this slot actually saw", not "fragments the
+/// whole chain saw".
+///
+/// Operator tooling reads these via
+/// [`ChainFilter::slot_counters`] -- the admin `/api/v1/wasm-filter`
+/// route surfaces them as the `slots` field of its JSON body so
+/// operators debugging a drop-happy chain can pinpoint which slot
+/// is responsible.
+///
+/// PLAN Phase D session 140.
+#[derive(Debug, Default)]
+pub struct SlotCounters {
+    /// Total fragments this slot observed (kept + dropped).
+    pub fragments_seen: std::sync::atomic::AtomicU64,
+    /// Fragments this slot returned `Some` for.
+    pub fragments_kept: std::sync::atomic::AtomicU64,
+    /// Fragments this slot returned `None` for (dropped, short-
+    /// circuits the rest of the chain for that fragment).
+    pub fragments_dropped: std::sync::atomic::AtomicU64,
+}
+
+impl SlotCounters {
+    /// Snapshot accessor for `fragments_seen`.
+    pub fn seen(&self) -> u64 {
+        self.fragments_seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Snapshot accessor for `fragments_kept`.
+    pub fn kept(&self) -> u64 {
+        self.fragments_kept.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Snapshot accessor for `fragments_dropped`.
+    pub fn dropped(&self) -> u64 {
+        self.fragments_dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Internal wrapper that instruments a [`SharedFilter`] with its
+/// per-slot [`SlotCounters`]. Hidden from the public API because it
+/// only exists to back [`ChainFilter`]'s instrumentation; external
+/// callers constructing chains use [`SharedFilter`] directly and
+/// get instrumentation automatically.
+#[derive(Clone)]
+struct InstrumentedFilter {
+    inner: SharedFilter,
+    counters: Arc<SlotCounters>,
+}
+
+impl FragmentFilter for InstrumentedFilter {
+    fn apply(&self, fragment: Fragment) -> Option<Fragment> {
+        use std::sync::atomic::Ordering;
+        self.counters.fragments_seen.fetch_add(1, Ordering::Relaxed);
+        match self.inner.apply(fragment) {
+            Some(out) => {
+                self.counters.fragments_kept.fetch_add(1, Ordering::Relaxed);
+                Some(out)
+            }
+            None => {
+                self.counters.fragments_dropped.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+}
+
 /// Ordered composition of multiple [`SharedFilter`]s. Applied in
 /// insertion order; the first filter that returns `None` drops
 /// the fragment and short-circuits the remaining filters in the
@@ -322,7 +392,10 @@ impl std::fmt::Debug for SharedFilter {
 /// Each entry keeps its own [`SharedFilter`], so hot-reloading a
 /// single module via [`WasmFilterReloader`] only swaps that one
 /// slot; downstream filters continue to see the reloaded module's
-/// output on the next fragment.
+/// output on the next fragment. Each entry also carries its own
+/// [`SlotCounters`] so operators can observe the
+/// seen / kept / dropped breakdown per slot via
+/// [`Self::slot_counters`] (PLAN Phase D session 140).
 ///
 /// An empty chain is a valid no-op filter (every fragment passes
 /// through unchanged); callers that want "no filter at all" should
@@ -331,12 +404,22 @@ impl std::fmt::Debug for SharedFilter {
 /// nothing.
 #[derive(Clone)]
 pub struct ChainFilter {
-    filters: Vec<SharedFilter>,
+    filters: Vec<InstrumentedFilter>,
 }
 
 impl ChainFilter {
-    /// Build a chain from the given ordered list of filters.
+    /// Build a chain from the given ordered list of filters. Each
+    /// slot is wrapped in an internal instrumentation layer that
+    /// increments its [`SlotCounters`] on every `apply`; the
+    /// counters are exposed via [`Self::slot_counters`].
     pub fn new(filters: Vec<SharedFilter>) -> Self {
+        let filters = filters
+            .into_iter()
+            .map(|inner| InstrumentedFilter {
+                inner,
+                counters: Arc::new(SlotCounters::default()),
+            })
+            .collect();
         Self { filters }
     }
 
@@ -356,13 +439,14 @@ impl ChainFilter {
         self.filters.is_empty()
     }
 
-    /// Borrow the ordered filter list. Exposed for the CLI / admin
-    /// surface so operators can introspect the configured chain;
-    /// the returned slice is a snapshot of the filter handles,
-    /// which are themselves live via their internal `SharedFilter`
-    /// mutex.
-    pub fn filters(&self) -> &[SharedFilter] {
-        &self.filters
+    /// Clone the per-slot counter handles in insertion order. The
+    /// returned `Arc<SlotCounters>`s share state with the live chain
+    /// so a later snapshot read reflects subsequent `apply` calls.
+    /// Exposed for the admin `/api/v1/wasm-filter` route to report
+    /// per-slot seen / kept / dropped alongside the per-broadcast
+    /// aggregate the bridge already tracks.
+    pub fn slot_counters(&self) -> Vec<Arc<SlotCounters>> {
+        self.filters.iter().map(|f| Arc::clone(&f.counters)).collect()
     }
 }
 
@@ -593,7 +677,7 @@ mod tests {
     fn chain_from_vec_roundtrips_filter_list() {
         let chain: ChainFilter = vec![shared(WAT_NOOP), shared(WAT_NOOP)].into();
         assert_eq!(chain.len(), 2);
-        assert_eq!(chain.filters().len(), 2);
+        assert_eq!(chain.slot_counters().len(), 2);
     }
 
     #[test]
@@ -607,5 +691,79 @@ mod tests {
         assert!(chain.apply(frag.clone()).is_some(), "both noop -> keep");
         slot_one.replace(compile(WAT_DROP));
         assert!(chain.apply(frag).is_none(), "first-slot reload to DROP should drop");
+    }
+
+    // -------------- Per-slot counters (v1.1 session 140) --------------
+
+    #[test]
+    fn slot_counters_start_at_zero() {
+        let chain = ChainFilter::new(vec![shared(WAT_NOOP), shared(WAT_NOOP)]);
+        let counters = chain.slot_counters();
+        for c in &counters {
+            assert_eq!(c.seen(), 0);
+            assert_eq!(c.kept(), 0);
+            assert_eq!(c.dropped(), 0);
+        }
+    }
+
+    #[test]
+    fn slot_counters_increment_on_apply() {
+        let chain = ChainFilter::new(vec![shared(WAT_NOOP), shared(WAT_NOOP)]);
+        let counters = chain.slot_counters();
+        for _ in 0..5 {
+            let frag = sample_fragment(b"payload");
+            assert!(chain.apply(frag).is_some());
+        }
+        // Both slots see every fragment because both keep.
+        assert_eq!(counters[0].seen(), 5);
+        assert_eq!(counters[0].kept(), 5);
+        assert_eq!(counters[0].dropped(), 0);
+        assert_eq!(counters[1].seen(), 5);
+        assert_eq!(counters[1].kept(), 5);
+        assert_eq!(counters[1].dropped(), 0);
+    }
+
+    #[test]
+    fn short_circuit_prevents_later_slots_from_seeing_dropped_fragments() {
+        // noop -> drop -> noop: slot 0 sees every fragment, slot 1
+        // drops every fragment, slot 2 never gets called.
+        let chain = ChainFilter::new(vec![shared(WAT_NOOP), shared(WAT_DROP), shared(WAT_NOOP)]);
+        let counters = chain.slot_counters();
+        for _ in 0..3 {
+            let frag = sample_fragment(b"payload");
+            assert!(chain.apply(frag).is_none());
+        }
+        assert_eq!(counters[0].seen(), 3);
+        assert_eq!(counters[0].kept(), 3);
+        assert_eq!(counters[0].dropped(), 0);
+
+        assert_eq!(counters[1].seen(), 3);
+        assert_eq!(counters[1].kept(), 0);
+        assert_eq!(counters[1].dropped(), 3);
+
+        // Slot 2 is short-circuited by slot 1's drop: it never
+        // sees a fragment.
+        assert_eq!(counters[2].seen(), 0);
+        assert_eq!(counters[2].kept(), 0);
+        assert_eq!(counters[2].dropped(), 0);
+    }
+
+    #[test]
+    fn slot_counter_handles_are_shared_with_live_chain() {
+        // `slot_counters` returns Arc clones, so a snapshot taken
+        // before any apply still reflects subsequent apply calls.
+        let chain = ChainFilter::new(vec![shared(WAT_NOOP)]);
+        let snapshot = chain.slot_counters();
+        assert_eq!(snapshot[0].seen(), 0);
+        chain.apply(sample_fragment(b"one")).unwrap();
+        chain.apply(sample_fragment(b"two")).unwrap();
+        // Same Arc; seen now reflects both applies.
+        assert_eq!(snapshot[0].seen(), 2);
+    }
+
+    #[test]
+    fn empty_chain_has_no_slot_counters() {
+        let chain = ChainFilter::empty();
+        assert!(chain.slot_counters().is_empty());
     }
 }

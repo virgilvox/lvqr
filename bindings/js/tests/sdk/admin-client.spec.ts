@@ -158,6 +158,16 @@ describe('LvqrAdminClient against a running lvqr', () => {
       expect(typeof b.kept).toBe('number');
       expect(typeof b.dropped).toBe('number');
     }
+    // Session 140: per-slot counters mirror chain_length. With no
+    // publisher the counters stay at zero but the shape + length
+    // must match the configured chain so dashboards can render
+    // per-slot panels even before any traffic lands.
+    expect(Array.isArray(state.slots)).toBe(true);
+    expect(state.slots.length).toBe(1);
+    expect(state.slots[0].index).toBe(0);
+    expect(state.slots[0].seen).toBe(0);
+    expect(state.slots[0].kept).toBe(0);
+    expect(state.slots[0].dropped).toBe(0);
   });
 
   it('fetchTimeoutMs aborts hung requests', async () => {

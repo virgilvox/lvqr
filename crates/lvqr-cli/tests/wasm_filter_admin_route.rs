@@ -144,6 +144,40 @@ async fn admin_route_reports_chain_length_and_per_broadcast_counters() {
         dropped, seen,
         "chain with drop at slot 2 must drop every observed fragment; got dropped={dropped} seen={seen}",
     );
+
+    // PLAN Phase D session 140: per-slot counters surface which
+    // filter is doing the dropping. Slot 0 is the no-op
+    // (frame-counter.wasm) which keeps every fragment it sees; slot
+    // 1 is the drop-all (redact-keyframes.wasm) which drops every
+    // fragment it sees. Counter semantics: seen / kept / dropped
+    // are per-slot so slot 1's `dropped` equals the chain's
+    // composite `dropped`, while slot 0's `kept` equals the total.
+    let slots = body["slots"].as_array().expect("slots is array");
+    assert_eq!(slots.len(), 2, "slots must mirror --wasm-filter count");
+
+    assert_eq!(slots[0]["index"], 0);
+    let slot0_seen = slots[0]["seen"].as_u64().expect("slot 0 seen u64");
+    let slot0_kept = slots[0]["kept"].as_u64().expect("slot 0 kept u64");
+    let slot0_dropped = slots[0]["dropped"].as_u64().expect("slot 0 dropped u64");
+    assert_eq!(
+        slot0_seen, slot0_kept,
+        "frame-counter.wasm at slot 0 must keep every fragment it sees"
+    );
+    assert_eq!(slot0_dropped, 0, "slot 0 (noop) must never drop");
+
+    assert_eq!(slots[1]["index"], 1);
+    let slot1_seen = slots[1]["seen"].as_u64().expect("slot 1 seen u64");
+    let slot1_kept = slots[1]["kept"].as_u64().expect("slot 1 kept u64");
+    let slot1_dropped = slots[1]["dropped"].as_u64().expect("slot 1 dropped u64");
+    assert_eq!(slot1_kept, 0, "slot 1 (drop-all) must never keep");
+    assert_eq!(
+        slot1_dropped, slot1_seen,
+        "slot 1 (drop-all) must drop every fragment it sees"
+    );
+    assert_eq!(
+        slot1_seen, slot0_kept,
+        "short-circuit: slot 1 only sees what slot 0 kept"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -160,4 +194,5 @@ async fn admin_route_reports_disabled_when_no_filter_configured() {
     assert_eq!(body["enabled"], false);
     assert_eq!(body["chain_length"], 0);
     assert_eq!(body["broadcasts"].as_array().unwrap().len(), 0);
+    assert_eq!(body["slots"].as_array().unwrap().len(), 0);
 }

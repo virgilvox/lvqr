@@ -26,6 +26,7 @@ from .types import (
     SloSnapshot,
     StreamInfo,
     WasmFilterBroadcastStats,
+    WasmFilterSlotStats,
     WasmFilterState,
 )
 
@@ -235,10 +236,23 @@ class LvqrClient:
             )
             for b in data.get("broadcasts", [])
         ]
+        # `slots` was added in PLAN Phase D session 140; pre-140
+        # servers omit it. `.get("slots", [])` keeps parsing sound
+        # against older deployments.
+        slots = [
+            WasmFilterSlotStats(
+                index=int(s.get("index", 0)),
+                seen=int(s.get("seen", 0)),
+                kept=int(s.get("kept", 0)),
+                dropped=int(s.get("dropped", 0)),
+            )
+            for s in data.get("slots", [])
+        ]
         return WasmFilterState(
             enabled=bool(data.get("enabled", False)),
             chain_length=int(data.get("chain_length", 0)),
             broadcasts=broadcasts,
+            slots=slots,
         )
 
     # -----------------------------------------------------------------

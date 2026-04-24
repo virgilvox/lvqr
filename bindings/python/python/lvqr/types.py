@@ -22,6 +22,8 @@ can be unpacked via ``**kwargs`` into the constructors. The mapping:
   ``lvqr_admin::cluster_routes::FederationStatusView``.
 * :class:`WasmFilterBroadcastStats` mirrors
   ``lvqr_admin::WasmFilterBroadcastStats``.
+* :class:`WasmFilterSlotStats` mirrors
+  ``lvqr_admin::WasmFilterSlotStats``.
 * :class:`WasmFilterState` mirrors ``lvqr_admin::WasmFilterState``.
 """
 
@@ -175,15 +177,41 @@ class WasmFilterBroadcastStats:
 
 
 @dataclass
+class WasmFilterSlotStats:
+    """Per-slot WASM filter counters. ``index`` is the filter's
+    position in the chain (0-based). Later slots in a chain report
+    smaller ``seen`` counts when an earlier slot drops, because the
+    chain short-circuits on the first ``None``. PLAN Phase D session
+    140."""
+
+    index: int = 0
+    #: Fragments this slot observed (kept + dropped for this slot).
+    seen: int = 0
+    #: Fragments this slot returned ``Some`` for.
+    kept: int = 0
+    #: Fragments this slot returned ``None`` for (short-circuit drop).
+    dropped: int = 0
+
+
+@dataclass
 class WasmFilterState:
     """Outer shape of ``/api/v1/wasm-filter``. When
     ``--wasm-filter`` is unset the server returns
-    ``{enabled=False, chain_length=0, broadcasts=[]}`` (200 OK, not
-    404) so dashboards can pre-bake the shape and poll
-    unconditionally."""
+    ``{enabled=False, chain_length=0, broadcasts=[], slots=[]}``
+    (200 OK, not 404) so dashboards can pre-bake the shape and
+    poll unconditionally.
+
+    ``slots`` was added in PLAN Phase D session 140; older servers
+    (pre-140) omit the field. The Python client's ``wasm_filter()``
+    defensively defaults it to an empty list so the dataclass
+    construction does not break against a pre-140 deployment."""
 
     enabled: bool = False
     #: Number of filters composed into the installed chain.
     #: Constant for the server's lifetime.
     chain_length: int = 0
     broadcasts: list[WasmFilterBroadcastStats] = field(default_factory=list)
+    #: Per-slot counters in insertion order. Contains
+    #: ``chain_length`` entries when ``enabled`` is True; empty
+    #: otherwise.
+    slots: list[WasmFilterSlotStats] = field(default_factory=list)

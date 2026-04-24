@@ -293,8 +293,8 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // in-flight fragments finish on the old module and the next
     // fragment sees the new one, without disturbing the other
     // slots in the chain.
-    let (wasm_filter_handle, wasm_reloader_handles) = if config.wasm_filter.is_empty() {
-        (None, Vec::new())
+    let (wasm_filter_handle, wasm_reloader_handles, wasm_slot_counters) = if config.wasm_filter.is_empty() {
+        (None, Vec::new(), Vec::new())
     } else {
         let mut shareds: Vec<lvqr_wasm::SharedFilter> = Vec::with_capacity(config.wasm_filter.len());
         let mut reloaders: Vec<lvqr_wasm::WasmFilterReloader> = Vec::with_capacity(config.wasm_filter.len());
@@ -310,10 +310,17 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         }
         let chain = lvqr_wasm::ChainFilter::new(shareds);
         let chain_len = chain.len();
+        // PLAN Phase D session 140: extract per-slot counter handles
+        // BEFORE wrapping the chain in the bridge's outer SharedFilter.
+        // The outer SharedFilter type-erases the ChainFilter; capturing
+        // the Arc<SlotCounters> handles here is how the admin closure
+        // below reads per-slot seen/kept/dropped for
+        // `GET /api/v1/wasm-filter`.
+        let slot_counters = chain.slot_counters();
         tracing::info!(chain_len, "WASM fragment filter chain installed");
         let chain_shared = lvqr_wasm::SharedFilter::new(chain);
         let bridge = lvqr_wasm::install_wasm_filter_bridge(&shared_registry, chain_shared, chain_len);
-        (Some(bridge), reloaders)
+        (Some(bridge), reloaders, slot_counters)
     };
 
     // RTMP ingest bridged to MoQ. Pre-bind the TCP listener so we can
@@ -783,24 +790,38 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // closure returns `{enabled: false, chain_length: 0,
     // broadcasts: []}` so dashboards can pre-bake the shape.
     let admin_state = match wasm_filter_handle.clone() {
-        Some(bridge) => admin_state.with_wasm_filter(move || {
-            let broadcasts = bridge
-                .tracked()
-                .into_iter()
-                .map(|(broadcast, track)| lvqr_admin::WasmFilterBroadcastStats {
-                    seen: bridge.fragments_seen(&broadcast, &track),
-                    kept: bridge.fragments_kept(&broadcast, &track),
-                    dropped: bridge.fragments_dropped(&broadcast, &track),
-                    broadcast,
-                    track,
-                })
-                .collect();
-            lvqr_admin::WasmFilterState {
-                enabled: true,
-                chain_length: bridge.chain_length(),
-                broadcasts,
-            }
-        }),
+        Some(bridge) => {
+            let slot_counters = wasm_slot_counters.clone();
+            admin_state.with_wasm_filter(move || {
+                let broadcasts = bridge
+                    .tracked()
+                    .into_iter()
+                    .map(|(broadcast, track)| lvqr_admin::WasmFilterBroadcastStats {
+                        seen: bridge.fragments_seen(&broadcast, &track),
+                        kept: bridge.fragments_kept(&broadcast, &track),
+                        dropped: bridge.fragments_dropped(&broadcast, &track),
+                        broadcast,
+                        track,
+                    })
+                    .collect();
+                let slots = slot_counters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, c)| lvqr_admin::WasmFilterSlotStats {
+                        index,
+                        seen: c.seen(),
+                        kept: c.kept(),
+                        dropped: c.dropped(),
+                    })
+                    .collect();
+                lvqr_admin::WasmFilterState {
+                    enabled: true,
+                    chain_length: bridge.chain_length(),
+                    broadcasts,
+                    slots,
+                }
+            })
+        }
         None => admin_state,
     };
 

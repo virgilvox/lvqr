@@ -16,6 +16,7 @@ from lvqr import (
     SloSnapshot,
     StreamInfo,
     WasmFilterBroadcastStats,
+    WasmFilterSlotStats,
     WasmFilterState,
 )
 
@@ -47,12 +48,20 @@ class TestTypes:
         assert state.enabled is False
         assert state.chain_length == 0
         assert state.broadcasts == []
+        assert state.slots == []
 
     def test_wasm_filter_broadcast_stats_defaults(self):
         stats = WasmFilterBroadcastStats(broadcast="live/demo", track="0.mp4")
         assert stats.seen == 0
         assert stats.kept == 0
         assert stats.dropped == 0
+
+    def test_wasm_filter_slot_stats_defaults(self):
+        slot = WasmFilterSlotStats()
+        assert slot.index == 0
+        assert slot.seen == 0
+        assert slot.kept == 0
+        assert slot.dropped == 0
 
     def test_federation_status_defaults(self):
         status = FederationStatus()
@@ -344,7 +353,12 @@ class TestClient:
         # disabled shape (200 OK body), not a 404.
         mock_get.return_value = MagicMock(
             status_code=200,
-            json=lambda: {"enabled": False, "chain_length": 0, "broadcasts": []},
+            json=lambda: {
+                "enabled": False,
+                "chain_length": 0,
+                "broadcasts": [],
+                "slots": [],
+            },
             raise_for_status=lambda: None,
         )
         client = LvqrClient("http://localhost:8080")
@@ -353,6 +367,7 @@ class TestClient:
         assert state.enabled is False
         assert state.chain_length == 0
         assert state.broadcasts == []
+        assert state.slots == []
         client.close()
 
     @patch("httpx.Client.get")
@@ -378,6 +393,10 @@ class TestClient:
                         "dropped": 0,
                     },
                 ],
+                "slots": [
+                    {"index": 0, "seen": 195, "kept": 195, "dropped": 0},
+                    {"index": 1, "seen": 195, "kept": 175, "dropped": 20},
+                ],
             },
             raise_for_status=lambda: None,
         )
@@ -393,4 +412,36 @@ class TestClient:
         assert state.broadcasts[0].dropped == 20
         assert state.broadcasts[1].broadcast == "live/cam2"
         assert state.broadcasts[1].dropped == 0
+        # Session 140: per-slot counters decompose the chain's
+        # outcome into per-filter activity.
+        assert len(state.slots) == 2
+        assert isinstance(state.slots[0], WasmFilterSlotStats)
+        assert state.slots[0].index == 0
+        assert state.slots[0].seen == 195
+        assert state.slots[0].kept == 195
+        assert state.slots[0].dropped == 0
+        assert state.slots[1].index == 1
+        assert state.slots[1].kept == 175
+        assert state.slots[1].dropped == 20
+        client.close()
+
+    @patch("httpx.Client.get")
+    def test_wasm_filter_pre_session_140_server_omits_slots(self, mock_get):
+        # Defensive: a pre-session-140 server would respond with no
+        # `slots` field. Client must default to an empty list, not
+        # throw.
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "enabled": True,
+                "chain_length": 1,
+                "broadcasts": [],
+            },
+            raise_for_status=lambda: None,
+        )
+        client = LvqrClient("http://localhost:8080")
+        state = client.wasm_filter()
+        assert state.enabled is True
+        assert state.chain_length == 1
+        assert state.slots == []
         client.close()

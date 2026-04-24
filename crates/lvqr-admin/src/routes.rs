@@ -28,14 +28,25 @@ pub struct MeshState {
 ///
 /// `enabled` mirrors whether `--wasm-filter` was configured at
 /// `lvqr serve` time. When false, `chain_length` is `0` and
-/// `broadcasts` is empty; the route still returns 200 OK so
-/// dashboards pre-baking the response shape do not need a separate
-/// 404 handler.
+/// both `broadcasts` and `slots` are empty; the route still
+/// returns 200 OK so dashboards pre-baking the response shape do
+/// not need a separate 404 handler.
+///
+/// `slots` carries per-filter-position counters (index 0 is the
+/// first filter in the chain, N-1 is the last). Short-circuit
+/// semantics mean later slots naturally report fewer `seen`
+/// fragments than earlier slots when an earlier slot drops --
+/// operators use this to pinpoint which filter is denying in a
+/// drop-heavy chain. PLAN Phase D session 140.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WasmFilterState {
     pub enabled: bool,
     pub chain_length: usize,
     pub broadcasts: Vec<WasmFilterBroadcastStats>,
+    /// Per-slot counters in insertion order. Always contains
+    /// `chain_length` entries when `enabled` is true.
+    #[serde(default)]
+    pub slots: Vec<WasmFilterSlotStats>,
 }
 
 /// Per-`(broadcast, track)` WASM filter counters. Values are atomic
@@ -45,6 +56,20 @@ pub struct WasmFilterState {
 pub struct WasmFilterBroadcastStats {
     pub broadcast: String,
     pub track: String,
+    pub seen: u64,
+    pub kept: u64,
+    pub dropped: u64,
+}
+
+/// Per-slot WASM filter counters. `index` is the filter's position
+/// in the chain (0-based). `seen` / `kept` / `dropped` describe
+/// what THAT slot observed -- later slots in a chain will show
+/// smaller `seen` counts when an earlier slot drops, because the
+/// chain short-circuits on the first `None`. PLAN Phase D session
+/// 140.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WasmFilterSlotStats {
+    pub index: usize,
     pub seen: u64,
     pub kept: u64,
     pub dropped: u64,
@@ -120,6 +145,7 @@ impl AdminState {
                 enabled: false,
                 chain_length: 0,
                 broadcasts: Vec::new(),
+                slots: Vec::new(),
             }),
         }
     }
@@ -612,6 +638,7 @@ mod tests {
         assert!(!st.enabled);
         assert_eq!(st.chain_length, 0);
         assert!(st.broadcasts.is_empty());
+        assert!(st.slots.is_empty());
     }
 
     #[tokio::test]
@@ -626,6 +653,20 @@ mod tests {
                 kept: 9,
                 dropped: 1,
             }],
+            slots: vec![
+                WasmFilterSlotStats {
+                    index: 0,
+                    seen: 10,
+                    kept: 10,
+                    dropped: 0,
+                },
+                WasmFilterSlotStats {
+                    index: 1,
+                    seen: 10,
+                    kept: 9,
+                    dropped: 1,
+                },
+            ],
         });
         let app = build_router(state);
         let response = app
@@ -648,6 +689,16 @@ mod tests {
         assert_eq!(st.broadcasts[0].seen, 10);
         assert_eq!(st.broadcasts[0].kept, 9);
         assert_eq!(st.broadcasts[0].dropped, 1);
+        // Per-slot stats: slot 0 keeps everything, slot 1 drops one.
+        assert_eq!(st.slots.len(), 2);
+        assert_eq!(st.slots[0].index, 0);
+        assert_eq!(st.slots[0].seen, 10);
+        assert_eq!(st.slots[0].kept, 10);
+        assert_eq!(st.slots[0].dropped, 0);
+        assert_eq!(st.slots[1].index, 1);
+        assert_eq!(st.slots[1].seen, 10);
+        assert_eq!(st.slots[1].kept, 9);
+        assert_eq!(st.slots[1].dropped, 1);
     }
 
     #[tokio::test]
