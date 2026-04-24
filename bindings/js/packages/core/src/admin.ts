@@ -156,6 +156,41 @@ export interface FederationStatus {
   links: FederationLinkStatus[];
 }
 
+/**
+ * Per-`(broadcast, track)` WASM filter counters. Mirrors
+ * `lvqr_admin::WasmFilterBroadcastStats`.
+ */
+export interface WasmFilterBroadcastStats {
+  /** Broadcast name (e.g. `"live/cam1"`). */
+  broadcast: string;
+  /** Track name within the broadcast (e.g. `"0.mp4"`). */
+  track: string;
+  /** Total fragments observed through the chain (kept + dropped). */
+  seen: number;
+  /** Fragments the chain returned `Some` for (survived every slot). */
+  kept: number;
+  /** Fragments a slot in the chain returned `None` for (short-circuit). */
+  dropped: number;
+}
+
+/**
+ * Shape of `GET /api/v1/wasm-filter`. Mirrors
+ * `lvqr_admin::WasmFilterState`. When `--wasm-filter` is unset the
+ * server returns `{ enabled: false, chain_length: 0, broadcasts: [] }`
+ * rather than 404 so dashboards can pre-bake the shape.
+ */
+export interface WasmFilterState {
+  /** Whether `--wasm-filter` was configured on the server. */
+  enabled: boolean;
+  /**
+   * Number of filters composed into the chain installed at
+   * `lvqr serve` time. Constant for the server's lifetime.
+   */
+  chain_length: number;
+  /** Every `(broadcast, track)` pair the filter tap has observed. */
+  broadcasts: WasmFilterBroadcastStats[];
+}
+
 export interface LvqrAdminClientOptions {
   /**
    * Per-request deadline in milliseconds. Applied to every admin
@@ -179,7 +214,7 @@ const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
  * Client for the LVQR admin HTTP API.
  *
  * Covers every route the admin router mounts today:
- * `/healthz`, `/api/v1/{stats,streams,mesh,slo}`, and the
+ * `/healthz`, `/api/v1/{stats,streams,mesh,slo,wasm-filter}`, and the
  * cluster-gated `/api/v1/cluster/{nodes,broadcasts,config,federation}`.
  *
  * @example
@@ -268,6 +303,16 @@ export class LvqrAdminClient {
    */
   async clusterFederation(): Promise<FederationStatus> {
     return this.getJson<FederationStatus>('/api/v1/cluster/federation');
+  }
+
+  /**
+   * `GET /api/v1/wasm-filter` -- configured WASM filter chain shape +
+   * per-(broadcast, track) seen/kept/dropped counters. Returns
+   * `{ enabled: false, chain_length: 0, broadcasts: [] }` when
+   * `--wasm-filter` is unset; tooling can poll unconditionally.
+   */
+  async wasmFilter(): Promise<WasmFilterState> {
+    return this.getJson<WasmFilterState>('/api/v1/wasm-filter');
   }
 
   /**

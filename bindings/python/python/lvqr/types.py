@@ -20,6 +20,9 @@ can be unpacked via ``**kwargs`` into the constructors. The mapping:
   matching ``serde(rename_all = "lowercase")`` on the Rust enum).
 * :class:`FederationStatus` mirrors
   ``lvqr_admin::cluster_routes::FederationStatusView``.
+* :class:`WasmFilterBroadcastStats` mirrors
+  ``lvqr_admin::WasmFilterBroadcastStats``.
+* :class:`WasmFilterState` mirrors ``lvqr_admin::WasmFilterState``.
 """
 
 from __future__ import annotations
@@ -150,3 +153,37 @@ class FederationStatus:
     deliberately so tooling can poll unconditionally."""
 
     links: list[FederationLinkStatus] = field(default_factory=list)
+
+
+@dataclass
+class WasmFilterBroadcastStats:
+    """Per-``(broadcast, track)`` WASM filter counters surfaced by
+    ``/api/v1/wasm-filter``. Fields mirror the atomic counters that
+    the filter bridge increments on every fragment that flows
+    through the installed chain."""
+
+    broadcast: str
+    track: str
+    #: Total fragments observed through the chain (kept + dropped).
+    seen: int = 0
+    #: Fragments the chain returned ``Some`` for (survived every
+    #: slot).
+    kept: int = 0
+    #: Fragments a slot in the chain returned ``None`` for
+    #: (short-circuit drop).
+    dropped: int = 0
+
+
+@dataclass
+class WasmFilterState:
+    """Outer shape of ``/api/v1/wasm-filter``. When
+    ``--wasm-filter`` is unset the server returns
+    ``{enabled=False, chain_length=0, broadcasts=[]}`` (200 OK, not
+    404) so dashboards can pre-bake the shape and poll
+    unconditionally."""
+
+    enabled: bool = False
+    #: Number of filters composed into the installed chain.
+    #: Constant for the server's lifetime.
+    chain_length: int = 0
+    broadcasts: list[WasmFilterBroadcastStats] = field(default_factory=list)

@@ -15,6 +15,8 @@ from lvqr import (
     SloEntry,
     SloSnapshot,
     StreamInfo,
+    WasmFilterBroadcastStats,
+    WasmFilterState,
 )
 
 
@@ -39,6 +41,18 @@ class TestTypes:
     def test_slo_snapshot_defaults(self):
         snapshot = SloSnapshot()
         assert snapshot.broadcasts == []
+
+    def test_wasm_filter_state_defaults(self):
+        state = WasmFilterState()
+        assert state.enabled is False
+        assert state.chain_length == 0
+        assert state.broadcasts == []
+
+    def test_wasm_filter_broadcast_stats_defaults(self):
+        stats = WasmFilterBroadcastStats(broadcast="live/demo", track="0.mp4")
+        assert stats.seen == 0
+        assert stats.kept == 0
+        assert stats.dropped == 0
 
     def test_federation_status_defaults(self):
         status = FederationStatus()
@@ -322,4 +336,61 @@ class TestClient:
         assert status.links[1].state == "failed"
         assert status.links[1].last_error == "handshake refused"
         assert status.links[1].last_connected_at_ms is None
+        client.close()
+
+    @patch("httpx.Client.get")
+    def test_wasm_filter_disabled(self, mock_get):
+        # No --wasm-filter configured -- server returns the
+        # disabled shape (200 OK body), not a 404.
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"enabled": False, "chain_length": 0, "broadcasts": []},
+            raise_for_status=lambda: None,
+        )
+        client = LvqrClient("http://localhost:8080")
+        state = client.wasm_filter()
+        assert isinstance(state, WasmFilterState)
+        assert state.enabled is False
+        assert state.chain_length == 0
+        assert state.broadcasts == []
+        client.close()
+
+    @patch("httpx.Client.get")
+    def test_wasm_filter_populated(self, mock_get):
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "enabled": True,
+                "chain_length": 2,
+                "broadcasts": [
+                    {
+                        "broadcast": "live/cam1",
+                        "track": "0.mp4",
+                        "seen": 120,
+                        "kept": 100,
+                        "dropped": 20,
+                    },
+                    {
+                        "broadcast": "live/cam2",
+                        "track": "0.mp4",
+                        "seen": 75,
+                        "kept": 75,
+                        "dropped": 0,
+                    },
+                ],
+            },
+            raise_for_status=lambda: None,
+        )
+        client = LvqrClient("http://localhost:8080")
+        state = client.wasm_filter()
+        assert state.enabled is True
+        assert state.chain_length == 2
+        assert len(state.broadcasts) == 2
+        assert isinstance(state.broadcasts[0], WasmFilterBroadcastStats)
+        assert state.broadcasts[0].broadcast == "live/cam1"
+        assert state.broadcasts[0].seen == 120
+        assert state.broadcasts[0].kept == 100
+        assert state.broadcasts[0].dropped == 20
+        assert state.broadcasts[1].broadcast == "live/cam2"
+        assert state.broadcasts[1].dropped == 0
         client.close()

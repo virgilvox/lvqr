@@ -36,6 +36,8 @@ export {
   type FederationConnectState,
   type FederationLinkStatus,
   type FederationStatus,
+  type WasmFilterBroadcastStats,
+  type WasmFilterState,
 } from './admin';
 export { detectTransport, type TransportType } from './transport';
 export { MoqSubscriber } from './moq';

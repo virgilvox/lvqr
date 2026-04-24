@@ -16,6 +16,8 @@ from .types import (
     SloEntry,
     SloSnapshot,
     StreamInfo,
+    WasmFilterBroadcastStats,
+    WasmFilterState,
 )
 
 __all__ = [
@@ -32,4 +34,6 @@ __all__ = [
     "FederationConnectState",
     "FederationLinkStatus",
     "FederationStatus",
+    "WasmFilterBroadcastStats",
+    "WasmFilterState",
 ]

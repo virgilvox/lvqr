@@ -139,6 +139,27 @@ describe('LvqrAdminClient against a running lvqr', () => {
     }
   });
 
+  it('wasmFilter returns a WasmFilterState shape', async () => {
+    const state = await admin.wasmFilter();
+    expect(typeof state.enabled).toBe('boolean');
+    expect(typeof state.chain_length).toBe('number');
+    expect(Array.isArray(state.broadcasts)).toBe(true);
+    // The test harness boots without --wasm-filter, so the server
+    // returns the disabled shape (`{enabled:false, chain_length:0,
+    // broadcasts:[]}`). Shape-check any entries defensively so the
+    // test keeps passing if the harness gets a filter configured.
+    expect(state.enabled).toBe(false);
+    expect(state.chain_length).toBe(0);
+    expect(state.broadcasts.length).toBe(0);
+    for (const b of state.broadcasts) {
+      expect(typeof b.broadcast).toBe('string');
+      expect(typeof b.track).toBe('string');
+      expect(typeof b.seen).toBe('number');
+      expect(typeof b.kept).toBe('number');
+      expect(typeof b.dropped).toBe('number');
+    }
+  });
+
   it('fetchTimeoutMs aborts hung requests', async () => {
     // Point the client at an IP that accepts TCP but never responds.
     // `203.0.113.1` is TEST-NET-3 (RFC 5737) and should black-hole.

@@ -1,7 +1,7 @@
 """LVQR admin API client.
 
 Covers every route the admin router mounts today:
-``/healthz``, ``/api/v1/{stats,streams,mesh,slo}``, and the
+``/healthz``, ``/api/v1/{stats,streams,mesh,slo,wasm-filter}``, and the
 cluster-gated ``/api/v1/cluster/{nodes,broadcasts,config,federation}``.
 The surface mirrors the TypeScript ``@lvqr/core`` ``LvqrAdminClient``
 1:1 so operator tooling in either language lines up.
@@ -25,6 +25,8 @@ from .types import (
     SloEntry,
     SloSnapshot,
     StreamInfo,
+    WasmFilterBroadcastStats,
+    WasmFilterState,
 )
 
 
@@ -215,6 +217,29 @@ class LvqrClient:
             for l in data.get("links", [])
         ]
         return FederationStatus(links=links)
+
+    def wasm_filter(self) -> WasmFilterState:
+        """``GET /api/v1/wasm-filter`` -- configured WASM filter chain
+        shape + per-``(broadcast, track)`` counters. Returns
+        ``WasmFilterState(enabled=False, chain_length=0, broadcasts=[])``
+        when ``--wasm-filter`` is unset; tooling can poll
+        unconditionally without a 404 handler."""
+        data = self._get_json("/api/v1/wasm-filter")
+        broadcasts = [
+            WasmFilterBroadcastStats(
+                broadcast=b.get("broadcast", ""),
+                track=b.get("track", ""),
+                seen=b.get("seen", 0),
+                kept=b.get("kept", 0),
+                dropped=b.get("dropped", 0),
+            )
+            for b in data.get("broadcasts", [])
+        ]
+        return WasmFilterState(
+            enabled=bool(data.get("enabled", False)),
+            chain_length=int(data.get("chain_length", 0)),
+            broadcasts=broadcasts,
+        )
 
     # -----------------------------------------------------------------
     # Shared GET helper. Applies the bearer header (via httpx default
