@@ -230,6 +230,7 @@ curl http://localhost:8080/healthz             # liveness
 curl http://localhost:8080/api/v1/streams      # active broadcasts
 curl http://localhost:8080/api/v1/stats        # connection counts
 curl http://localhost:8080/api/v1/slo          # latency SLO snapshot
+curl http://localhost:8080/api/v1/wasm-filter  # WASM chain length + counters
 curl http://localhost:8080/metrics             # Prometheus scrape
 ```
 

@@ -1,8 +1,82 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D rows "webhook auth provider" (session 135) + "WASM filter chain composition" (session 136) both SHIPPED**. **1003** workspace tests on the default gate (991 -> 1003, +12 from session 136's chain slice). 29 crates. `lvqr-wasm` now exposes a `ChainFilter` type that composes an ordered `Vec<SharedFilter>` with short-circuit-on-drop semantics; `lvqr serve --wasm-filter <PATH>` accepts multiple values (repeat the flag or comma-separate) and installs the chain before any ingest listener accepts traffic. Each slot keeps its own `WasmFilterReloader` so hot-swapping one module does not disturb the others. True stream-modifying downstream propagation (subscribers see filter output) remains anti-scope; the chain runs in tap mode. Remaining Phase D scope (after session 136): mesh data-plane completion, one hardware encoder backend, authoritative DASH-IF container validator, npm + PyPI publish cycle.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D rows "webhook auth provider" (session 135) + "WASM filter chain composition" (session 136) SHIPPED**. **Session 137 (2026-04-24) added the `GET /api/v1/wasm-filter` admin route** completing the chain feature from an ops-observability perspective. **1008** workspace tests on the default gate (1003 -> 1008, +5 from session 137: 3 admin unit + 2 integration). 29 crates. Operators running a filter chain now get live HTTP introspection into `chain_length` + per-`(broadcast, track)` seen/kept/dropped counters without having to parse Prometheus counters. The `WasmFilterBridgeHandle` carries a new `chain_length()` accessor; `install_wasm_filter_bridge` grew a `chain_length: usize` parameter (single caller in `lvqr-cli::start()` passes `ChainFilter::len()`; in-crate tests pass 1). Remaining Phase D scope (after session 137): mesh data-plane completion, one hardware encoder backend, authoritative DASH-IF container validator, npm + PyPI publish cycle.
 
-**Last Updated**: 2026-04-24 (session 136 close). Session 135's commit pair (`dfa1cb0..b51fe2b`) is local-only, 2 ahead of `origin/main` at `c0d9198`, pending user push. Session 136 commits the WASM chain feat + close-doc on top, so local main is now 4 ahead of origin.
+**Last Updated**: 2026-04-24 (session 137 close). Local main is 7 ahead of `origin/main` at `c0d9198` (sessions 135+136+README-drift+137 pending user push).
+
+## Session 137 close (2026-04-24)
+
+**Shipped**: `GET /api/v1/wasm-filter` admin route. A follow-on to session 136's WASM chain-composition feature that closes the operator-visibility gap (operators running a chain can now observe its shape + per-broadcast counters via the standard admin surface). Default-gate workspace test count grows **1003 -> 1008** (+5: 3 lvqr-admin unit tests + 2 lvqr-cli integration tests).
+
+This session was a pivot off the Phase D named items (DASH-IF validator, hardware encoder backend, publish cycle) because none of those three options had a local-verification path given the current dev environment: Docker daemon is installed but off, so `dashif/conformance` container cannot be exercised locally; GStreamer CLI is absent, so a VideoToolbox encoder factory cannot be verified locally; npm + PyPI credentials are not available. Rather than ship unverified CI-only workflow YAML or a half-scaffolded encoder, this session completed the natural follow-up to session 136's chain work -- the admin route that makes the chain observable to operators in production.
+
+### Deliverables
+
+1. **`crates/lvqr-wasm/src/observer.rs`** gains a `chain_length: usize` field on `WasmFilterBridgeHandle` plus a `pub fn chain_length(&self) -> usize` accessor. `install_wasm_filter_bridge` grew a `chain_length` parameter; the single external caller in `lvqr-cli::start()` passes `ChainFilter::len()`, the 4 in-crate tests pass `1`. `Debug` impl grew to print `chain_length` alongside `tracked_broadcasts`.
+
+2. **`crates/lvqr-admin/src/routes.rs`** gains:
+   * Two new public `#[derive(Serialize, Deserialize)]` types: `WasmFilterState { enabled, chain_length, broadcasts }` and `WasmFilterBroadcastStats { broadcast, track, seen, kept, dropped }`.
+   * A new `get_wasm_filter: Arc<dyn Fn() -> WasmFilterState + Send + Sync>` field on `AdminState` with a default closure returning `{enabled: false, chain_length: 0, broadcasts: []}`.
+   * A new `with_wasm_filter(get: impl Fn() -> WasmFilterState + Send + Sync + 'static) -> Self` builder method, mirroring the existing `with_mesh` / `with_slo` callback pattern so `lvqr-admin` stays free of a `lvqr-wasm` dep.
+   * New `/api/v1/wasm-filter` route in `build_router` behind the existing admin-auth middleware.
+   * 3 new `#[tokio::test]` cases: default disabled shape, configured-snapshot shape, admin-auth rejection.
+
+3. **`crates/lvqr-admin/src/lib.rs`** re-exports the two new public types (`WasmFilterBroadcastStats`, `WasmFilterState`).
+
+4. **`crates/lvqr-cli/src/lib.rs::start()`** calls `.with_wasm_filter(move || ...)` on `AdminState` when `wasm_filter_handle` is `Some`. The closure clones the `WasmFilterBridgeHandle`, reads `chain_length()` + iterates `tracked()` + reads per-broadcast counters via the handle's existing `fragments_seen` / `fragments_kept` / `fragments_dropped` methods. When no filter was configured the admin default (disabled body) applies unchanged.
+
+5. **`crates/lvqr-cli/tests/wasm_filter_admin_route.rs`** (new, 2 `#[tokio::test]` cases):
+   * `admin_route_reports_chain_length_and_per_broadcast_counters` -- starts a `TestServer` with a two-filter chain (`frame-counter.wasm` + `redact-keyframes.wasm`), publishes RTMP keyframes, issues a real HTTP `GET /api/v1/wasm-filter` against the admin server, and asserts the JSON body contains `enabled: true`, `chain_length: 2`, and a `live/admin-chain` entry with `seen > 0 && kept == 0 && dropped == seen` (chain short-circuits on slot 2's drop).
+   * `admin_route_reports_disabled_when_no_filter_configured` -- boots a plain `TestServer` with no filter and asserts `{enabled: false, chain_length: 0, broadcasts: []}`.
+
+6. **Docs**:
+   * `README.md` "Observe" quickstart gains a `curl` line for `/api/v1/wasm-filter`.
+   * `docs/observability.md` grows a new "WASM filter chain" section paralleling the existing "Latency SLO" section: operator-facing body shape, disabled-body contract, field semantics, three troubleshooting hints (`chain_length` mismatch, zero `seen`, surprising `dropped`).
+
+### Key 137 design decisions baked in
+
+* **Callback closure on `AdminState`, not a direct dep.** `lvqr-admin` stays free of `lvqr-wasm`; the `with_wasm_filter(Fn() -> WasmFilterState)` pattern matches the existing `with_mesh` / `with_slo` shape so CLI composition root is the single place that peeks at the bridge handle.
+
+* **Chain length baked into the bridge handle, not recomputed.** `install_wasm_filter_bridge` takes `chain_length: usize` at install time and stores it on the handle. Alternative would be to re-expose the inner `SharedFilter` and downcast to `ChainFilter`, but that ties the bridge to the chain type and breaks the "bridge sees any FragmentFilter" abstraction. Storing the static length as a scalar on the handle is clean, cheap, and correct: chain length is set once at `start()` and never changes for the server lifetime (there is no runtime "add a filter" API, and there cannot be without a mesh of lifetime invariants).
+
+* **Default admin shape is 200-OK-with-disabled, not 404.** Mirrors the existing SLO route pattern. Dashboards (Grafana, custom ops tools) can pre-bake the response shape and render a "WASM filter not configured" hint client-side without a 404 / 200 fork. Also: returning 200 even when disabled means the route's auth behavior (reject on bad token) is unambiguous.
+
+* **Counters read per-request, not snapshotted.** The closure re-iterates `tracked()` + re-reads counters on every admin GET. Cheap (atomic loads over a bounded DashMap) and always fresh. An alternative "cached snapshot" pattern would reduce cost for heavy polling but introduce staleness that's visible to operators debugging a misbehaving filter -- exactly the wrong tradeoff.
+
+* **Handle is `Clone`, closure clones it once.** The `WasmFilterBridgeHandle` is `Clone` (session-B design). The admin closure takes a cloned handle via `move || { ... bridge.tracked() ... }` so the AdminState remains `Clone` without extra lifetime plumbing.
+
+* **`chain_length: usize` is a signature change, not a soft-compat helper.** Adding a second `install_wasm_filter_bridge_with_len` function was rejected because the caller set is tiny (one external, four tests) and soft-compat layers accumulate indefinitely. Single signature, updated all call sites in one session.
+
+* **No metric for `chain_length`.** Prometheus labels are expensive; a single scalar `chain_length` is fine as a REST body field. Exposing it as a metric would be a steady-state gauge with one time series per server -- dashboard-worthy but not yet a named SLO.
+
+* **Integration test uses the existing two WASM fixtures.** `frame-counter.wasm` + `redact-keyframes.wasm` already ship under `crates/lvqr-wasm/examples/`; reusing them avoids a fresh `build_fixtures` step. The chain outcome (`noop -> drop`) is the same as session 136's `wasm_filter_chain.rs`; this session's test proves the admin route mirrors the same outcome over HTTP.
+
+* **Phase-D pivot explicit in the header.** DASH-IF + hardware encoder + publish cycle all have local-verification gaps the dev box cannot close autonomously. Shipping the WASM admin route keeps session cadence high with full local verification while those three wait for the bits they need (Docker daemon, GStreamer CLI, registry credentials).
+
+### Ground truth (session 137 close)
+
+* **Head (pre-push)**: `feat(wasm+admin)` + `docs` close-doc commit (pending). `origin/main` at `c0d9198` unchanged; local main is 7 ahead (135 pair + 136 pair + README-drift single + 137 pair pending).
+* **Tests**:
+  * Default workspace gate: **1008** passed / 0 failed / 3 ignored (1003 -> 1008; +3 lvqr-admin unit + 2 integration).
+  * `lvqr-wasm --lib`: 23 passed / 0 failed / 0 ignored (unchanged; `chain_length` parameter added to install_wasm_filter_bridge + 4 test call sites updated).
+  * `lvqr-admin --lib`: 28 passed / 0 failed / 0 ignored (25 pre-existing + 3 new: default disabled, configured snapshot, admin-auth rejection).
+  * `lvqr-cli --test wasm_filter_admin_route`: 2 passed / 0 failed / 0 ignored.
+* **CI gates locally clean**:
+  * `cargo fmt --all -- --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `cargo test --workspace` 1008 / 0 / 3.
+* **Workspace**: **29 crates**, unchanged.
+
+### Known limitations / documented v1 shape (after 137 close)
+
+* **Per-slot counters not exposed.** The bridge tap observes the chain's COMPOSITE decision; there is no way today to ask "is slot 2 doing the dropping?". Adding per-slot instrumentation would widen `FilterStats` + require each slot to have its own counter group, which is a non-trivial refactor deferred to a follow-up session.
+* **No metric for `chain_length`.** Operators who want chain length in Grafana would need a dedicated exporter reading the admin route.
+* **No SDK method for the admin route.** `@lvqr/core` + `lvqr` Python admin clients both gained 9/9 route parity in sessions 122/123. The new 10th route is not yet on the clients; this is a follow-up row bundled with the npm + PyPI publish cycle.
+* **Phase D named rows unchanged.** DASH-IF container validator, hardware encoder backend, npm + PyPI publish cycle, mesh data-plane completion -- all still open; each waits on external bits the dev environment cannot currently supply.
+* All other session 136 + earlier known limitations unchanged.
+
+
+
 
 ## Session 136 close (2026-04-24)
 

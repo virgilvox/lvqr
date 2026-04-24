@@ -295,6 +295,48 @@ panels the same percentiles plus the raw sample rate.
 Full runbook, per-transport threshold table, and troubleshooting
 checklist: [`docs/slo.md`](slo.md).
 
+## WASM filter chain (PLAN Phase D session 137)
+
+`lvqr_wasm_fragments_total{outcome=keep|drop}` is a Prometheus
+counter fired by the filter bridge on every fragment that flows
+through the configured `--wasm-filter` chain. In parallel, the
+bridge maintains per-`(broadcast, track)` atomic counters that
+the admin API surfaces:
+
+```bash
+curl -H "Authorization: Bearer $LVQR_ADMIN_TOKEN" \
+  http://localhost:8080/api/v1/wasm-filter
+```
+
+Returns:
+
+```json
+{
+  "enabled": true,
+  "chain_length": 2,
+  "broadcasts": [
+    { "broadcast": "live/cam1", "track": "0.mp4",
+      "seen": 1240, "kept": 1238, "dropped": 2 }
+  ]
+}
+```
+
+`chain_length` is the number of filters composed via repeated
+`--wasm-filter` (or comma-separated `LVQR_WASM_FILTER`). The
+`broadcasts` array gives every `(broadcast, track)` pair the
+filter tap has seen since startup; counters are atomic but may
+drift by one or two between reads for the same key. When
+`--wasm-filter` is unset the route replies 200 OK with
+`{ enabled: false, chain_length: 0, broadcasts: [] }` so
+dashboards pre-baking the shape do not need a 404 handler.
+
+Use this route to verify a deployed filter chain is (a) the
+length you configured and (b) actually observing traffic. If
+`chain_length` is wrong, the CLI flag did not parse the way you
+expected. If `seen == 0` for every entry, the broadcast never
+reached the bridge. If `dropped > 0` surprises you, one of the
+chained filters is denying.
+
 ## Load-bearing invariant (LBD #4)
 
 Lifecycle events (publisher up / down, viewer join / leave)
