@@ -342,10 +342,11 @@ gaps explicitly named in Known v0.4.0 limitations.
    NVENC on Linux). The three others stay deferred to v1.2.
 7. **Stream-modifying WASM filter chains** (multi-filter
    composition). v1 single-filter drop + rewrite ships today.
-8. **Webhook auth provider**, **stream-key CRUD admin API**,
-   **hot config reload**, **dedicated DVR scrub web UI**,
-   **SCTE-35 passthrough** -- smaller or more-speculative items;
-   pick based on operator demand.
+8. **Stream-key CRUD admin API**, **hot config reload**,
+   **dedicated DVR scrub web UI**, **SCTE-35 passthrough** --
+   smaller or more-speculative items; pick based on operator
+   demand. (The **webhook auth provider** also listed here v1
+   shipped in session 135; see `docs/auth.md#webhook-auth-provider`.)
 
 The list below groups the same remaining work by logical area.
 
@@ -470,7 +471,18 @@ test.
   `POST /api/v1/slo/client-sample` endpoint.
 
 ### Auth + ops polish
-- [ ] **Webhook auth provider.**
+- [x] ~~**Webhook auth provider.**~~ Shipped in session 135.
+  `--webhook-auth-url <URL>` on `lvqr serve` enables a new
+  `WebhookAuthProvider` (feature-gated on `webhook`; included in
+  `--features full`) that delegates every `AuthContext` decision
+  (publish / subscribe / admin) to an operator-owned HTTP endpoint.
+  `POST` with a JSON body (`{"op":"publish", "app", "key",
+  "broadcast"?}` / `{"op":"subscribe", "token"?, "broadcast"}` /
+  `{"op":"admin", "token"}`); reply `{"allow": bool, "reason": str?}`.
+  Per-decision TTL cache with separate allow/deny TTLs absorbs repeat
+  traffic and keeps a flapping webhook from being hit per request.
+  Mutually exclusive with `--jwks-url` and `--jwt-secret`. See
+  `docs/auth.md#webhook-auth-provider`.
 - [x] ~~**OAuth2 / JWKS dynamic key discovery.**~~ Shipped in
   session 126. `--jwks-url <URL>` on `lvqr serve` enables a new
   `JwksAuthProvider` (feature-gated on `jwks`; included in

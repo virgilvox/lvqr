@@ -22,6 +22,7 @@ Three built-in providers are available:
 | `StaticAuthProvider` | Short single-tenant deployments. Env-configured publish / subscribe / admin tokens. |
 | `JwtAuthProvider` (feature `jwt`) | Multi-tenant or time-bound access. HS256 tokens with a shared secret. |
 | `JwksAuthProvider` (feature `jwks`) | Multi-tenant or SSO deployments with an existing identity provider. Dynamic asymmetric JWTs (RS256 / ES256 / EdDSA) validated against public keys fetched from a JWKS endpoint. |
+| `WebhookAuthProvider` (feature `webhook`) | Operators who already own an auth service and want LVQR to delegate every decision over HTTP. `POST` to a configured URL; JSON `{allow, reason}` reply. Per-decision TTL cache absorbs repeat requests. |
 
 Custom providers implement the `AuthProvider` trait; the `check`
 method receives an `AuthContext` and returns `AuthDecision::Allow` or
@@ -448,8 +449,105 @@ different.
   aborted when the provider is dropped. `lvqr serve` holds the
   provider for the full server lifetime.
 
+## Webhook auth provider
+
+Delegates every `AuthContext` decision to an operator-owned HTTP endpoint.
+Useful when auth already lives in a company-internal service (database
+lookups, policy engine, per-broadcast ACL) and JWT / JWKS are the wrong
+fit. Requires the `webhook` Cargo feature (included in `--features full`).
+
+### Enabling
+
+```bash
+lvqr serve \
+  --webhook-auth-url https://auth.example.com/lvqr-check \
+  --webhook-auth-cache-ttl-seconds 60 \
+  --webhook-auth-deny-cache-ttl-seconds 10 \
+  --webhook-auth-fetch-timeout-seconds 5
+```
+
+Equivalent environment variables: `LVQR_WEBHOOK_AUTH_URL`,
+`LVQR_WEBHOOK_AUTH_CACHE_TTL_SECONDS`,
+`LVQR_WEBHOOK_AUTH_DENY_CACHE_TTL_SECONDS`,
+`LVQR_WEBHOOK_AUTH_FETCH_TIMEOUT_SECONDS`.
+
+Mutually exclusive with `--jwks-url` and `--jwt-secret`: each picks a
+distinct signing / decision strategy, and a silent fall-through between
+them would hide a misconfiguration.
+
+### Request shape
+
+Each decision is a `POST` with `Content-Type: application/json`. The body
+is tagged on the `op` field; absent fields are `null` (or omitted for
+`broadcast` when unset):
+
+```json
+{"op":"publish","app":"live","key":"<bearer>","broadcast":"live/cam1"}
+{"op":"subscribe","token":"<bearer>","broadcast":"live/cam1"}
+{"op":"admin","token":"<bearer>"}
+```
+
+* `app` on `publish` is a short ingest-surface label (`live` for RTMP,
+  `whip`, `srt`, `rtsp`, `ws`).
+* `key` on `publish` is the verbatim bearer credential (RTMP stream key
+  or `Authorization: Bearer` token from WHIP / SRT / RTSP / WS ingest).
+* `broadcast` on `publish` is `None` for RTMP (the stream key doubles as
+  the broadcast name) and `Some("<app>/<name>")` for every other ingest
+  surface.
+
+### Response shape
+
+The webhook must reply `2xx` with a JSON body:
+
+```json
+{"allow": true}
+{"allow": false, "reason": "token revoked"}
+```
+
+`reason` is optional. Non-2xx responses and malformed bodies are cached
+as deny decisions with the error text surfaced in the LVQR deny reason,
+so a broken webhook does not silently allow access.
+
+### Caching semantics
+
+`AuthProvider::check` is synchronous; LVQR cannot block an axum handler
+on a network call, so the provider caches decisions and returns
+synchronously from the cache:
+
+* **Cache hit + fresh**: returns the cached decision.
+* **Cache miss or expired**: returns `Deny("webhook cache miss;
+  decision pending")` and kicks a background task that POSTs the
+  context to the webhook and populates the cache. Subsequent requests
+  for the same context succeed once the webhook call completes. This
+  mirrors `JwksAuthProvider`'s unknown-`kid` behaviour.
+
+Two separate TTLs govern eviction:
+
+* `--webhook-auth-cache-ttl-seconds` (default 60 s) governs allow
+  decisions. Operators balancing staleness-against-latency tune this.
+* `--webhook-auth-deny-cache-ttl-seconds` (default 10 s) governs deny
+  decisions, including `webhook call failed` denies from 5xx / timeout
+  responses. Kept shorter than the allow TTL so transient webhook
+  outages recover quickly without turning off the cache altogether
+  (which would let a flapping webhook hammer the operator's infra).
+
+Concurrent `check` calls for the same context coalesce: only one
+`POST` per unique cache key lands per batch, even if N callers are
+waiting on the decision.
+
+### Anti-scope
+
+* No retry on webhook failure. A failed POST caches a deny for
+  `deny_cache_ttl`; the next attempt after that re-hits the webhook.
+* No parallel POSTs within a batch. A slow webhook serializes all
+  pending decisions; scale the webhook endpoint independently.
+* No connection probe at `lvqr serve` startup. URL shape is validated,
+  but the first webhook call happens on the first cache miss. An
+  unreachable endpoint surfaces as denies with error reasons; there is
+  no equivalent of the JWKS "fail-fast on startup" check because the
+  webhook might legitimately reject a `GET` / `HEAD` probe.
+
 ## Anti-scope
 
 * No revocation list. Token validity depends on `exp`.
 * No per-protocol claim differences. The claim surface is flat.
-* No webhook auth provider yet (tracked as a v1.1 follow-up).

@@ -1,8 +1,105 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 / 121-B / 122-A / 122-B / 122-C / 122-D / 122-E / 122-F + SDK-docs-reconnect all SHIPPED**. **Shared-helpers refactor is COMPLETE**. **991** workspace tests on the default gate (unchanged across sessions 131-134; all four were pure code-dedup refactors). 29 crates. `lvqr_test_utils::{http, flv, rtmp}` modules centralize every primitive (HTTP GET, FLV tag builders, RTMP handshake, and RTMP event-loop helpers `send_results` / `send_result` / `read_until`) that integration tests historically reimplemented per file. `one_token_all_protocols.rs` keeps a local Result-returning handshake variant with a documented single-caller contract. Remaining phase-C work: authoritative DASH-IF container validator + webhook auth provider + npm + PyPI publish cycle carrying the 9/9 admin + JWKS + sign_live_url public APIs.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D row "webhook auth provider" SHIPPED in session 135**. **991** workspace tests on the default gate (unchanged; the 15 new webhook tests live behind the `webhook` Cargo feature which is off by default). 29 crates. `lvqr-auth` now exposes four providers: `NoopAuthProvider`, `StaticAuthProvider`, `JwtAuthProvider` (feature `jwt`), `JwksAuthProvider` (feature `jwks`), and `WebhookAuthProvider` (feature `webhook`, new). `--webhook-auth-url` on `lvqr serve` delegates every `AuthContext` decision to an operator-owned HTTP endpoint; per-decision TTL cache absorbs repeat traffic. Remaining Phase D scope (after session 135): mesh data-plane completion, one hardware encoder backend, WASM filter chains v1.1, authoritative DASH-IF container validator, npm + PyPI publish cycle.
 
-**Last Updated**: 2026-04-23 (session 134 close + post-close audit). Session 134's commit pair (`refactor(tests): factor read_until + send helpers into lvqr-test-utils::rtmp` + `docs: session 134 close`) lands on `origin/main` in the chain `19817f0..de849cc`. A post-close audit on the same date corrected three drift items: PLAN row 122-D/E/F had malformed table cells (missing closing `|` bars), rows 111-A / 118 / 119 lacked explicit SHIPPED markers, and the Phase D session-range table (122-125 / 126-129 / 130-132 / 133+) was authored on the assumption that Phase C closed at session 121 -- it did not, so Phase D now starts at session 135 with the original scope items reordered around what's left. README also dropped its stale "session-121 block" anchor for the audit, flipped the "SDK reconnect + retry semantics are undocumented" Known Limitation to Fixed (session 125 shipped the docs), and added the session-133/134 `lvqr-test-utils::rtmp` module to the contributor section alongside `http` + `flv`.
+**Last Updated**: 2026-04-23 (session 135 close). Session 134's commit pair (`19817f0..de849cc`) is unchanged on `origin/main`. Session 135 commits the webhook-auth feat + close-doc on top.
+
+## Session 135 close (2026-04-23)
+
+**Shipped**: Phase D row "Webhook auth provider" -- the first Phase D row to land after Phase C closed in session 134. New `WebhookAuthProvider` in `lvqr-auth` behind a new `webhook` Cargo feature; CLI wiring in `lvqr-cli` via four new `--webhook-auth-*` flags; operator docs in `docs/auth.md`. Default-gate workspace count unchanged at **991 / 0 / 3** (new tests are feature-gated on `webhook`, off by default). `lvqr-auth --features webhook` gate gains **15** new tests (25 -> 40 passing).
+
+### Deliverables
+
+1. **`crates/lvqr-auth/src/webhook_provider.rs`** (~330 LOC + ~280 LOC of tests) -- new module registered as `#[cfg(feature = "webhook")] mod webhook_provider` in `lvqr-auth/src/lib.rs` with `WebhookAuthConfig` + `WebhookAuthProvider` re-exported. Public surface mirrors `JwksAuthProvider`'s shape: async `new(cfg) -> Result<Self, AuthError>`, sync `check(ctx) -> AuthDecision` via the shared `AuthProvider` trait, `config()` + `cached_decision_count()` introspection accessors, `Drop` aborts the background task.
+
+2. **Caching model.** `check()` is sync (the trait contract). A `RwLock<HashMap<CacheKey, CacheEntry>>` stores decisions with per-entry `expires_at`. Cache hit + fresh returns the cached decision; miss-or-expired enqueues the `AuthContext` into a `pending: StdMutex<HashMap<CacheKey, AuthContext>>` and calls `tokio::sync::Notify::notify_one()`. Concurrent checks for the same key coalesce inside `pending` (HashMap insert is a no-op on key collision) so only one POST per unique context per batch hits the webhook.
+
+3. **Background fetcher task.** Spawned from `new()`; loops on `kick.notified().await`; drains `pending` under a brief `StdMutex` hold; POSTs each context serially via `reqwest::Client` (shared `fetch_timeout`); writes each decision back under `cache.write()` with `allow_cache_ttl` (default 60 s) or `deny_cache_ttl` (default 10 s). On cache overflow (capacity default 4096) evicts the entry with the earliest `expires_at` -- not strict LRU but O(n) over a bounded `n` and sufficient for an auth-decision cache where TTL dominates.
+
+4. **Request body JSON shape.** `#[derive(Serialize)] enum WebhookRequestBody` with `#[serde(tag = "op", rename_all = "lowercase")]` produces `{"op":"publish","app","key","broadcast"?}`, `{"op":"subscribe","token"?,"broadcast"}`, `{"op":"admin","token"}`. `broadcast` + `token` skip-if-none so absent fields omit instead of serializing `null`. Borrowed `&str` so no per-POST allocation beyond serde_json's output buffer.
+
+5. **Response body JSON shape.** `#[derive(Deserialize)] struct WebhookResponse { allow: bool, #[serde(default)] reason: Option<String> }` on a 2xx. 5xx / timeout / malformed body all map to `AuthDecision::Deny { reason: "webhook call failed: <error>" }` and cache for `deny_cache_ttl` so a broken webhook drains the pending queue quickly instead of looping.
+
+6. **Config validation** at `new()` time: empty URL, non-http(s) scheme, `allow_cache_ttl < 1s`, zero `deny_cache_ttl`, zero `fetch_timeout` all fail fast as `AuthError::InvalidConfig`. No startup probe to the webhook itself (the endpoint may legitimately reject `GET` / `HEAD` requests); runtime unreachability surfaces as `Deny` reasons on the first few decisions.
+
+7. **CLI wiring in `crates/lvqr-cli/src/main.rs`.** Four new flags on `lvqr serve`, all feature-gated on `webhook`:
+   * `--webhook-auth-url <URL>` / `LVQR_WEBHOOK_AUTH_URL`
+   * `--webhook-auth-cache-ttl-seconds <u64>` (default 60) / `LVQR_WEBHOOK_AUTH_CACHE_TTL_SECONDS`
+   * `--webhook-auth-deny-cache-ttl-seconds <u64>` (default 10) / `LVQR_WEBHOOK_AUTH_DENY_CACHE_TTL_SECONDS`
+   * `--webhook-auth-fetch-timeout-seconds <u64>` (default 5) / `LVQR_WEBHOOK_AUTH_FETCH_TIMEOUT_SECONDS`
+
+   Precedence cascade (docs at the call site): `--jwks-url` > `--webhook-auth-url` > `--jwt-secret` > static-token provider > `NoopAuthProvider`. Mutually exclusive pairs: webhook vs jwks, webhook vs jwt-secret, jwks vs jwt-secret (latter pre-existing). Startup rejects combinations with a clear error message rather than silently picking one strategy.
+
+8. **`check_jwks_flag_combination` renamed to `check_auth_flag_combinations`.** Now handles all three pairwise mutex checks; gated on `any(feature = "jwks", feature = "webhook")` with a stub variant for builds with neither feature. `serve_from_args` calls a new `build_auth(&args) -> Result<SharedAuth>` helper that linearizes the cascade under one `#[cfg]` block per feature instead of the previous nested `if-else-cfg`. Net: fewer cfg seams in the caller.
+
+9. **Test coverage.** 10 wiremock-backed `#[tokio::test]` functions + 5 pure-data config-validation `#[test]` functions + 2 serialization / discriminator unit tests in `webhook_provider::tests`:
+   * Config: empty URL, non-http scheme, short allow TTL, zero deny TTL, zero timeout, sensible defaults.
+   * Data: `CacheKey::from_ctx` discriminates the three variants, request body has the `"op":"publish"` tag + omits absent `broadcast`.
+   * Integration: happy allow roundtrip, deny with surfaced reason, cache hit does not re-POST (`expect(1)` wiremock guard), distinct contexts produce distinct cache entries, 5xx denies with error reason + caches, malformed body denies with parse-error reason, concurrent 20 checks for same context coalesce into 1 cache entry, oldest-first eviction when capacity overflows.
+
+   **5 CLI tests** in `main.rs::webhook_cli_tests`: unset flags pass combination check, URL flag parses, webhook+jwt-secret mutex, webhook+jwks mutex (gated on `feature = "jwks"`), TTL + timeout overrides apply.
+
+10. **`docs/auth.md`** grows a new **"Webhook auth provider"** section (~90 lines) documenting enabling, request + response body shapes, caching semantics with the allow-vs-deny TTL rationale, and explicit anti-scope (no retry, serial POSTs, no startup probe). Providers table gains the new row. Anti-scope bullet "No webhook auth provider yet" dropped.
+
+11. **`README.md`** flips `[ ] Webhook auth provider` to `[x] ~~Webhook auth provider~~ Shipped in session 135...`; "Next up" item 8 updated to drop webhook from the `[ ]` list.
+
+12. **`tracking/PLAN_V1.1.md`** Phase D scope row marked SHIPPED + new "Phase D shipped rows" subtable with the full deliverable list per row.
+
+### Key 135 design decisions baked in
+
+* **Sync `check()` + background fetcher matches `JwksAuthProvider`'s pattern.** Trait contract is sync; LVQR calls `check()` from axum handlers, MoQ accept loops, RTMP callbacks. Blocking any of those on a network call would deadlock the runtime. The `Deny("cache miss; decision pending")` first-request response is the same UX JWKS presents for an unknown `kid`; documented explicitly in the module header.
+
+* **Two separate TTLs (`allow_cache_ttl` + `deny_cache_ttl`).** A single TTL would force a tradeoff between caching allow decisions long (better throughput) and caching deny decisions short (broken webhook recovers quickly). Splitting lets operators set `allow=60s` + `deny=10s` so a failing webhook drains the pending queue in 10 s and a working webhook serves cached allows for 60 s.
+
+* **`deny_cache_ttl > 0` is enforced at config time.** A zero deny TTL would cache nothing on failure; every request would re-queue + re-POST + re-fail, hammering the broken webhook. The 1-second minimum (documented) rules this out.
+
+* **Serial POSTs within a batch, not `JoinSet` or `join_all`.** A slow webhook backpressures decisions but does not fan out concurrent HTTP connections that could overwhelm the operator's endpoint on a cold-cache flood (e.g., server restart with 500 active subscribers). Explicit anti-scope in `docs/auth.md`; operators scale the webhook endpoint independently.
+
+* **Oldest-`expires_at` eviction, not strict LRU.** Strict LRU requires tracking access time + doubly-linked list. For an auth-decision cache where TTL dominates, "evict the entry that would expire next" is both cheaper (O(n) over bounded n, no list maintenance) and semantically closer to "forget the stalest decision first". Documented in the `cache_capacity` field comment.
+
+* **No startup connectivity probe.** Unlike JWKS (which can always respond to a `GET` / `HEAD` with its key set), the webhook endpoint has no canonical probe shape. A `GET` might 404 even on a working webhook that only accepts POST. A synthetic `op:"healthcheck"` POST would force a contract on the webhook that is surprising to operators who already run their own endpoint. Cheap path: validate URL shape at `new()`, surface runtime unreachability via Deny reasons on early requests. Explicit anti-scope in `docs/auth.md`.
+
+* **Credentials in the POST body.** Raw tokens / stream keys flow to the operator's webhook because the entire point is operator-owned decision logic. Logged URL only, not body; documented. Operators run the webhook on infrastructure they trust.
+
+* **Deduplication via `pending: HashMap<CacheKey, AuthContext>`.** 20 concurrent `check()` calls for the same token land 20 `pending.entry(key).or_insert_with(clone)` calls that collapse to 1 entry; the fetcher POSTs once. Single-test proof in `concurrent_checks_for_same_context_coalesce_into_one_post`. Avoids a thundering-herd-style fanout on cold-cache flood.
+
+* **Precedence: JWKS > webhook > jwt-secret.** Arbitrary but documented. JWKS-before-webhook reflects "if you already have JWKS, that's the lower-latency path (no network call per token); the webhook is for operators who cannot deploy an IdP". Precedence only matters for programming-error combinations (caught by the mutex checks anyway); real deployments set one flag.
+
+* **`check_auth_flag_combinations` (renamed).** Old name `check_jwks_flag_combination` was singular; now handles three pairwise mutexes. The `#[cfg(any(feature = "jwks", feature = "webhook"))]` union gates the function body, with a fallthrough `#[cfg(not(any(...)))]` stub so default-feature builds still compile.
+
+* **`lvqr_test_utils` stays untouched.** Webhook tests use `wiremock` directly (already in `lvqr-auth` dev-deps for JWKS tests). No new shared-helper surface needed.
+
+### Ground truth (session 135 close)
+
+* **Head (pre-push)**: `feat(auth)` + this close-doc commit (pending). `origin/main` at `c0d9198` unchanged from session 134's post-close audit.
+* **Tests**:
+  * Default workspace gate: **991** passed / 0 failed / 3 ignored (unchanged; new tests feature-gated on `webhook`).
+  * `lvqr-auth --features webhook`: 40 passed / 0 failed / 0 ignored (25 pre-existing + 15 new from this session).
+  * `lvqr-cli --features webhook --bin lvqr`: 12 passed / 0 failed / 0 ignored (8 c2pa + 4 webhook; the 5th webhook test `webhook_plus_jwks_is_mutex_error` requires `webhook,jwks` both enabled).
+  * `lvqr-cli --features webhook,jwks --bin lvqr`: 18 passed / 0 failed / 0 ignored.
+* **CI gates locally clean**:
+  * `cargo fmt --all -- --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `cargo clippy -p lvqr-auth --features webhook --all-targets -- -D warnings` clean.
+  * `cargo clippy -p lvqr-cli --features webhook --all-targets -- -D warnings` clean.
+  * `cargo test --workspace` 991 / 0 / 3.
+* **Workspace**: **29 crates**, unchanged.
+
+### Known limitations / documented v1 shape (after 135 close)
+
+* **First-request-per-context denies.** Cache miss returns `Deny("cache miss; decision pending")`; the background task POSTs the webhook and caches the decision; the next request for the same context succeeds. Same UX JWKS presents for unknown `kid`. Documented in the module header + `docs/auth.md#webhook-auth-provider`.
+* **Serial POSTs within a batch.** A slow webhook backpressures all pending decisions. Anti-scope in `docs/auth.md`; operators scale the webhook endpoint.
+* **No startup connectivity probe.** URL shape validated; runtime unreachability surfaces as deny reasons on early requests.
+* **No retry on webhook failure.** A failed POST caches a deny for `deny_cache_ttl`; the next attempt re-hits the webhook.
+* **Authoritative DASH-IF container validator** still deferred.
+* **npm + PyPI publish cycle** still pending (needs credentials).
+* **Mesh data-plane completion** still Phase D.
+* **Hardware encoder backend** still Phase D (needs deployment-target pick).
+* **WASM filter chains v1.1** still Phase D.
+* All other session 134 + earlier known limitations unchanged.
+
+
+
 
 ## Session 134 close (2026-04-23)
 
