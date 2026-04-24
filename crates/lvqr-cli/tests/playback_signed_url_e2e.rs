@@ -40,15 +40,12 @@ use hmac::{Hmac, Mac};
 use lvqr_auth::{SharedAuth, StaticAuthConfig, StaticAuthProvider};
 use lvqr_cli::sign_playback_url;
 use lvqr_test_utils::flv::{flv_video_nalu, flv_video_seq_header};
-use lvqr_test_utils::rtmp::rtmp_client_handshake;
+use lvqr_test_utils::rtmp::{read_until, rtmp_client_handshake, send_result, send_results};
 use lvqr_test_utils::{TestServer, TestServerConfig};
-use rml_rtmp::sessions::{
-    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
-};
+use rml_rtmp::sessions::{ClientSession, ClientSessionConfig, ClientSessionEvent, PublishRequestType};
 use rml_rtmp::time::RtmpTimestamp;
 use sha2::Sha256;
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -71,47 +68,6 @@ async fn http_get_with_bearer(addr: SocketAddr, path: &str, bearer: Option<&str>
     http_get_with(addr, path, opts).await
 }
 
-async fn send_results(stream: &mut TcpStream, results: &[ClientSessionResult]) {
-    for r in results {
-        if let ClientSessionResult::OutboundResponse(packet) = r {
-            stream.write_all(&packet.bytes).await.unwrap();
-        }
-    }
-}
-
-async fn send_result(stream: &mut TcpStream, r: &ClientSessionResult) {
-    if let ClientSessionResult::OutboundResponse(packet) = r {
-        stream.write_all(&packet.bytes).await.unwrap();
-    }
-}
-
-async fn read_until<F>(stream: &mut TcpStream, session: &mut ClientSession, predicate: F)
-where
-    F: Fn(&ClientSessionEvent) -> bool,
-{
-    let mut buf = vec![0u8; 65536];
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    loop {
-        let remaining = deadline - tokio::time::Instant::now();
-        let n = tokio::time::timeout(remaining, stream.read(&mut buf))
-            .await
-            .expect("timeout")
-            .expect("read err");
-        let results = session.handle_input(&buf[..n]).unwrap();
-        for r in results {
-            match r {
-                ClientSessionResult::OutboundResponse(packet) => {
-                    stream.write_all(&packet.bytes).await.unwrap();
-                }
-                ClientSessionResult::RaisedEvent(ref e) if predicate(e) => {
-                    return;
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
 async fn publish_two_keyframes(addr: SocketAddr, app: &str, key: &str) -> (TcpStream, ClientSession) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream.set_nodelay(true).unwrap();
@@ -126,7 +82,7 @@ async fn publish_two_keyframes(addr: SocketAddr, app: &str, key: &str) -> (TcpSt
 
     let connect = session.request_connection(app.into()).unwrap();
     send_result(&mut stream, &connect).await;
-    read_until(&mut stream, &mut session, |e| {
+    read_until(&mut stream, &mut session, TIMEOUT, |e| {
         matches!(e, ClientSessionEvent::ConnectionRequestAccepted)
     })
     .await;
@@ -135,7 +91,7 @@ async fn publish_two_keyframes(addr: SocketAddr, app: &str, key: &str) -> (TcpSt
         .request_publishing(key.into(), PublishRequestType::Live)
         .unwrap();
     send_result(&mut stream, &publish).await;
-    read_until(&mut stream, &mut session, |e| {
+    read_until(&mut stream, &mut session, TIMEOUT, |e| {
         matches!(e, ClientSessionEvent::PublishRequestAccepted)
     })
     .await;

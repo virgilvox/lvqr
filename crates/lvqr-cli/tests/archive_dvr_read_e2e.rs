@@ -37,16 +37,13 @@
 //! real on-disk writes, real tokio::net TCP for every HTTP call.
 
 use lvqr_test_utils::flv::{flv_video_nalu, flv_video_seq_header};
-use lvqr_test_utils::rtmp::rtmp_client_handshake;
+use lvqr_test_utils::rtmp::{read_until, rtmp_client_handshake, send_result, send_results};
 use lvqr_test_utils::{TestServer, TestServerConfig};
-use rml_rtmp::sessions::{
-    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
-};
+use rml_rtmp::sessions::{ClientSession, ClientSessionConfig, ClientSessionEvent, PublishRequestType};
 use rml_rtmp::time::RtmpTimestamp;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -74,49 +71,6 @@ async fn http_get_with_range(addr: SocketAddr, path: &str, range: Option<&str>) 
 // RTMP client helpers (mirror rtmp_archive_e2e.rs).
 // =====================================================================
 
-async fn send_results(stream: &mut TcpStream, results: &[ClientSessionResult]) {
-    for result in results {
-        if let ClientSessionResult::OutboundResponse(packet) = result {
-            stream.write_all(&packet.bytes).await.unwrap();
-        }
-    }
-}
-
-async fn send_result(stream: &mut TcpStream, result: &ClientSessionResult) {
-    if let ClientSessionResult::OutboundResponse(packet) = result {
-        stream.write_all(&packet.bytes).await.unwrap();
-    }
-}
-
-async fn read_until<F>(stream: &mut TcpStream, session: &mut ClientSession, predicate: F)
-where
-    F: Fn(&ClientSessionEvent) -> bool,
-{
-    let mut buf = vec![0u8; 65536];
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        let remaining = deadline - Instant::now();
-        let n = match tokio::time::timeout(remaining, stream.read(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => n,
-            Ok(Ok(_)) => panic!("server closed connection unexpectedly"),
-            Ok(Err(e)) => panic!("read error: {e}"),
-            Err(_) => panic!("timed out waiting for expected RTMP event"),
-        };
-        let results = session.handle_input(&buf[..n]).unwrap();
-        for result in results {
-            match result {
-                ClientSessionResult::OutboundResponse(packet) => {
-                    stream.write_all(&packet.bytes).await.unwrap();
-                }
-                ClientSessionResult::RaisedEvent(ref event) if predicate(event) => {
-                    return;
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
 async fn connect_and_publish(addr: SocketAddr, app: &str, stream_key: &str) -> (TcpStream, ClientSession) {
     let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
         .await
@@ -136,7 +90,7 @@ async fn connect_and_publish(addr: SocketAddr, app: &str, stream_key: &str) -> (
 
     let connect_result = session.request_connection(app.to_string()).unwrap();
     send_result(&mut stream, &connect_result).await;
-    read_until(&mut stream, &mut session, |e| {
+    read_until(&mut stream, &mut session, TIMEOUT, |e| {
         matches!(e, ClientSessionEvent::ConnectionRequestAccepted)
     })
     .await;
@@ -145,7 +99,7 @@ async fn connect_and_publish(addr: SocketAddr, app: &str, stream_key: &str) -> (
         .request_publishing(stream_key.to_string(), PublishRequestType::Live)
         .unwrap();
     send_result(&mut stream, &publish_result).await;
-    read_until(&mut stream, &mut session, |e| {
+    read_until(&mut stream, &mut session, TIMEOUT, |e| {
         matches!(e, ClientSessionEvent::PublishRequestAccepted)
     })
     .await;

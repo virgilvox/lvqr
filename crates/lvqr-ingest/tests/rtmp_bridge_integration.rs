@@ -3,159 +3,18 @@
 //! Sends real RTMP handshake and publish data over TCP, then verifies
 //! the bridge creates a MoQ broadcast with CMAF-formatted tracks.
 
-use bytes::Bytes;
 use lvqr_moq::Track;
-use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use rml_rtmp::sessions::{
-    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
+use lvqr_test_utils::find_available_port;
+use lvqr_test_utils::flv::{
+    flv_audio_aac_lc_seq_header_44k_stereo, flv_audio_raw, flv_video_nalu, flv_video_seq_header,
 };
+use lvqr_test_utils::rtmp::{read_until, rtmp_client_handshake, send_result, send_results};
+use rml_rtmp::sessions::{ClientSession, ClientSessionConfig, ClientSessionEvent, PublishRequestType};
 use rml_rtmp::time::RtmpTimestamp;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-
-fn find_available_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("failed to bind ephemeral port")
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-// -- Helpers for constructing valid FLV tag data --
-
-/// Build an FLV AVC sequence header (video codec config).
-fn flv_video_seq_header() -> Bytes {
-    let sps = [0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9];
-    let pps = [0x68, 0xEE, 0x3C, 0x80];
-    let mut tag = vec![
-        0x17, // keyframe + AVC
-        0x00, // AVC sequence header
-        0x00, 0x00, 0x00, // CTS = 0
-        // AVCDecoderConfigurationRecord
-        0x01, // configurationVersion
-        0x64, // profile (High)
-        0x00, // compat
-        0x1F, // level (3.1)
-        0xFF, // lengthSizeMinusOne=3 | reserved
-        0xE1, // numSPS=1 | reserved
-    ];
-    tag.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&sps);
-    tag.push(0x01); // numPPS=1
-    tag.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    tag.extend_from_slice(&pps);
-    Bytes::from(tag)
-}
-
-/// Build an FLV AVC NALU (keyframe or delta).
-fn flv_video_nalu(keyframe: bool, cts: i32, nalu_data: &[u8]) -> Bytes {
-    let frame_type = if keyframe { 0x17 } else { 0x27 };
-    let mut tag = vec![
-        frame_type,
-        0x01, // AVC NALU
-        (cts >> 16) as u8,
-        (cts >> 8) as u8,
-        cts as u8,
-    ];
-    tag.extend_from_slice(nalu_data);
-    Bytes::from(tag)
-}
-
-/// Build an FLV AAC sequence header (audio codec config).
-fn flv_audio_seq_header() -> Bytes {
-    // AAC-LC (obj=2), 44100 Hz (freq_idx=4), stereo (ch=2)
-    let b0: u8 = (2 << 3) | (4 >> 1);
-    let b1: u8 = (4 << 7) | (2 << 3);
-    Bytes::from(vec![0xAF, 0x00, b0, b1])
-}
-
-/// Build an FLV AAC raw data frame.
-fn flv_audio_raw(aac_data: &[u8]) -> Bytes {
-    let mut tag = vec![0xAF, 0x01];
-    tag.extend_from_slice(aac_data);
-    Bytes::from(tag)
-}
-
-// -- RTMP client helpers --
-
-async fn rtmp_client_handshake(stream: &mut TcpStream) -> Vec<u8> {
-    let mut handshake = Handshake::new(PeerType::Client);
-    let p0_and_p1 = handshake
-        .generate_outbound_p0_and_p1()
-        .expect("client handshake generate failed");
-    stream.write_all(&p0_and_p1).await.unwrap();
-
-    let mut buf = vec![0u8; 8192];
-    loop {
-        let n = stream.read(&mut buf).await.unwrap();
-        assert!(n > 0, "server closed during handshake");
-
-        match handshake.process_bytes(&buf[..n]).expect("client handshake error") {
-            HandshakeProcessResult::InProgress { response_bytes } => {
-                if !response_bytes.is_empty() {
-                    stream.write_all(&response_bytes).await.unwrap();
-                }
-            }
-            HandshakeProcessResult::Completed {
-                response_bytes,
-                remaining_bytes,
-            } => {
-                if !response_bytes.is_empty() {
-                    stream.write_all(&response_bytes).await.unwrap();
-                }
-                return remaining_bytes;
-            }
-        }
-    }
-}
-
-async fn send_results(stream: &mut TcpStream, results: &[ClientSessionResult]) {
-    for result in results {
-        if let ClientSessionResult::OutboundResponse(packet) = result {
-            stream.write_all(&packet.bytes).await.unwrap();
-        }
-    }
-}
-
-async fn send_result(stream: &mut TcpStream, result: &ClientSessionResult) {
-    if let ClientSessionResult::OutboundResponse(packet) = result {
-        stream.write_all(&packet.bytes).await.unwrap();
-    }
-}
-
-async fn read_until<F>(stream: &mut TcpStream, session: &mut ClientSession, predicate: F)
-where
-    F: Fn(&ClientSessionEvent) -> bool,
-{
-    let mut buf = vec![0u8; 65536];
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-
-    loop {
-        let remaining = deadline - tokio::time::Instant::now();
-        let n = match tokio::time::timeout(remaining, stream.read(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => n,
-            Ok(Ok(_)) => panic!("server closed connection unexpectedly"),
-            Ok(Err(e)) => panic!("read error: {e}"),
-            Err(_) => panic!("timed out waiting for expected RTMP event"),
-        };
-
-        let results = session.handle_input(&buf[..n]).expect("client session input error");
-        for result in results {
-            match result {
-                ClientSessionResult::OutboundResponse(packet) => {
-                    stream.write_all(&packet.bytes).await.unwrap();
-                }
-                ClientSessionResult::RaisedEvent(ref event) if predicate(event) => {
-                    return;
-                }
-                _ => {}
-            }
-        }
-    }
-}
 
 async fn connect_and_publish(port: u16, app: &str, stream_key: &str) -> (TcpStream, ClientSession) {
     let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(format!("127.0.0.1:{port}")))
@@ -184,7 +43,7 @@ async fn connect_and_publish(port: u16, app: &str, stream_key: &str) -> (TcpStre
         .expect("request_connection failed");
     send_result(&mut stream, &connect_result).await;
 
-    read_until(&mut stream, &mut session, |e| {
+    read_until(&mut stream, &mut session, TIMEOUT, |e| {
         matches!(e, ClientSessionEvent::ConnectionRequestAccepted)
     })
     .await;
@@ -194,7 +53,7 @@ async fn connect_and_publish(port: u16, app: &str, stream_key: &str) -> (TcpStre
         .expect("request_publishing failed");
     send_result(&mut stream, &publish_result).await;
 
-    read_until(&mut stream, &mut session, |e| {
+    read_until(&mut stream, &mut session, TIMEOUT, |e| {
         matches!(e, ClientSessionEvent::PublishRequestAccepted)
     })
     .await;
@@ -359,7 +218,7 @@ async fn rtmp_audio_produces_cmaf() {
     let (mut stream, mut session) = connect_and_publish(port, "live", "audio-test").await;
 
     // 1. Send audio sequence header
-    let seq_header = flv_audio_seq_header();
+    let seq_header = flv_audio_aac_lc_seq_header_44k_stereo();
     let result = session
         .publish_audio_data(seq_header, RtmpTimestamp::new(0), false)
         .expect("publish_audio_data failed");

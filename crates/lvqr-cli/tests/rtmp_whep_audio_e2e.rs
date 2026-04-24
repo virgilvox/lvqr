@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use lvqr_test_utils::flv::{flv_audio_aac_lc_seq_header, flv_audio_raw, flv_video_nalu, flv_video_seq_header};
 use lvqr_test_utils::http::HttpResponse;
-use lvqr_test_utils::rtmp::rtmp_client_handshake;
+use lvqr_test_utils::rtmp::{read_until, rtmp_client_handshake, send_result, send_results};
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use lvqr_transcode::AacToOpusEncoderFactory;
 use lvqr_transcode::test_support::generate_aac_access_units;
@@ -59,51 +59,6 @@ fn flv_audio_seq_header_48k_stereo() -> bytes::Bytes {
 // RTMP publish helpers (copied from rtmp_dash_e2e.rs verbatim)
 // =====================================================================
 
-async fn send_results(stream: &mut TcpStream, results: &[ClientSessionResult]) {
-    for result in results {
-        if let ClientSessionResult::OutboundResponse(packet) = result {
-            stream.write_all(&packet.bytes).await.unwrap();
-        }
-    }
-}
-
-async fn send_result(stream: &mut TcpStream, result: &ClientSessionResult) {
-    if let ClientSessionResult::OutboundResponse(packet) = result {
-        stream.write_all(&packet.bytes).await.unwrap();
-    }
-}
-
-async fn read_until<F>(stream: &mut TcpStream, session: &mut ClientSession, predicate: F)
-where
-    F: Fn(&ClientSessionEvent) -> bool,
-{
-    let mut buf = vec![0u8; 65536];
-    let deadline = tokio::time::Instant::now() + RTMP_TIMEOUT;
-    loop {
-        let remaining = deadline - tokio::time::Instant::now();
-        let n = match tokio::time::timeout(remaining, stream.read(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => n,
-            Ok(Ok(_)) => panic!("server closed connection unexpectedly"),
-            Ok(Err(e)) => panic!("read error: {e}"),
-            Err(_) => panic!("timed out waiting for expected RTMP event"),
-        };
-        let results = session.handle_input(&buf[..n]).unwrap();
-        for result in results {
-            match result {
-                ClientSessionResult::OutboundResponse(packet) => {
-                    stream.write_all(&packet.bytes).await.unwrap();
-                }
-                ClientSessionResult::RaisedEvent(ref event) => {
-                    if predicate(event) {
-                        return;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
 async fn connect_and_publish(addr: SocketAddr, app: &str, stream_key: &str) -> (TcpStream, ClientSession) {
     let mut stream = tokio::time::timeout(RTMP_TIMEOUT, TcpStream::connect(addr))
         .await
@@ -123,7 +78,7 @@ async fn connect_and_publish(addr: SocketAddr, app: &str, stream_key: &str) -> (
 
     let connect_result = session.request_connection(app.to_string()).unwrap();
     send_result(&mut stream, &connect_result).await;
-    read_until(&mut stream, &mut session, |e| {
+    read_until(&mut stream, &mut session, RTMP_TIMEOUT, |e| {
         matches!(e, ClientSessionEvent::ConnectionRequestAccepted)
     })
     .await;
@@ -132,7 +87,7 @@ async fn connect_and_publish(addr: SocketAddr, app: &str, stream_key: &str) -> (
         .request_publishing(stream_key.to_string(), PublishRequestType::Live)
         .unwrap();
     send_result(&mut stream, &publish_result).await;
-    read_until(&mut stream, &mut session, |e| {
+    read_until(&mut stream, &mut session, RTMP_TIMEOUT, |e| {
         matches!(e, ClientSessionEvent::PublishRequestAccepted)
     })
     .await;
