@@ -161,10 +161,18 @@ class WasmFilterBroadcastStats:
     dropped: int = 0        # a slot returned None (short-circuit)
 
 @dataclass
+class WasmFilterSlotStats:
+    index: int = 0          # 0-based position in the chain
+    seen: int = 0           # fragments THIS slot observed
+    kept: int = 0           # fragments this slot returned Some for
+    dropped: int = 0        # fragments this slot returned None for
+
+@dataclass
 class WasmFilterState:
     enabled: bool = False   # mirrors whether --wasm-filter was configured
     chain_length: int = 0   # constant for the server's lifetime
     broadcasts: list[WasmFilterBroadcastStats] = field(default_factory=list)
+    slots: list[WasmFilterSlotStats] = field(default_factory=list)
 ```
 
 ## Timeouts + retries
@@ -263,7 +271,7 @@ The package on PyPI at `0.3.1` ships three methods
 (`healthz`, `stats`, `list_streams`). `main` adds seven more
 (`mesh`, `slo`, `cluster_nodes`, `cluster_broadcasts`,
 `cluster_config`, `cluster_federation`, `wasm_filter`) + a
-`bearer_token` kwarg + 13 new dataclasses. All additive; no
+`bearer_token` kwarg + 14 new dataclasses. All additive; no
 breaking changes. When pinning to a specific release, test
 for method existence if your code runs against both
 versions:

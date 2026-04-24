@@ -317,6 +317,10 @@ Returns:
   "broadcasts": [
     { "broadcast": "live/cam1", "track": "0.mp4",
       "seen": 1240, "kept": 1238, "dropped": 2 }
+  ],
+  "slots": [
+    { "index": 0, "seen": 1240, "kept": 1240, "dropped": 0 },
+    { "index": 1, "seen": 1240, "kept": 1238, "dropped": 2 }
   ]
 }
 ```
@@ -334,8 +338,14 @@ Use this route to verify a deployed filter chain is (a) the
 length you configured and (b) actually observing traffic. If
 `chain_length` is wrong, the CLI flag did not parse the way you
 expected. If `seen == 0` for every entry, the broadcast never
-reached the bridge. If `dropped > 0` surprises you, one of the
-chained filters is denying.
+reached the bridge. If `dropped > 0` surprises you, the `slots`
+array tells you which filter in the chain is denying: `slots[i]`
+reports what the filter at position `i` observed. Short-circuit
+semantics mean later slots in a chain have smaller `seen` counts
+when an earlier slot drops -- `slots[0].kept == slots[1].seen` is
+the invariant for a two-slot chain. PLAN Phase D session 140 added
+the `slots` field; pre-140 servers omit it and the SDKs default
+`slots` to an empty list on deserialization.
 
 ## Load-bearing invariant (LBD #4)
 

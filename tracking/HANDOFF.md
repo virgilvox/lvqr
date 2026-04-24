@@ -1,8 +1,111 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D rows "webhook auth provider" (session 135) + "WASM filter chain composition" (session 136) SHIPPED**. **Session 137 added `GET /api/v1/wasm-filter` admin route**; **session 138 extended the JS + Python SDK admin clients with the new method**; **session 139 wired `--wasm-filter` into `sdk-tests.yml`** so the live Vitest assertion exercises the chain-configured admin shape end-to-end (`enabled: true, chain_length: 1`), closing the session-138 "no live chain test" known limitation. Default-gate Rust workspace unchanged at **1008/0/3** (session 139 touched only the CI workflow + one Vitest assertion; no source code changes). Python pytest at 25; Vitest at 11 (all passing against a chain-configured local lvqr instance, smoke-verified this session). 29 crates. Admin surface at **10 routes** on both published language targets. Remaining Phase D scope: mesh data-plane completion, one hardware encoder backend, authoritative DASH-IF container validator, npm + PyPI publish cycle (now carries sessions 135 + 136 + 137 + 138 + 139 worth of updates).
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D thread on the WASM chain feature is now 6 sessions deep** -- rows "webhook auth provider" (135) + "WASM filter chain composition" (136) + admin route (137) + SDK bindings (138) + sdk-tests.yml wiring (139) + per-slot counters (140) all SHIPPED. **Session 140 (2026-04-24) added per-slot counters** -- `SlotCounters` + `InstrumentedFilter` inside `lvqr-wasm`, a new `slots: Vec<WasmFilterSlotStats>` field on the admin route's body, and matching JS + Python SDK types + client parsing. Operators debugging a drop-heavy chain can now pinpoint exactly which slot is denying via `GET /api/v1/wasm-filter`. Default-gate Rust workspace **1008 -> 1013** (+5: 5 new ChainFilter slot-counter unit tests in `lvqr-wasm`; the admin schema extension landed without new test count because the existing configured-snapshot test grew assertions instead of creating new ones). Python pytest **25 -> 27** (+2: new slot-stats defaults + new pre-session-140 defensive-parse test). Vitest unchanged at 11 but the existing live chain test grew per-slot assertions. 29 crates. Admin surface at **10 routes** on both published language targets. Remaining Phase D scope: mesh data-plane completion, one hardware encoder backend, authoritative DASH-IF container validator, npm + PyPI publish cycle.
 
-**Last Updated**: 2026-04-24 (session 139 close). Sessions 135-137 are pushed (`origin/main` at `1a1667e`); sessions 138-139 local pending push.
+**Last Updated**: 2026-04-24 (session 140 close). Sessions 135-137 are pushed (`origin/main` at `1a1667e`); sessions 138-140 local pending push.
+
+## Session 140 close (2026-04-24)
+
+**Shipped**: Per-slot WASM filter counters. Closes the session-137 explicit known limitation: "Per-slot counters not exposed. The bridge tap observes the chain's COMPOSITE decision; there is no way today to ask 'is slot 2 doing the dropping?'". New `SlotCounters` struct in `lvqr-wasm`, internal `InstrumentedFilter` wrapper, `ChainFilter::slot_counters()` accessor. New `WasmFilterSlotStats` type added to `lvqr-admin` and plumbed through the `/api/v1/wasm-filter` route's body as a new `slots: Vec<WasmFilterSlotStats>` field. Matching JS + Python SDK types + client-side parsing. Integration test gains per-slot assertions that verify the short-circuit invariant `slots[i+1].seen <= slots[i].kept`. Smoke-verified locally: `curl /api/v1/wasm-filter` against a chain-configured lvqr returns `{"enabled":true,"chain_length":1,"broadcasts":[],"slots":[{"index":0,"seen":0,"kept":0,"dropped":0}]}`.
+
+### Deliverables
+
+1. **`crates/lvqr-wasm/src/lib.rs`**:
+   * New `pub struct SlotCounters { fragments_seen, fragments_kept, fragments_dropped: AtomicU64 }` with `.seen()` / `.kept()` / `.dropped()` snapshot accessors.
+   * New internal `struct InstrumentedFilter { inner: SharedFilter, counters: Arc<SlotCounters> }` that wraps each slot and increments counters on `FragmentFilter::apply`.
+   * `ChainFilter` now holds `Vec<InstrumentedFilter>` instead of `Vec<SharedFilter>`. `ChainFilter::new(Vec<SharedFilter>)` wraps each input in an `InstrumentedFilter` at construction.
+   * New `ChainFilter::slot_counters() -> Vec<Arc<SlotCounters>>` accessor clones the per-slot Arc handles so the admin closure can snapshot counters from outside the filter apply path.
+   * `ChainFilter::filters()` accessor removed (was only used by one test, replaced with `slot_counters().len()`).
+   * 5 new unit tests: counters start at zero / counters increment on apply / short-circuit prevents later slots from seeing dropped fragments / counter handles share state with live chain / empty chain has no slot counters.
+
+2. **`crates/lvqr-admin/src/routes.rs`**:
+   * New `pub struct WasmFilterSlotStats { index, seen, kept, dropped }` with `Serialize + Deserialize`.
+   * `WasmFilterState` grows a `slots: Vec<WasmFilterSlotStats>` field with `#[serde(default)]` so pre-session-140 clients deserializing a new-server body (or new clients parsing a pre-session-140 server body) both work without a schema-version bump.
+   * Default (disabled) closure now also returns an empty `slots` vec.
+   * Configured-snapshot unit test grew to assert the new slots field contents + the short-circuit invariant.
+   * Disabled-route unit test gained a `st.slots.is_empty()` assertion.
+
+3. **`crates/lvqr-admin/src/lib.rs`** re-exports the new `WasmFilterSlotStats` alongside the existing admin types.
+
+4. **`crates/lvqr-cli/src/lib.rs::start()`**:
+   * Extracts `chain.slot_counters()` BEFORE wrapping the `ChainFilter` in the bridge's outer `SharedFilter` (the wrap type-erases the chain structure, so the counter handles need to be cloned while the concrete chain is still in scope).
+   * The destructuring binding grew from `(Option<bridge>, Vec<reloaders>)` to `(Option<bridge>, Vec<reloaders>, Vec<Arc<SlotCounters>>)`; the empty-wasm-filter branch yields `Vec::new()` for the counters as well.
+   * The admin `with_wasm_filter(move || ...)` closure now captures both `bridge` and `slot_counters`; it builds the `slots` array via `slot_counters.iter().enumerate().map(...)`.
+
+5. **`crates/lvqr-cli/tests/wasm_filter_admin_route.rs`**:
+   * `admin_route_reports_chain_length_and_per_broadcast_counters` test gains ~30 lines of slot-array assertions: slots length mirrors `chain_length`; slot 0 (frame-counter.wasm) keeps every fragment it sees; slot 1 (redact-keyframes.wasm) drops every fragment it sees; the invariant `slots[1].seen == slots[0].kept` holds (proving short-circuit semantics flow through to the admin body).
+   * `admin_route_reports_disabled_when_no_filter_configured` gains a `body["slots"].as_array().unwrap().len() == 0` assertion.
+
+6. **`bindings/js/packages/core/src/admin.ts`**:
+   * New `WasmFilterSlotStats` interface.
+   * `WasmFilterState` grows a required `slots: WasmFilterSlotStats[]` field (TypeScript structural typing means pre-session-140 server bodies that omit the field would trip; the Python client is the asymmetric-compatibility path via its defensive `.get("slots", [])` unmarshaler).
+
+7. **`bindings/js/packages/core/src/index.ts`** re-exports the new interface.
+
+8. **`bindings/js/tests/sdk/admin-client.spec.ts`** live-server Vitest test grew 5 assertions on the `state.slots` array (length, index, and zeroed counters with no publisher).
+
+9. **`bindings/python/python/lvqr/types.py`**:
+   * New `@dataclass WasmFilterSlotStats` with index + seen/kept/dropped fields (all defaulted to 0).
+   * `WasmFilterState` grows a `slots: list[WasmFilterSlotStats] = field(default_factory=list)` field.
+
+10. **`bindings/python/python/lvqr/client.py::wasm_filter()`** now parses the `slots` array with a defensive `.get("slots", [])` fallback so a pre-session-140 server (which omits the field) still produces a valid `WasmFilterState(slots=[])`.
+
+11. **`bindings/python/python/lvqr/__init__.py`** re-exports the new `WasmFilterSlotStats` dataclass.
+
+12. **`bindings/python/tests/test_client.py`**:
+    * New `test_wasm_filter_slot_stats_defaults` asserts the default construction.
+    * `test_wasm_filter_disabled` body expanded to include `slots: []`.
+    * `test_wasm_filter_populated` body expanded with a 2-slot JSON payload that matches the configured-snapshot assertion set.
+    * New `test_wasm_filter_pre_session_140_server_omits_slots` proves the defensive `.get("slots", [])` fallback works against a pre-session-140 server (body omits the key entirely).
+
+13. **Docs**:
+    * `docs/observability.md` WASM filter chain section grows a new slots field in the example JSON body + an expanded "use this route to..." paragraph naming `slots` as the per-filter debugging surface and calling out the short-circuit invariant.
+    * `docs/sdk/javascript.md` type reference grows the new `WasmFilterSlotStats` TypeScript interface + extends `WasmFilterState` with the `slots` field.
+    * `docs/sdk/python.md` type reference grows the new `@dataclass WasmFilterSlotStats` + extends the `WasmFilterState` dataclass definition. Migration section updated: 13 -> 14 dataclasses.
+
+### Key 140 design decisions baked in
+
+* **Instrumentation lives inside `lvqr-wasm`, not the bridge.** The bridge installer (`install_wasm_filter_bridge`) still takes a single opaque `SharedFilter` and knows nothing about chain structure. The per-slot counters are the responsibility of the `ChainFilter` type itself; operator code reads them via the chain's own accessor, not via the bridge handle. This preserves the bridge's "accepts any FragmentFilter" abstraction and keeps unit tests of chain semantics in `lvqr-wasm` where they belong.
+
+* **`InstrumentedFilter` is crate-internal.** External callers constructing chains still pass `Vec<SharedFilter>`; `ChainFilter::new` does the wrapping automatically. Exposing `InstrumentedFilter` as a public type would invite external callers to build partially-instrumented chains, which adds complexity without use cases.
+
+* **`Arc<SlotCounters>` exposed by clone, not borrow.** `slot_counters()` returns an owned `Vec<Arc<SlotCounters>>`. Callers snapshot the Arc handles and hold them alongside the live chain; a snapshot read always reflects current state because Arc shares the same atomic fields as the live instrumentation. Tests assert this invariant explicitly (`slot_counter_handles_are_shared_with_live_chain`).
+
+* **`#[serde(default)]` on the new `slots` field** means: (a) a pre-session-140 server body deserializes into a new client without throwing -- `slots` defaults to `Vec::new()` when absent; (b) the field is always emitted by a new server so new clients that assume it exists work fine. The asymmetric direction -- a pre-session-140 client that does not know about `slots` -- also works because TypeScript's structural typing is lenient on extra fields and Python's `.get("slots", [])` tolerates anything.
+
+* **Short-circuit invariant `slots[i+1].seen <= slots[i].kept` asserted in the integration test.** This is the load-bearing correctness property of the chain semantics; a regression that broke short-circuit (e.g., always calling every slot) would produce `slots[1].seen == slots[0].seen` instead. Catching that here is cheap.
+
+* **`index` explicit in `WasmFilterSlotStats`, not implicit from array position.** The JSON body emits slots in insertion order so `index` is redundant for a strict reader, but including it makes the shape robust against clients that reorder arrays (some tooling sorts JSON objects) and makes individual slot entries self-describing when logged or quoted out of context. No significant size overhead (one extra u64 per slot).
+
+* **Did not add per-`(broadcast, track)` slot counters.** Full per-slot-per-broadcast counters would require plumbing the broadcast+track pair through `FragmentFilter::apply` (breaking trait change) or redesigning the bridge to know about chain structure (API coupling). The global per-slot counters cover the operator's main question ("which filter is denying?") cheaply; per-broadcast slot breakdown is a v1.2 follow-up if operator feedback asks for it.
+
+* **Live smoke test verified the full wiring.** Started lvqr with `--wasm-filter crates/lvqr-wasm/examples/frame-counter.wasm` locally; curl against `/api/v1/wasm-filter` returned `{"enabled":true,"chain_length":1,"broadcasts":[],"slots":[{"index":0,"seen":0,"kept":0,"dropped":0}]}` as expected.
+
+### Ground truth (session 140 close)
+
+* **Head (pre-push)**: `feat(wasm+admin+sdk)` + docs close (pending). Sessions 135-137 pushed (origin `1a1667e`); sessions 138-140 local: `d661138` + `77689a0` + `7823c4b` + `595af99` + session-140 pair (pending). Local main is 6 ahead of origin after this session.
+* **Tests**:
+  * Rust workspace default gate: **1013** passed / 0 failed / 3 ignored (1008 -> 1013; +5 lvqr-wasm slot-counter unit tests).
+  * `lvqr-wasm --lib`: 28 passed / 0 failed / 0 ignored (23 pre + 5 new).
+  * `lvqr-admin --lib`: 28 passed / 0 failed / 0 ignored (unchanged; existing configured-snapshot test grew assertions in place).
+  * `lvqr-cli --test wasm_filter_admin_route`: 2 passed / 0 failed / 0 ignored (assertions expanded).
+  * `bindings/python pytest`: **27** passed / 0 failed (25 pre + 2 new: slot-stats defaults + pre-session-140 defensive parse).
+  * `@lvqr/core` tsc: clean. Vitest case count unchanged at 11; existing `wasmFilter` test grew 5 slot assertions.
+* **CI gates locally clean**:
+  * `cargo fmt --all -- --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `tsc` clean on both `@lvqr/core` + `@lvqr/player` packages.
+* **Workspace**: **29 crates**, unchanged.
+
+### Known limitations / documented v1 shape (after 140 close)
+
+* **Per-`(broadcast, track)` slot counters not exposed.** The `slots` array aggregates across ALL broadcasts. Per-broadcast slot breakdown is anti-scope for v1.1; a follow-up session could plumb context through `FragmentFilter::apply` if operator feedback asks for it.
+* **No metric for per-slot counters.** Prometheus exposure would be a `lvqr_wasm_chain_slot_total{slot_index="0", outcome="keep|drop"}` counter; deferred.
+* **JS `WasmFilterState.slots` is a required field.** A pre-session-140 server body that omits the key would produce a missing field at runtime. Python client's `.get("slots", [])` fallback is the asymmetric-compat story; TypeScript callers polling older servers would need a defensive check. Pragmatic: TypeScript consumers on `main` see a `main` server, not an older one, so this only matters for mixed deployments.
+* **All other session 139 + earlier known limitations unchanged.**
+
+
+
 
 ## Session 139 close (2026-04-24)
 

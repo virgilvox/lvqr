@@ -197,10 +197,18 @@ interface WasmFilterBroadcastStats {
   dropped: number;        // a slot returned None (short-circuit)
 }
 
+interface WasmFilterSlotStats {
+  index: number;          // 0-based position in the chain
+  seen: number;           // fragments THIS slot observed
+  kept: number;           // fragments this slot returned Some for
+  dropped: number;        // fragments this slot returned None for
+}
+
 interface WasmFilterState {
   enabled: boolean;       // mirrors whether --wasm-filter was configured
   chain_length: number;   // constant for the server's lifetime
   broadcasts: WasmFilterBroadcastStats[];
+  slots: WasmFilterSlotStats[];  // per-slot counters, added in session 140
 }
 ```
 
