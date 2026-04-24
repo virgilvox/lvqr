@@ -58,7 +58,11 @@ lvqr-agent = { workspace = true, optional = true }
 # accessor returns an `&lvqr_transcode::TranscodeRunnerHandle`, and the
 # `with_transcode_ladder` builder names `RenditionSpec` directly.
 lvqr-transcode = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["rt", "macros", "net"] }
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util"] }
+# Session 133 (PLAN row 122-E): shared RTMP handshake helper in
+# `lvqr_test_utils::rtmp`. rml_rtmp's `Handshake` state machine is
+# the same one the 12 RTMP-class integration tests reimplemented.
+rml_rtmp = { workspace = true }
 tokio-util = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }

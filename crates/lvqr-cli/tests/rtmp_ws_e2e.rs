@@ -24,7 +24,7 @@ use axum::routing::get;
 use futures::StreamExt;
 use lvqr_moq::Track;
 use lvqr_test_utils::flv::{flv_video_nalu, flv_video_seq_header};
-use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
+use lvqr_test_utils::rtmp::rtmp_client_handshake;
 use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
 };
@@ -48,34 +48,6 @@ fn find_available_port() -> u16 {
 // =====================================================================
 // RTMP client handshake + publish (copied from lvqr-ingest integration)
 // =====================================================================
-
-async fn rtmp_client_handshake(stream: &mut TcpStream) -> Vec<u8> {
-    let mut handshake = Handshake::new(PeerType::Client);
-    let p0_and_p1 = handshake.generate_outbound_p0_and_p1().unwrap();
-    stream.write_all(&p0_and_p1).await.unwrap();
-
-    let mut buf = vec![0u8; 8192];
-    loop {
-        let n = stream.read(&mut buf).await.unwrap();
-        assert!(n > 0, "server closed during handshake");
-        match handshake.process_bytes(&buf[..n]).unwrap() {
-            HandshakeProcessResult::InProgress { response_bytes } => {
-                if !response_bytes.is_empty() {
-                    stream.write_all(&response_bytes).await.unwrap();
-                }
-            }
-            HandshakeProcessResult::Completed {
-                response_bytes,
-                remaining_bytes,
-            } => {
-                if !response_bytes.is_empty() {
-                    stream.write_all(&response_bytes).await.unwrap();
-                }
-                return remaining_bytes;
-            }
-        }
-    }
-}
 
 async fn send_results(stream: &mut TcpStream, results: &[ClientSessionResult]) {
     for result in results {
@@ -111,10 +83,8 @@ where
                 ClientSessionResult::OutboundResponse(packet) => {
                     stream.write_all(&packet.bytes).await.unwrap();
                 }
-                ClientSessionResult::RaisedEvent(ref event) => {
-                    if predicate(event) {
-                        return;
-                    }
+                ClientSessionResult::RaisedEvent(ref event) if predicate(event) => {
+                    return;
                 }
                 _ => {}
             }

@@ -39,9 +39,9 @@ use lvqr_test_utils::flv::{
     flv_audio_aac_lc_seq_header_44k_stereo, flv_audio_raw, flv_video_nalu, flv_video_seq_header,
 };
 use lvqr_test_utils::http::{HttpGetOptions, HttpResponse, http_get_with};
+use lvqr_test_utils::rtmp::rtmp_client_handshake;
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use lvqr_transcode::{RenditionSpec, SoftwareTranscoderFactory};
-use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
 };
@@ -76,33 +76,6 @@ fn skip_reason() -> Option<String> {
 // RTMP client helpers (same shape as rtmp_hls_e2e.rs). FLV tag
 // builders + http_get now live in `lvqr_test_utils::{flv, http}`.
 // =====================================================================
-
-async fn rtmp_handshake(stream: &mut TcpStream) -> Vec<u8> {
-    let mut handshake = Handshake::new(PeerType::Client);
-    let p0_p1 = handshake.generate_outbound_p0_and_p1().unwrap();
-    stream.write_all(&p0_p1).await.unwrap();
-    let mut buf = vec![0u8; 8192];
-    loop {
-        let n = stream.read(&mut buf).await.unwrap();
-        assert!(n > 0, "server closed during handshake");
-        match handshake.process_bytes(&buf[..n]).unwrap() {
-            HandshakeProcessResult::InProgress { response_bytes } => {
-                if !response_bytes.is_empty() {
-                    stream.write_all(&response_bytes).await.unwrap();
-                }
-            }
-            HandshakeProcessResult::Completed {
-                response_bytes,
-                remaining_bytes,
-            } => {
-                if !response_bytes.is_empty() {
-                    stream.write_all(&response_bytes).await.unwrap();
-                }
-                return remaining_bytes;
-            }
-        }
-    }
-}
 
 async fn send_results(stream: &mut TcpStream, results: &[ClientSessionResult]) {
     for r in results {
@@ -155,7 +128,7 @@ async fn connect_and_publish(addr: SocketAddr, app: &str, key: &str) -> (TcpStre
         .unwrap()
         .unwrap();
     stream.set_nodelay(true).unwrap();
-    let remaining = rtmp_handshake(&mut stream).await;
+    let remaining = rtmp_client_handshake(&mut stream).await;
 
     let config = ClientSessionConfig::new();
     let (mut session, initial) = ClientSession::new(config).unwrap();

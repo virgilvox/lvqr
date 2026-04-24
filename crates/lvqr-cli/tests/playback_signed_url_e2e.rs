@@ -40,8 +40,8 @@ use hmac::{Hmac, Mac};
 use lvqr_auth::{SharedAuth, StaticAuthConfig, StaticAuthProvider};
 use lvqr_cli::sign_playback_url;
 use lvqr_test_utils::flv::{flv_video_nalu, flv_video_seq_header};
+use lvqr_test_utils::rtmp::rtmp_client_handshake;
 use lvqr_test_utils::{TestServer, TestServerConfig};
-use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
 };
@@ -69,32 +69,6 @@ async fn http_get_with_bearer(addr: SocketAddr, path: &str, bearer: Option<&str>
     };
     opts.bearer = bearer;
     http_get_with(addr, path, opts).await
-}
-
-async fn rtmp_handshake(stream: &mut TcpStream) -> Vec<u8> {
-    let mut handshake = Handshake::new(PeerType::Client);
-    let p0_p1 = handshake.generate_outbound_p0_and_p1().unwrap();
-    stream.write_all(&p0_p1).await.unwrap();
-    let mut buf = vec![0u8; 8192];
-    loop {
-        let n = stream.read(&mut buf).await.unwrap();
-        match handshake.process_bytes(&buf[..n]).unwrap() {
-            HandshakeProcessResult::InProgress { response_bytes } => {
-                if !response_bytes.is_empty() {
-                    stream.write_all(&response_bytes).await.unwrap();
-                }
-            }
-            HandshakeProcessResult::Completed {
-                response_bytes,
-                remaining_bytes,
-            } => {
-                if !response_bytes.is_empty() {
-                    stream.write_all(&response_bytes).await.unwrap();
-                }
-                return remaining_bytes;
-            }
-        }
-    }
 }
 
 async fn send_results(stream: &mut TcpStream, results: &[ClientSessionResult]) {
@@ -129,10 +103,8 @@ where
                 ClientSessionResult::OutboundResponse(packet) => {
                     stream.write_all(&packet.bytes).await.unwrap();
                 }
-                ClientSessionResult::RaisedEvent(ref e) => {
-                    if predicate(e) {
-                        return;
-                    }
+                ClientSessionResult::RaisedEvent(ref e) if predicate(e) => {
+                    return;
                 }
                 _ => {}
             }
@@ -143,7 +115,7 @@ where
 async fn publish_two_keyframes(addr: SocketAddr, app: &str, key: &str) -> (TcpStream, ClientSession) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream.set_nodelay(true).unwrap();
-    let remaining = rtmp_handshake(&mut stream).await;
+    let remaining = rtmp_client_handshake(&mut stream).await;
     let (mut session, initial) = ClientSession::new(ClientSessionConfig::new()).unwrap();
     send_results(&mut stream, &initial).await;
     if !remaining.is_empty() {

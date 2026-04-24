@@ -148,10 +148,8 @@ where
                 ClientSessionResult::OutboundResponse(packet) => {
                     stream.write_all(&packet.bytes).await.unwrap();
                 }
-                ClientSessionResult::RaisedEvent(ref event) => {
-                    if predicate(event) {
-                        return;
-                    }
+                ClientSessionResult::RaisedEvent(ref event) if predicate(event) => {
+                    return;
                 }
                 _ => {}
             }

@@ -3,6 +3,7 @@ use std::net::TcpListener;
 
 pub mod flv;
 pub mod http;
+pub mod rtmp;
 mod test_server;
 pub use test_server::{TestServer, TestServerConfig};
 

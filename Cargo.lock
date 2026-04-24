@@ -3552,6 +3552,7 @@ dependencies = [
  "lvqr-wasm",
  "rand 0.8.5",
  "rcgen 0.13.2",
+ "rml_rtmp",
  "tempfile",
  "tokio",
  "tokio-util",
