@@ -1,8 +1,83 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D row "webhook auth provider" SHIPPED in session 135**. **991** workspace tests on the default gate (unchanged; the 15 new webhook tests live behind the `webhook` Cargo feature which is off by default). 29 crates. `lvqr-auth` now exposes four providers: `NoopAuthProvider`, `StaticAuthProvider`, `JwtAuthProvider` (feature `jwt`), `JwksAuthProvider` (feature `jwks`), and `WebhookAuthProvider` (feature `webhook`, new). `--webhook-auth-url` on `lvqr serve` delegates every `AuthContext` decision to an operator-owned HTTP endpoint; per-decision TTL cache absorbs repeat traffic. Remaining Phase D scope (after session 135): mesh data-plane completion, one hardware encoder backend, WASM filter chains v1.1, authoritative DASH-IF container validator, npm + PyPI publish cycle.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D rows "webhook auth provider" (session 135) + "WASM filter chain composition" (session 136) both SHIPPED**. **1003** workspace tests on the default gate (991 -> 1003, +12 from session 136's chain slice). 29 crates. `lvqr-wasm` now exposes a `ChainFilter` type that composes an ordered `Vec<SharedFilter>` with short-circuit-on-drop semantics; `lvqr serve --wasm-filter <PATH>` accepts multiple values (repeat the flag or comma-separate) and installs the chain before any ingest listener accepts traffic. Each slot keeps its own `WasmFilterReloader` so hot-swapping one module does not disturb the others. True stream-modifying downstream propagation (subscribers see filter output) remains anti-scope; the chain runs in tap mode. Remaining Phase D scope (after session 136): mesh data-plane completion, one hardware encoder backend, authoritative DASH-IF container validator, npm + PyPI publish cycle.
 
-**Last Updated**: 2026-04-23 (session 135 close). Session 134's commit pair (`19817f0..de849cc`) is unchanged on `origin/main`. Session 135 commits the webhook-auth feat + close-doc on top.
+**Last Updated**: 2026-04-24 (session 136 close). Session 135's commit pair (`dfa1cb0..b51fe2b`) is local-only, 2 ahead of `origin/main` at `c0d9198`, pending user push. Session 136 commits the WASM chain feat + close-doc on top, so local main is now 4 ahead of origin.
+
+## Session 136 close (2026-04-24)
+
+**Shipped**: Phase D row "Stream-modifying WASM pipelines v2 with chaining" (chain-composition slice). New `ChainFilter` public type in `lvqr-wasm`; `--wasm-filter` widened to `Vec<PathBuf>` with per-slot hot-reload; 7 unit tests + 4 CLI parse tests + 1 RTMP integration test land on the default gate (no new Cargo feature; pure additive). Default-gate workspace test count grows **991 -> 1003** (+12). True stream-modifying downstream propagation remains anti-scope per `crates/lvqr-wasm/src/observer.rs`.
+
+### Deliverables
+
+1. **`crates/lvqr-wasm/src/lib.rs`** grows a new `pub struct ChainFilter { filters: Vec<SharedFilter> }`. Public API surface: `ChainFilter::new(Vec<SharedFilter>)`, `ChainFilter::empty()`, `len()`, `is_empty()`, `filters()`. `impl FragmentFilter for ChainFilter` iterates the list in insertion order and returns `None` the first time a filter drops (propagating via the `?` operator), which short-circuits the remaining slots for that fragment. `Clone + Debug + From<Vec<SharedFilter>>` derives round out the type. The crate-level anti-scope comment is updated: "no stateful filters, no GPU, no browser target" (dropped the now-incorrect "no multi-filter pipeline" line).
+
+2. **CLI: `--wasm-filter` widened from `Option<PathBuf>` to `Vec<PathBuf>`.** Clap arg is `#[arg(long, env = "LVQR_WASM_FILTER", value_delimiter = ',', num_args = 1..)]` so both the repeated-flag shape (`--wasm-filter a.wasm --wasm-filter b.wasm`) and the comma-separated env shape (`LVQR_WASM_FILTER=a.wasm,b.wasm`) parse into the same ordered `Vec`. Single-path callers are unchanged (a one-value vec is functionally a single filter).
+
+3. **`ServeConfig.wasm_filter: Option<PathBuf>` -> `Vec<PathBuf>`.** `Default` impl updated (`None` -> `Vec::new()`). Breaking change to the public `lvqr_cli::ServeConfig` surface; acceptable at pre-1.0 v0.4.0 and the handoff doc explicitly names it as a shape change.
+
+4. **`ServerHandle::_wasm_reloader: Option<WasmFilterReloader>` -> `_wasm_reloaders: Vec<WasmFilterReloader>`.** N slots each get their own watcher; `Drop` on the handle drops each reloader independently, which stops its worker thread. No user-visible API change (underscore-prefixed field, pub(crate)).
+
+5. **`start()` rewires the wasm-filter bridge.** Empty `config.wasm_filter` -> install nothing (same as before). Non-empty -> loop each path, build N `SharedFilter`s + N `WasmFilterReloader`s, wrap the ordered list in `ChainFilter`, then call `install_wasm_filter_bridge(&registry, SharedFilter::new(chain))` exactly once. The bridge API is unchanged; the tap installation site sees a single opaque `SharedFilter` whose internals happen to be a chain.
+
+6. **`TestServerConfig::with_wasm_filter(path)` changed from `self.wasm_filter = Some(path.into())` to `self.wasm_filter.push(path.into())`.** Preserves the builder signature. Repeated calls chain filters in insertion order -- that is exactly the v1.1 chain-composition surface the CLI exposes. The two existing tests (`wasm_frame_counter.rs` single-call, `wasm_hot_reload.rs` single-call) continue to run via the degenerate 1-filter chain.
+
+7. **Tests.** 7 new unit tests in `lvqr-wasm::tests` (empty chain passthrough / single-filter equivalence with bare filter / short-circuit on first drop / intermediate-output propagation through the chain / drop-first-vs-truncate-first order sensitivity / `From<Vec<SharedFilter>>` roundtrip / replacing one chained slot mid-life via `SharedFilter::replace`). 4 new CLI parse tests in `main.rs::wasm_filter_cli_tests` (unset = empty vec / single path = 1-element vec / repeated flag stacks in order / comma-delimited stacks). 1 new integration test in `crates/lvqr-cli/tests/wasm_filter_chain.rs` driving a real RTMP publish through a `(frame-counter, redact-keyframes)` chain and asserting `seen > 0 && kept == 0 && dropped == seen` -- proves both slots are consulted end-to-end and the slot-2 drop short-circuits the chain.
+
+8. **Docs.**
+   * `README.md` "Next up" item 7 prose rewritten: chain-composition shipped in session 136; downstream propagation (stream-modifying pipeline) remains anti-scope; points readers at `crates/lvqr-wasm/src/observer.rs` for the tap-mode contract.
+   * `README.md` "Egress + encoders" checkbox for "Stream-modifying WASM filter chains" flipped to `[x]` with a concrete shipped-in-session-136 detail block.
+   * `README.md` CLI reference block updated: "WASM filter chain (read-only tap in v1)" section now documents the repeated-flag + comma-separated shapes.
+   * `tracking/PLAN_V1.1.md` Phase D scope row for the WASM chaining marquee marked SHIPPED (chain-composition slice) + new detailed row in the "Phase D shipped rows" subtable.
+
+### Key 136 design decisions baked in
+
+* **Chain composition lives in `lvqr-wasm`, not in the bridge.** The bridge installer (`install_wasm_filter_bridge`) keeps its single `SharedFilter` argument; `start()` wraps the `ChainFilter` in a `SharedFilter` before handing it off. The bridge never learns about chains. Benefits: zero API change on the bridge side, bridge tests stay minimal (single filter is enough), the chain implementation is unit-testable in `lvqr-wasm` without a tokio runtime.
+
+* **Each chained slot keeps its own `SharedFilter`.** The `ChainFilter` holds `Vec<SharedFilter>`, not `Vec<Box<dyn FragmentFilter>>`. This is load-bearing: the session-C hot-reloader calls `SharedFilter::replace` to swap a module in place; if the chain held the `Box` directly, a per-path reloader could not target just its own slot. By keeping one `SharedFilter` per slot, the reloader's "swap this path's module" semantics compose naturally with the chain's "iterate in order" semantics.
+
+* **Short-circuit on first drop, no "rollback".** Once a filter returns `None`, subsequent slots are not called. An operator writing a filter chain knows their slot's `apply` only runs if every slot before it kept the fragment. This is the natural pipeline semantics and matches the observer.rs tap contract where "dropped" is a terminal state.
+
+* **Double-wrap is intentional.** `SharedFilter::new(ChainFilter::new(Vec<SharedFilter>))` applies two mutex acquisitions per fragment: one on the outer SharedFilter, one per chained slot's SharedFilter. Each hold is microseconds (brief HashMap-get + function-pointer dispatch), not a workload problem, and the two-layer shape is what lets the bridge take a single opaque `SharedFilter` while the chain slots stay individually replaceable. Unwrapping would require a bridge API change (accept `impl FragmentFilter + Clone`) for a negligible performance win.
+
+* **`ChainFilter::empty()` is legal but unused at the CLI.** An empty `config.wasm_filter` short-circuits BEFORE chain construction -- `start()` installs nothing, no bridge, no reloaders. The empty chain exists for completeness (and one unit test) but the CLI path never constructs one. If a user types `--wasm-filter` with zero values, clap rejects (`num_args = 1..`).
+
+* **`value_delimiter = ','` + `num_args = 1..` together** give us both the repeat-flag shape AND the env-var comma-shape without a second config field. One semantic surface, two ergonomic UIs.
+
+* **`TestServerConfig::with_wasm_filter` changed semantics, kept signature.** Old: `with_wasm_filter(path)` replaced whatever was there. New: pushes to the vec. The old shape only ever allowed ONE filter so the semantic difference only surfaces when a test calls the builder twice -- which the existing two tests never did. Preserves every existing test call site; enables the new `wasm_filter_chain.rs` test without a second method.
+
+* **Breaking `ServeConfig.wasm_filter` shape change documented, not version-bumped.** At pre-1.0 v0.4.0 the workspace permits internal breaking changes in point-of-use types. `ServeConfig` is the `start()` composition root; every in-repo caller is updated in this session. External callers have not adopted `lvqr-cli` as a library (v0.3.x publishes are `@lvqr/core`, `@lvqr/player`, `lvqr` Python, `lvqr-core`, not `lvqr-cli`). No external consumers to notify.
+
+* **Integration test uses the two committed WASM fixtures** (`frame-counter.wasm` noop + `redact-keyframes.wasm` drop-all) rather than building a fresh multi-filter module. Reuses the same `cargo run -p lvqr-wasm --example build_fixtures` toolchain path. The `noop -> drop` chain gives a clear tap-observable outcome: every fragment is seen and every fragment is dropped. Single-filter companion coverage already exists in `wasm_frame_counter.rs` (all-keep) + `wasm_hot_reload.rs` (replace mid-life).
+
+### Ground truth (session 136 close)
+
+* **Head (pre-push)**: `feat(wasm)` + this close-doc commit (pending). `origin/main` at `c0d9198` unchanged; local main is 4 ahead (session 135's pair + session 136's pair).
+* **Tests**:
+  * Default workspace gate: **1003** passed / 0 failed / 3 ignored (991 -> 1003, +12 from session 136: +7 chain unit tests in lvqr-wasm + 4 CLI parse tests + 1 integration test).
+  * `lvqr-wasm --lib`: 23 passed / 0 failed / 0 ignored (16 pre-existing + 7 new).
+  * `lvqr-cli --bin lvqr` (default features): 12 passed / 0 failed / 0 ignored (8 c2pa + 4 wasm_filter_cli_tests).
+  * `lvqr-cli --test wasm_filter_chain`: 1 passed / 0 failed / 0 ignored.
+  * `lvqr-auth --features webhook` (from session 135): 40 passed / 0 failed / 0 ignored, unchanged.
+* **CI gates locally clean**:
+  * `cargo fmt --all -- --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `cargo test --workspace` 1003 / 0 / 3.
+* **Workspace**: **29 crates**, unchanged.
+
+### Known limitations / documented v1 shape (after 136 close)
+
+* **Chain is tap-only.** Downstream subscribers see the original fragment bytes, not the chain's output. `crates/lvqr-wasm/src/observer.rs` documents the tap contract; stream-modifying pipeline (where subscribers see filter output) is explicitly deferred there. Chain composition does not change this.
+* **Serial per-fragment apply.** One chain iteration per fragment; no parallelism across slots (would violate the ordered-pipeline semantics anyway). Each slot's WASM `apply` is itself serial per store.
+* **Drop-first policy.** A slot that returns `None` terminates the chain for that fragment; there is no "skip this slot, try the next" recovery path. Intentional for pipeline semantics; operators who want branching logic build it inside a single guest.
+* **Authoritative DASH-IF container validator** still deferred.
+* **npm + PyPI publish cycle** still pending (needs credentials).
+* **Mesh data-plane completion** still Phase D.
+* **Hardware encoder backend** still Phase D (needs deployment-target pick).
+* All other session 135 + earlier known limitations unchanged.
+
+
+
 
 ## Session 135 close (2026-04-23)
 

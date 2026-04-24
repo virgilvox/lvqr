@@ -340,8 +340,13 @@ gaps explicitly named in Known v0.4.0 limitations.
    `docs/mesh.md` to IMPLEMENTED.
 6. **One hardware encoder backend** (VideoToolbox on macOS or
    NVENC on Linux). The three others stay deferred to v1.2.
-7. **Stream-modifying WASM filter chains** (multi-filter
-   composition). v1 single-filter drop + rewrite ships today.
+7. **WASM filter chain composition shipped in session 136** --
+   `--wasm-filter` accepts multiple paths (repeated flag or
+   comma-separated) and installs an ordered `ChainFilter` whose
+   first drop short-circuits the rest. Each slot keeps its own
+   hot-reload watcher. Downstream propagation of filter output
+   (true stream-modifying pipeline) is still anti-scope; see
+   `crates/lvqr-wasm/src/observer.rs` for the tap-mode contract.
 8. **Stream-key CRUD admin API**, **hot config reload**,
    **dedicated DVR scrub web UI**, **SCTE-35 passthrough** --
    smaller or more-speculative items; pick based on operator
@@ -460,9 +465,17 @@ test.
   NVENC for Linux, picked per deployment target). Remaining
   three backends (VAAPI, QSV, and whichever of NVENC or
   VideoToolbox is not picked first) deferred to v1.2.
-- [ ] **Stream-modifying WASM filter chains.** v1 already lets
-  single filters drop or rewrite fragment payload bytes; v1.1
-  lets operators compose multiple filters.
+- [x] ~~**WASM filter chain composition.**~~ Shipped in session
+  136. `--wasm-filter` now accepts multiple values (repeat the
+  flag or comma-separate) and installs a `lvqr_wasm::ChainFilter`
+  in the configured order; the first filter that drops a fragment
+  short-circuits the rest. Each slot keeps its own
+  `WasmFilterReloader` so hot-swapping one module does not
+  disturb the others. The per-filter `apply` contract is
+  unchanged: payload-rewrite is allowed at the filter level,
+  downstream subscribers still see the original bytes (tap mode).
+  True stream-modifying downstream propagation remains
+  anti-scope; see `crates/lvqr-wasm/src/observer.rs`.
 - [ ] **MoQ egress latency SLO.** Server-side measurement would
   require a MoQ wire change that was explicitly rejected in the
   v1.1-B scoping call (keeps foreign MoQ clients compatible).
@@ -674,11 +687,18 @@ lvqr serve [OPTIONS]
                             operator helper.
                             Env: LVQR_HMAC_PLAYBACK_SECRET.
 
-  WASM filter (read-only tap in v1):
+  WASM filter chain (read-only tap in v1):
   --wasm-filter <PATH>      Path to a .wasm module exporting
                             on_fragment(ptr, len) -> i32. Hot-
                             reloaded on file change.
-                            Env: LVQR_WASM_FILTER.
+                            Repeat the flag (or comma-separate
+                            values) to install an ordered filter
+                            chain; the first drop in the chain
+                            short-circuits the remaining slots.
+                            Each slot has its own hot-reload
+                            watcher.
+                            Env: LVQR_WASM_FILTER
+                            (comma-separated for chains).
 
   Captions (requires --features whisper at build):
   --whisper-model <PATH>    Path to a whisper.cpp ggml model
