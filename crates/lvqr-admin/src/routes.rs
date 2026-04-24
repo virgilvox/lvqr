@@ -24,6 +24,32 @@ pub struct MeshState {
     pub offload_percentage: f64,
 }
 
+/// WASM filter chain state returned by `GET /api/v1/wasm-filter`.
+///
+/// `enabled` mirrors whether `--wasm-filter` was configured at
+/// `lvqr serve` time. When false, `chain_length` is `0` and
+/// `broadcasts` is empty; the route still returns 200 OK so
+/// dashboards pre-baking the response shape do not need a separate
+/// 404 handler.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WasmFilterState {
+    pub enabled: bool,
+    pub chain_length: usize,
+    pub broadcasts: Vec<WasmFilterBroadcastStats>,
+}
+
+/// Per-`(broadcast, track)` WASM filter counters. Values are atomic
+/// snapshots at read time and may drift by one or two fragments
+/// between the different counter reads for the same key.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WasmFilterBroadcastStats {
+    pub broadcast: String,
+    pub track: String,
+    pub seen: u64,
+    pub kept: u64,
+    pub dropped: u64,
+}
+
 /// Provider for /metrics endpoint output. Returns Prometheus text-format
 /// metrics. Set up by Phase 4 (metrics).
 pub type MetricsRender = Arc<dyn Fn() -> String + Send + Sync>;
@@ -60,6 +86,14 @@ pub struct AdminState {
     /// wire the tracker into any egress surface; the route then
     /// returns an empty broadcast list. Tier 4 item 4.7 session A.
     slo: Option<crate::slo::LatencyTracker>,
+    /// Snapshot callback for the `GET /api/v1/wasm-filter` route.
+    /// Populated by [`AdminState::with_wasm_filter`]; defaults to a
+    /// "no filter configured" closure that returns an empty
+    /// [`WasmFilterState`] with `enabled: false`. The indirection
+    /// keeps `lvqr-admin` free of a `lvqr-wasm` dep so builds that
+    /// turn off the filter stack pay no graph cost. PLAN Phase D
+    /// session 137.
+    get_wasm_filter: Arc<dyn Fn() -> WasmFilterState + Send + Sync>,
 }
 
 impl AdminState {
@@ -82,6 +116,11 @@ impl AdminState {
             #[cfg(feature = "cluster")]
             federation_status: None,
             slo: None,
+            get_wasm_filter: Arc::new(|| WasmFilterState {
+                enabled: false,
+                chain_length: 0,
+                broadcasts: Vec::new(),
+            }),
         }
     }
 
@@ -146,6 +185,17 @@ impl AdminState {
         self.slo = Some(tracker);
         self
     }
+
+    /// Wire a snapshot closure backing the `GET /api/v1/wasm-filter`
+    /// route. The CLI's composition root passes a closure that reads
+    /// `chain_length` + per-broadcast counters off the
+    /// `WasmFilterBridgeHandle` stored on [`lvqr_cli::ServerHandle`].
+    /// Without this call the route returns `{enabled: false,
+    /// chain_length: 0, broadcasts: []}`. PLAN Phase D session 137.
+    pub fn with_wasm_filter(mut self, get: impl Fn() -> WasmFilterState + Send + Sync + 'static) -> Self {
+        self.get_wasm_filter = Arc::new(get);
+        self
+    }
 }
 
 /// Structured error responses for the admin API.
@@ -174,7 +224,8 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/api/v1/stats", get(get_stats))
         .route("/api/v1/streams", get(list_streams))
         .route("/api/v1/mesh", get(get_mesh))
-        .route("/api/v1/slo", get(get_slo));
+        .route("/api/v1/slo", get(get_slo))
+        .route("/api/v1/wasm-filter", get(get_wasm_filter));
 
     #[cfg(feature = "cluster")]
     {
@@ -233,6 +284,14 @@ async fn get_slo(State(state): State<AdminState>) -> Result<Json<serde_json::Val
         None => Vec::new(),
     };
     Ok(Json(json!({ "broadcasts": broadcasts })))
+}
+
+/// `GET /api/v1/wasm-filter` handler. Returns the chain length +
+/// per-`(broadcast, track)` counters for the configured WASM filter
+/// chain, or an empty "disabled" body when `--wasm-filter` is unset.
+/// PLAN Phase D session 137.
+async fn get_wasm_filter(State(state): State<AdminState>) -> Result<Json<WasmFilterState>, AdminError> {
+    Ok(Json((state.get_wasm_filter)()))
 }
 
 /// Middleware that validates the `Authorization: Bearer` header against the
@@ -529,6 +588,83 @@ mod tests {
         let app = build_router(state);
         let response = app
             .oneshot(Request::builder().uri("/api/v1/slo").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wasm_filter_route_defaults_to_disabled_when_unconfigured() {
+        let state = test_state(vec![]);
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/wasm-filter")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let st: WasmFilterState = serde_json::from_slice(&body).unwrap();
+        assert!(!st.enabled);
+        assert_eq!(st.chain_length, 0);
+        assert!(st.broadcasts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wasm_filter_route_renders_configured_snapshot() {
+        let state = test_state(vec![]).with_wasm_filter(|| WasmFilterState {
+            enabled: true,
+            chain_length: 2,
+            broadcasts: vec![WasmFilterBroadcastStats {
+                broadcast: "live/demo".into(),
+                track: "0.mp4".into(),
+                seen: 10,
+                kept: 9,
+                dropped: 1,
+            }],
+        });
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/wasm-filter")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let st: WasmFilterState = serde_json::from_slice(&body).unwrap();
+        assert!(st.enabled);
+        assert_eq!(st.chain_length, 2);
+        assert_eq!(st.broadcasts.len(), 1);
+        assert_eq!(st.broadcasts[0].broadcast, "live/demo");
+        assert_eq!(st.broadcasts[0].track, "0.mp4");
+        assert_eq!(st.broadcasts[0].seen, 10);
+        assert_eq!(st.broadcasts[0].kept, 9);
+        assert_eq!(st.broadcasts[0].dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn wasm_filter_route_respects_admin_auth() {
+        let auth: SharedAuth = Arc::new(StaticAuthProvider::new(StaticAuthConfig {
+            admin_token: Some("secret".into()),
+            ..Default::default()
+        }));
+        let state = test_state(vec![]).with_auth(auth);
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/wasm-filter")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);

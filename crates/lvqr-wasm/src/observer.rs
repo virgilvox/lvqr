@@ -57,6 +57,13 @@ type StatsKey = (String, String);
 #[derive(Clone)]
 pub struct WasmFilterBridgeHandle {
     stats: Arc<DashMap<StatsKey, Arc<FilterStats>>>,
+    /// Static length of the filter chain installed via
+    /// [`install_wasm_filter_bridge`]. Constant for the server's
+    /// lifetime; exposed on the handle so operator tooling (the
+    /// `/api/v1/wasm-filter` admin route) can report the chain
+    /// shape without peeking at the private `SharedFilter` the
+    /// bridge was constructed from.
+    chain_length: usize,
     // Tasks stay alive until the handle is dropped. Each task
     // ends on its own when the underlying broadcaster closes.
     _tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -65,12 +72,21 @@ pub struct WasmFilterBridgeHandle {
 impl std::fmt::Debug for WasmFilterBridgeHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WasmFilterBridgeHandle")
+            .field("chain_length", &self.chain_length)
             .field("tracked_broadcasts", &self.stats.len())
             .finish()
     }
 }
 
 impl WasmFilterBridgeHandle {
+    /// Number of filters in the installed chain. A single-filter
+    /// deployment reports 1; an empty `--wasm-filter` deployment
+    /// never constructs the bridge, so every live handle carries a
+    /// non-zero chain length.
+    pub fn chain_length(&self) -> usize {
+        self.chain_length
+    }
+
     /// Total fragments observed for `(broadcast, track)` (kept
     /// plus dropped). Returns 0 if the filter has not yet seen
     /// any fragment for this key.
@@ -121,9 +137,17 @@ impl WasmFilterBridgeHandle {
 /// original fragment still flows to every other subscriber
 /// unchanged. See the module-level docs for why the tap is
 /// non-modifying in v1.
+///
+/// `chain_length` is the static number of filters composed inside
+/// `filter`. For a single [`crate::WasmFilter`] it is `1`; for a
+/// [`crate::ChainFilter`] it is the `len()` of the chain at
+/// installation time. Operator tooling reads this via
+/// [`WasmFilterBridgeHandle::chain_length`] without needing to
+/// pierce the type erasure of the inner `SharedFilter`.
 pub fn install_wasm_filter_bridge(
     registry: &FragmentBroadcasterRegistry,
     filter: SharedFilter,
+    chain_length: usize,
 ) -> WasmFilterBridgeHandle {
     let stats: Arc<DashMap<StatsKey, Arc<FilterStats>>> = Arc::new(DashMap::new());
     let tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -171,7 +195,11 @@ pub fn install_wasm_filter_bridge(
 
     tracing::info!("WASM filter bridge installed on FragmentBroadcasterRegistry");
 
-    WasmFilterBridgeHandle { stats, _tasks: tasks }
+    WasmFilterBridgeHandle {
+        stats,
+        chain_length,
+        _tasks: tasks,
+    }
 }
 
 #[cfg(test)]
@@ -219,7 +247,7 @@ mod tests {
     async fn bridge_counts_fragments_through_no_op_filter() {
         let registry = FragmentBroadcasterRegistry::new();
         let filter = SharedFilter::new(compile(WAT_NOOP));
-        let handle = install_wasm_filter_bridge(&registry, filter);
+        let handle = install_wasm_filter_bridge(&registry, filter, 1);
 
         let bc = registry.get_or_create("live", "0.mp4", FragmentMeta::new("avc1.640028", 90000));
         for i in 0..5 {
@@ -237,7 +265,7 @@ mod tests {
     async fn drop_filter_increments_only_dropped_counter() {
         let registry = FragmentBroadcasterRegistry::new();
         let filter = SharedFilter::new(compile(WAT_DROP));
-        let handle = install_wasm_filter_bridge(&registry, filter);
+        let handle = install_wasm_filter_bridge(&registry, filter, 1);
 
         let bc = registry.get_or_create("live", "0.mp4", FragmentMeta::new("avc1.640028", 90000));
         for i in 0..3 {
@@ -254,7 +282,7 @@ mod tests {
     async fn tap_is_non_modifying_downstream_subscribers_see_original() {
         let registry = FragmentBroadcasterRegistry::new();
         let filter = SharedFilter::new(compile(WAT_DROP));
-        let _handle = install_wasm_filter_bridge(&registry, filter);
+        let _handle = install_wasm_filter_bridge(&registry, filter, 1);
 
         let bc = registry.get_or_create("live", "0.mp4", FragmentMeta::new("avc1.640028", 90000));
         let mut downstream = bc.subscribe();
@@ -272,7 +300,7 @@ mod tests {
     async fn tracked_lists_every_broadcast_the_bridge_has_seen() {
         let registry = FragmentBroadcasterRegistry::new();
         let filter = SharedFilter::new(compile(WAT_NOOP));
-        let handle = install_wasm_filter_bridge(&registry, filter);
+        let handle = install_wasm_filter_bridge(&registry, filter, 1);
 
         let _a = registry.get_or_create("live", "0.mp4", FragmentMeta::new("avc1.640028", 90000));
         let _b = registry.get_or_create("live", "1.mp4", FragmentMeta::new("mp4a.40.2", 48000));

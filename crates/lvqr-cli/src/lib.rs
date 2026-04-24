@@ -309,9 +309,10 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             reloaders.push(reloader);
         }
         let chain = lvqr_wasm::ChainFilter::new(shareds);
-        tracing::info!(chain_len = chain.len(), "WASM fragment filter chain installed");
+        let chain_len = chain.len();
+        tracing::info!(chain_len, "WASM fragment filter chain installed");
         let chain_shared = lvqr_wasm::SharedFilter::new(chain);
-        let bridge = lvqr_wasm::install_wasm_filter_bridge(&shared_registry, chain_shared);
+        let bridge = lvqr_wasm::install_wasm_filter_bridge(&shared_registry, chain_shared, chain_len);
         (Some(bridge), reloaders)
     };
 
@@ -772,6 +773,36 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // so `GET /api/v1/slo` returns per-(broadcast, transport)
     // p50 / p95 / p99 / max samples.
     let admin_state = admin_state.with_slo(slo_tracker.clone());
+
+    // PLAN Phase D session 137: expose the configured WASM filter
+    // chain on `GET /api/v1/wasm-filter` when `--wasm-filter` was
+    // set. The handle is already in scope from the bridge install
+    // earlier in `start()`; the closure reads a snapshot per call
+    // so the route always reflects the current chain_length + per-
+    // broadcast counters. When no filter is configured the default
+    // closure returns `{enabled: false, chain_length: 0,
+    // broadcasts: []}` so dashboards can pre-bake the shape.
+    let admin_state = match wasm_filter_handle.clone() {
+        Some(bridge) => admin_state.with_wasm_filter(move || {
+            let broadcasts = bridge
+                .tracked()
+                .into_iter()
+                .map(|(broadcast, track)| lvqr_admin::WasmFilterBroadcastStats {
+                    seen: bridge.fragments_seen(&broadcast, &track),
+                    kept: bridge.fragments_kept(&broadcast, &track),
+                    dropped: bridge.fragments_dropped(&broadcast, &track),
+                    broadcast,
+                    track,
+                })
+                .collect();
+            lvqr_admin::WasmFilterState {
+                enabled: true,
+                chain_length: bridge.chain_length(),
+                broadcasts,
+            }
+        }),
+        None => admin_state,
+    };
 
     // Session 111-B1: hoist `MeshCoordinator` construction out of
     // the admin-router block so it can be stored on `ServerHandle`
