@@ -139,17 +139,17 @@ describe('LvqrAdminClient against a running lvqr', () => {
     }
   });
 
-  it('wasmFilter returns a WasmFilterState shape', async () => {
+  it('wasmFilter returns a WasmFilterState shape reflecting the configured chain', async () => {
     const state = await admin.wasmFilter();
     expect(typeof state.enabled).toBe('boolean');
     expect(typeof state.chain_length).toBe('number');
     expect(Array.isArray(state.broadcasts)).toBe(true);
-    // The test harness boots without --wasm-filter, so the server
-    // returns the disabled shape (`{enabled:false, chain_length:0,
-    // broadcasts:[]}`). Shape-check any entries defensively so the
-    // test keeps passing if the harness gets a filter configured.
-    expect(state.enabled).toBe(false);
-    expect(state.chain_length).toBe(0);
+    // Session 139 wired `--wasm-filter crates/lvqr-wasm/examples/frame-counter.wasm`
+    // into sdk-tests.yml's lvqr serve spawn, so the admin route
+    // reports a single-slot chain. No publisher is running, so
+    // `broadcasts` stays empty; the chain is live and observable.
+    expect(state.enabled).toBe(true);
+    expect(state.chain_length).toBe(1);
     expect(state.broadcasts.length).toBe(0);
     for (const b of state.broadcasts) {
       expect(typeof b.broadcast).toBe('string');

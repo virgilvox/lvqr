@@ -22,8 +22,13 @@ env:
 # Ubuntu runner, build lvqr-cli in debug, spawn it in the
 # background with `--mesh-enabled` + `--cluster-listen` so every
 # admin route (including the cluster-gated ones) answers 200,
-# then run each SDK test suite. `continue-on-error: true` for the
-# first weeks on `main` so setup fragility surfaces in artifacts
+# then run each SDK test suite. Session 139 adds `--wasm-filter`
+# pointing at the committed `frame-counter.wasm` fixture so the
+# `LvqrAdminClient.wasmFilter()` Vitest assertion can exercise
+# the chain-configured shape end-to-end (`enabled: true,
+# chain_length: 1`), closing the session-138 "no live chain test"
+# known limitation. `continue-on-error: true` for the first
+# weeks on `main` so setup fragility surfaces in artifacts
 # without blocking PRs.
 
 jobs:
@@ -75,6 +80,7 @@ jobs:
             --mesh-enabled \
             --cluster-listen 127.0.0.1:18093 \
             --no-auth-signal \
+            --wasm-filter crates/lvqr-wasm/examples/frame-counter.wasm \
             > /tmp/sdk-tests-out/lvqr.log 2>&1 &
           echo $! > /tmp/lvqr.pid
           # Wait up to 15 s for /healthz. Matches the Vitest
