@@ -59,13 +59,16 @@ in-process AI agents, cross-cluster federation, peer mesh).
   requests, so HTML5 `<video>` seekability works out of the box.
 
 ### Programmable data plane
-- **WASM per-fragment filters** (`--wasm-filter <path>`,
+- **WASM per-fragment filter chains** (`--wasm-filter <path>...`,
   `LVQR_WASM_FILTER`) via `wasmtime 25`. Guests observe every
   ingested fragment and may drop it (negative return) or rewrite
-  its payload bytes (non-negative length return). `notify`-backed
-  hot-reload atomically swaps the running filter. Fragment
-  metadata (track id, PTS, DTS, flags) is read-only in v1;
-  multi-filter chaining is on the v1.1 roadmap. Examples under
+  its payload bytes (non-negative length return). Repeat
+  `--wasm-filter` (or comma-separate `LVQR_WASM_FILTER`) to
+  install an ordered chain; the first filter that drops a
+  fragment short-circuits the rest. `notify`-backed hot-reload
+  atomically swaps any single slot in the chain without
+  disturbing the others. Fragment metadata (track id, PTS, DTS,
+  flags) is read-only in v1. Examples under
   `crates/lvqr-wasm/examples/`.
 - **In-process AI agents** (`lvqr-agent`, `lvqr-agent-whisper`).
   One drain task per agent per `(broadcast, track)`,
