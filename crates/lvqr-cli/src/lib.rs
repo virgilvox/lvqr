@@ -968,11 +968,40 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                 }
             }));
 
+            // Session 141: bridge ForwardReport signal messages into
+            // the mesh coordinator so the admin route can expose
+            // actual-vs-intended offload. The callback is invoked with
+            // the peer_id resolved from the WS session state, not from
+            // a wire field, so a peer can only report for itself.
+            let mesh_for_report = mesh.clone();
+            signal.set_forward_report_callback(Arc::new(move |peer_id, forwarded_frames| {
+                mesh_for_report.record_forward_report(peer_id, forwarded_frames);
+            }));
+
             let mesh_for_admin = mesh.clone();
-            let admin_with_mesh = admin_state.with_mesh(move || lvqr_admin::MeshState {
-                enabled: true,
-                peer_count: mesh_for_admin.peer_count(),
-                offload_percentage: mesh_for_admin.offload_percentage(),
+            let admin_with_mesh = admin_state.with_mesh(move || {
+                // Session 141: per-peer stats derived from the tree
+                // snapshot. `intended_children` is the topology
+                // planner's assignment; `forwarded_frames` is the
+                // cumulative value from the most recent ForwardReport.
+                let peers = mesh_for_admin
+                    .tree_snapshot()
+                    .into_iter()
+                    .map(|p| lvqr_admin::MeshPeerStats {
+                        peer_id: p.id.clone(),
+                        role: format!("{:?}", p.role),
+                        parent: p.parent.clone(),
+                        depth: p.depth,
+                        intended_children: p.children.len(),
+                        forwarded_frames: p.forwarded_frames,
+                    })
+                    .collect();
+                lvqr_admin::MeshState {
+                    enabled: true,
+                    peer_count: mesh_for_admin.peer_count(),
+                    offload_percentage: mesh_for_admin.offload_percentage(),
+                    peers,
+                }
             });
 
             tracing::info!(

@@ -19,6 +19,7 @@ from .types import (
     ConfigEntry,
     FederationLinkStatus,
     FederationStatus,
+    MeshPeerStats,
     MeshState,
     NodeCapacity,
     RelayStats,
@@ -131,12 +132,30 @@ class LvqrClient:
         ]
 
     def mesh(self) -> MeshState:
-        """``GET /api/v1/mesh`` -- current peer-mesh state."""
+        """``GET /api/v1/mesh`` -- current peer-mesh state.
+
+        The ``peers`` array was added in session 141 for
+        actual-vs-intended offload reporting; pre-141 servers omit
+        the field and the defensive ``.get("peers", [])`` fallback
+        keeps parsing sound against older deployments.
+        """
         data = self._get_json("/api/v1/mesh")
+        peers = [
+            MeshPeerStats(
+                peer_id=p.get("peer_id", ""),
+                role=p.get("role", "Leaf"),
+                parent=p.get("parent"),
+                depth=int(p.get("depth", 0)),
+                intended_children=int(p.get("intended_children", 0)),
+                forwarded_frames=int(p.get("forwarded_frames", 0)),
+            )
+            for p in data.get("peers", [])
+        ]
         return MeshState(
             enabled=bool(data.get("enabled", False)),
             peer_count=data.get("peer_count", 0),
             offload_percentage=float(data.get("offload_percentage", 0.0)),
+            peers=peers,
         )
 
     def slo(self) -> SloSnapshot:

@@ -62,6 +62,14 @@ export class MeshPeer {
   private parentConn: PeerConnection | null = null;
   private children = new Map<string, PeerConnection>();
   private iceConfig: RTCConfiguration;
+  /** Cumulative count of fragments forwarded to DataChannel children.
+   *  Incremented inside `forwardToChildren` per successful `dc.send()`.
+   *  Reported to the server via `ForwardReport` on a 1 s interval so
+   *  `GET /api/v1/mesh` can surface actual-vs-intended offload.
+   *  Session 141. */
+  private forwardedFrames: number = 0;
+  private lastReportedFrames: number = 0;
+  private reportInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: MeshConfig) {
     this.config = config;
@@ -81,6 +89,7 @@ export class MeshPeer {
           peer_id: this.config.peerId,
           track: this.config.track,
         }));
+        this.startForwardReportLoop();
         resolve();
       };
 
@@ -97,12 +106,14 @@ export class MeshPeer {
 
       this.signal.onclose = () => {
         this.signal = null;
+        this.stopForwardReportLoop();
       };
     });
   }
 
   /** Disconnect from mesh. */
   close(): void {
+    this.stopForwardReportLoop();
     this.parentConn?.pc.close();
     this.parentConn = null;
     for (const child of this.children.values()) {
@@ -119,6 +130,19 @@ export class MeshPeer {
 
   get childCount(): number {
     return this.children.size;
+  }
+
+  /**
+   * Cumulative count of fragments this peer has forwarded to its
+   * DataChannel children. Matches the `forwarded_frames` value the
+   * peer reports to the server via the `/signal` `ForwardReport`
+   * message (see `crates/lvqr-signal`). Reset on close(); preserved
+   * across WS reconnects by the client-side counter (the server
+   * tolerates resets via replace-rather-than-accumulate semantics).
+   * Session 141.
+   */
+  get forwardedFrameCount(): number {
+    return this.forwardedFrames;
   }
 
   /**
@@ -298,6 +322,11 @@ export class MeshPeer {
       if (child.dc && child.dc.readyState === 'open') {
         try {
           child.dc.send(data as unknown as ArrayBuffer);
+          // Session 141: count one send per child per frame. Operators
+          // reading `/api/v1/mesh` see this as the peer's actual
+          // forwarded_frames count; the topology planner's
+          // intended_children is a separate field.
+          this.forwardedFrames += 1;
         } catch {
           // DataChannel may be closing
         }
@@ -309,6 +338,28 @@ export class MeshPeer {
   private sendSignal(msg: Record<string, unknown>): void {
     if (this.signal?.readyState === WebSocket.OPEN) {
       this.signal.send(JSON.stringify(msg));
+    }
+  }
+
+  /** Start the 1-second forward-report emitter. Session 141. */
+  private startForwardReportLoop(): void {
+    // Guard against a duplicate loop on reconnect.
+    this.stopForwardReportLoop();
+    this.reportInterval = setInterval(() => {
+      // Skip-on-unchanged: idle peers and leaves that never forward
+      // stay silent on the signaling channel.
+      if (this.forwardedFrames === this.lastReportedFrames) {
+        return;
+      }
+      this.sendSignal({ type: 'ForwardReport', forwarded_frames: this.forwardedFrames });
+      this.lastReportedFrames = this.forwardedFrames;
+    }, 1000);
+  }
+
+  private stopForwardReportLoop(): void {
+    if (this.reportInterval !== null) {
+      clearInterval(this.reportInterval);
+      this.reportInterval = null;
     }
   }
 }

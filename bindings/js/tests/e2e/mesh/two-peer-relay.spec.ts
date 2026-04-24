@@ -33,6 +33,7 @@ import { resolve } from 'node:path';
 
 const MESH_JS_PATH = resolve(__dirname, '../../../packages/core/dist/mesh.js');
 const SIGNAL_URL = 'ws://127.0.0.1:18088/signal';
+const ADMIN_URL = 'http://127.0.0.1:18088';
 const BROADCAST = 'live/mesh-test';
 
 // Dist ships as ESM; convert to a classic script that exposes
@@ -173,6 +174,65 @@ test('two-peer DataChannel mesh relays a root-pushed frame to the child', async 
     (f) => f.length === payload.length && f.every((b, i) => b === payload[i]),
   );
   expect(matching).toEqual(payload);
+
+  // Session 141: the `pushFrame` loop is still running from the
+  // earlier `setInterval`. Let the client-side 1 s ForwardReport
+  // timer fire at least twice and stop the push loop so the counts
+  // stabilise, then poll `/api/v1/mesh` and assert the actual-vs-
+  // intended shape. The sample windows overlap in practice (the
+  // first report fires 1 s after signal.onopen, before a DataChannel
+  // exists on a fresh harness), so the second poll is the one that
+  // reliably reflects forwarded frames.
+  await pageA.waitForTimeout(2_500);
+  await pageA.evaluate(() => {
+    const timer = (window as unknown as { __pushTimer?: ReturnType<typeof setInterval> }).__pushTimer;
+    if (timer) {
+      clearInterval(timer);
+    }
+  });
+  // Let the last ForwardReport emit before we poll.
+  await pageA.waitForTimeout(1_200);
+
+  type MeshPeerStats = {
+    peer_id: string;
+    role: string;
+    parent: string | null;
+    depth: number;
+    intended_children: number;
+    forwarded_frames: number;
+  };
+  const mesh = (await (await fetch(`${ADMIN_URL}/api/v1/mesh`)).json()) as {
+    enabled: boolean;
+    peer_count: number;
+    offload_percentage: number;
+    peers: MeshPeerStats[];
+  };
+  expect(mesh.enabled).toBe(true);
+  expect(Array.isArray(mesh.peers)).toBe(true);
+
+  const root = mesh.peers.find((p) => p.peer_id === 'peer-one');
+  const relay = mesh.peers.find((p) => p.peer_id === 'peer-two');
+  expect(root, 'peer-one must be present in the mesh snapshot').toBeDefined();
+  expect(relay, 'peer-two must be present in the mesh snapshot').toBeDefined();
+
+  // peer-one is the root with peer-two attached as its child.
+  expect(root!.role).toBe('Root');
+  expect(root!.parent).toBeNull();
+  expect(root!.depth).toBe(0);
+  expect(root!.intended_children).toBe(1);
+  // peer-one has been forwarding frames to peer-two on a 100 ms
+  // cadence for ~2.5 s; the actual count is harness-dependent but
+  // must be strictly positive (at least one send landed before the
+  // channel close race).
+  expect(root!.forwarded_frames).toBeGreaterThan(0);
+
+  // peer-two is a leaf in this two-peer harness (no grandchildren).
+  // It has received frames but has not forwarded any.
+  expect(relay!.role).toBe('Relay');
+  expect(relay!.parent).toBe('peer-one');
+  expect(relay!.depth).toBe(1);
+  expect(relay!.intended_children).toBe(0);
+  expect(relay!.forwarded_frames).toBe(0);
 
   await contextA.close();
   await contextB.close();

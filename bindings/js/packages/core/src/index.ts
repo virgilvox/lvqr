@@ -26,6 +26,7 @@ export {
   type LvqrAdminClientOptions,
   type RelayStats,
   type StreamInfo,
+  type MeshPeerStats,
   type MeshState,
   type SloEntry,
   type SloSnapshot,

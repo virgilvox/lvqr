@@ -18,6 +18,28 @@ export interface StreamInfo {
 }
 
 /**
+ * Per-peer offload stats surfaced by `GET /api/v1/mesh`. Mirrors
+ * `lvqr_admin::MeshPeerStats`. `intended_children` reflects what the
+ * topology planner assigned; `forwarded_frames` reflects the
+ * cumulative count the peer reported via the `/signal` `ForwardReport`
+ * message. PLAN Phase D session 141.
+ */
+export interface MeshPeerStats {
+  /** Unique peer id as seen by the coordinator. */
+  peer_id: string;
+  /** Tree role: `"Root"`, `"Relay"`, or `"Leaf"`. */
+  role: string;
+  /** Parent peer id, or `null` for roots. */
+  parent: string | null;
+  /** Depth in the tree (0 = root). */
+  depth: number;
+  /** Children the planner assigned to this peer. */
+  intended_children: number;
+  /** Cumulative frames this peer has forwarded to its children. */
+  forwarded_frames: number;
+}
+
+/**
  * Current peer-mesh state. Mirrors `lvqr_admin::MeshState`.
  */
 export interface MeshState {
@@ -28,9 +50,17 @@ export interface MeshState {
   /**
    * Intended offload percentage, 0..=100. Reflects the topology
    * planner's projected fanout, not measured bandwidth savings.
-   * Actual-vs-intended offload is on the phase-D roadmap.
+   * Compare against the per-peer `forwarded_frames` values in `peers`
+   * for the actual-vs-intended picture.
    */
   offload_percentage: number;
+  /**
+   * Per-peer intended-vs-actual offload stats. Empty when mesh is
+   * disabled. Added in session 141; servers older than that omit the
+   * field (TypeScript's structural typing is lenient on extra or
+   * missing fields on read).
+   */
+  peers: MeshPeerStats[];
 }
 
 /**

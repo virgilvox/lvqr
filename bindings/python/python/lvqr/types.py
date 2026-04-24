@@ -7,6 +7,7 @@ can be unpacked via ``**kwargs`` into the constructors. The mapping:
 * :class:`RelayStats` mirrors ``lvqr_core::RelayStats``.
 * :class:`StreamInfo` mirrors ``lvqr_admin::StreamInfo``.
 * :class:`MeshState` mirrors ``lvqr_admin::MeshState``.
+* :class:`MeshPeerStats` mirrors ``lvqr_admin::MeshPeerStats``.
 * :class:`SloEntry` + :class:`SloSnapshot` mirror
   ``lvqr_admin::SloEntry`` + the ``json!({ "broadcasts": ... })``
   wrapper emitted by ``get_slo``.
@@ -54,15 +55,43 @@ class StreamInfo:
 
 
 @dataclass
+class MeshPeerStats:
+    """Per-peer offload stats surfaced by ``/api/v1/mesh``.
+
+    ``intended_children`` is the topology planner's assignment;
+    ``forwarded_frames`` is the cumulative count the peer reported
+    via the ``/signal`` ``ForwardReport`` message. Session 141 --
+    actual-vs-intended offload reporting.
+    """
+
+    peer_id: str = ""
+    #: Tree role: ``"Root"``, ``"Relay"``, or ``"Leaf"``.
+    role: str = "Leaf"
+    #: Parent peer id, or ``None`` for roots.
+    parent: Optional[str] = None
+    depth: int = 0
+    intended_children: int = 0
+    forwarded_frames: int = 0
+
+
+@dataclass
 class MeshState:
-    """Current peer-mesh state from ``/api/v1/mesh``."""
+    """Current peer-mesh state from ``/api/v1/mesh``.
+
+    ``peers`` carries per-peer intended-vs-actual offload stats.
+    Added in session 141; older servers (pre-141) omit the field and
+    :meth:`lvqr.LvqrClient.mesh` defensively defaults to an empty
+    list so the dataclass construction does not break against a
+    pre-141 deployment."""
 
     enabled: bool = False
     peer_count: int = 0
     #: Intended offload percentage (topology planner projection),
-    #: not measured bandwidth savings. Actual-vs-intended offload
-    #: is on the phase-D roadmap.
+    #: not measured bandwidth savings. Compare against the per-peer
+    #: ``forwarded_frames`` values in ``peers`` for the
+    #: actual-vs-intended picture.
     offload_percentage: float = 0.0
+    peers: list[MeshPeerStats] = field(default_factory=list)
 
 
 @dataclass

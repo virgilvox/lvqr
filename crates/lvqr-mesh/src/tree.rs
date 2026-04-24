@@ -38,6 +38,13 @@ pub struct PeerInfo {
     pub depth: u32,
     /// Estimated upload bandwidth in kbps.
     pub upload_kbps: u32,
+    /// Cumulative count of fragments this peer has forwarded to its
+    /// DataChannel children, as reported by the client's periodic
+    /// `ForwardReport` signal message. Session 141 -- actual-vs-
+    /// intended offload reporting. `#[serde(default)]` so pre-141
+    /// tree snapshots still deserialize.
+    #[serde(default)]
+    pub forwarded_frames: u64,
     /// When this peer joined.
     #[serde(skip)]
     pub joined_at: Option<Instant>,
@@ -56,6 +63,7 @@ impl PeerInfo {
             children: Vec::new(),
             depth: 0,
             upload_kbps: 5000, // default 5 Mbps
+            forwarded_frames: 0,
             joined_at: Some(Instant::now()),
             last_heartbeat: Some(Instant::now()),
         }
@@ -98,6 +106,7 @@ mod tests {
         assert!(peer.children.is_empty());
         assert_eq!(peer.depth, 0);
         assert_eq!(peer.upload_kbps, 5000);
+        assert_eq!(peer.forwarded_frames, 0);
     }
 
     #[test]

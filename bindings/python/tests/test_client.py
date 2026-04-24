@@ -9,6 +9,7 @@ from lvqr import (
     FederationLinkStatus,
     FederationStatus,
     LvqrClient,
+    MeshPeerStats,
     MeshState,
     NodeCapacity,
     RelayStats,
@@ -38,6 +39,16 @@ class TestTypes:
         assert mesh.enabled is False
         assert mesh.peer_count == 0
         assert mesh.offload_percentage == 0.0
+        assert mesh.peers == []
+
+    def test_mesh_peer_stats_defaults(self):
+        peer = MeshPeerStats()
+        assert peer.peer_id == ""
+        assert peer.role == "Leaf"
+        assert peer.parent is None
+        assert peer.depth == 0
+        assert peer.intended_children == 0
+        assert peer.forwarded_frames == 0
 
     def test_slo_snapshot_defaults(self):
         snapshot = SloSnapshot()
@@ -141,6 +152,24 @@ class TestClient:
                 "enabled": True,
                 "peer_count": 4,
                 "offload_percentage": 27.5,
+                "peers": [
+                    {
+                        "peer_id": "root-1",
+                        "role": "Root",
+                        "parent": None,
+                        "depth": 0,
+                        "intended_children": 3,
+                        "forwarded_frames": 1200,
+                    },
+                    {
+                        "peer_id": "relay-7",
+                        "role": "Relay",
+                        "parent": "root-1",
+                        "depth": 1,
+                        "intended_children": 1,
+                        "forwarded_frames": 400,
+                    },
+                ],
             },
             raise_for_status=lambda: None,
         )
@@ -149,6 +178,37 @@ class TestClient:
         assert mesh.enabled is True
         assert mesh.peer_count == 4
         assert mesh.offload_percentage == 27.5
+        assert len(mesh.peers) == 2
+        assert mesh.peers[0].peer_id == "root-1"
+        assert mesh.peers[0].role == "Root"
+        assert mesh.peers[0].parent is None
+        assert mesh.peers[0].intended_children == 3
+        assert mesh.peers[0].forwarded_frames == 1200
+        assert mesh.peers[1].parent == "root-1"
+        assert mesh.peers[1].depth == 1
+        assert mesh.peers[1].forwarded_frames == 400
+        client.close()
+
+    @patch("httpx.Client.get")
+    def test_mesh_pre_session_141_server_omits_peers(self, mock_get):
+        # Session 141 defensive-parse: older servers (pre-141) omit the
+        # `peers` field entirely. `.get("peers", [])` must keep the
+        # dataclass construction sound against those bodies.
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "enabled": True,
+                "peer_count": 2,
+                "offload_percentage": 50.0,
+            },
+            raise_for_status=lambda: None,
+        )
+        client = LvqrClient("http://localhost:8080")
+        mesh = client.mesh()
+        assert mesh.enabled is True
+        assert mesh.peer_count == 2
+        assert mesh.offload_percentage == 50.0
+        assert mesh.peers == []
         client.close()
 
     @patch("httpx.Client.get")

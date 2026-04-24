@@ -5,8 +5,8 @@ pub mod slo;
 pub mod cluster_routes;
 
 pub use routes::{
-    AdminError, AdminState, MeshState, MetricsRender, StreamInfo, WasmFilterBroadcastStats, WasmFilterSlotStats,
-    WasmFilterState, build_router,
+    AdminError, AdminState, MeshPeerStats, MeshState, MetricsRender, StreamInfo, WasmFilterBroadcastStats,
+    WasmFilterSlotStats, WasmFilterState, build_router,
 };
 pub use slo::{LatencyTracker, SloEntry};
 

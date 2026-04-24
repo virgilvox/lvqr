@@ -17,11 +17,43 @@ pub struct StreamInfo {
 }
 
 /// Mesh state returned by the API.
+///
+/// `peers` carries per-peer intended-vs-actual offload counters; the
+/// `intended_children` value comes from the topology planner's
+/// assignment, while `forwarded_frames` is the cumulative count the
+/// client reported via the `/signal` `ForwardReport` message (see
+/// `lvqr_signal::SignalMessage::ForwardReport`). When mesh is disabled
+/// the vec is empty. Added in session 141 with `#[serde(default)]`
+/// so pre-141 clients still deserialize new-server bodies (and vice
+/// versa on the Python side via `.get("peers", [])`).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MeshState {
     pub enabled: bool,
     pub peer_count: usize,
     pub offload_percentage: f64,
+    /// Per-peer intended-vs-actual offload stats. Empty when mesh is
+    /// disabled. Session 141 -- actual-vs-intended offload reporting.
+    #[serde(default)]
+    pub peers: Vec<MeshPeerStats>,
+}
+
+/// Per-peer offload stats exposed via `GET /api/v1/mesh`.
+///
+/// `intended_children` is the count of tree children the topology
+/// planner assigned to this peer (derived from `PeerInfo.children`).
+/// `forwarded_frames` is the cumulative count of fragments the peer
+/// has reported forwarding to its DataChannel children via the
+/// `/signal` `ForwardReport` message; the server replaces rather
+/// than accumulates so a client reconnect cannot inflate the
+/// displayed value indefinitely. Session 141.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MeshPeerStats {
+    pub peer_id: String,
+    pub role: String,
+    pub parent: Option<String>,
+    pub depth: u32,
+    pub intended_children: usize,
+    pub forwarded_frames: u64,
 }
 
 /// WASM filter chain state returned by `GET /api/v1/wasm-filter`.
@@ -133,6 +165,7 @@ impl AdminState {
                 enabled: false,
                 peer_count: 0,
                 offload_percentage: 0.0,
+                peers: Vec::new(),
             }),
             auth: Arc::new(NoopAuthProvider),
             metrics_render: None,
@@ -458,6 +491,7 @@ mod tests {
         let mesh: MeshState = serde_json::from_slice(&body).unwrap();
         assert!(!mesh.enabled);
         assert_eq!(mesh.peer_count, 0);
+        assert!(mesh.peers.is_empty());
     }
 
     #[tokio::test]
@@ -466,6 +500,24 @@ mod tests {
             enabled: true,
             peer_count: 42,
             offload_percentage: 73.5,
+            peers: vec![
+                MeshPeerStats {
+                    peer_id: "root-1".into(),
+                    role: "Root".into(),
+                    parent: None,
+                    depth: 0,
+                    intended_children: 3,
+                    forwarded_frames: 1200,
+                },
+                MeshPeerStats {
+                    peer_id: "relay-7".into(),
+                    role: "Relay".into(),
+                    parent: Some("root-1".into()),
+                    depth: 1,
+                    intended_children: 1,
+                    forwarded_frames: 400,
+                },
+            ],
         });
         let app = build_router(state);
 
@@ -479,6 +531,44 @@ mod tests {
         assert!(mesh.enabled);
         assert_eq!(mesh.peer_count, 42);
         assert!((mesh.offload_percentage - 73.5).abs() < 0.01);
+        assert_eq!(mesh.peers.len(), 2);
+
+        // Session 141: the admin body surfaces the intended-vs-actual
+        // split per peer.
+        let root = mesh
+            .peers
+            .iter()
+            .find(|p| p.peer_id == "root-1")
+            .expect("root-1 present");
+        assert_eq!(root.role, "Root");
+        assert!(root.parent.is_none());
+        assert_eq!(root.depth, 0);
+        assert_eq!(root.intended_children, 3);
+        assert_eq!(root.forwarded_frames, 1200);
+
+        let relay = mesh
+            .peers
+            .iter()
+            .find(|p| p.peer_id == "relay-7")
+            .expect("relay-7 present");
+        assert_eq!(relay.role, "Relay");
+        assert_eq!(relay.parent.as_deref(), Some("root-1"));
+        assert_eq!(relay.depth, 1);
+        assert_eq!(relay.intended_children, 1);
+        assert_eq!(relay.forwarded_frames, 400);
+    }
+
+    #[tokio::test]
+    async fn mesh_state_deserializes_pre_141_body_without_peers() {
+        // Session 141 compat: `peers` has `#[serde(default)]`, so a
+        // pre-141 server body that omits the field entirely must still
+        // parse into an empty vec on a new client.
+        let body = br#"{"enabled":true,"peer_count":3,"offload_percentage":66.6}"#;
+        let mesh: MeshState = serde_json::from_slice(body).unwrap();
+        assert!(mesh.enabled);
+        assert_eq!(mesh.peer_count, 3);
+        assert!((mesh.offload_percentage - 66.6).abs() < 0.01);
+        assert!(mesh.peers.is_empty(), "missing peers field must default to empty");
     }
 
     #[tokio::test]

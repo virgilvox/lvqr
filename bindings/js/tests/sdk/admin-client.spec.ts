@@ -73,6 +73,18 @@ describe('LvqrAdminClient against a running lvqr', () => {
     expect(typeof mesh.offload_percentage).toBe('number');
     // Test fixture boots with --mesh-enabled so `enabled` must be true.
     expect(mesh.enabled).toBe(true);
+    // Session 141: the admin body carries per-peer intended-vs-actual
+    // offload stats. The sdk-tests harness has no publisher or browser
+    // peers so the vec is empty, but the shape must be array-valued.
+    expect(Array.isArray(mesh.peers)).toBe(true);
+    for (const peer of mesh.peers) {
+      expect(typeof peer.peer_id).toBe('string');
+      expect(typeof peer.role).toBe('string');
+      expect(peer.parent === null || typeof peer.parent === 'string').toBe(true);
+      expect(typeof peer.depth).toBe('number');
+      expect(typeof peer.intended_children).toBe('number');
+      expect(typeof peer.forwarded_frames).toBe('number');
+    }
   });
 
   it('slo returns a { broadcasts: [] } snapshot', async () => {

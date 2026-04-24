@@ -58,6 +58,17 @@ pub enum SignalMessage {
     /// `invalid_track`, `expected_register`, `duplicate_register`) and
     /// `reason` is a human-readable sentence suitable for logging.
     Error { code: String, reason: String },
+
+    /// Client-to-server periodic report of the cumulative count of
+    /// fragments the peer has forwarded to its DataChannel children.
+    ///
+    /// The value is a running total the client maintains locally. The
+    /// server replaces rather than accumulates so a reconnect cannot
+    /// inflate the displayed offload. The peer_id is resolved from the
+    /// WS session state; a peer can only report for itself.
+    ///
+    /// Session 141 -- actual-vs-intended offload reporting.
+    ForwardReport { forwarded_frames: u64 },
 }
 
 /// Maximum accepted `peer_id` byte length. Short enough to make brute-force
@@ -105,11 +116,23 @@ struct PeerSession {
 /// Returns an optional message to send back to the peer.
 pub type PeerCallback = Arc<dyn Fn(&str, &str, bool) -> Option<SignalMessage> + Send + Sync>;
 
+/// Callback invoked when a registered peer sends a `ForwardReport`.
+/// The first argument is the peer_id as resolved from the WS session
+/// state (NOT a field on the wire message), and the second is the
+/// cumulative forwarded-frame count the client reported.
+///
+/// Kept as a standalone callback (rather than a channel the coordinator
+/// drains) so `lvqr-signal` remains independent of `lvqr-mesh`;
+/// `lvqr-cli::start()` wires the bridge into `MeshCoordinator::
+/// record_forward_report`.
+pub type ForwardReportCallback = Arc<dyn Fn(&str, u64) + Send + Sync>;
+
 /// WebRTC signaling server for mesh peer connections.
 #[derive(Clone)]
 pub struct SignalServer {
     peers: Arc<DashMap<String, PeerSession>>,
     on_peer: Option<PeerCallback>,
+    on_forward_report: Option<ForwardReportCallback>,
 }
 
 impl SignalServer {
@@ -117,6 +140,7 @@ impl SignalServer {
         Self {
             peers: Arc::new(DashMap::new()),
             on_peer: None,
+            on_forward_report: None,
         }
     }
 
@@ -125,6 +149,13 @@ impl SignalServer {
     /// message to send to the peer (e.g., AssignParent).
     pub fn set_peer_callback(&mut self, cb: PeerCallback) {
         self.on_peer = Some(cb);
+    }
+
+    /// Set a callback for `ForwardReport` messages from registered peers.
+    /// Called with (peer_id, forwarded_frames). `lvqr-cli` wires this
+    /// into `MeshCoordinator::record_forward_report`. Session 141.
+    pub fn set_forward_report_callback(&mut self, cb: ForwardReportCallback) {
+        self.on_forward_report = Some(cb);
     }
 
     pub fn peer_count(&self) -> usize {
@@ -383,6 +414,19 @@ async fn recv_ws_message(socket: &mut WebSocket) -> Option<Result<SignalMessage,
 }
 
 fn handle_signal_message(server: &SignalServer, from_peer: &str, msg: SignalMessage) {
+    // ForwardReport is a client-to-server message with no `to` field;
+    // the server resolves the sender from its WS session state (a peer
+    // can only report for itself). Handle it before the peer-forwarding
+    // match below so it cannot be routed to an arbitrary target.
+    if let SignalMessage::ForwardReport { forwarded_frames } = msg {
+        if let Some(ref cb) = server.on_forward_report {
+            cb(from_peer, forwarded_frames);
+        } else {
+            debug!(from = from_peer, "ForwardReport received with no callback installed");
+        }
+        return;
+    }
+
     let target = match &msg {
         SignalMessage::Offer { to, .. } | SignalMessage::Answer { to, .. } | SignalMessage::IceCandidate { to, .. } => {
             Some(to.clone())
@@ -613,6 +657,73 @@ mod tests {
         assert!(!is_valid_track("a\\b"));
         assert!(!is_valid_track("live test"));
         assert!(!is_valid_track("liveü"));
+    }
+
+    #[test]
+    fn forward_report_round_trips() {
+        let msg = SignalMessage::ForwardReport { forwarded_frames: 2024 };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"ForwardReport\""));
+        assert!(json.contains("\"forwarded_frames\":2024"));
+        let parsed: SignalMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SignalMessage::ForwardReport { forwarded_frames } => {
+                assert_eq!(forwarded_frames, 2024);
+            }
+            _ => panic!("expected ForwardReport"),
+        }
+    }
+
+    #[test]
+    fn forward_report_callback_invoked_with_session_peer_id() {
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Vec<(String, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_cb = Arc::clone(&captured);
+
+        let mut server = SignalServer::new();
+        server.set_forward_report_callback(Arc::new(move |peer_id, frames| {
+            captured_cb.lock().unwrap().push((peer_id.to_string(), frames));
+        }));
+
+        let _rx = server.register_peer("peer-alpha", "live/test");
+
+        // Route a ForwardReport through the private dispatcher as if it
+        // arrived on peer-alpha's WebSocket.
+        handle_signal_message(
+            &server,
+            "peer-alpha",
+            SignalMessage::ForwardReport { forwarded_frames: 99 },
+        );
+
+        let snapshot = captured.lock().unwrap().clone();
+        assert_eq!(snapshot, vec![("peer-alpha".to_string(), 99)]);
+    }
+
+    #[test]
+    fn forward_report_without_callback_is_silent_noop() {
+        let server = SignalServer::new();
+        // No panic; no forwarding; no output. The test simply asserts
+        // that we can dispatch without a callback installed.
+        handle_signal_message(
+            &server,
+            "peer-anon",
+            SignalMessage::ForwardReport { forwarded_frames: 10 },
+        );
+    }
+
+    #[test]
+    fn forward_report_does_not_leak_to_other_peers() {
+        let server = SignalServer::new();
+        let _rx_a = server.register_peer("peer-a", "live/test");
+        let mut rx_b = server.register_peer("peer-b", "live/test");
+
+        handle_signal_message(&server, "peer-a", SignalMessage::ForwardReport { forwarded_frames: 7 });
+
+        // peer-b's outbound channel should not have received the report.
+        assert!(
+            rx_b.try_recv().is_err(),
+            "ForwardReport must not be forwarded to other peers"
+        );
     }
 
     #[test]

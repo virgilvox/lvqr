@@ -238,6 +238,22 @@ impl MeshCoordinator {
         }
     }
 
+    /// Record the cumulative forwarded-frame count reported by a peer.
+    ///
+    /// The client sends its own running total on each report; the server
+    /// replaces rather than accumulates so a reconnect (client counter
+    /// resets to zero) cannot cause the displayed offload to drift
+    /// upward forever. Unknown-peer reports are silently ignored: a
+    /// client may briefly outlive its tree entry when `remove_peer`
+    /// fires between the client's last emit and WS close.
+    ///
+    /// Session 141 -- actual-vs-intended offload reporting.
+    pub fn record_forward_report(&self, id: &str, forwarded_frames: u64) {
+        if let Some(mut entry) = self.peers.get_mut(id) {
+            entry.forwarded_frames = forwarded_frames;
+        }
+    }
+
     /// Find peers that have timed out (no heartbeat within timeout period).
     pub fn find_dead_peers(&self) -> Vec<PeerId> {
         let timeout = std::time::Duration::from_secs(self.config.heartbeat_timeout_secs);
@@ -601,6 +617,63 @@ mod tests {
             new_parent_after.children.contains(&"child".to_string()),
             "new parent missing the reassigned child"
         );
+    }
+
+    #[test]
+    fn record_forward_report_sets_counter() {
+        let coord = default_coordinator();
+        coord.add_peer("peer-1".into(), "live/test".into()).unwrap();
+
+        // Default is zero.
+        assert_eq!(coord.get_peer("peer-1").unwrap().forwarded_frames, 0);
+
+        // Record a running total.
+        coord.record_forward_report("peer-1", 42);
+        assert_eq!(coord.get_peer("peer-1").unwrap().forwarded_frames, 42);
+
+        // Later reports replace rather than accumulate.
+        coord.record_forward_report("peer-1", 100);
+        assert_eq!(coord.get_peer("peer-1").unwrap().forwarded_frames, 100);
+    }
+
+    #[test]
+    fn record_forward_report_on_unknown_peer_is_noop() {
+        let coord = default_coordinator();
+        coord.add_peer("peer-1".into(), "live/test".into()).unwrap();
+
+        // Should not panic; unknown IDs are silently ignored.
+        coord.record_forward_report("nonexistent", 999);
+
+        // Existing peer's counter is untouched.
+        assert_eq!(coord.get_peer("peer-1").unwrap().forwarded_frames, 0);
+    }
+
+    #[test]
+    fn record_forward_report_handles_reconnect_reset() {
+        let coord = default_coordinator();
+        coord.add_peer("peer-1".into(), "live/test".into()).unwrap();
+
+        // Client reports a running total, then reconnects (counter
+        // drops back to zero on the client side). The server-visible
+        // counter follows the wire value rather than clamping to the
+        // previous max.
+        coord.record_forward_report("peer-1", 500);
+        assert_eq!(coord.get_peer("peer-1").unwrap().forwarded_frames, 500);
+        coord.record_forward_report("peer-1", 5);
+        assert_eq!(coord.get_peer("peer-1").unwrap().forwarded_frames, 5);
+    }
+
+    #[test]
+    fn record_forward_report_isolates_peers() {
+        let coord = default_coordinator();
+        coord.add_peer("peer-a".into(), "live/test".into()).unwrap();
+        coord.add_peer("peer-b".into(), "live/test".into()).unwrap();
+
+        coord.record_forward_report("peer-a", 100);
+        coord.record_forward_report("peer-b", 250);
+
+        assert_eq!(coord.get_peer("peer-a").unwrap().forwarded_frames, 100);
+        assert_eq!(coord.get_peer("peer-b").unwrap().forwarded_frames, 250);
     }
 
     #[test]
