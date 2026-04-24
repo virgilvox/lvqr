@@ -131,6 +131,16 @@ interface MeshState {
   enabled: boolean;
   peer_count: number;
   offload_percentage: number; // intended offload, not measured
+  peers: MeshPeerStats[];     // per-peer intended-vs-actual, session 141
+}
+
+interface MeshPeerStats {
+  peer_id: string;
+  role: string;               // "Root" | "Relay" | "Leaf"
+  parent: string | null;
+  depth: number;
+  intended_children: number;  // from the topology planner
+  forwarded_frames: number;   // from the peer's ForwardReport
 }
 
 interface SloEntry {
@@ -369,9 +379,19 @@ const transport = detectTransport();
 `MeshPeer` connects to the server's `/signal` WebSocket, opens
 an `RTCPeerConnection` to an assigned parent peer, and relays
 incoming DataChannel frames to its own children. The
-two-browser happy path ships; operator-grade completion
-(actual-vs-intended offload, per-peer capacity advertisement,
-TURN recipe, three-peer matrix) is on the phase-D roadmap.
+two-browser happy path ships; remaining operator-grade
+completion (per-peer capacity advertisement, TURN recipe,
+three-peer matrix) is on the phase-D roadmap.
+
+**Actual-vs-intended offload reporting** shipped in session 141.
+`MeshPeer` maintains a private cumulative forwarded-frame
+counter and emits a `ForwardReport` signal message every
+second (skip-on-unchanged, so idle peers stay silent). Read the
+count locally via `peer.forwardedFrameCount`; read the
+server-aggregated values via `adminClient.mesh()` which surfaces
+a `peers: MeshPeerStats[]` array with `intended_children`
+(topology planner) and `forwarded_frames` (client report) per
+peer.
 
 ```typescript
 import { MeshPeer } from '@lvqr/core';
@@ -397,6 +417,10 @@ await peer.connect();
 // Root peer: inject media received from the server into the
 // mesh tree.
 peer.pushFrame(new Uint8Array([0x01, 0x02, 0x03]));
+
+// Local cumulative forwarded-frame count (also reported to the
+// server every second for /api/v1/mesh surfacing).
+console.log(`forwarded so far: ${peer.forwardedFrameCount}`);
 
 // Later:
 peer.close();

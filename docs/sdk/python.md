@@ -95,6 +95,23 @@ class MeshState:
     enabled: bool = False
     peer_count: int = 0
     offload_percentage: float = 0.0
+    # Added in session 141 with a defensive .get("peers", [])
+    # parse so pre-141 servers that omit the field still
+    # deserialize cleanly.
+    peers: list[MeshPeerStats] = field(default_factory=list)
+
+@dataclass
+class MeshPeerStats:
+    # Per-peer intended-vs-actual offload stats. intended_children
+    # comes from the topology planner; forwarded_frames is the
+    # cumulative count the peer reported via the /signal
+    # ForwardReport message. Session 141.
+    peer_id: str = ""
+    role: str = "Leaf"              # "Root" | "Relay" | "Leaf"
+    parent: Optional[str] = None
+    depth: int = 0
+    intended_children: int = 0
+    forwarded_frames: int = 0
 
 @dataclass
 class SloEntry:
@@ -271,7 +288,7 @@ The package on PyPI at `0.3.1` ships three methods
 (`healthz`, `stats`, `list_streams`). `main` adds seven more
 (`mesh`, `slo`, `cluster_nodes`, `cluster_broadcasts`,
 `cluster_config`, `cluster_federation`, `wasm_filter`) + a
-`bearer_token` kwarg + 14 new dataclasses. All additive; no
+`bearer_token` kwarg + 15 new dataclasses. All additive; no
 breaking changes. When pinning to a specific release, test
 for method existence if your code runs against both
 versions:

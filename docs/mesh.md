@@ -39,9 +39,6 @@ high-fan-out broadcasts.
 > under a second on loopback.
 >
 > What is still phase-D scope:
-> - Actual-vs-intended offload reporting (clients report
->   "served by peer X"; coordinator aggregates; `/api/v1/mesh`
->   returns measured).
 > - Per-peer capacity advertisement (bandwidth + CPU) so
 >   rebalancing uses measured capacity instead of hardcoded
 >   `max-children`.
@@ -49,10 +46,21 @@ high-fan-out broadcasts.
 > - Three-peer Playwright matrix + the 5-artifact test contract
 >   sweep across WebRTC-heavy browsers.
 >
-> Until phase-D lands, a deployment that sets `--mesh-enabled`
-> serves every subscriber directly from the server; the offload
-> percentage reported by `/api/v1/mesh` is intended offload
-> based on tree shape, not measured traffic.
+> **Actual-vs-intended offload reporting** shipped in session 141.
+> Browser peers report their cumulative forwarded-frame count to
+> the server every second via a new `ForwardReport` signal
+> message; `GET /api/v1/mesh` surfaces the counts alongside the
+> topology planner's intended `children` count in a new `peers`
+> array. Operators can now compare "how many children did the
+> planner assign to peer X" against "how many frames has peer X
+> actually forwarded". See the "Per-peer offload snapshot" block
+> below.
+>
+> Until the remaining phase-D rows land, a deployment that sets
+> `--mesh-enabled` still serves every subscriber directly from
+> the server; the `offload_percentage` field on `/api/v1/mesh`
+> remains the intended offload based on tree shape, not measured
+> traffic.
 >
 > Tracking in
 > [`tracking/PLAN_V1.1.md`](../tracking/PLAN_V1.1.md) under
@@ -211,9 +219,69 @@ session 111-B1):
 {
   "enabled": true,
   "peer_count": 42,
-  "offload_percentage": 0.0
+  "offload_percentage": 73.5,
+  "peers": [
+    {
+      "peer_id": "peer-one",
+      "role": "Root",
+      "parent": null,
+      "depth": 0,
+      "intended_children": 3,
+      "forwarded_frames": 1200
+    },
+    {
+      "peer_id": "peer-seven",
+      "role": "Relay",
+      "parent": "peer-one",
+      "depth": 1,
+      "intended_children": 1,
+      "forwarded_frames": 400
+    }
+  ]
 }
 ```
+
+### Per-peer offload snapshot (session 141)
+
+The `peers` array carries per-peer offload stats. Operators can
+compare the topology planner's `intended_children` assignment
+against the peer's self-reported `forwarded_frames` count to
+answer questions like "is peer X actually relaying to its tree
+children?" and "which peer is the drop from zero-actual
+forwards?"
+
+| Field | Meaning |
+|---|---|
+| `peer_id` | Unique id registered via `/signal` |
+| `role` | `Root`, `Relay`, or `Leaf` |
+| `parent` | Parent peer id, or `null` for roots |
+| `depth` | Distance from origin (0 = Root) |
+| `intended_children` | Count of tree children the planner assigned to this peer |
+| `forwarded_frames` | Cumulative frames the peer has reported forwarding via DataChannel |
+
+#### ForwardReport wire message
+
+The per-peer `forwarded_frames` value is reported by the browser
+over the existing `/signal` WebSocket as a new message variant:
+
+```json
+{ "type": "ForwardReport", "forwarded_frames": 1200 }
+```
+
+The server resolves the sender from the WS session state (no
+`peer_id` on the wire, so a peer can only report for itself).
+`MeshPeer` emits this every second automatically, with
+skip-on-unchanged: idle peers and leaf peers that never forward
+stay silent on the signaling channel.
+
+The cumulative value is **replaced** server-side rather than
+accumulated, so a browser reconnect (client counter resets to
+zero) simply drops the displayed value back down to the new
+running total. Nothing drifts upward forever.
+
+Added in session 141 with `#[serde(default)]` on the new `peers`
+field so pre-141 clients and servers remain interoperable;
+callers upgrading the SDK do not need a coordinated server bump.
 
 `offload_percentage` is intended offload based on tree shape,
 not measured traffic, until the data plane ships.

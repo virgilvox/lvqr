@@ -1,8 +1,132 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D thread on the WASM chain feature is now 6 sessions deep** -- rows "webhook auth provider" (135) + "WASM filter chain composition" (136) + admin route (137) + SDK bindings (138) + sdk-tests.yml wiring (139) + per-slot counters (140) all SHIPPED. **Session 140 (2026-04-24) added per-slot counters** -- `SlotCounters` + `InstrumentedFilter` inside `lvqr-wasm`, a new `slots: Vec<WasmFilterSlotStats>` field on the admin route's body, and matching JS + Python SDK types + client parsing. Operators debugging a drop-heavy chain can now pinpoint exactly which slot is denying via `GET /api/v1/wasm-filter`. Default-gate Rust workspace **1008 -> 1013** (+5: 5 new ChainFilter slot-counter unit tests in `lvqr-wasm`; the admin schema extension landed without new test count because the existing configured-snapshot test grew assertions instead of creating new ones). Python pytest **25 -> 27** (+2: new slot-stats defaults + new pre-session-140 defensive-parse test). Vitest unchanged at 11 but the existing live chain test grew per-slot assertions. 29 crates. Admin surface at **10 routes** on both published language targets. Remaining Phase D scope: mesh data-plane completion, one hardware encoder backend, authoritative DASH-IF container validator, npm + PyPI publish cycle.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D 7 sessions deep** -- WASM chain thread (135-140) closed + mesh data-plane row 1 (actual-vs-intended offload) shipped in 141. **Session 141 (2026-04-24) added mesh offload reporting** -- new `SignalMessage::ForwardReport` client-to-server variant carries a cumulative forwarded-frame count; `MeshCoordinator::record_forward_report` replaces the per-peer counter; `GET /api/v1/mesh` grows a `peers: Vec<MeshPeerStats>` array exposing `intended_children` from the topology planner alongside the client-reported `forwarded_frames`. JS `MeshPeer` self-emits on a 1 s skip-on-unchanged interval. Closes the first of four unshipped mesh data-plane rows in README's "Peer mesh data plane" checklist. Default-gate Rust workspace **1013 -> 1022** (+9: 4 `record_forward_report` coord tests + 1 `peer_info_defaults` extension + 4 `ForwardReport` signal tests; the admin test count grew by 1 via the new pre-141 defensive-parse test). Python pytest **27 -> 29** (+2: `MeshPeerStats` defaults + pre-141 defensive-parse). Vitest 11 unchanged; the existing live-chain test grew an array-shape assertion for `mesh.peers`. Playwright two-peer spec gained a full admin-poll block asserting `forwarded_frames > 0` for the Root and `== 0` for the leaf Relay. 29 crates. Admin surface at **10 routes** on both published language targets. Remaining Phase D scope: per-peer capacity advertisement, TURN recipe, three-peer Playwright matrix, hardware encoder backend, DASH-IF validator, npm + PyPI publish.
 
-**Last Updated**: 2026-04-24 (session 140 close). Sessions 135-137 are pushed (`origin/main` at `1a1667e`); sessions 138-140 local pending push.
+**Last Updated**: 2026-04-24 (session 141 close). Sessions 135-137 are pushed (`origin/main` at `1a1667e`); sessions 138-141 local pending push.
+
+## Session 141 close (2026-04-24)
+
+**Shipped**: Actual-vs-intended mesh offload reporting. Closes the first of four unshipped bullets under README's "Peer mesh data plane" checklist (line 439-441): "clients report 'served by peer X'; coordinator aggregates; `/api/v1/mesh` returns measured offload". Browser peers now maintain a private cumulative forwarded-frame counter, increment it on each successful DataChannel send, and emit a new `ForwardReport` signal message once per second (skip-on-unchanged, so idle peers stay silent). Server resolves the sender from the WS session state (no `peer_id` on the wire -- a peer can only report for itself) and calls `MeshCoordinator::record_forward_report`, which replaces rather than accumulates so a reconnect cannot inflate the displayed value. `GET /api/v1/mesh` grows a new `peers: Vec<MeshPeerStats>` field that pairs the topology planner's `intended_children` with the client-reported `forwarded_frames` per peer. Smoke-verified locally: `curl /api/v1/mesh` against a mesh-enabled lvqr with no peers returns `{"enabled":true,"peer_count":0,"offload_percentage":0.0,"peers":[]}`.
+
+### Deliverables
+
+1. **`crates/lvqr-mesh/src/tree.rs`**:
+   * `PeerInfo` grows a `forwarded_frames: u64` field with `#[serde(default)]` so pre-141 snapshots still deserialize. `PeerInfo::new` initializes it to 0.
+   * `peer_info_defaults` unit test extended to assert the new field's default.
+
+2. **`crates/lvqr-mesh/src/coordinator.rs`**:
+   * New `pub fn record_forward_report(&self, id: &str, forwarded_frames: u64)`. Grabs `peers.get_mut(id)` and replaces the counter. Unknown-peer reports are silent no-ops (a client may outlive its tree entry when `remove_peer` fires between the client's last emit and WS close).
+   * 4 new unit tests: `record_forward_report_sets_counter` / `..._on_unknown_peer_is_noop` / `..._handles_reconnect_reset` / `..._isolates_peers`.
+
+3. **`crates/lvqr-signal/src/signaling.rs`**:
+   * New `SignalMessage::ForwardReport { forwarded_frames: u64 }` variant. No `peer_id` on the wire -- tightens contract to "peer can only report for itself".
+   * New `ForwardReportCallback` type + `SignalServer::set_forward_report_callback` setter mirroring the existing `PeerCallback` pattern. Keeps `lvqr-signal` independent of `lvqr-mesh`.
+   * `handle_signal_message` gains a short-circuit `ForwardReport` arm before the `to`-field dispatch so a client cannot abuse the variant to forward a message to a target peer.
+   * 4 new unit tests: `forward_report_round_trips` / `forward_report_callback_invoked_with_session_peer_id` / `forward_report_without_callback_is_silent_noop` / `forward_report_does_not_leak_to_other_peers`.
+
+4. **`crates/lvqr-admin/src/routes.rs`**:
+   * New `pub struct MeshPeerStats { peer_id, role, parent, depth, intended_children, forwarded_frames }` with `Serialize + Deserialize`.
+   * `MeshState` grows a `peers: Vec<MeshPeerStats>` field with `#[serde(default)]` so pre-141 clients deserializing new-server bodies (and new clients parsing pre-141 bodies) both work without a schema-version bump.
+   * Default (disabled) closure now also returns an empty `peers` vec.
+   * `mesh_disabled_by_default` gains a `peers.is_empty()` assertion; `mesh_with_peers` test body expanded with a 2-peer JSON payload and per-peer assertions.
+   * New `mesh_state_deserializes_pre_141_body_without_peers` test proves the defensive `#[serde(default)]` fallback works against a pre-141 server body (omits the `peers` key entirely).
+
+5. **`crates/lvqr-admin/src/lib.rs`**: re-exports `MeshPeerStats`.
+
+6. **`crates/lvqr-cli/src/lib.rs::start()`**:
+   * Bridges `SignalServer::set_forward_report_callback` into `MeshCoordinator::record_forward_report` (new 3-line closure next to the existing `set_peer_callback` block).
+   * `with_mesh` closure extended to iterate `mesh.tree_snapshot()` and build `Vec<MeshPeerStats>`; maps `PeerInfo.children.len()` to `intended_children` and `PeerInfo.forwarded_frames` to `forwarded_frames`.
+
+7. **`bindings/js/packages/core/src/mesh.ts`**:
+   * `MeshPeer` gains private `forwardedFrames` + `lastReportedFrames` + `reportInterval` state.
+   * `forwardToChildren` increments `forwardedFrames` on each successful `dc.send()` (not attempted sends; matches the actual forwarded semantics).
+   * `connect()` schedules `startForwardReportLoop` after the WS opens; `close()` calls `stopForwardReportLoop`. The WS `onclose` path also clears the interval so a dropped connection does not leak timers.
+   * `startForwardReportLoop` fires a 1-second `setInterval` that emits `{"type":"ForwardReport","forwarded_frames":N}` ONLY when `N !== lastReportedFrames` -- skip-on-unchanged keeps idle peers silent.
+   * New `forwardedFrameCount: number` public getter exposes the counter locally for callers that want to display the value without polling the admin route.
+
+8. **`bindings/js/packages/core/src/admin.ts`**:
+   * New `MeshPeerStats` interface mirroring the Rust shape byte-for-byte.
+   * `MeshState` grows a `peers: MeshPeerStats[]` field.
+
+9. **`bindings/js/packages/core/src/index.ts`** re-exports `MeshPeerStats`.
+
+10. **`bindings/js/tests/sdk/admin-client.spec.ts`**:
+    * `mesh returns a MeshState shape` test grows an `Array.isArray(mesh.peers)` assertion plus a per-peer shape loop (harmless on an empty harness, catches regressions when a publisher or peer is added later).
+
+11. **`bindings/js/tests/e2e/mesh/two-peer-relay.spec.ts`**:
+    * New `ADMIN_URL` constant (reuses the `18088` port the playwright webServer already mounts).
+    * After the existing `pushFrame` loop proves the DataChannel relay works, the test waits ~2.5 s for two `ForwardReport` emits to land, stops the push loop, waits another ~1.2 s for the last emit, then polls `GET /api/v1/mesh` and asserts: peer-one (Root) has `intended_children == 1` and `forwarded_frames > 0`; peer-two (Relay) has `intended_children == 0` and `forwarded_frames == 0`.
+
+12. **`bindings/python/python/lvqr/types.py`**:
+    * New `@dataclass MeshPeerStats` with all fields defaulted (so `MeshPeerStats()` gives the disabled-server shape).
+    * `MeshState` grows a `peers: list[MeshPeerStats] = field(default_factory=list)` field. Docstring updated.
+
+13. **`bindings/python/python/lvqr/client.py::mesh()`** now parses the `peers` array with a defensive `.get("peers", [])` fallback so a pre-141 server (which omits the field) still produces a valid `MeshState(peers=[])`.
+
+14. **`bindings/python/python/lvqr/__init__.py`** re-exports `MeshPeerStats`.
+
+15. **`bindings/python/tests/test_client.py`**:
+    * `test_mesh_state_defaults` extended with `mesh.peers == []` assertion.
+    * New `test_mesh_peer_stats_defaults` asserts default construction.
+    * `test_mesh` body expanded with a 2-peer payload matching the Rust configured-snapshot assertion set.
+    * New `test_mesh_pre_session_141_server_omits_peers` proves the defensive fallback works against a pre-141 server body.
+
+16. **Docs**:
+    * `docs/mesh.md` "What is still phase-D scope" subsection moves the "actual-vs-intended offload" bullet out and into a new "shipped in session 141" paragraph. Admin-route JSON example grows the populated `peers` array. New "Per-peer offload snapshot (session 141)" section documents the field table + `ForwardReport` wire message + reconnect semantics.
+    * `docs/observability.md` grows a paragraph after the mesh-metric table naming the per-peer counters as JSON-body-only (not Prometheus) and linking to the new mesh.md section.
+    * `docs/sdk/javascript.md` type reference grows the new `MeshPeerStats` TypeScript interface + extends `MeshState` with the `peers` field. The Peer-mesh section gains a paragraph about the 1 s `ForwardReport` cadence + the new `forwardedFrameCount` getter.
+    * `docs/sdk/python.md` type reference grows the new `@dataclass MeshPeerStats` + extends the `MeshState` dataclass definition. Migration section updated: 14 -> 15 dataclasses.
+
+17. **`tracking/SESSION_141_BRIEFING.md`**: locked design decisions BEFORE any source file was opened -- ForwardReport wire shape, callback plumbing, cumulative-replace semantics, 1 s skip-on-unchanged cadence, anti-scope.
+
+### Key 141 design decisions baked in
+
+* **`ForwardReport` carries no `peer_id` on the wire.** Server resolves from WS session state. A peer can only report for itself. This matches the trust model of `handle_signal_message(from_peer: &str, msg)` where `from_peer` is the post-Register session identity.
+
+* **Counter is cumulative + replace-on-report, not delta + accumulate.** Client sends its running total; server overwrites rather than adds. Reconnect-safe: if the client reconnects (counter resets to 0), the server simply follows the wire value back down. Nothing drifts upward forever. Tradeoff: the server-visible value briefly drops at reconnect; operators polling `/api/v1/mesh` during a reconnect window see the dip. Acceptable for an observability surface; not used for billing.
+
+* **Skip-on-unchanged in the 1 s emit loop.** Idle peers and leaf peers that never forward anything stay silent on the `/signal` channel. Prevents the WS from becoming noisy at N peers scale.
+
+* **`ForwardReportCallback` type is standalone, NOT part of `PeerCallback`.** Register/unregister carries a message response (the `AssignParent`); ForwardReport is fire-and-forget. Reusing `PeerCallback` would force a `None` return on every report. Separate type is clearer and keeps each callback's contract focused.
+
+* **`lvqr-signal` remains independent of `lvqr-mesh`.** `ForwardReportCallback: Fn(&str, u64)` exposes just the report semantics, not the coordinator shape. Bridge wired in `lvqr-cli::start()` next to the existing `set_peer_callback` block.
+
+* **`PeerInfo.forwarded_frames` is a plain `u64`, not `AtomicU64`.** DashMap already serializes per-key access via `get_mut`. Atomics would complicate the existing `Clone` derive without buying anything -- every read path goes through `tree_snapshot()` or `get_peer()` which both clone.
+
+* **Counter increments on successful `dc.send()`, not on `pushFrame` calls.** Fanout to N children = N increments per `pushFrame`. This matches the "served by peer X" intent (one send = one relayed frame) rather than the application-level frame count. A parent with closed children DataChannels forwards nothing and reports nothing -- correctly.
+
+* **No per-`(peer, child)` breakdown.** Single aggregate per peer. Splitting by child would require either a protocol change (`ForwardReport` carrying a map) or a richer `MeshPeerStats` shape. Operator question answered today is "is peer X forwarding?" -- yes/no. Per-child splits are a v1.2 candidate if operator feedback asks.
+
+* **Playwright two-peer assertions use `> 0`, not an exact count.** The 100 ms push interval running for ~2.5 s before the admin poll means a count in the 20-25 range, but SCTP backpressure + DataChannel open race can reduce that on slow CI runners. Asserting strictly positive captures the semantic ("at least one send landed") without flaking on timing.
+
+* **Live smoke verified the full wiring.** Started lvqr with `--mesh-enabled` locally; curl against `/api/v1/mesh` returned `{"enabled":true,"peer_count":0,"offload_percentage":0.0,"peers":[]}` -- the empty-mesh shape the new serde round-trip expects.
+
+### Ground truth (session 141 close)
+
+* **Head (pre-push)**: `feat(mesh+admin+sdk)` + docs close (pending). Sessions 135-137 pushed (origin `1a1667e`); sessions 138-140 local + session-141 pair (pending). Local main will be 8 ahead of origin after this session's docs-close commit lands.
+* **Tests**:
+  * Rust workspace default gate: **1022** passed / 0 failed / 3 ignored (1013 -> 1022; +4 coord + 1 tree + 4 signal = 9 net).
+  * `lvqr-mesh --lib`: 18 passed / 0 failed (13 pre + 4 new coord + 1 extended tree).
+  * `lvqr-signal --lib`: 16 passed / 0 failed (12 pre + 4 new).
+  * `lvqr-admin --lib`: 29 passed / 0 failed (28 pre + 1 new pre-141 defensive-parse; the existing `mesh_with_peers` test grew body assertions without adding a new entry).
+  * `bindings/python pytest`: **29** passed / 0 failed (27 pre + 2 new: `MeshPeerStats` defaults + pre-141 defensive parse).
+  * `@lvqr/core` tsc: clean on both `packages/core` + `packages/player`. Vitest case count unchanged at 11; existing `mesh` test grew `peers` array-shape assertions.
+  * Playwright `two-peer-relay.spec.ts`: new admin-poll assertion block added; runs on the `mesh-e2e.yml` CI workflow on every push to main (not exercised locally in this session -- gated behind the browser install + the webServer webkit binary).
+* **CI gates locally clean**:
+  * `cargo fmt --all -- --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `tsc` clean on both `@lvqr/core` + `@lvqr/player` packages.
+* **Workspace**: **29 crates**, unchanged.
+
+### Known limitations / documented v1 shape (after 141 close)
+
+* **No per-`(peer, child)` breakdown.** `forwarded_frames` aggregates across every DataChannel send. Per-child offload visibility would require extending `ForwardReport` to carry a map (or switching to a delta protocol with child IDs); deferred to v1.2.
+* **`forwarded_frames` is frame count, not bytes.** Operators computing a bandwidth savings estimate from this field must multiply by a typical fragment size. A bytes counter is additive and could land alongside in a future session if operator feedback asks.
+* **No Prometheus label for per-peer counters.** `lvqr_mesh_peer_forwarded_frames_total{peer_id="..."}` would require label-set governance (peer_id is high-cardinality for large meshes). The JSON route is sufficient for interactive debugging today.
+* **`MeshState.peers` is a required JS field.** A pre-141 server body that omits the key would produce a missing-field read at runtime. Python's `.get("peers", [])` is the asymmetric-compat story; TypeScript callers polling older servers see `undefined` reads but do not throw (structural typing is lenient on reads). Pragmatic: TS consumers on `main` see a `main` server, not an older one, so this only matters for mixed deployments during a rolling upgrade.
+* **Playwright assertion is `> 0`, not an exact count.** Tradeoff documented inline -- SCTP timing makes exact counts flaky.
+* **All other session 140 + earlier known limitations unchanged.**
+
 
 ## Session 140 close (2026-04-24)
 

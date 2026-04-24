@@ -133,6 +133,14 @@ Session J may upgrade this to a per-`(name, labels)`
 | `lvqr_mesh_peers` | gauge | -- | lvqr-mesh |
 | `lvqr_mesh_offload_percentage` | gauge (.set) | -- | lvqr-mesh |
 
+Per-peer intended-vs-actual offload counters are NOT exposed as
+Prometheus metrics today. They live on the admin JSON body at
+`GET /api/v1/mesh` under `peers[].forwarded_frames` and
+`peers[].intended_children`; promoting them to labeled counters
+(`lvqr_mesh_peer_forwarded_frames_total{peer_id="..."}`) is a
+potential future session if operators ask for Prometheus-native
+alerting. See [mesh.md](mesh.md#per-peer-offload-snapshot-session-141).
+
 Resource attributes applied to every metric:
 - `service.name` (from `LVQR_SERVICE_NAME`)
 - every `LVQR_OTLP_RESOURCE` `k=v` pair
