@@ -76,15 +76,17 @@ pub struct ServerHandle {
     /// state after driving WS subscribers through the relay.
     /// Session 111-B1.
     pub(crate) mesh_coordinator: Option<Arc<lvqr_mesh::MeshCoordinator>>,
-    /// WASM filter hot-reload watcher kept alive for the
-    /// server's lifetime when `--wasm-filter` is configured.
-    /// On every debounced change to the module path, the
-    /// reloader recompiles the module and swaps it into the
-    /// shared filter; in-flight `apply` calls complete on the
-    /// old module, subsequent calls see the new one. Unused
-    /// directly; held for its `Drop` side effect of stopping
-    /// the watcher thread on shutdown.
-    pub(crate) _wasm_reloader: Option<lvqr_wasm::WasmFilterReloader>,
+    /// One WASM filter hot-reload watcher per entry in the
+    /// configured filter chain. Empty when `--wasm-filter` is
+    /// unset; otherwise holds N watchers in the same order as the
+    /// chain. On every debounced change to a watched path, that
+    /// slot's reloader recompiles its module and swaps it into its
+    /// own `SharedFilter`; in-flight `apply` calls on that slot
+    /// complete on the old module, subsequent calls see the new
+    /// one, and the other slots in the chain are unaffected.
+    /// Unused directly; held for each watcher's `Drop` side effect
+    /// of stopping its background thread on shutdown.
+    pub(crate) _wasm_reloaders: Vec<lvqr_wasm::WasmFilterReloader>,
     /// Shared `(broadcast, track)`-keyed registry every
     /// ingest crate publishes into and every consumer
     /// (HLS / DASH / archive / WASM filter / captions

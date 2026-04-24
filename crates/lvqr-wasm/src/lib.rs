@@ -65,9 +65,12 @@
 //!
 //! # Anti-scope (per `tracking/TIER_4_PLAN.md` section 4.2)
 //!
-//! No multi-filter pipeline, no stateful filters, no GPU, no
-//! browser target. Every `apply` call creates a fresh
-//! `wasmtime::Store`; state does not carry between invocations.
+//! No stateful filters, no GPU, no browser target. Every `apply`
+//! call creates a fresh `wasmtime::Store`; state does not carry
+//! between invocations. Multi-filter composition via
+//! [`ChainFilter`] landed in v1.1 (PLAN Phase D, session 136);
+//! each filter in the chain still follows the stateless-per-apply
+//! contract independently.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -311,6 +314,79 @@ impl std::fmt::Debug for SharedFilter {
     }
 }
 
+/// Ordered composition of multiple [`SharedFilter`]s. Applied in
+/// insertion order; the first filter that returns `None` drops
+/// the fragment and short-circuits the remaining filters in the
+/// chain.
+///
+/// Each entry keeps its own [`SharedFilter`], so hot-reloading a
+/// single module via [`WasmFilterReloader`] only swaps that one
+/// slot; downstream filters continue to see the reloaded module's
+/// output on the next fragment.
+///
+/// An empty chain is a valid no-op filter (every fragment passes
+/// through unchanged); callers that want "no filter at all" should
+/// skip installing a chain rather than install an empty one, so
+/// the tap task and its metric counters are not wired up for
+/// nothing.
+#[derive(Clone)]
+pub struct ChainFilter {
+    filters: Vec<SharedFilter>,
+}
+
+impl ChainFilter {
+    /// Build a chain from the given ordered list of filters.
+    pub fn new(filters: Vec<SharedFilter>) -> Self {
+        Self { filters }
+    }
+
+    /// Construct an empty chain. Every fragment passes through
+    /// unchanged. Mostly useful in tests.
+    pub fn empty() -> Self {
+        Self { filters: Vec::new() }
+    }
+
+    /// Number of filters in the chain.
+    pub fn len(&self) -> usize {
+        self.filters.len()
+    }
+
+    /// Whether the chain has zero filters.
+    pub fn is_empty(&self) -> bool {
+        self.filters.is_empty()
+    }
+
+    /// Borrow the ordered filter list. Exposed for the CLI / admin
+    /// surface so operators can introspect the configured chain;
+    /// the returned slice is a snapshot of the filter handles,
+    /// which are themselves live via their internal `SharedFilter`
+    /// mutex.
+    pub fn filters(&self) -> &[SharedFilter] {
+        &self.filters
+    }
+}
+
+impl FragmentFilter for ChainFilter {
+    fn apply(&self, mut fragment: Fragment) -> Option<Fragment> {
+        for filter in &self.filters {
+            fragment = filter.apply(fragment)?;
+        }
+        Some(fragment)
+    }
+}
+
+impl std::fmt::Debug for ChainFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainFilter").field("len", &self.filters.len()).finish()
+    }
+}
+
+impl From<Vec<SharedFilter>> for ChainFilter {
+    fn from(filters: Vec<SharedFilter>) -> Self {
+        Self::new(filters)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,5 +523,89 @@ mod tests {
         std::fs::write(tmp.path(), bytes).unwrap();
         let filter = WasmFilter::load(tmp.path()).expect("load");
         assert_eq!(filter.path(), Some(tmp.path()));
+    }
+
+    // -------------- ChainFilter (v1.1) --------------
+
+    fn shared(wat: &str) -> SharedFilter {
+        SharedFilter::new(compile(wat))
+    }
+
+    #[test]
+    fn empty_chain_passes_every_fragment_through_unchanged() {
+        let chain = ChainFilter::empty();
+        assert!(chain.is_empty());
+        assert_eq!(chain.len(), 0);
+        let frag = sample_fragment(b"payload");
+        let out = chain.apply(frag.clone()).expect("empty chain keeps");
+        assert_eq!(out.payload, frag.payload);
+    }
+
+    #[test]
+    fn single_filter_chain_matches_bare_filter_output() {
+        let bare = compile(WAT_TRUNCATE_1);
+        let chain = ChainFilter::new(vec![shared(WAT_TRUNCATE_1)]);
+        let frag = sample_fragment(b"hello");
+        let bare_out = bare.apply(frag.clone()).unwrap();
+        let chain_out = chain.apply(frag).unwrap();
+        assert_eq!(bare_out.payload, chain_out.payload);
+    }
+
+    #[test]
+    fn chain_short_circuits_on_first_drop() {
+        // noop -> drop -> noop: middle filter drops; third must
+        // never see the fragment. We can't directly observe "was
+        // third called" without a counter, but the final decision
+        // must be None.
+        let chain = ChainFilter::new(vec![shared(WAT_NOOP), shared(WAT_DROP), shared(WAT_NOOP)]);
+        let frag = sample_fragment(b"anything");
+        assert!(chain.apply(frag).is_none());
+    }
+
+    #[test]
+    fn chain_passes_intermediate_outputs_down_the_pipeline() {
+        // truncate-to-1 then no-op: the no-op must see a 1-byte
+        // payload and keep it unchanged.
+        let chain = ChainFilter::new(vec![shared(WAT_TRUNCATE_1), shared(WAT_NOOP)]);
+        let frag = sample_fragment(b"abcdef");
+        let out = chain.apply(frag).expect("chain keeps");
+        assert_eq!(out.payload.as_ref(), b"a");
+    }
+
+    #[test]
+    fn chain_order_matters() {
+        // drop-before-truncate drops regardless of payload.
+        // truncate-before-drop also drops (drop is unconditional in
+        // this WAT), but the intermediate fragment had the
+        // truncated length; we can't observe that from outside.
+        // Instead swap the shapes: noop-then-truncate vs
+        // truncate-then-noop both keep, but a chain with drop
+        // FIRST gates every downstream filter entirely.
+        let drop_first = ChainFilter::new(vec![shared(WAT_DROP), shared(WAT_TRUNCATE_1)]);
+        let trunc_first = ChainFilter::new(vec![shared(WAT_TRUNCATE_1), shared(WAT_NOOP)]);
+        let frag = sample_fragment(b"payload");
+        assert!(drop_first.apply(frag.clone()).is_none(), "drop-first must drop");
+        let out = trunc_first.apply(frag).expect("truncate-then-noop keeps");
+        assert_eq!(out.payload.as_ref(), b"p");
+    }
+
+    #[test]
+    fn chain_from_vec_roundtrips_filter_list() {
+        let chain: ChainFilter = vec![shared(WAT_NOOP), shared(WAT_NOOP)].into();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain.filters().len(), 2);
+    }
+
+    #[test]
+    fn replacing_a_chained_slot_updates_that_slot_only() {
+        // The first slot is a hot-reloadable SharedFilter; we
+        // reach in and replace it mid-life. Mirrors what the
+        // reloader does on a file change.
+        let slot_one = shared(WAT_NOOP);
+        let chain = ChainFilter::new(vec![slot_one.clone(), shared(WAT_NOOP)]);
+        let frag = sample_fragment(b"hello");
+        assert!(chain.apply(frag.clone()).is_some(), "both noop -> keep");
+        slot_one.replace(compile(WAT_DROP));
+        assert!(chain.apply(frag).is_none(), "first-slot reload to DROP should drop");
     }
 }

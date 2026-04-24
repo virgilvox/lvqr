@@ -315,10 +315,18 @@ struct ServeArgs {
     /// `FragmentBroadcasterRegistry` before any ingest listener
     /// starts accepting traffic. The tap observes every fragment
     /// and drives `lvqr_wasm_fragments_total{outcome=keep|drop}`
-    /// counters. Tier 4 item 4.2 session B (observation only);
-    /// stream-modifying filters ship in a later v1.1 pass.
-    #[arg(long, env = "LVQR_WASM_FILTER")]
-    wasm_filter: Option<PathBuf>,
+    /// counters. Tier 4 item 4.2 session B (observation only).
+    ///
+    /// The flag accepts multiple values and may be repeated to
+    /// compose an ordered chain of filters (PLAN Phase D, session
+    /// 136): `--wasm-filter a.wasm --wasm-filter b.wasm` is
+    /// equivalent to `--wasm-filter a.wasm,b.wasm`. Chain order is
+    /// preserved; the first filter that drops a fragment
+    /// short-circuits the rest of the chain for that fragment. Each
+    /// path is watched independently by its own reloader, so
+    /// hot-swapping one slot does not disturb the others.
+    #[arg(long, env = "LVQR_WASM_FILTER", value_delimiter = ',', num_args = 1..)]
+    wasm_filter: Vec<PathBuf>,
 
     /// Path to a whisper.cpp `ggml-*.bin` model file. When set,
     /// `serve` installs a `WhisperCaptionsFactory` on the shared
@@ -1107,5 +1115,65 @@ mod webhook_cli_tests {
         assert_eq!(a.webhook_auth_cache_ttl_seconds, 120);
         assert_eq!(a.webhook_auth_deny_cache_ttl_seconds, 5);
         assert_eq!(a.webhook_auth_fetch_timeout_seconds, 3);
+    }
+}
+
+#[cfg(test)]
+mod wasm_filter_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> ServeArgs {
+        match Cli::parse_from(args) {
+            Cli::Serve(a) => a,
+        }
+    }
+
+    #[test]
+    fn wasm_filter_unset_is_empty_vec() {
+        let a = parse(&["lvqr", "serve"]);
+        assert!(a.wasm_filter.is_empty());
+    }
+
+    #[test]
+    fn single_wasm_filter_preserves_legacy_shape() {
+        let a = parse(&["lvqr", "serve", "--wasm-filter", "/tmp/a.wasm"]);
+        assert_eq!(a.wasm_filter.len(), 1);
+        assert_eq!(a.wasm_filter[0], std::path::PathBuf::from("/tmp/a.wasm"));
+    }
+
+    #[test]
+    fn repeated_wasm_filter_flag_stacks_into_chain_order() {
+        let a = parse(&[
+            "lvqr",
+            "serve",
+            "--wasm-filter",
+            "/tmp/a.wasm",
+            "--wasm-filter",
+            "/tmp/b.wasm",
+            "--wasm-filter",
+            "/tmp/c.wasm",
+        ]);
+        assert_eq!(
+            a.wasm_filter,
+            vec![
+                std::path::PathBuf::from("/tmp/a.wasm"),
+                std::path::PathBuf::from("/tmp/b.wasm"),
+                std::path::PathBuf::from("/tmp/c.wasm"),
+            ]
+        );
+    }
+
+    #[test]
+    fn comma_delimited_wasm_filter_also_stacks_into_chain() {
+        // Matches the LVQR_WASM_FILTER=a.wasm,b.wasm env-var shape.
+        let a = parse(&["lvqr", "serve", "--wasm-filter", "/tmp/a.wasm,/tmp/b.wasm"]);
+        assert_eq!(
+            a.wasm_filter,
+            vec![
+                std::path::PathBuf::from("/tmp/a.wasm"),
+                std::path::PathBuf::from("/tmp/b.wasm"),
+            ]
+        );
     }
 }

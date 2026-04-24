@@ -46,7 +46,7 @@ pub struct TestServerConfig {
     record_dir: Option<PathBuf>,
     archive_dir: Option<PathBuf>,
     hmac_playback_secret: Option<String>,
-    wasm_filter: Option<PathBuf>,
+    wasm_filter: Vec<PathBuf>,
     hls_disabled: bool,
     dash_enabled: bool,
     srt_enabled: bool,
@@ -236,8 +236,13 @@ impl TestServerConfig {
     /// any ingest listener starts. The server holds the
     /// `WasmFilterBridgeHandle` on `ServerHandle`; tests read
     /// per-broadcast counters off it.
+    ///
+    /// Repeated calls chain filters in insertion order so tests
+    /// can exercise the multi-filter pipeline that CLI's
+    /// `--wasm-filter` flag accepts (PLAN Phase D, session 136).
+    /// A single call preserves the legacy single-filter shape.
     pub fn with_wasm_filter(mut self, path: impl Into<PathBuf>) -> Self {
-        self.wasm_filter = Some(path.into());
+        self.wasm_filter.push(path.into());
         self
     }
 

@@ -137,17 +137,23 @@ pub struct ServeConfig {
     /// want captions. Tier 4 item 4.5 session D.
     #[cfg(feature = "whisper")]
     pub whisper_model: Option<PathBuf>,
-    /// Optional path to a WASM fragment filter module. When set,
-    /// `start()` loads + compiles the module via
-    /// `lvqr_wasm::WasmFilter::load` and installs a filter tap
-    /// on the shared `FragmentBroadcasterRegistry` before any
-    /// ingest listener starts accepting traffic. The tap
-    /// observes every fragment flowing through every
+    /// Ordered list of WASM fragment filter modules. When
+    /// non-empty, `start()` loads + compiles each module via
+    /// `lvqr_wasm::WasmFilter::load` and installs a single
+    /// `lvqr_wasm::ChainFilter` tap on the shared
+    /// `FragmentBroadcasterRegistry` before any ingest listener
+    /// starts accepting traffic. Chain order is preserved; the
+    /// first filter that drops a fragment short-circuits the rest
+    /// of the chain for that fragment. Each path is watched
+    /// independently via its own `WasmFilterReloader` so
+    /// hot-swapping one slot does not disturb the others.
+    ///
+    /// The tap observes every fragment flowing through every
     /// broadcaster and drives
-    /// `lvqr_wasm_fragments_total{outcome=keep|drop}` counters;
-    /// in v1 it does NOT modify what downstream subscribers
-    /// receive (session-86 scope narrowing). Omit to disable.
-    pub wasm_filter: Option<PathBuf>,
+    /// `lvqr_wasm_fragments_total{outcome=keep|drop}` counters; in
+    /// v1 it does NOT modify what downstream subscribers receive
+    /// (session-86 scope narrowing). Leave empty to disable.
+    pub wasm_filter: Vec<PathBuf>,
     /// Install the global Prometheus recorder. Must be `false` in tests
     /// because `metrics-exporter-prometheus` panics on the second install
     /// in a process. `main.rs` sets this to `true`.
@@ -299,7 +305,7 @@ impl ServeConfig {
             c2pa: None,
             #[cfg(feature = "whisper")]
             whisper_model: None,
-            wasm_filter: None,
+            wasm_filter: Vec::new(),
             install_prometheus: false,
             otel_metrics_recorder: None,
             tls_cert: None,
