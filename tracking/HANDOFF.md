@@ -1,8 +1,63 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D rows "webhook auth provider" (session 135) + "WASM filter chain composition" (session 136) SHIPPED**. **Session 137 added `GET /api/v1/wasm-filter` admin route**. **Session 138 (2026-04-24) extended the JS + Python SDK admin clients with the new method** -- `@lvqr/core::LvqrAdminClient.wasmFilter()` + `lvqr.LvqrClient.wasm_filter()` both return a `WasmFilterState` mirroring the Rust shape; 4 new pytest cases + 1 new Vitest case against a live server. Default-gate Rust workspace unchanged at **1008/0/3** (this session touched only JS + Python bindings). Python `pytest` count 21 -> 25 (+4). 29 crates. Admin surface now at **10 routes** on both published language targets (previously 9/9 after session 123). Remaining Phase D scope: mesh data-plane completion, one hardware encoder backend, authoritative DASH-IF container validator, npm + PyPI publish cycle (now carries the session-135 webhook + 136 chain + 137 admin-route + 138 SDK bindings).
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D rows "webhook auth provider" (session 135) + "WASM filter chain composition" (session 136) SHIPPED**. **Session 137 added `GET /api/v1/wasm-filter` admin route**; **session 138 extended the JS + Python SDK admin clients with the new method**; **session 139 wired `--wasm-filter` into `sdk-tests.yml`** so the live Vitest assertion exercises the chain-configured admin shape end-to-end (`enabled: true, chain_length: 1`), closing the session-138 "no live chain test" known limitation. Default-gate Rust workspace unchanged at **1008/0/3** (session 139 touched only the CI workflow + one Vitest assertion; no source code changes). Python pytest at 25; Vitest at 11 (all passing against a chain-configured local lvqr instance, smoke-verified this session). 29 crates. Admin surface at **10 routes** on both published language targets. Remaining Phase D scope: mesh data-plane completion, one hardware encoder backend, authoritative DASH-IF container validator, npm + PyPI publish cycle (now carries sessions 135 + 136 + 137 + 138 + 139 worth of updates).
 
-**Last Updated**: 2026-04-24 (session 138 close). Sessions 135-137 are pushed (`origin/main` now at `1a1667e`); session 138 commits the SDK feat + close-doc on top.
+**Last Updated**: 2026-04-24 (session 139 close). Sessions 135-137 are pushed (`origin/main` at `1a1667e`); sessions 138-139 local pending push.
+
+## Session 139 close (2026-04-24)
+
+**Shipped**: `sdk-tests.yml` CI workflow now boots `lvqr serve` with `--wasm-filter crates/lvqr-wasm/examples/frame-counter.wasm`, so the live Vitest assertion for `LvqrAdminClient.wasmFilter()` exercises the chain-configured admin shape (`enabled: true, chain_length: 1`) end-to-end instead of the disabled-body shape. Closes the session-138 "Known Limitation": **no live-server integration test for the chain-configured shape on the SDK side**. Smoke-verified locally: lvqr boots with the new flag, the admin route returns the expected JSON (`{"enabled":true,"chain_length":1,"broadcasts":[]}`), and all 11 Vitest cases pass against that live instance.
+
+### Deliverables
+
+1. **`.github/workflows/sdk-tests.yml`**:
+   * Background `lvqr serve` spawn grows a new arg: `--wasm-filter crates/lvqr-wasm/examples/frame-counter.wasm`. Uses the committed fixture that already backs `wasm_frame_counter.rs` + `wasm_filter_chain.rs` + `wasm_filter_admin_route.rs`; no new files to commit.
+   * Workflow header comment updated to note session 139's change + the session-138 gap it closes.
+
+2. **`bindings/js/tests/sdk/admin-client.spec.ts`**:
+   * The existing `wasmFilter returns a WasmFilterState shape` test had asserted the disabled shape because session 138's sdk-tests.yml harness booted without `--wasm-filter`. Session 139 flipped the harness, so the test now asserts `enabled: true, chain_length: 1, broadcasts: []` (no publisher in the harness keeps `broadcasts` empty; the chain is live and observable). Test name widened to `wasmFilter returns a WasmFilterState shape reflecting the configured chain`.
+
+3. **Local smoke verification**:
+   * `cargo build -p lvqr-cli` (cached -- no source touched).
+   * Booted `lvqr serve --admin-port 18090 --hls-port 0 --rtmp-port 18091 --port 18092 --mesh-enabled --cluster-listen 127.0.0.1:18093 --no-auth-signal --wasm-filter crates/lvqr-wasm/examples/frame-counter.wasm` in the background.
+   * `curl http://127.0.0.1:18090/api/v1/wasm-filter` returned `{"enabled":true,"chain_length":1,"broadcasts":[]}` -- the shape the updated assertion expects.
+   * `cd bindings/js && LVQR_TEST_ADMIN_URL=http://127.0.0.1:18090 npm run test:sdk` -- 11/11 Vitest cases pass in 31 ms. Killed lvqr after.
+
+### Key 139 design decisions baked in
+
+* **One lvqr serve invocation, not two.** Adding a second invocation (one with `--wasm-filter`, one without) would double CI wall-clock and require a second admin port. Flipping the single harness to the chain-configured shape + flipping the one affected test assertion is the smallest change that closes the gap. The disabled shape is already tested via mocks in Python pytest + type defaults in both SDKs; no need for a live server to prove disabled works too.
+
+* **Use the committed `frame-counter.wasm` fixture.** Already in the repo at `crates/lvqr-wasm/examples/frame-counter.wasm`; backs four existing integration tests (`wasm_frame_counter.rs`, `wasm_filter_chain.rs`, `wasm_hot_reload.rs`, `wasm_filter_admin_route.rs`). Zero new artifacts to commit; CI does not need a build step to produce the wasm.
+
+* **No publisher in the harness.** `broadcasts: []` is fine and intentional. A real RTMP publisher in Vitest would require a JS RTMP client; that is out of scope for this workflow. End-to-end chain-configured coverage with a publisher already exists at the Rust layer (`wasm_filter_admin_route.rs`). The Vitest assertion is about SDK wiring, not about the chain actually tapping traffic.
+
+* **Federation-flake investigation aborted.** Session 134 named `lvqr-admin::cluster_routes::tests::federation_route_reports_configured_link_status` as an intermittent flake. 8 full-module runs this session all passed cleanly; the session 134 note said "failed once in the first workspace-test run and passed on every subsequent isolated re-run", so reproduction requires the full `cargo test --workspace` run and specific scheduling. Without local repro, any fix would be speculative band-aid work. Path aborted in favor of the smaller, more certain sdk-tests.yml win.
+
+* **DASH-IF + hardware encoder still paused.** Docker daemon is installed but off on the dev box; GStreamer CLI is absent. Authoring CI workflow YAML that I cannot verify locally (the session-139 change is small + well-understood, but a `dashif/conformance` container integration is not) keeps producing speculative work. Both items wait for the bits the dev environment cannot currently supply.
+
+### Ground truth (session 139 close)
+
+* **Head (pre-push)**: `ci(sdk)` + this close-doc commit (pending). Sessions 135-137 pushed (origin `1a1667e`); session 138 local (commits `d661138` + `77689a0`); session 139 adds two more. Local main is 4 ahead of origin after this session.
+* **Tests**:
+  * Rust workspace default gate: **1008** passed / 0 failed / 3 ignored (unchanged; no Rust code touched).
+  * `bindings/python pytest`: **25** passed / 0 failed (unchanged).
+  * `bindings/js @lvqr/core` Vitest: **11** passed / 0 failed against a chain-configured local lvqr (smoke-verified this session; CI runs same shape).
+  * Local smoke: `curl /api/v1/wasm-filter` returns `{"enabled":true,"chain_length":1,"broadcasts":[]}` as expected.
+* **CI gates locally clean**:
+  * `cargo fmt --all -- --check` clean (no Rust change).
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95 (no Rust change).
+  * `tsc` clean on both `@lvqr/core` + `@lvqr/player` (no TypeScript API change).
+* **Workspace**: 29 Rust crates (unchanged), `@lvqr/core` + `@lvqr/player` TypeScript packages, `lvqr` Python package.
+
+### Known limitations / documented v1 shape (after 139 close)
+
+* **Live chain test has no publisher.** Broadcasts stay empty; the assertion proves SDK wiring but not that fragments flow through the chain. End-to-end chain-with-traffic coverage lives at the Rust integration-test layer.
+* **Federation flake** still pre-existing; investigation aborted this session (no local repro).
+* **DASH-IF container validator, hardware encoder, npm + PyPI publish, mesh data-plane** -- all still waiting on external bits the dev environment cannot supply.
+* All other session 138 + earlier known limitations unchanged.
+
+
+
 
 ## Session 138 close (2026-04-24)
 
