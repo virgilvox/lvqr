@@ -1,8 +1,80 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 / 121-B / 122-A / 122-B / 122-C / 122-D + SDK-docs-reconnect all SHIPPED**. **991** workspace tests on the default gate (unchanged across sessions 131 + 132; both were pure code-dedup refactors). 29 crates. `lvqr_test_utils::{http, flv}` modules are now the sole source of HTTP GET + FLV tag primitive code in `crates/lvqr-cli/tests/*.rs`. Zero local http_get bodies, zero local FLV definitions. Remaining phase-C work: RTMP handshake helper factor (PLAN 122-E; subtle per-file variance wants a dedicated session) + authoritative DASH-IF container validator + webhook auth provider + npm + PyPI publish cycle carrying the 9/9 admin + JWKS + sign_live_url public APIs.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C rows 117 / 117-A / 117-B / 117-C / 117-D / 118-A / 118-B / 119-A / 119-B / 119-C / 120 / 121 / 121-B / 122-A / 122-B / 122-C / 122-D / 122-E + SDK-docs-reconnect all SHIPPED**. **991** workspace tests on the default gate (unchanged across sessions 131 + 132 + 133; all three were pure code-dedup refactors). 29 crates. `lvqr_test_utils::{http, flv, rtmp}` modules now centralize the three RTMP-helper surfaces every integration test used to reimplement (http GET + FLV tag builders + `rtmp_client_handshake` driver). One file (`one_token_all_protocols.rs`) keeps a local Result-returning handshake variant with a documented single-caller contract. Remaining phase-C work: `read_until` / `send_results` / `send_result` helpers still duplicated across ~14 files (PLAN 122-F, future slice) + authoritative DASH-IF container validator + webhook auth provider + npm + PyPI publish cycle carrying the 9/9 admin + JWKS + sign_live_url public APIs.
 
-**Last Updated**: 2026-04-23 (session 132 close). Session 132's commit pair (`refactor(tests): drain http_get from 8 non-RTMP test files` + `docs: session 132 close`) rides on top of the session-131 + README chain at `c882da1`; the full chain `cc1f560..ebf1b1d` lands on `origin/main` on 2026-04-23.
+**Last Updated**: 2026-04-23 (session 133 close). Session 133's commit pair (`refactor(tests): factor RTMP handshake into lvqr-test-utils::rtmp` + `docs: session 133 close`) rides on top of the session-131 + README + session-132 chain at `92535d7`.
+
+## Session 133 close (2026-04-23)
+
+**Shipped**: PLAN row 122-E (fifth slice of the shared-helpers refactor; drains the `rtmp_client_handshake` duplication surface across 13 test files). New `lvqr-test-utils::rtmp` module registered in `lib.rs`. Default-gate workspace count unchanged at **991 / 0 / 3**.
+
+### Deliverables
+
+1. **`crates/lvqr-test-utils/src/rtmp.rs`** (~85 LOC) -- new module registered as `pub mod rtmp` in `lvqr-test-utils/src/lib.rs`. Exposes `rtmp_client_handshake(stream: &mut TcpStream) -> Vec<u8>`, the panic-on-error variant that 12 of the 13 migrating files already used. The module doc comment explicitly documents the panic contract, and explains why the Result-returning variant used by `one_token_all_protocols` stays local (single-caller; that test's `try_rtmp_publish` maps `Err` to `return false` as a signal that the server dropped the handshake, which the panic variant would turn into a test failure instead).
+
+2. **`crates/lvqr-test-utils/Cargo.toml`** -- adds `rml_rtmp = { workspace = true }` to dependencies (previously absent; the handshake module names `Handshake`, `HandshakeProcessResult`, `PeerType` directly) and `io-util` to tokio's feature list (needed for `AsyncReadExt::read` / `AsyncWriteExt::write_all`). Dep-graph change invalidated the incremental clippy cache for every consumer crate, surfacing 11 pre-existing `collapsible_match` lints in test-file `read_until` helpers; drive-by-fixed via `cargo clippy --fix`.
+
+3. **13 test files migrated** to consume the shared helper:
+   * Direct consumption (rename local `fn rtmp_client_handshake` into module import): `archive_dvr_read_e2e`, `c2pa_cli_flags_e2e` (feature-gated on c2pa), `c2pa_verify_e2e` (feature-gated on c2pa), `rtmp_archive_e2e`, `rtmp_dash_e2e`, `rtmp_hls_e2e`, `rtmp_ws_e2e`, `rtmp_whep_audio_e2e` (feature-gated on transcode), `wasm_frame_counter`, `wasm_hot_reload`, `whisper_cli_e2e` (feature-gated on whisper; #[ignore]'d).
+   * Rename + consumption (rename local `fn rtmp_handshake` call sites to `rtmp_client_handshake` + import the shared helper): `playback_signed_url_e2e`, `transcode_ladder_e2e` (feature-gated on transcode).
+
+4. **`one_token_all_protocols.rs` intentionally left with its local handshake.** The file's `fn rtmp_handshake(stream) -> std::io::Result<Vec<u8>>` is semantically different from the shared panic-returning variant: the surrounding `try_rtmp_publish(addr, app, key) -> bool` helper uses `Err(std::io::Error)` propagation to distinguish "handshake succeeded + server rejected publish" from "server closed mid-handshake" (which is exactly the auth-rejection signal the test wants). Exposing a `_try` shared variant for one caller would be premature factoring; the module doc comment in `lvqr-test-utils::rtmp` names this explicitly so future contributors understand the single-caller exemption.
+
+5. **Drive-by `collapsible_match` lint fix across 11 files.** `cargo clippy --fix --allow-dirty --allow-staged` auto-applied the suggested guard-pattern rewrite in every test file's `read_until` helper. The lint was pre-existing but masked by clippy's incremental cache; the new `rml_rtmp` dep on `lvqr-test-utils` invalidated the cache and surfaced the lint. Fixed files: `archive_dvr_read_e2e`, `c2pa_cli_flags_e2e`, `c2pa_verify_e2e`, `playback_signed_url_e2e`, `rtmp_archive_e2e`, `rtmp_dash_e2e`, `rtmp_hls_e2e`, `rtmp_ws_e2e`, `wasm_frame_counter`, `wasm_hot_reload` (lvqr-cli) + `rtmp_bridge_integration` (lvqr-ingest).
+
+6. **`tracking/PLAN_V1.1.md`** row 122-E marked SHIPPED with the per-file detail list inline.
+
+7. **README.md + `docs/auth.md` unchanged** -- pure internal hygiene; no operator-facing surface moved.
+
+### Key 133 design decisions baked in
+
+* **Expose only the panic variant in the shared module.** 12 of 13 migrating files used `.unwrap()` / `assert!` panics on handshake errors; the Result-returning variant is a single-caller. YAGNI + explicit documentation on the module's one-caller exemption. If a second caller ever needs Result-returning semantics, the module doc comment explicitly points at the `_try` follow-up slot.
+
+* **Drop the rml_rtmp::handshake import line from every migrated file.** Every migrated file previously imported `rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType}` for its own local handshake fn. Those imports are now redundant once the local fn is gone. The `rml_rtmp::sessions::{...}` imports stay because the test bodies still name `ClientSession`, `ClientSessionEvent`, etc. directly.
+
+* **Rename `rtmp_handshake` -> `rtmp_client_handshake` at the 2 diverging call sites** (`playback_signed_url_e2e`, `transcode_ladder_e2e`). The shared module is canonical; keeping two names would mean maintaining two-call-site aliasing for no benefit. The rename is a 1-line change per file (`let remaining = rtmp_handshake(&mut stream).await;` -> `let remaining = rtmp_client_handshake(&mut stream).await;`).
+
+* **Fix `collapsible_match` lint auto-instead-of-allow.** Session 133's initial clippy run surfaced 11 pre-existing lints after the dep-graph change invalidated the incremental cache. Two options: (a) add `#[allow(clippy::collapsible_match)]` module-level attributes across 14 files, or (b) apply the clippy-suggested fix via `cargo clippy --fix`. Went with (b) because the fix is pure style (turns `match { RaisedEvent(ref event) => { if predicate(event) { return; } } }` into `match { RaisedEvent(ref event) if predicate(event) => return, }`) with no behavior delta and leaves the tree in a cleaner shape. The `read_until` helper itself is still duplicated per file; factoring that out is PLAN 122-F.
+
+* **`read_until` + `send_results` + `send_result` stay local.** These three helpers are the remaining duplication in RTMP test files. Factoring them requires harmonizing predicate signatures (all variants currently use `Fn(&ClientSessionEvent) -> bool`, identical so migrating is mechanical) AND picking an Instant type (some files use `tokio::time::Instant`, others `std::time::Instant` -- both work for the deadline arithmetic). That is session 134's work (PLAN 122-F); keeping this slice single-purpose avoids mixing the RTMP handshake rewrite with an unrelated harmonization pass.
+
+* **Transcode-feature runtime verification still deferred.** `brew install gstreamer` completed mid-session but the formula is a metapackage that does not ship `gstreamer-app-1.0.pc`; pkg-config still can't resolve the dev lib so `cargo test --features transcode` compile-fails before it runs. Same posture as sessions 131 + 132: `feature-matrix.yml` CI is the authoritative runtime signal.
+
+* **Default-gate test count unchanged at 991/0/3.** The session adds zero tests + removes zero tests. ~240 LOC of duplicated handshake bodies drop in exchange for 85 LOC of new shared module + 13 LOC of import-line changes.
+
+### Ground truth (session 133 close)
+
+* **Head (pre-push)**: `refactor(tests)` + this close-doc commit (pending). `origin/main` at `92535d7` unchanged from session 131 + README + session 132 push.
+* **Tests**:
+  * Default workspace gate: **991** passed / 0 failed / 3 ignored (unchanged from session 132).
+  * Per-file re-runs after migration: rtmp_archive 2/0/0, rtmp_hls 3/0/0, rtmp_dash 2/0/0, c2pa_verify 1/0/0 (--features c2pa), c2pa_cli_flags 2/0/0 (--features c2pa).
+  * Compile-verified under feature gates: whisper_cli_e2e via `cargo check --features whisper` (session 131 precedent). rtmp_whep_audio_e2e + transcode_ladder_e2e compile-verified to the extent the local host allows (brew gstreamer metapackage missing pkg-config's gstreamer-app-1.0.pc file; full compile deferred to feature-matrix.yml's transcode cell on CI).
+* **CI gates locally clean**:
+  * `cargo fmt --all --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95 (after the drive-by `collapsible_match` auto-fix).
+  * `cargo test --workspace` 991 / 0 / 3.
+* **Workspace**: **29 crates**, unchanged.
+
+### Audit trail (session 133)
+
+Post-migration grep for local `rtmp_client_handshake` / `rtmp_handshake` function definitions in `crates/lvqr-cli/tests/*.rs`:
+
+* Files with a local handshake definition: **1** (`one_token_all_protocols.rs`, Result-returning single-caller variant with documented exemption).
+* Files consuming the shared `lvqr_test_utils::rtmp::rtmp_client_handshake`: 13.
+* Files with no handshake at all (don't do RTMP): the rest.
+
+### Known limitations / documented v1 shape (after 133 close)
+
+* **`read_until` + `send_results` + `send_result` RTMP test helpers still duplicated across ~14 files.** PLAN 122-F follow-up slice. Factoring requires choosing an Instant type (tokio vs std) and harmonizing the Fn predicate constraint (identical in shape across variants today). Same mechanical pattern as 122-A/B/C/D/E.
+* **`one_token_all_protocols.rs` keeps its local `fn rtmp_handshake` Result-variant.** Single-caller with documented error-recovery contract. Exposing a `_try` shared variant is premature factoring; revisit if a second Result-consumer appears.
+* **transcode + rtmp_whep_audio runtime verification still deferred to CI.** `brew gstreamer` metapackage lacks the dev-lib .pc file needed for `cargo` to compile the transcode-feature graph locally.
+* **Authoritative DASH-IF container validator deferred**; GPAC MP4Box remains primary.
+* **Webhook auth provider** still pending.
+* **npm + PyPI publish cycle** still pending.
+* All other session 132 + earlier known limitations unchanged.
+
+
+## Session 132 close (2026-04-23)
 
 ## Session 132 close (2026-04-23)
 
