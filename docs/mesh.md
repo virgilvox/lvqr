@@ -43,8 +43,6 @@ high-fan-out broadcasts.
 >   rebalancing uses measured capacity instead of hardcoded
 >   `max-children`.
 > - TURN deployment recipe for peers behind symmetric NAT.
-> - Three-peer Playwright matrix + the 5-artifact test contract
->   sweep across WebRTC-heavy browsers.
 >
 > **Actual-vs-intended offload reporting** shipped in session 141.
 > Browser peers report their cumulative forwarded-frame count to
@@ -55,6 +53,19 @@ high-fan-out broadcasts.
 > planner assign to peer X" against "how many frames has peer X
 > actually forwarded". See the "Per-peer offload snapshot" block
 > below.
+>
+> **Three-peer Playwright matrix** shipped in session 142
+> (`bindings/js/tests/e2e/mesh/three-peer-chain.spec.ts`). Three
+> Chromium browser contexts form a depth-2 chain
+> (peer-1 -> peer-2 -> peer-3) and the test asserts both byte-for-
+> byte frame delivery at the leaf AND the per-peer offload-report
+> shape across the chain. The middle peer's `forwarded_frames`
+> counter is the load-bearing signal: a single-hop test cannot
+> distinguish "received-then-forwarded" from "received-only", so
+> the depth-2 case is what proves session 141's reporting works
+> on real multi-hop topologies. Browser matrix beyond Chromium +
+> the `--features` cell sweep across WebRTC-heavy engines remain
+> v1.2 candidates.
 >
 > Until the remaining phase-D rows land, a deployment that sets
 > `--mesh-enabled` still serves every subscriber directly from

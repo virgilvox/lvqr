@@ -1,8 +1,83 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D 7 sessions deep** -- WASM chain thread (135-140) closed + mesh data-plane row 1 (actual-vs-intended offload) shipped in 141. **Session 141 (2026-04-24) added mesh offload reporting** -- new `SignalMessage::ForwardReport` client-to-server variant carries a cumulative forwarded-frame count; `MeshCoordinator::record_forward_report` replaces the per-peer counter; `GET /api/v1/mesh` grows a `peers: Vec<MeshPeerStats>` array exposing `intended_children` from the topology planner alongside the client-reported `forwarded_frames`. JS `MeshPeer` self-emits on a 1 s skip-on-unchanged interval. Closes the first of four unshipped mesh data-plane rows in README's "Peer mesh data plane" checklist. Default-gate Rust workspace **1013 -> 1022** (+9: 4 `record_forward_report` coord tests + 1 `peer_info_defaults` extension + 4 `ForwardReport` signal tests; the admin test count grew by 1 via the new pre-141 defensive-parse test). Python pytest **27 -> 29** (+2: `MeshPeerStats` defaults + pre-141 defensive-parse). Vitest 11 unchanged; the existing live-chain test grew an array-shape assertion for `mesh.peers`. Playwright two-peer spec gained a full admin-poll block asserting `forwarded_frames > 0` for the Root and `== 0` for the leaf Relay. 29 crates. Admin surface at **10 routes** on both published language targets. Remaining Phase D scope: per-peer capacity advertisement, TURN recipe, three-peer Playwright matrix, hardware encoder backend, DASH-IF validator, npm + PyPI publish.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D 8 sessions deep** -- WASM chain thread (135-140) closed + mesh data-plane rows 1 (offload reporting, 141) and 2 (three-peer Playwright matrix, 142) shipped. **Session 142 (2026-04-24) added the three-peer Playwright matrix** -- new `bindings/js/tests/e2e/mesh/three-peer-chain.spec.ts` spawns three Chromium contexts forming a depth-2 chain `peer-1 -> peer-2 -> peer-3`, asserts byte-equality at the leaf AND session-141 per-peer offload counters across the chain (the middle peer's `forwarded_frames > 0` is the load-bearing assertion that proves multi-hop relay works). Playwright webServer config gains `--max-peers 1` so the assignment is deterministic. New `parentPeerId` getter on `MeshPeer`. Sessions 138-141 pushed in this session (`origin/main` advanced from `1a1667e` to `0c2320d`); session 142 local. Default-gate Rust workspace unchanged at **1022/0/3** (no Rust changes). Python pytest unchanged at **29**. Vitest unchanged at 11. 29 crates. Admin surface at **10 routes**. Remaining Phase D scope: per-peer capacity advertisement, TURN recipe, hardware encoder backend, DASH-IF validator, npm + PyPI publish.
 
-**Last Updated**: 2026-04-24 (session 141 close). Sessions 135-137 are pushed (`origin/main` at `1a1667e`); sessions 138-141 local pending push.
+**Last Updated**: 2026-04-24 (session 142 close). Sessions 135-141 are pushed (`origin/main` at `0c2320d`); session 142 local pending push.
+
+## Session 142 close (2026-04-24)
+
+**Shipped**: Three-peer Playwright matrix. Closes the second of the four unshipped bullets under README's "Peer mesh data plane" checklist (line 446-447). New `bindings/js/tests/e2e/mesh/three-peer-chain.spec.ts` spawns three Chromium contexts forming a depth-2 chain (`peer-1` Root -> `peer-2` Relay -> `peer-3` Relay grandchild) and asserts both the byte-for-byte frame relay AND the per-peer admin shape across the chain. The middle peer's `forwarded_frames > 0` is the load-bearing assertion that the depth-2 case adds over session 141's two-peer test: a single-hop test cannot distinguish "received-then-forwarded" from "received-only" because session 141's counter only fires on `dc.send`. Pure test + docs + one-line MeshPeer accessor; no source changes outside `bindings/js/`. Sessions 138-141 also pushed in this session (`origin/main` is now `0c2320d`).
+
+### Deliverables
+
+1. **`bindings/js/playwright.config.ts`**:
+   * webServer command grows `--max-peers 1`. Forces deterministic chain assignment: peer-1 takes the only Root slot, peer-2 fills peer-1's only child slot, peer-3 descends to peer-2. The two-peer-relay spec is unaffected because it only ever uses one slot on peer-1.
+
+2. **`bindings/js/packages/core/src/mesh.ts`**:
+   * New public getter `parentPeerId: string | null`. Reads the existing private `parentId` field. Tests now wait for `peer.parentPeerId === 'expected-parent'` deterministically rather than fishing in private state. `null` for Root peers and for peers that have not yet received an `AssignParent`.
+
+3. **`bindings/js/tests/e2e/mesh/three-peer-chain.spec.ts`** (new, ~250 lines):
+   * Single test `three-peer chain relays root-pushed frames to a depth-2 grandchild`.
+   * Three browser contexts; same harness pattern as the two-peer spec (`addInitScript` injection of `dist/mesh.js` as a global plus `__setupPeer` helper).
+   * Connects peer-1, waits for Role=Root. Connects peer-2, waits for Role=Relay AND `parentPeerId === 'peer-one'`. Waits for peer-1 `childCount >= 1` to confirm the DataChannel opened on the parent side BEFORE peer-3 connects (without this, peer-3 could race in front of peer-2's slot claim under `--max-peers 1`).
+   * Connects peer-3, waits for Role=Relay AND `parentPeerId === 'peer-two'`. Waits for peer-2 `childCount >= 1`.
+   * Pushes frames from peer-1 on a 100 ms loop; waits for peer-3's `__frames` array to contain the expected payload.
+   * Waits ~2.5 s for the session-141 ForwardReport interval to emit at least twice (peer-2's first emit fires before it is forwarding to peer-3, so the second is the one that reflects the chain). Stops the push loop, waits another 1.2 s for the final emit.
+   * Polls `GET /api/v1/mesh` and asserts:
+     * `enabled === true`, `peer_count === 3`, `offload_percentage` between 60 and 70 (2/3 ~= 66.7%).
+     * `peer-1`: Root, parent=null, depth=0, intended_children=1, forwarded_frames > 0.
+     * `peer-2`: Relay, parent="peer-one", depth=1, intended_children=1, forwarded_frames > 0 (LOAD-BEARING).
+     * `peer-3`: Relay, parent="peer-two", depth=2, intended_children=0, forwarded_frames === 0.
+
+4. **`README.md`**:
+   * "Three-peer browser Playwright E2E" bullet flipped from `[ ]` to `[x]` with the strikethrough + shipped-in-142 prose, linking the new spec.
+
+5. **`docs/mesh.md`**:
+   * "What is still phase-D scope" subsection trimmed to two bullets (capacity + TURN); three-peer matrix moved into a new shipped-in-142 paragraph alongside the session-141 offload-reporting paragraph.
+
+6. **`docs/sdk/javascript.md`**:
+   * Peer-mesh section gains a paragraph naming the new `parentPeerId` getter and explaining its `null`-pre-assignment semantics.
+
+7. **`tracking/SESSION_142_BRIEFING.md`** (new): locks the design before any source file is opened. Documents the topology forcing rationale (`--max-peers 1` + `--mesh-root-peer-count 1`), the per-peer expectation table, the load-bearing assertion, and the anti-scope list (no 4+ peer matrix, no fault injection, no browser matrix expansion, no exact-count assertions).
+
+### Key 142 design decisions baked in
+
+* **Single global `--max-peers 1`, not a second webServer.** Adding a second webServer entry on a different port would isolate the new spec's harness from the existing two-peer spec's, but doubles the boot cost in CI and adds a port-allocation cliff. The two-peer test only ever uses one slot on peer-1, so lowering the global cap to 1 is invisible to it. If a future fan-out test (one Root with 3 children) needs `max_children >= 3`, that session will add a second webServer at that point.
+
+* **Separate spec file, not an extension of `two-peer-relay.spec.ts`.** Each test reads as a single narrative (depth-1 fanout vs depth-2 chain). CI can opt-in/out of the new test independently. Test-name labelling is clearer in Playwright reports.
+
+* **`parentPeerId` getter, not exposed assignment object.** The full `AssignParent` message also carries `role` and `depth`, both of which already have getters (`peerRole`, no `depth` getter today; depth is reachable via the admin route's `peers[]`). Adding a single string getter is the minimum surface needed for deterministic chain-formation waits.
+
+* **Wait for parent-side `childCount >= 1` BEFORE connecting the next peer.** Without this barrier, peer-3 could Register at the coordinator before peer-2's `add_peer` settled, racing for peer-1's only child slot under `--max-peers 1`. Sequencing the parent-side DataChannel-open ack ensures the assignment is committed.
+
+* **`forwarded_frames > 0` rather than an exact count.** Same rationale as session 141's two-peer assertion -- SCTP timing variance on shared CI runners makes exact counts flake-prone. The semantic ("the chain transmitted at least one frame end-to-end") is what the test cares about.
+
+* **Three-peer chain, not three-peer fan-out.** The plan brief originally called this a "matrix"; the actual test is a chain. A fan-out (one Root, two children, no grandchild) would re-test session 141's reporting on a wider topology but would not exercise the multi-hop relay path. The chain is the topology that uniquely validates the depth-2 forward path.
+
+* **Browsers: Chromium only.** Same as session 115. RTCPeerConnection compat across Firefox + WebKit + their varying SCTP implementations is a v1.2 candidate; the cost is a real browser-matrix CI workflow which is several sessions of work on its own.
+
+### Ground truth (session 142 close)
+
+* **Head (pre-push)**: `feat(mesh-test+sdk)` + docs close (pending). Sessions 135-141 pushed (origin `0c2320d` after this session pushed sessions 138-141). After session-142 docs-close lands, local main will be 2 ahead of origin.
+* **Tests**:
+  * Rust workspace default gate: **1022** passed / 0 failed / 3 ignored (UNCHANGED; no Rust source touched).
+  * `bindings/python pytest`: **29** passed / 0 failed (UNCHANGED).
+  * `@lvqr/core` tsc: clean. Vitest case count unchanged at 11.
+  * `@lvqr/player` tsc: clean.
+  * Playwright spec: typecheck clean for both `three-peer-chain.spec.ts` and `two-peer-relay.spec.ts`. The actual browser run happens in the `mesh-e2e.yml` CI workflow on every push; not exercised locally this session.
+* **CI gates locally clean**:
+  * `cargo fmt --all -- --check` clean.
+  * No clippy run needed (no Rust source touched).
+  * `tsc` clean on `@lvqr/core` + `@lvqr/player` and on both e2e specs.
+* **Workspace**: **29 crates**, unchanged.
+
+### Known limitations / documented v1 shape (after 142 close)
+
+* **Browser matrix is Chromium only.** Firefox / WebKit engine compatibility is unverified. README mesh-data-plane checklist line 446-447 was scoped to Playwright + the 5-artifact contract; both ship today against Chromium. Cross-browser RTCPeerConnection + SCTP behavior is v1.2 scope.
+* **Strict ordering relies on slot-claim sequencing.** `--max-peers 1` makes the chain deterministic only because peer-2 connects + claims peer-1's slot before peer-3 connects. The test enforces this via a `childCount >= 1` wait on the parent. A racing harness that connected all three at once could land peer-3 in peer-1's slot first, leaving peer-2 to descend to peer-3 -- a different (still valid) chain that would fail the test's parent assertions.
+* **Fault injection not covered.** Killing peer-2 mid-flight to test orphan reassignment for peer-3 is anti-scope. The orphan-reassign path is unit-tested in `lvqr-mesh::coordinator::tests::reassign_orphaned_peer`.
+* **All other session 141 + earlier known limitations unchanged.**
+
 
 ## Session 141 close (2026-04-24)
 

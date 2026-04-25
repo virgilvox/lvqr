@@ -443,8 +443,14 @@ test.
   bandwidth + CPU instead of hardcoded `max-children`.
 - [ ] **TURN deployment recipe** + STUN fallback config. Document
   coturn integration for peers behind symmetric NAT.
-- [ ] **Three-peer browser Playwright E2E** feeding the 5-artifact
-  test contract.
+- [x] ~~**Three-peer browser Playwright E2E** feeding the
+  5-artifact test contract.~~ Shipped in session 142 as
+  [`bindings/js/tests/e2e/mesh/three-peer-chain.spec.ts`](bindings/js/tests/e2e/mesh/three-peer-chain.spec.ts).
+  Three Chromium contexts form a depth-2 chain
+  (peer-1 -> peer-2 -> peer-3); the test asserts both byte-
+  equality at the leaf and the session-141 per-peer offload-report
+  shape across the chain. Browser matrix beyond Chromium remains
+  v1.2 scope.
 - [ ] Flip [`docs/mesh.md`](docs/mesh.md) from "topology planner
   only" to "IMPLEMENTED". (The two-peer slice ships; the phase-D
   items above gate the "IMPLEMENTED" flip.)

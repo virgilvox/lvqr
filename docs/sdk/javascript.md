@@ -393,6 +393,12 @@ a `peers: MeshPeerStats[]` array with `intended_children`
 (topology planner) and `forwarded_frames` (client report) per
 peer.
 
+Read the assigned parent via `peer.parentPeerId` (added in
+session 142 alongside the three-peer Playwright matrix). Returns
+`null` for Root peers and for peers that have not yet received an
+`AssignParent` message; once the assignment lands, the value is
+the parent's peer_id.
+
 ```typescript
 import { MeshPeer } from '@lvqr/core';
 
