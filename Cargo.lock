@@ -3166,6 +3166,7 @@ name = "lvqr-cli"
 version = "0.4.1"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "axum 0.8.8",
  "base64",
  "bytes",

@@ -35,6 +35,7 @@ use lvqr_fragment::{FragmentBroadcasterRegistry, FragmentStream};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
+use crate::config_reload::SwappableHmacSecret;
 use crate::signed_url::{SignedUrlCheck, compute_signature, verify_signed_url_generic};
 
 /// Broadcaster-native archive indexer. Session 59 consumer-side
@@ -435,12 +436,15 @@ pub(crate) struct ArchiveState {
     pub canonical_dir: Arc<PathBuf>,
     pub index: Arc<RedbSegmentIndex>,
     pub auth: SharedAuth,
-    /// Optional HMAC signing secret (PLAN row 121). When `Some`,
-    /// every playback handler accepts a `?exp=<ts>&sig=<b64url>`
-    /// pair as an alternative auth path that short-circuits the
-    /// [`SharedAuth`] subscribe gate. `None` falls back to the
-    /// normal gate unchanged.
-    pub hmac_secret: Option<Arc<[u8]>>,
+    /// Optional HMAC signing secret (PLAN row 121, session 148 hot-
+    /// reload). The swap handle's inner `Option<Arc<[u8]>>` is loaded
+    /// per request: when `Some`, every playback handler accepts a
+    /// `?exp=<ts>&sig=<b64url>` pair as an alternative auth path that
+    /// short-circuits the [`SharedAuth`] subscribe gate. `None` falls
+    /// back to the normal gate unchanged. Session 148 swaps this in
+    /// place on `POST /api/v1/config-reload` so secret rotation takes
+    /// effect immediately without a server bounce.
+    pub hmac_secret: SwappableHmacSecret,
 }
 
 /// Extract a bearer token from an incoming request. Two
@@ -537,8 +541,9 @@ async fn playback_handler(
     Query(params): Query<PlaybackQuery>,
 ) -> Response {
     let request_path = format!("/playback/{broadcast}");
+    let secret_snapshot = state.hmac_secret.load_full();
     match verify_signed_url(
-        state.hmac_secret.as_deref(),
+        secret_snapshot.as_ref().as_deref(),
         &request_path,
         params.sig.as_deref(),
         params.exp,
@@ -602,8 +607,9 @@ async fn latest_handler(
     Query(params): Query<LatestQuery>,
 ) -> Response {
     let request_path = format!("/playback/latest/{broadcast}");
+    let secret_snapshot = state.hmac_secret.load_full();
     match verify_signed_url(
-        state.hmac_secret.as_deref(),
+        secret_snapshot.as_ref().as_deref(),
         &request_path,
         params.sig.as_deref(),
         params.exp,
@@ -676,8 +682,9 @@ async fn file_handler(
     Query(params): Query<FileQuery>,
 ) -> Response {
     let request_path = format!("/playback/file/{rel}");
+    let secret_snapshot = state.hmac_secret.load_full();
     match verify_signed_url(
-        state.hmac_secret.as_deref(),
+        secret_snapshot.as_ref().as_deref(),
         &request_path,
         params.sig.as_deref(),
         params.exp,
@@ -993,7 +1000,7 @@ pub(crate) fn playback_router(
     dir: PathBuf,
     index: Arc<RedbSegmentIndex>,
     auth: SharedAuth,
-    hmac_secret: Option<Arc<[u8]>>,
+    hmac_secret: SwappableHmacSecret,
 ) -> Router {
     let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
     let state = ArchiveState {

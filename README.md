@@ -111,6 +111,17 @@ in-process AI agents, cross-cluster federation, peer mesh).
   so a misconfigured store cannot lock the operator out. Default
   on; opt out with `--no-streamkeys`.
   See [`docs/auth.md#stream-key-crud-admin-api`](docs/auth.md#stream-key-crud-admin-api).
+- **Hot config reload** (sessions 147 + 148):
+  `lvqr serve --config <path.toml>` plus SIGHUP and
+  `POST /api/v1/config-reload` rotate the auth chain
+  (Static / HS256 JWT), mesh ICE servers, and HMAC playback
+  secret atomically without restarting the relay. The swap
+  uses `arc_swap::ArcSwap` handles with single-digit-ns reads;
+  in-flight requests finish against the prior snapshot. Stream-
+  key store handles are preserved across reloads. `jwks_url` /
+  `webhook_auth_url` reload deferred (async-builder + HTTP-cache
+  complexity, future session). See
+  [`docs/config-reload.md`](docs/config-reload.md).
 - **One token, every ingest.** The same JWT admits a publisher
   across RTMP (stream key IS the JWT), WHIP
   (`Authorization: Bearer`), SRT (`streamid=m=publish,r=<broadcast>,t=<jwt>`),
@@ -313,16 +324,17 @@ items are smaller, closer to shippable, and close gaps explicitly
 named in Known v0.4.0 limitations.
 
 Stream-key CRUD admin API shipped in session 146; hot config
-reload (auth-only v1) shipped in session 147. The remaining
+reload (auth-only v1) shipped in session 147; mesh ICE +
+HMAC-secret reload (v2) shipped in session 148. The remaining
 ranking:
 
-1. ~~**Hot config reload.**~~ Auth-only v1 shipped in session 147
-   (`lvqr serve --config <path.toml>` + SIGHUP +
-   `POST /api/v1/config-reload` rebuild the static / JWT-HS256
-   provider atomically via a new
-   `lvqr_auth::HotReloadAuthProvider` ArcSwap wrap). Future
-   increments expand the file format to mesh ICE servers, HMAC
-   playback secret, and `jwks_url` / `webhook_auth_url`. See
+1. ~~**Hot config reload.**~~ Auth-only v1 shipped in session 147;
+   v2 (mesh ICE servers + HMAC playback secret) shipped in session
+   148 (`lvqr serve --config <path.toml>` + SIGHUP +
+   `POST /api/v1/config-reload` swap the auth chain, mesh ICE list,
+   and HMAC secret atomically via `arc_swap::ArcSwap` handles).
+   `jwks_url` / `webhook_auth_url` reload remain deferred (their
+   constructors are async + cache HTTP state). See
    [`docs/config-reload.md`](docs/config-reload.md).
 2. **SCTE-35 passthrough.** WebVTT captions already ship via
    the WASM agent path (session 96); SCTE-35 ad-marker events
@@ -345,16 +357,25 @@ ranking:
 
 #### Recently shipped (compact reference)
 
+* **Hot config reload v2: mesh ICE + HMAC secret** (session 148)
+  -- `mesh_ice_servers` and `hmac_playback_secret` join the
+  hot-reloadable surface. The `/signal` callback `load_full`s the
+  swapped ICE list per `Register`; live HLS / DASH and DVR
+  `/playback/*` middlewares `load_full` the swapped HMAC secret
+  per request. Outstanding URLs signed under a rotated secret stop
+  verifying immediately (the documented rotation intent).
+  `applied_keys` on the route response grows to include
+  `"mesh_ice"` / `"hmac_secret"` when those reload effectively;
+  session 147's deferred-warning emissions for these two keys
+  drop. `jwks_url` / `webhook_auth_url` reload remain deferred.
+  See [`docs/config-reload.md`](docs/config-reload.md).
 * **Hot config reload (auth-only v1)** (session 147) --
   `lvqr serve --config <path.toml>` + SIGHUP +
   `POST /api/v1/config-reload`. The `[auth]` section
   hot-reloads via a new `lvqr_auth::HotReloadAuthProvider`
   (`arc_swap::ArcSwap` swap with single-digit-ns reads; in-flight
   `check()` calls finish against the prior snapshot). Stream-key
-  store is preserved. `jwks_url` / `webhook_auth_url` /
-  `mesh_ice_servers` / `hmac_playback_secret` reload are
-  deferred to a future increment; the route surfaces warnings
-  when present. See
+  store is preserved. See
   [`docs/config-reload.md`](docs/config-reload.md).
 * **Stream-key CRUD admin API** (session 146) -- runtime mint /
   list / revoke / rotate over `/api/v1/streamkeys/*` backed by
@@ -597,6 +618,10 @@ test.
   `--no-streamkeys`. See
   [`docs/auth.md#stream-key-crud-admin-api`](docs/auth.md#stream-key-crud-admin-api).
 - [x] **Hot config reload.** Auth-only v1 shipped in session 147.
+  - Mesh ICE servers + HMAC playback secret hot-reload shipped in
+    session 148 (the deferred-warning emissions session 147 added
+    for those keys drop; `applied_keys` grows entries when they
+    reload effectively).
   See [`docs/config-reload.md`](docs/config-reload.md).
 - [ ] **Dedicated DVR scrub web UI.**
 - [ ] **SCTE-35 passthrough.** (WebVTT captions already ship via
@@ -735,9 +760,11 @@ lvqr serve [OPTIONS]
   --no-streamkeys           Disable runtime stream-key CRUD
                             (`/api/v1/streamkeys/*`). Default on.
                             Env: LVQR_NO_STREAMKEYS.
-  --config <PATH>           TOML config file for hot reload
-                            (auth section). SIGHUP + admin POST
-                            re-apply. Env: LVQR_CONFIG.
+  --config <PATH>           TOML config file for hot reload.
+                            Hot-reloadable keys: `[auth]` section
+                            (static + HS256 JWT), `mesh_ice_servers`,
+                            `hmac_playback_secret`. SIGHUP + admin
+                            POST re-apply. Env: LVQR_CONFIG.
   --jwt-secret <S>          Enable HS256 JWT (replaces static tokens)
   --jwt-issuer <I>          Expected iss claim
   --jwt-audience <A>        Expected aud claim

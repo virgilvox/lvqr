@@ -23,14 +23,13 @@
 //! Configured deployments (static subscribe-token, JWT) get the
 //! gate automatically.
 
-use std::sync::Arc;
-
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use lvqr_auth::{AuthContext, AuthDecision, SharedAuth};
 
+use crate::config_reload::SwappableHmacSecret;
 use crate::signed_url::{LiveScheme, SignedUrlCheck, verify_live_signed_url};
 
 // =====================================================================
@@ -52,14 +51,16 @@ pub(crate) struct LivePlaybackAuthState {
     /// be replayed against the DASH route tree.
     pub(crate) scheme: LiveScheme,
     /// Operator-configured HMAC-SHA256 secret for signed URLs (session
-    /// 128). When `None`, the middleware never attempts signed-URL
-    /// verification + always falls through to the subscribe-token gate.
-    /// When `Some`, a request that presents `?sig=...&exp=...` is
-    /// verified first; a valid signature short-circuits the
-    /// subscribe-token gate. An invalid (tampered / expired) signature
-    /// returns 403 Forbidden (not 401) so clients can distinguish
-    /// missing auth from wrong auth.
-    pub(crate) hmac_secret: Option<Arc<[u8]>>,
+    /// 128 + 148). The swap handle's inner `Option<Arc<[u8]>>` decides
+    /// behavior on each request: `None` skips signed-URL verification
+    /// and falls through to the subscribe-token gate; `Some` verifies
+    /// `?sig=...&exp=...` first, with a valid signature short-circuiting
+    /// the gate and an invalid (tampered / expired) signature returning
+    /// 403 Forbidden (not 401) so clients can distinguish missing auth
+    /// from wrong auth. Session 148 hot-reloads this swap so a
+    /// rotated secret takes effect on the very next request without a
+    /// server bounce.
+    pub(crate) hmac_secret: SwappableHmacSecret,
 }
 
 /// Tower middleware that applies the subscribe-auth gate to live HLS
@@ -94,18 +95,23 @@ pub(crate) async fn live_playback_auth_middleware(
         return next.run(request).await;
     };
 
-    // Session 128: signed-URL short-circuit. When the operator has
-    // configured --hmac-playback-secret and the request carries both
-    // sig + exp, verify against the scheme+broadcast-scoped HMAC
-    // before consulting the subscribe-token provider. Allow skips
-    // the token gate; Deny returns a 403 body naming the failure;
-    // NotAttempted (no secret configured, or no sig+exp on the
-    // request) falls through to the existing subscribe-token path.
-    if state.hmac_secret.is_some() {
+    // Session 128 + 148: signed-URL short-circuit. The swap handle's
+    // inner `Option<Arc<[u8]>>` is loaded once per request (single-
+    // digit-ns ArcSwap::load); when `Some` and the request carries
+    // both `sig` + `exp`, verify against the scheme+broadcast-scoped
+    // HMAC before consulting the subscribe-token provider. Allow
+    // skips the token gate; Deny returns a 403 body naming the
+    // failure; NotAttempted (no secret configured, or no sig+exp on
+    // the request) falls through to the existing subscribe-token
+    // path. Hot-reload (session 148) replaces the inner via the
+    // ConfigReloadHandle so a rotated secret takes effect on the
+    // next request without restarting the server.
+    let secret_snapshot = state.hmac_secret.load_full();
+    if let Some(secret_bytes) = secret_snapshot.as_ref().as_ref() {
         let sig = extract_query_param(&query, "sig");
         let exp = extract_query_param(&query, "exp").and_then(|v| v.parse::<u64>().ok());
         match verify_live_signed_url(
-            state.hmac_secret.as_deref(),
+            Some(secret_bytes.as_ref()),
             state.scheme,
             &broadcast,
             sig.as_deref(),

@@ -1,29 +1,35 @@
-//! End-to-end test for hot config reload (session 147).
+//! End-to-end tests for hot config reload (sessions 147 + 148).
 //!
-//! Boots a `TestServer` with `--config <path>` pointing at a TOML
-//! file containing `[auth] publish_key = "v1"`. Verifies:
+//! Session 147 covered the auth-section reload path (RTMP publish key
+//! swap via SIGHUP / `POST /api/v1/config-reload`). Session 148 closes
+//! the deferred-key gap by hot-reloading two more categories:
 //!
-//! 1. RTMP publish with `"v1"` succeeds (file applied at boot).
-//! 2. RTMP publish with `"v2"` denied.
-//! 3. Rewrite the file with `publish_key = "v2"`.
-//! 4. `POST /api/v1/config-reload`. 200, body confirms `applied_keys: ["auth"]`.
-//! 5. RTMP publish with `"v1"` denied (old token invalidated).
-//! 6. RTMP publish with `"v2"` succeeds (new provider live).
-//! 7. `GET /api/v1/config-reload` reports the most recent reload's
-//!    timestamp + kind (`"admin_post"`).
+//! * **Mesh ICE servers**: the `/signal` callback's `AssignParent`
+//!   payload swaps to the new list on the next Register after a
+//!   reload. Operators rotating a TURN credential no longer need to
+//!   bounce the relay.
+//! * **HMAC playback secret**: live HLS / DASH and `/playback/*`
+//!   middleware load the secret per request, so a rotated secret
+//!   takes effect immediately. Outstanding URLs signed under the
+//!   prior secret stop verifying (the documented intent of a secret
+//!   rotation).
 //!
-//! No mocks. The test goes through `lvqr_cli::start` exactly as
+//! No mocks. Every test goes through `lvqr_cli::start` exactly as
 //! `lvqr serve --config foo.toml` does.
 
+use futures_util::SinkExt;
+use lvqr_cli::{LiveScheme, sign_live_url};
+use lvqr_test_utils::http::http_get_status;
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
 };
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
 
 const RTMP_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -369,6 +375,248 @@ publish_key = "v1""#,
     assert!(
         try_rtmp_publish(rtmp_addr, "live", "v1").await,
         "prior provider survives a failed reload"
+    );
+
+    server.shutdown().await.expect("shutdown");
+}
+
+// =====================================================================
+// Session 148: mesh ICE-server hot reload.
+// =====================================================================
+
+/// Open `/signal`, send `Register`, return the parsed `AssignParent`
+/// JSON. Panics on any protocol deviation. The lvqr-signal server
+/// fires the peer callback synchronously on Register and ships the
+/// callback's `Some(AssignParent { ... })` reply back over the same
+/// WS as a single Text frame.
+async fn register_and_read_assign_parent(signal_url: &str, peer_id: &str) -> serde_json::Value {
+    use futures_util::StreamExt;
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(signal_url)
+        .await
+        .expect("signal upgrade");
+    let register = serde_json::json!({
+        "type": "Register",
+        "peer_id": peer_id,
+        "track": "live/demo",
+    })
+    .to_string();
+    ws.send(Message::Text(register)).await.expect("ws send Register");
+
+    let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("AssignParent frame timed out")
+        .expect("ws closed before AssignParent")
+        .expect("ws read error");
+    let text = match frame {
+        Message::Text(t) => t.to_string(),
+        other => panic!("expected Text frame after Register; got {other:?}"),
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).expect("AssignParent frame is not JSON");
+    assert_eq!(
+        value.get("type").and_then(|v| v.as_str()),
+        Some("AssignParent"),
+        "expected type=AssignParent; got {value:?}"
+    );
+    drop(ws);
+    value
+}
+
+/// Mesh ICE-server hot reload: the operator-configured list flips
+/// across `POST /api/v1/config-reload` and the next `Register` on
+/// `/signal` sees the new list in its `AssignParent`. Deferred to
+/// session 148 because session 147 captured the list by clone in the
+/// signal callback's closure; 148 swaps it through an
+/// `arc_swap::ArcSwap`.
+#[tokio::test]
+async fn config_reload_swaps_mesh_ice_servers_via_admin_post() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let path = dir.path().join("lvqr.toml");
+    std::fs::write(
+        &path,
+        r#"
+[[mesh_ice_servers]]
+urls = ["stun:boot.example:3478"]"#,
+    )
+    .expect("write boot ice");
+
+    let server = TestServer::start(
+        TestServerConfig::new()
+            .with_mesh(3)
+            .with_config_file(path.clone())
+            .with_no_streamkeys(),
+    )
+    .await
+    .expect("TestServer::start");
+    let admin_addr = server.admin_addr();
+    let signal_url = server.signal_url();
+
+    // Boot reload should have applied the file. Register and verify
+    // the boot ICE entry shows up on `AssignParent`.
+    let initial = register_and_read_assign_parent(&signal_url, "peer-1").await;
+    let initial_urls = initial
+        .get("ice_servers")
+        .and_then(|v| v.as_array())
+        .expect("ice_servers array on AssignParent")
+        .iter()
+        .flat_map(|e| {
+            e.get("urls")
+                .and_then(|u| u.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|u| u.as_str().map(str::to_string))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        initial_urls.iter().any(|u| u == "stun:boot.example:3478"),
+        "boot ICE entry must appear in AssignParent; got {initial_urls:?}"
+    );
+
+    // Rewrite the file with a different ICE server, POST reload.
+    std::fs::write(
+        &path,
+        r#"
+[[mesh_ice_servers]]
+urls = ["turn:rotated.example:3478"]
+username = "u"
+credential = "p""#,
+    )
+    .expect("write rotated ice");
+
+    let resp = admin_post(admin_addr, "/api/v1/config-reload", None).await;
+    assert_eq!(
+        resp.status,
+        200,
+        "POST /api/v1/config-reload must succeed; body: {:?}",
+        String::from_utf8_lossy(&resp.body)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&resp.body).expect("config-reload body is JSON");
+    assert!(parsed["applied_keys"].is_array());
+    assert!(
+        parsed["applied_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("mesh_ice")),
+        "applied_keys must include mesh_ice after a list change; got {parsed:?}"
+    );
+
+    // Open another `/signal`, Register, observe the new list.
+    let after = register_and_read_assign_parent(&signal_url, "peer-2").await;
+    let after_urls = after
+        .get("ice_servers")
+        .and_then(|v| v.as_array())
+        .expect("ice_servers array")
+        .iter()
+        .flat_map(|e| {
+            e.get("urls")
+                .and_then(|u| u.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|u| u.as_str().map(str::to_string))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        after_urls.iter().any(|u| u == "turn:rotated.example:3478"),
+        "rotated ICE entry must appear on subsequent Register; got {after_urls:?}"
+    );
+    assert!(
+        !after_urls.iter().any(|u| u == "stun:boot.example:3478"),
+        "boot ICE entry must NOT appear after reload; got {after_urls:?}"
+    );
+
+    server.shutdown().await.expect("shutdown");
+}
+
+// =====================================================================
+// Session 148: HMAC playback secret hot reload.
+// =====================================================================
+
+fn unix_exp_in(seconds: u64) -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        + seconds
+}
+
+/// HMAC playback secret hot reload: an outstanding URL signed under
+/// the boot secret stops verifying after `POST /api/v1/config-reload`,
+/// while a URL signed under the new secret verifies. Deferred from
+/// session 147 because the secret was captured by clone into the
+/// live HLS / DASH `LivePlaybackAuthState` and the DVR ArchiveState;
+/// session 148 threads a `SwappableHmacSecret` through both surfaces.
+#[tokio::test]
+async fn config_reload_rotates_hmac_playback_secret_via_admin_post() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let path = dir.path().join("lvqr.toml");
+    std::fs::write(&path, r#"hmac_playback_secret = "boot-secret""#).expect("write boot secret");
+
+    let server = TestServer::start(
+        TestServerConfig::new()
+            .with_config_file(path.clone())
+            .with_no_streamkeys(),
+    )
+    .await
+    .expect("TestServer::start");
+    let admin_addr = server.admin_addr();
+    let hls_addr = server.hls_addr();
+
+    // Boot reload should have applied the file. A URL signed under
+    // `boot-secret` must NOT be 401/403 (signed URL short-circuits
+    // the noop subscribe gate; the inner HLS handler may 404 if the
+    // playlist file is missing, which is fine -- this test is about
+    // the auth gate, not the HLS body).
+    let exp = unix_exp_in(600);
+    let suffix_boot = sign_live_url(b"boot-secret", LiveScheme::Hls, "live/demo", exp);
+    let path_boot = format!("/hls/live/demo/playlist.m3u8?{suffix_boot}");
+    let status_pre = http_get_status(hls_addr, &path_boot).await;
+    assert_ne!(
+        status_pre, 401,
+        "boot-signed URL must short-circuit subscribe gate pre-reload; got {status_pre}"
+    );
+    assert_ne!(
+        status_pre, 403,
+        "boot-signed URL must verify pre-reload; got {status_pre}"
+    );
+
+    // Rotate.
+    std::fs::write(&path, r#"hmac_playback_secret = "rotated-secret""#).expect("write rotated");
+    let resp = admin_post(admin_addr, "/api/v1/config-reload", None).await;
+    assert_eq!(
+        resp.status,
+        200,
+        "POST reload must succeed; body: {:?}",
+        String::from_utf8_lossy(&resp.body)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&resp.body).expect("config-reload body is JSON");
+    assert!(
+        parsed["applied_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("hmac_secret")),
+        "applied_keys must include hmac_secret after rotation; got {parsed:?}"
+    );
+
+    // Old-signed URL: the rotated secret invalidates it. The HMAC
+    // verifier returns 403 ("signed URL signature invalid").
+    let status_old = http_get_status(hls_addr, &path_boot).await;
+    assert_eq!(
+        status_old, 403,
+        "boot-signed URL must 403 after rotation; got {status_old}"
+    );
+
+    // New-signed URL: verifies under the rotated secret.
+    let suffix_new = sign_live_url(b"rotated-secret", LiveScheme::Hls, "live/demo", exp);
+    let path_new = format!("/hls/live/demo/playlist.m3u8?{suffix_new}");
+    let status_new = http_get_status(hls_addr, &path_new).await;
+    assert_ne!(
+        status_new, 401,
+        "rotated-signed URL must short-circuit subscribe gate; got {status_new}"
+    );
+    assert_ne!(
+        status_new, 403,
+        "rotated-signed URL must verify post-reload; got {status_new}"
     );
 
     server.shutdown().await.expect("shutdown");

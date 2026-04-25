@@ -1,8 +1,208 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Mesh ICE servers / HMAC secret / `jwks_url` / `webhook_auth_url` reload deferred to session 148 (route surfaces warnings when present). Default-gate tests after 147: Rust workspace **1099** / 0 / 0 (was 1070 post-146; +29 net), Python pytest **38** (was 35), Vitest unchanged at 13. Admin surface 11 -> **12 route trees** (added `/api/v1/config-reload`). **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API** -- `/api/v1/streamkeys/*` lets operators mint, list, revoke, and rotate ingest stream keys at runtime via a new `MultiKeyAuthProvider` that wraps the existing JWT / Static / JWKS / Webhook chain additively. Workspace 0.4.1 unchanged (no crates.io / npm / PyPI publish; that's its own session). **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates so sessions 141-144 source is reachable from `cargo install`. Default-gate tests after 146: Rust workspace **1070** / 0 / 0 (was 1043 / 0 / 3; +30 unit in lvqr-auth + lvqr-admin, +2 RTMP integration; the 3 prior-ignored were feature-gated on this host), Python pytest **35** (was 30; +5 streamkey defensive-parse), Vitest **13** (was 11; +2 live streamkey round-trip). 29 crates. Admin surface at **11 route trees** (added `/api/v1/streamkeys/*`).
+## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 148 (2026-04-25) shipped hot config reload v2 (mesh ICE + HMAC secret)** -- `mesh_ice_servers` and `hmac_playback_secret` join the hot-reloadable surface alongside auth, swapped atomically via `arc_swap::ArcSwap` handles threaded through the `/signal` callback (per-Register `load_full`) and the live HLS / DASH / DVR `/playback/*` middlewares (per-request `load_full`). The session 147 deferred-warning emissions for these two keys drop; `applied_keys` on the route response grows entries (`"mesh_ice"` / `"hmac_secret"`) only when the new value diffs from the prior snapshot. `jwks_url` / `webhook_auth_url` reload remain deferred (async-builder + HTTP-cache complexity, separate session). **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Default-gate tests after 148: Rust workspace **1107** / 0 / 0 (was 1099 post-147; +8 net: 8 new lvqr-cli unit covering ice + hmac + applied_keys diff paths + clear semantics + no-deferred-warnings regression, 2 new RTMP-shape integration cases in `config_reload_e2e.rs` mesh ICE + HMAC rotation; the workshop-148 step rewrote one prior unit test from warnings-shape to applied_keys-shape, net unit delta = 8). Python pytest **38** unchanged. Vitest unchanged at 13. Admin surface unchanged at **12 route trees**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API**; **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates.
 
-**Last Updated**: 2026-04-25 (session 147 close).
+**Last Updated**: 2026-04-25 (session 148 close).
+
+## Session 148 close (2026-04-25)
+
+**Shipped**: Hot config reload v2 -- `mesh_ice_servers` and
+`hmac_playback_secret` join the hot-reloadable surface alongside the
+auth section. The `/signal` callback `load_full`s the swapped ICE
+list per `Register`; live HLS / DASH and DVR `/playback/*`
+middlewares `load_full` the swapped HMAC secret per request.
+Outstanding URLs signed under a rotated secret stop verifying
+immediately (the documented rotation intent). `applied_keys` on the
+route response grows entries `"mesh_ice"` / `"hmac_secret"` only
+when the new value diffs from the prior snapshot; the session 147
+deferred-warning emissions for these two keys drop. `jwks_url` /
+`webhook_auth_url` reload remain deferred (async-builder + HTTP-
+cache complexity, separate session).
+
+### Deliverables
+
+1. **`crates/lvqr-cli/src/config_reload.rs`** (extended): two new
+   public types -- `SwappableIceServers = Arc<ArcSwap<Vec<IceServer>>>`
+   and `SwappableHmacSecret = Arc<ArcSwap<Option<Arc<[u8]>>>>` -- and
+   their boot-time builders (`new_ice_swap`, `new_hmac_swap`).
+   `ConfigReloadHandle::new` now takes both swap handles; `reload`
+   diffs the file's new values against the prior snapshots
+   (deep `==` on the swap-loaded inner; pointer-eq fast path is
+   degenerate on a fresh build so it is omitted), pushes
+   `"mesh_ice"` / `"hmac_secret"` into `applied_keys` only when
+   diffed, then atomically swaps both alongside the auth chain. The
+   two `warnings.push(...)` lines for these keys are deleted; the
+   route's `warnings` field stays in the wire shape for forward-
+   compat with future deferred categories. +8 unit tests covering
+   diff-detection (positive + negative), clear semantics (missing
+   key in file -> swap to None / empty), no-deferred-warnings
+   regression, and reload-failure-keeps-prior-snapshot-intact for
+   the new categories.
+
+2. **`crates/lvqr-cli/src/lib.rs`** (refactor): three downstream
+   capture sites flip from "captured-by-clone" to "load-on-each-
+   call":
+   * Signal callback: the `ice_servers_for_signal` capture is
+     replaced by a `SwappableIceServers` clone; the closure
+     `load_full`s once per Register and uses the same snapshot for
+     both the existing-peer reuse path and the fresh-assign path
+     (matches the in-flight semantics: the AssignParent ships the
+     snapshot loaded at callback entry, the next Register sees the
+     post-reload list).
+   * `LivePlaybackAuthState.hmac_secret` field type flips to
+     `SwappableHmacSecret`; HLS + DASH spawn blocks pass
+     `hmac_swap.clone()` instead of the prior captured Arc.
+   * `playback_router(.., hmac_secret: SwappableHmacSecret)`
+     argument type flips; the per-handler `verify_signed_url` call
+     `load_full`s + threads the `Option<&[u8]>` into the existing
+     verifier helper.
+   * Boot construction: `hmac_swap` and `ice_swap` are built
+     adjacent to `hot_provider` (line 165-168) so all three are
+     ready before the boot-time `handle.reload("boot")` runs and
+     overrides them with the file's values.
+
+3. **`crates/lvqr-cli/src/auth_middleware.rs`** (refactor):
+   `LivePlaybackAuthState.hmac_secret: SwappableHmacSecret`. The
+   middleware `load_full`s once per request and matches on
+   `Option<&[u8]>`; cost is one `ArcSwap::load` (single-digit ns)
+   on top of the existing per-request HMAC verify.
+
+4. **`crates/lvqr-cli/src/archive.rs`** (refactor): `ArchiveState.
+   hmac_secret: SwappableHmacSecret`; `playback_router` 4th-arg
+   type flips. The three handlers (`playback_handler`,
+   `latest_handler`, `file_handler`) each `load_full` once per
+   request before the verify call.
+
+5. **`crates/lvqr-cli/Cargo.toml`** (additive): `arc-swap = {
+   workspace = true }` direct dep (was transitive via lvqr-auth).
+
+6. **`crates/lvqr-cli/tests/config_reload_e2e.rs`** (extended):
+   two new RTMP-shape integration cases.
+   * `config_reload_swaps_mesh_ice_servers_via_admin_post`: file
+     has one ICE server, TestServer + `with_mesh(3)` +
+     `with_config_file(path)`, open `/signal` + Register, read the
+     `AssignParent` reply, assert the boot ICE entry shows up.
+     Rewrite file with a different ICE server, POST reload, assert
+     `applied_keys` includes `"mesh_ice"`. Open another `/signal`
+     + Register on a fresh peer, observe the new ICE entry.
+   * `config_reload_rotates_hmac_playback_secret_via_admin_post`:
+     file has `hmac_playback_secret = "boot-secret"`, TestServer +
+     `with_config_file(path)`, mint a signed URL with
+     `sign_live_url(b"boot-secret", LiveScheme::Hls, ..)`, GET HLS
+     route -> not 401/403 (sig short-circuits the noop subscribe
+     gate). Rewrite file with `"rotated-secret"`, POST reload,
+     assert `applied_keys` includes `"hmac_secret"`. Old-signed URL
+     -> 403 ("signed URL signature invalid"); URL signed under the
+     new secret -> not 401/403.
+
+7. **`docs/config-reload.md`** (rewrite): drops the deferred
+   callouts for `mesh_ice_servers` + `hmac_playback_secret`; moves
+   them to "What hot-reloads" alongside the auth section. Adds a
+   "Clear semantics" section documenting that omitting a key in
+   the file CLEARS the corresponding runtime state on the next
+   reload (empty array = clear ICE list; missing top-level key =
+   clear HMAC secret). Anti-scope explicitly retains "no
+   `jwks_url` / `webhook_auth_url` reload" as deferred to a future
+   session.
+
+8. **`README.md`**: "Recently shipped" gains a session 148 entry;
+   the existing "Hot config reload" `[x]` gets a session-148
+   sub-bullet noting mesh ICE + HMAC reload; the ranked Next-up #1
+   entry updates the prose to reflect v1 (auth) + v2 (mesh + HMAC)
+   shipped, with `jwks_url` / `webhook_auth_url` flagged as the
+   remaining deferred work.
+
+### Key 148 design decisions baked in
+
+* **Two new `Arc<ArcSwap<T>>` handles, no newtype.** Unlike
+  session 147's `AuthCell` (needed because `Arc<dyn AuthProvider>`
+  is unsized), `Vec<IceServer>` and `Option<Arc<[u8]>>` are both
+  `Sized` and work directly with `ArcSwap::from_pointee`. The
+  swap-handle types are public on `lvqr_cli::config_reload` so the
+  composition root can build them at boot.
+
+* **Diff detection by deep `==` against the loaded snapshot.** Each
+  reload constructs a fresh `Arc<...>` from the file body, so a
+  pointer-eq fast path is structurally dead code. Deep `==` on a
+  small `Vec<IceServer>` (1-3 entries typical) and an
+  `Option<Arc<[u8]>>` (~32 bytes) is well below the cost of the
+  file read that just preceded it. Diffing is what drives
+  `applied_keys`: operators see exactly which categories their
+  reload effectively touched.
+
+* **Clear semantics: missing key = clear state.** Omitting
+  `mesh_ice_servers` from the file (or supplying an empty array)
+  swaps the live list to empty. Omitting `hmac_playback_secret`
+  swaps the live secret to `None`. This matches the file-as-source-
+  of-truth model session 147 established for auth-section keys, and
+  is documented as the rotate-by-clear path in
+  `docs/config-reload.md`.
+
+* **One reload pipeline for all three categories.** The auth chain,
+  ICE list, and HMAC secret all reload atomically inside
+  `ConfigReloadHandle::reload(kind)`. A build failure (malformed
+  TOML, JWT init reject) leaves all three prior snapshots in place
+  -- no partial swap. The rebuild order is auth -> ICE -> HMAC,
+  but the `swap` calls happen sequentially after every build step
+  succeeds, so a JWT reject can never leave a half-applied state.
+
+* **`load_full` per call site.** The signal callback loads the ICE
+  snapshot once at the top of the connected branch and uses it for
+  both the existing-peer reuse path and the fresh-assign path; an
+  `AssignParent` mid-callback ships the snapshot it captured at
+  entry. The playback middleware loads the HMAC snapshot once per
+  request. Cost: one `ArcSwap::load` (single-digit ns) on top of
+  the existing per-emit / per-request work, identical to the
+  session 147 auth path.
+
+### Ground truth (session 148 close)
+
+* **Source change scope**: 8 files substantively edited:
+  * `crates/lvqr-cli/Cargo.toml` (arc-swap direct dep).
+  * `crates/lvqr-cli/src/config_reload.rs` (swap types + extended
+    reload + 8 new unit tests + 1 unit test rewritten).
+  * `crates/lvqr-cli/src/lib.rs` (signal callback + 3 HMAC capture
+    sites flipped).
+  * `crates/lvqr-cli/src/auth_middleware.rs` (LivePlaybackAuthState
+    field type flip + load_full).
+  * `crates/lvqr-cli/src/archive.rs` (ArchiveState + playback_router
+    flip + 3 handler load_fulls).
+  * `crates/lvqr-cli/tests/config_reload_e2e.rs` (+2 tests).
+  * `docs/config-reload.md` (rewrite).
+  * `README.md`, `tracking/HANDOFF.md` (this session's close
+    block).
+* **Tests** verified at session close via
+  `cargo test -p lvqr-cli --lib` (40 tests, was 32 post-147 in
+  this crate; +8 net) and
+  `cargo test -p lvqr-cli --test config_reload_e2e` (5 tests, was
+  3 post-147; +2 net).
+* **CI gates**: `cargo fmt --all -- --check` clean; `cargo clippy
+  --workspace --all-targets -- -D warnings` clean.
+* **Workspace version**: `0.4.1` unchanged. No publish.
+* **Admin surface**: unchanged at 12 route trees (the route's wire
+  shape is unchanged; `applied_keys` simply grows entries).
+* **SDK packages**: unchanged at 0.3.2 (the array-of-strings shape
+  for `applied_keys` already accepted the new entries on both TS +
+  Python clients without a code change).
+
+### Known limitations after 148
+
+* **`jwks_url` and `webhook_auth_url` reload deferred.** Their
+  constructors are async + cache HTTP state; replacing them
+  mid-process needs additional plumbing and is its own session's
+  scope.
+* **Structural keys still bounce-required.** Port bindings, feature
+  flags, record / archive directories, `mesh_enabled`, cluster
+  topology -- none of these are in the file format yet, and reload
+  never rebinds sockets. Operators changing these keys still bounce
+  the relay.
+* **No file watcher.** Operator must explicitly SIGHUP or POST.
+* **No SDK shape change.** The TS + Python clients accept
+  `applied_keys` as `string[]` / `list[str]` already and continue
+  to work with the new `"mesh_ice"` / `"hmac_secret"` entries. A
+  future session may add typed enums for the category names if
+  operators ask for them.
+
 
 ## Session 147 close (2026-04-25)
 

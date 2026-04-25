@@ -155,6 +155,17 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let hot_provider = Arc::new(HotReloadAuthProvider::new(post_streamkey_auth));
     let auth: SharedAuth = hot_provider.clone();
 
+    // Session 148: build the SwappableIceServers + SwappableHmacSecret
+    // from the CLI / boot-time `config` BEFORE the ConfigReloadHandle
+    // takes ownership of clones. Both feed the same downstream
+    // surfaces (signal callback / playback middleware) the
+    // ConfigReloadHandle's reload mutates atomically. When --config
+    // is set, the boot-time `handle.reload("boot")` below replaces
+    // both with the file's values before any client request arrives.
+    let ice_swap: config_reload::SwappableIceServers = config_reload::new_ice_swap(config.mesh_ice_servers.clone());
+    let hmac_swap: config_reload::SwappableHmacSecret =
+        config_reload::new_hmac_swap(config.hmac_playback_secret.as_deref());
+
     let config_reload_handle: Option<config_reload::SharedReloadHandle> = match config.config_reload.clone() {
         Some(seed) => {
             let handle = Arc::new(config_reload::ConfigReloadHandle::new(
@@ -163,6 +174,8 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                 streamkey_store.clone(),
                 config.streamkeys_enabled,
                 hot_provider.clone(),
+                ice_swap.clone(),
+                hmac_swap.clone(),
             ));
             // Apply the file at boot so the merge semantics (file
             // overrides CLI defaults for auth-section fields) take
@@ -985,14 +998,15 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         .route("/ingest/{*broadcast}", get(ws_ingest_handler))
         .with_state(ws_state);
 
-    // PLAN v1.1 row 121 + session 128: when `ServeConfig.hmac_playback_secret`
-    // is set, every playback surface accepts `?sig=...&exp=...` as an
-    // alternative auth path that short-circuits the `SharedAuth`
-    // subscribe gate. Wrap the secret in `Arc<[u8]>` so every handler
-    // and middleware clone shares one copy. Hoisted above the
-    // `combined_router` block so the downstream HLS + DASH spawn
-    // blocks can also capture it into their `LivePlaybackAuthState`.
-    let hmac_playback_secret: Option<Arc<[u8]>> = config.hmac_playback_secret.as_ref().map(|s| Arc::from(s.as_bytes()));
+    // PLAN v1.1 row 121 + session 128 + 148: every playback surface
+    // (DVR `/playback/*` plus live HLS / DASH) accepts `?sig=...&exp=...`
+    // as an alternative auth path that short-circuits the `SharedAuth`
+    // subscribe gate. The shared `hmac_swap` (built above) holds the
+    // current `Option<Arc<[u8]>>` snapshot and is hot-reloaded by the
+    // ConfigReloadHandle on `POST /api/v1/config-reload` / SIGHUP.
+    // Each downstream consumer below clones the swap handle and
+    // `load_full`s per request -- single-digit-ns ArcSwap::load on
+    // top of the existing per-request work.
 
     let combined_router = {
         let admin_router = if let Some(mesh) = mesh_coordinator.clone() {
@@ -1052,12 +1066,17 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             // that open `/signal` without first opening `/ws`
             // fall through to the pre-111-B2 path of
             // `add_peer` + fresh assignment.
-            // Session 143: capture the operator-configured ICE-server
-            // list once. Every AssignParent emitted by this callback
-            // includes a clone of the snapshot. Empty when
-            // `--mesh-ice-servers` was not set; clients then fall
-            // back to their constructor-provided list.
-            let ice_servers_for_signal = config.mesh_ice_servers.clone();
+            // Session 143 + 148: hand the operator-configured ICE-server
+            // list to clients via `AssignParent`. The list lives in a
+            // SwappableIceServers handle that the ConfigReloadHandle
+            // mutates atomically on `POST /api/v1/config-reload` /
+            // SIGHUP; the closure `load_full`s once per Register so a
+            // rotated TURN credential takes effect on the next emit
+            // without restarting the server. Empty list (operator never
+            // set `--mesh-ice-servers` and the file lacks
+            // `mesh_ice_servers`) emits `[]`; JS clients fall back to
+            // their constructor-provided default.
+            let ice_for_signal = ice_swap.clone();
             // Session 144: clamp the client's self-reported capacity to
             // the operator's configured global ceiling at register time
             // so on-disk PeerInfo.capacity never exceeds it.
@@ -1067,6 +1086,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                 let peer_id = event.peer_id;
                 let track = event.track;
                 if event.connected {
+                    let ice_snapshot = ice_for_signal.load_full();
                     if let Some(existing) = mesh_for_signal.get_peer(peer_id) {
                         tracing::debug!(
                             peer = %peer_id,
@@ -1079,7 +1099,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                             role: format!("{:?}", existing.role),
                             parent_id: existing.parent.clone(),
                             depth: existing.depth,
-                            ice_servers: ice_servers_for_signal.clone(),
+                            ice_servers: (*ice_snapshot).clone(),
                         });
                     }
                     let clamped_capacity = event.capacity.map(|c| c.min(global_max_children));
@@ -1097,7 +1117,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                                 role: format!("{:?}", a.role),
                                 parent_id: a.parent,
                                 depth: a.depth,
-                                ice_servers: ice_servers_for_signal.clone(),
+                                ice_servers: (*ice_snapshot).clone(),
                             })
                         }
                         Err(e) => {
@@ -1182,7 +1202,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                 dir.clone(),
                 Arc::clone(index),
                 auth.clone(),
-                hmac_playback_secret.clone(),
+                hmac_swap.clone(),
             ))
         } else {
             combined
@@ -1263,10 +1283,12 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         let shutdown_on_exit_hls = bg_shutdown_for_task.clone();
         let hls_auth = auth.clone();
         let hls_auth_disabled = config.no_auth_live_playback;
-        // PLAN v1.1 session 128: share the same HMAC secret with the
-        // live HLS + DASH auth middleware so one --hmac-playback-secret
-        // configuration mints signed URLs across all three route trees.
-        let hls_hmac_secret = hmac_playback_secret.clone();
+        // PLAN v1.1 session 128 + 148: share the same HMAC secret swap
+        // with the live HLS + DASH auth middleware so one
+        // `--hmac-playback-secret` configuration mints signed URLs
+        // across all three route trees AND so the session 148 hot
+        // reload propagates to every consumer in lockstep.
+        let hls_hmac_secret = hmac_swap.clone();
         let hls_fut = async move {
             let Some((listener, server)) = hls_router_pair else {
                 return;
@@ -1301,7 +1323,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         let shutdown_on_exit_dash = bg_shutdown_for_task.clone();
         let dash_auth = auth.clone();
         let dash_auth_disabled = config.no_auth_live_playback;
-        let dash_hmac_secret = hmac_playback_secret.clone();
+        let dash_hmac_secret = hmac_swap.clone();
         let dash_fut = async move {
             let Some((listener, server)) = dash_router_pair else {
                 return;
