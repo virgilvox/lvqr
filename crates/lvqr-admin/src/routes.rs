@@ -173,6 +173,14 @@ pub struct AdminState {
     /// returns `{"keys":[]}` and the mutating endpoints return
     /// 500 with a clear "store not configured" message.
     streamkey_store: Option<SharedStreamKeyStore>,
+    /// Optional `GET /api/v1/config-reload` status closure
+    /// (session 147). Populated by `lvqr-cli`'s composition root
+    /// when `--config` is set. `None` -> the route returns a
+    /// default `ConfigReloadStatus` (every Optional unset).
+    config_reload_status: Option<crate::config_reload_routes::ConfigReloadStatusFn>,
+    /// Optional `POST /api/v1/config-reload` trigger closure
+    /// (session 147). `None` -> the POST returns 503.
+    config_reload_trigger: Option<crate::config_reload_routes::ConfigReloadTriggerFn>,
 }
 
 impl AdminState {
@@ -203,6 +211,8 @@ impl AdminState {
                 slots: Vec::new(),
             }),
             streamkey_store: None,
+            config_reload_status: None,
+            config_reload_trigger: None,
         }
     }
 
@@ -296,6 +306,36 @@ impl AdminState {
     pub(crate) fn streamkey_store(&self) -> Option<&SharedStreamKeyStore> {
         self.streamkey_store.as_ref()
     }
+
+    /// Wire a `GET /api/v1/config-reload` status closure
+    /// (session 147). lvqr-cli's composition root passes a
+    /// closure that calls `ConfigReloadHandle::status()`.
+    pub fn with_config_reload_status(mut self, f: crate::config_reload_routes::ConfigReloadStatusFn) -> Self {
+        self.config_reload_status = Some(f);
+        self
+    }
+
+    /// Wire a `POST /api/v1/config-reload` trigger closure
+    /// (session 147). lvqr-cli's composition root passes a
+    /// closure that calls `ConfigReloadHandle::reload("admin_post")`.
+    pub fn with_config_reload_trigger(mut self, f: crate::config_reload_routes::ConfigReloadTriggerFn) -> Self {
+        self.config_reload_trigger = Some(f);
+        self
+    }
+
+    /// Borrow the wired status closure (or return a default
+    /// `ConfigReloadStatus` when not wired).
+    pub(crate) fn config_reload_status(&self) -> crate::config_reload_routes::ConfigReloadStatus {
+        match self.config_reload_status.as_ref() {
+            Some(f) => f(),
+            None => crate::config_reload_routes::ConfigReloadStatus::default(),
+        }
+    }
+
+    /// Borrow the wired trigger closure (or `None` when not wired).
+    pub(crate) fn config_reload_trigger(&self) -> Option<&crate::config_reload_routes::ConfigReloadTriggerFn> {
+        self.config_reload_trigger.as_ref()
+    }
 }
 
 /// Structured error responses for the admin API.
@@ -337,6 +377,11 @@ pub fn build_router(state: AdminState) -> Router {
         .route(
             "/api/v1/streamkeys/{id}/rotate",
             post(crate::streamkey_routes::rotate_streamkey),
+        )
+        .route(
+            "/api/v1/config-reload",
+            get(crate::config_reload_routes::get_config_reload)
+                .post(crate::config_reload_routes::trigger_config_reload),
         );
 
     #[cfg(feature = "cluster")]

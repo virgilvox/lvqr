@@ -1,3 +1,4 @@
+pub mod config_reload_routes;
 pub mod routes;
 pub mod slo;
 pub mod streamkey_routes;
@@ -5,6 +6,7 @@ pub mod streamkey_routes;
 #[cfg(feature = "cluster")]
 pub mod cluster_routes;
 
+pub use config_reload_routes::{ConfigReloadStatus, ConfigReloadStatusFn, ConfigReloadTriggerFn};
 pub use routes::{
     AdminError, AdminState, MeshPeerStats, MeshState, MetricsRender, StreamInfo, WasmFilterBroadcastStats,
     WasmFilterSlotStats, WasmFilterState, build_router,
