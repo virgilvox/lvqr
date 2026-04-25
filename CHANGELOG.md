@@ -6,6 +6,33 @@ summarises user-visible surface changes between tagged
 releases. For session-by-session engineering notes, see
 `tracking/HANDOFF.md`.
 
+## Unreleased (post-0.4.1)
+
+### Added
+
+* **Runtime stream-key CRUD admin API** (session 146). New routes
+  `GET /api/v1/streamkeys`, `POST /api/v1/streamkeys`,
+  `DELETE /api/v1/streamkeys/{id}`, and
+  `POST /api/v1/streamkeys/{id}/rotate` let admin clients mint, list,
+  revoke, and rotate ingest stream keys at runtime. Backed by a new
+  `lvqr_auth::MultiKeyAuthProvider` that wraps the existing auth
+  chain (Noop / Static / Jwt / Jwks / Webhook) additively: store-first
+  on Publish; Subscribe + Admin always delegate to the wrapped
+  provider so a misconfigured store cannot lock the operator out of
+  their own admin API. Tokens are
+  `lvqr_sk_<43-char base64url-no-pad>` (32 bytes OsRng + typed prefix
+  per industry convention -- Stripe `sk_live_`, GitHub `ghp_`, AWS
+  IVS `sk_<region>_`). In-memory only in v1; restart loses every
+  minted key (operators needing durable single-key publish auth keep
+  using `LVQR_PUBLISH_KEY` which becomes the wrapped fallback). New
+  `--no-streamkeys` (env `LVQR_NO_STREAMKEYS`) flag opts out for
+  pre-146 behavior verbatim. Counter
+  `lvqr_streamkeys_changed_total{op="mint"|"revoke"|"rotate"}`
+  increments once per successful API call. SDK clients
+  (`@lvqr/core` and `lvqr` python package on `main`) gain matching
+  `StreamKey` / `StreamKeySpec` types + four methods each. Default
+  on. See [`docs/auth.md#stream-key-crud-admin-api`](docs/auth.md#stream-key-crud-admin-api).
+
 ## [0.4.1] - 2026-04-24
 
 Workspace republish so the source on `origin/main` becomes
