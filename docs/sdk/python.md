@@ -1,7 +1,7 @@
 # Python SDK
 
 The `lvqr` Python package provides a synchronous admin client
-for LVQR relay servers. Ships at `0.3.1` on PyPI; the 9-method
+for LVQR relay servers. Ships at `0.3.2` on PyPI (released 2026-04-24); the 9-method
 admin surface documented below lands for consumers at the next
 release cycle.
 
@@ -286,16 +286,19 @@ process, use `ffmpeg-python` or `av` against the LL-HLS or
 MPEG-DASH endpoints; the admin client is the supported
 integration point for monitoring and ops tooling.
 
-## Migrating from `0.3.1` to `main`
+## Migrating from `0.3.1` to `0.3.2` (and to `main`)
 
 The package on PyPI at `0.3.1` ships three methods
-(`healthz`, `stats`, `list_streams`). `main` adds seven more
-(`mesh`, `slo`, `cluster_nodes`, `cluster_broadcasts`,
+(`healthz`, `stats`, `list_streams`). `0.3.2` (released
+2026-04-24) adds the full 9-method admin surface (`mesh`,
+`slo`, `cluster_nodes`, `cluster_broadcasts`,
 `cluster_config`, `cluster_federation`, `wasm_filter`) + a
-`bearer_token` kwarg + 15 new dataclasses. All additive; no
-breaking changes. When pinning to a specific release, test
-for method existence if your code runs against both
-versions:
+`bearer_token` kwarg + the per-peer offload + capacity fields
+on `MeshPeerStats` (`intended_children`, `forwarded_frames`,
+`capacity`). All additive; no breaking changes. `main` is at
+or near `0.3.2` after this release; future minor versions add
+to it. When pinning to a specific release, test for method
+existence if your code runs against both versions:
 
 ```python
 from lvqr import LvqrClient

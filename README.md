@@ -52,7 +52,7 @@ in-process AI agents, cross-cluster federation, peer mesh).
   [Known v0.4.0 limitations](#known-v040-limitations)
 - **MoQ** over QUIC / WebTransport via `moq-lite`, zero-copy
   fanout. Chrome / Edge 107+ via the `@lvqr/player` web component
-  (published at v0.3.1 on npm).
+  (published at v0.3.2 on npm).
 - **WebSocket fMP4** for browsers without WebTransport
 - **DVR scrub** via `/playback/*` backed by a `redb` segment index.
   Segment fetches honor RFC 7233 `Range: bytes=` single-range
@@ -215,7 +215,7 @@ ffmpeg -re -i source.mp4 -c copy -f mpegts srt://localhost:8890?streamid=live/de
 - **WHEP**: browser WebRTC player at
   `https://localhost:8443/whep/live/demo`
 - **MoQ**: Chrome/Edge 107+ via the `@lvqr/player` web component
-  (published at `@lvqr/player@0.3.1` on npm)
+  (published at `@lvqr/player@0.3.2` on npm)
 - **WebSocket fMP4**: `ws://localhost:8080/ws/live/demo` (MSE
   fallback for browsers without WebTransport)
 
@@ -263,9 +263,9 @@ full model, ops recipes, and tuning knobs.
 | Language | Install | Version | Description |
 |---|---|---|---|
 | Rust | `cargo add lvqr-core` | 0.4.0 (crates.io) | Shared types, `EventBus`, admin client |
-| JavaScript | `npm i @lvqr/core` | 0.3.1 (npm) | MoQ-Lite subscriber over WebTransport, WebSocket fMP4 fallback, admin client, `MeshPeer` WebRTC DataChannel relay (two-peer happy path verified via a Playwright browser E2E; operator-grade completion on the phase-D roadmap). `main` post-v0.3.1 adds `pushFrame(data)` on `MeshPeer`, an `onChildOpen(id, dc)` callback in `MeshConfig`, and `connectTimeoutMs` / `fetchTimeoutMs` on `LvqrClient` / `LvqrAdminClient`; land at the next publish cycle. |
-| JavaScript | `npm i @lvqr/player` | 0.3.1 (npm) | Drop-in `<lvqr-player>` web component with MSE fallback |
-| Python | `pip install lvqr` | 0.3.1 (PyPI) | Admin API client (no streaming surface) |
+| JavaScript | `npm i @lvqr/core` | 0.3.2 (npm) | MoQ-Lite subscriber over WebTransport, WebSocket fMP4 fallback, admin client (9/9 routes), `MeshPeer` WebRTC DataChannel relay with `pushFrame`, `onChildOpen`, `parentPeerId`, `forwardedFrameCount`, and `MeshConfig.capacity?: number` (per-peer relay capacity advertisement, session 144). Mesh data plane fully implemented as of session 144. |
+| JavaScript | `npm i @lvqr/player` | 0.3.2 (npm) | Drop-in `<lvqr-player>` web component with MSE fallback |
+| Python | `pip install lvqr` | 0.3.2 (PyPI) | Admin API client (9/9 routes), `MeshPeerStats.capacity` per-peer field (session 144), `bearer_token` kwarg, 16 dataclasses |
 
 See [`docs/sdk/javascript.md`](docs/sdk/javascript.md) for the JS
 API reference and
@@ -361,8 +361,8 @@ gaps explicitly named in Known v0.4.0 limitations.
 The list below groups the same remaining work by logical area.
 
 ### Client SDKs (shipped; completion work pending)
-JavaScript (`@lvqr/core`, `@lvqr/player` at 0.3.1 on npm), Python
-(`lvqr` at 0.3.1 on PyPI, admin client only), and Rust
+JavaScript (`@lvqr/core`, `@lvqr/player` at 0.3.2 on npm), Python
+(`lvqr` at 0.3.2 on PyPI, admin client only), and Rust
 (`lvqr-core` at 0.4.0 on crates.io) already ship. Remaining work:
 - [x] ~~**Expand `@lvqr/core` admin client** from 3 of 9
   `/api/v1/*` routes to all 9.~~ Shipped in session 122:
@@ -394,7 +394,7 @@ JavaScript (`@lvqr/core`, `@lvqr/player` at 0.3.1 on npm), Python
   exponential-backoff reconnect loop, and an admin-side retry
   recipe. [`docs/sdk/python.md`](docs/sdk/python.md) mirrors
   with httpx-specific retry patterns + a `bearer_token` kwarg
-  reference + a `0.3.1` -> `main` migration section.
+  reference + a `0.3.1` -> `0.3.2` migration section.
 - [x] ~~First `examples/tier4-demos/` public demo script.~~ Shipped
   in session 117 as
   [`examples/tier4-demos/demo-01.sh`](examples/tier4-demos/demo-01.sh),
@@ -646,13 +646,11 @@ published crate.
   `#[ignore]` because it needs a ~78 MB ggml model download;
   a scheduled-workflow follow-up will cache the model + flip it
   on.
-- **Client SDK admin coverage at 9/9 on `main`, 3/9 on the
-  last publish.** Both `@lvqr/core` (session 122) and the
-  Python `lvqr` package (session 123) now cover every
-  `/api/v1/*` route the admin router mounts. The published
-  npm + PyPI builds at 0.3.1 still ship the 3-method surface;
-  the 9-method surface lands for consumers at the next publish
-  cycle.
+- **Client SDK admin coverage at 9/9 on the published 0.3.2
+  release.** Both `@lvqr/core` (session 122) and the Python
+  `lvqr` package (session 123) cover every `/api/v1/*` route
+  the admin router mounts. **Shipped to consumers** in the
+  2026-04-24 0.3.2 npm + PyPI publish.
 - **SDK reconnect + retry semantics are documented on `main`.**
   **Fixed on `main`** in session 125:
   [`docs/sdk/javascript.md`](docs/sdk/javascript.md) gains a
@@ -661,9 +659,8 @@ published crate.
   exponential-backoff reconnect recipe + admin-side retry
   recipe. [`docs/sdk/python.md`](docs/sdk/python.md) mirrors
   with httpx-specific retry patterns + a `bearer_token` kwarg
-  reference + a `0.3.1` -> `main` migration section. The docs
-  + the `connectTimeoutMs` / `fetchTimeoutMs` knobs land for
-  consumers at the next npm + PyPI publish cycle.
+  reference + a `0.3.1` -> `0.3.2` migration section. **Shipped
+  to consumers** in the 2026-04-24 0.3.2 npm + PyPI publish.
 
 ## CLI reference
 

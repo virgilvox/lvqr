@@ -6,7 +6,7 @@ Two npm packages for browser integration:
   fMP4 fallback, admin API client, WebRTC DataChannel peer mesh)
 - `@lvqr/player` -- Drop-in `<lvqr-player>` Web Component
 
-Both ship at `0.3.1` on npm. Features added on `main` after the
+Both ship at `0.3.2` on npm (released 2026-04-24). Features added on `main` after the
 last publish (listed below under **Timeouts + reconnect** and
 **Admin API**) land for consumers at the next release cycle.
 
