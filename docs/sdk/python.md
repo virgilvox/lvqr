@@ -286,6 +286,42 @@ process, use `ffmpeg-python` or `av` against the LL-HLS or
 MPEG-DASH endpoints; the admin client is the supported
 integration point for monitoring and ops tooling.
 
+## Stream-key CRUD (session 146, `main`)
+
+`LvqrClient` exposes runtime CRUD over the server's
+`/api/v1/streamkeys` admin routes. Operators mint, list, revoke,
+and rotate stream keys without bouncing the relay.
+
+```python
+from lvqr import LvqrClient, StreamKeySpec
+
+with LvqrClient("http://localhost:8080", bearer_token="admin-secret") as client:
+    # Mint -- server fills id, token, created_at.
+    key = client.mint_streamkey(StreamKeySpec(
+        label="camera-a",
+        broadcast="live/cam-a",
+        ttl_seconds=3600,  # optional; omit for no expiry
+    ))
+    print(key.token)  # "lvqr_sk_<43-char base64url-no-pad>"
+
+    # List -- includes expired entries so operators can clean up.
+    keys = client.list_streamkeys()
+
+    # Rotate -- preserves id, swaps token. None keeps scope; passing
+    # a StreamKeySpec re-scopes while rotating.
+    rotated = client.rotate_streamkey(key.id)
+
+    # Revoke -- raises httpx.HTTPStatusError on 404.
+    client.revoke_streamkey(key.id)
+```
+
+`StreamKey` and `StreamKeySpec` are dataclasses on the `lvqr` top-level
+package; they mirror `lvqr_auth::StreamKey` / `StreamKeySpec` from the
+Rust server byte-for-byte and use defensive `.get(...)` parsers so a
+future server adding optional fields does not break older clients.
+Tokens carry the typed prefix `lvqr_sk_` (industry convention --
+secret-scanners can recognise leaked LVQR keys in public commits).
+
 ## Migrating from `0.3.1` to `0.3.2` (and to `main`)
 
 The package on PyPI at `0.3.1` ships three methods

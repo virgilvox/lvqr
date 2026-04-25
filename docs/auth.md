@@ -547,6 +547,125 @@ waiting on the decision.
   no equivalent of the JWKS "fail-fast on startup" check because the
   webhook might legitimately reject a `GET` / `HEAD` probe.
 
+## Stream-key CRUD admin API
+
+Session 146 added a runtime stream-key catalog so operators can mint,
+list, revoke, and rotate ingest stream keys without restarting the
+server or running an external JWT mint pipeline. The CRUD surface
+lives at `/api/v1/streamkeys/*` on the admin HTTP listener and gates
+the same Publish auth path RTMP, WHIP, SRT, RTSP, and WS-ingest
+share.
+
+### Composition with the existing chain
+
+`MultiKeyAuthProvider` wraps whatever `--jwt-secret` / `--jwks-url` /
+`--webhook-auth-url` / `LVQR_PUBLISH_KEY` configured (or
+`NoopAuthProvider` if none did). The wrap is purely **additive**:
+
+* `Publish` auth: the runtime store is consulted first; on hit, the
+  stored entry's `expires_at` and `broadcast` scope decide the outcome
+  WITHOUT consulting the wrapped provider (a tighter scope cannot be
+  silently widened by a more permissive layer underneath). On miss
+  (unknown or expired token) the wrapped provider runs as today.
+* `Subscribe` and `Admin` auth: ALWAYS delegated to the wrapped
+  provider. Stream-key CRUD never gates viewer or admin access; this
+  is a load-bearing safety property so a misconfigured store cannot
+  lock the operator out of their own admin API.
+
+The wrap is on by default. Operators who want pre-146 behavior verbatim
+disable it with `--no-streamkeys` (or env `LVQR_NO_STREAMKEYS=1`); the
+`/api/v1/streamkeys/*` routes are then unmounted and the wrap is
+skipped entirely.
+
+### Wire shape
+
+```
+GET    /api/v1/streamkeys                -> 200 { "keys": [StreamKey] }
+POST   /api/v1/streamkeys                -> 201 StreamKey      (body: StreamKeySpec)
+DELETE /api/v1/streamkeys/{id}           -> 204 | 404
+POST   /api/v1/streamkeys/{id}/rotate    -> 200 StreamKey | 404 (body: empty or StreamKeySpec)
+```
+
+`StreamKey` (server-assigned `id` + `token`):
+
+```json
+{
+  "id": "Qj3J0wHpQEqAh4N8Vb_2Mw",
+  "token": "lvqr_sk_lQB4xy8...43-char-base64url-no-pad",
+  "label": "camera-a",
+  "broadcast": "live/cam-a",
+  "created_at": 1712345678,
+  "expires_at": null
+}
+```
+
+`StreamKeySpec` (body for `POST` and `POST .../rotate`):
+
+```json
+{
+  "label": "camera-a",
+  "broadcast": "live/cam-a",
+  "ttl_seconds": null
+}
+```
+
+Every Optional field carries `#[serde(default)]` on the Rust side and
+defensive `.get(...)` parsers in the JS / Python SDKs, so a server
+adding a sibling field later does not break older clients.
+
+### Token format
+
+Tokens are `lvqr_sk_<43-char base64url-no-pad>`: 32 bytes of `OsRng`
+output, base64url-encoded with no padding, prefixed `lvqr_sk_` for
+secret-scanner recognisability (Stripe `sk_live_`, GitHub `ghp_`).
+Total ~51 chars. Operators publish with the literal token as the
+RTMP stream key (or as `Authorization: Bearer <token>` on
+WHIP / SRT / RTSP / WS-ingest, exactly the same carrier conventions
+as JWTs).
+
+### Rotate semantics
+
+`POST /api/v1/streamkeys/{id}/rotate` always swaps the token while
+preserving the stable `id`. The body decides what else changes:
+
+* **Empty body**: preserve `label` / `broadcast` / `expires_at`. Just
+  swap the token. Operator-friendly default for "I leaked the token,
+  rotate it but keep everything else."
+* **Non-empty `StreamKeySpec`**: re-scope while rotating. A `null`
+  field on the override CLEARS the existing field (so an operator
+  rotating to drop a TTL passes `{"ttl_seconds": null}` explicitly).
+
+The old token is invalidated atomically the moment rotate returns;
+in-flight publishers using the old token get denied on their next
+auth-path lookup.
+
+### Persistence
+
+In-memory only in v1. Restart loses every minted key. Operators who
+need durable single-key publish auth keep using the existing
+`LVQR_PUBLISH_KEY` (which becomes the wrapped fallback under
+MultiKey); a sled / SQLite-backed store impl is its own session and
+the `StreamKeyStore` trait is shaped so the swap is purely additive.
+
+### Observability
+
+Every successful mutating call emits
+
+```
+lvqr_streamkeys_changed_total{op="mint"|"revoke"|"rotate"} 1
+```
+
+(once per API call, not per affected key). Revoke effects on the
+auth path also surface on the existing
+`lvqr_auth_publish_denied_total{entry=...}` counter.
+
+### Anti-scope (session 146)
+
+* No persistence backend, no per-key rate limits, no daemon expiry
+  sweep, no subscribe-token CRUD, no JWT-mint endpoint, no bulk
+  operations, no webhook on key changes, no hot config reload.
+  Each is its own future session.
+
 ## Anti-scope
 
 * No revocation list. Token validity depends on `exp`.

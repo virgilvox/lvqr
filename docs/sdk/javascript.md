@@ -448,6 +448,45 @@ console.log(`forwarded so far: ${peer.forwardedFrameCount}`);
 peer.close();
 ```
 
+## Stream-key CRUD (session 146, `main`)
+
+`LvqrAdminClient` exposes runtime CRUD over the server's
+`/api/v1/streamkeys` admin routes. Operators mint, list, revoke,
+and rotate stream keys without bouncing the relay.
+
+```typescript
+import { LvqrAdminClient, type StreamKey } from '@lvqr/core';
+
+const admin = new LvqrAdminClient('http://localhost:8080', {
+  bearerToken: 'admin-secret',
+});
+
+// Mint -- server fills id, token, created_at.
+const key: StreamKey = await admin.mintStreamKey({
+  label: 'camera-a',
+  broadcast: 'live/cam-a',
+  ttl_seconds: 3600, // optional; omit for no expiry
+});
+console.log(key.token); // "lvqr_sk_<43-char base64url-no-pad>"
+
+// List -- includes expired entries so operators can clean up.
+const keys = await admin.listStreamKeys();
+
+// Rotate -- preserves id, swaps token. Empty argument keeps scope;
+// passing an override re-scopes while rotating.
+const rotated = await admin.rotateStreamKey(key.id);
+
+// Revoke -- 204 on success. Idempotent callers catch on rejection
+// to mean "already gone".
+await admin.revokeStreamKey(key.id);
+```
+
+`StreamKey` and `StreamKeySpec` are exported from `@lvqr/core` and
+mirror the `lvqr_auth::StreamKey` / `StreamKeySpec` Rust types
+byte-for-byte. Tokens carry the typed prefix `lvqr_sk_` (industry
+convention -- secret-scanners can recognise leaked LVQR keys in
+public commits).
+
 ## WASM module
 
 The `@lvqr/core` package includes a WASM module compiled from

@@ -101,6 +101,16 @@ in-process AI agents, cross-cluster federation, peer mesh).
   validation, or dynamic asymmetric JWT (RS256 / ES256 / EdDSA)
   with keys discovered from a JWKS endpoint (`--jwks-url`,
   `--features jwks`).
+- **Runtime stream-key CRUD** (session 146):
+  `/api/v1/streamkeys/{,/:id,/:id/rotate}` lets admin clients
+  mint, list, revoke, and rotate ingest stream keys without
+  bouncing the server. Tokens are
+  `lvqr_sk_<43-char base64url-no-pad>`. The wrap is purely
+  additive over whichever provider above is configured;
+  `Subscribe` + `Admin` auth always delegate to the wrapped chain
+  so a misconfigured store cannot lock the operator out. Default
+  on; opt out with `--no-streamkeys`.
+  See [`docs/auth.md#stream-key-crud-admin-api`](docs/auth.md#stream-key-crud-admin-api).
 - **One token, every ingest.** The same JWT admits a publisher
   across RTMP (stream key IS the JWT), WHIP
   (`Authorization: Bearer`), SRT (`streamid=m=publish,r=<broadcast>,t=<jwt>`),
@@ -231,6 +241,7 @@ curl http://localhost:8080/api/v1/streams      # active broadcasts
 curl http://localhost:8080/api/v1/stats        # connection counts
 curl http://localhost:8080/api/v1/slo          # latency SLO snapshot
 curl http://localhost:8080/api/v1/wasm-filter  # WASM chain length + counters
+curl http://localhost:8080/api/v1/streamkeys   # runtime stream-key catalog
 curl http://localhost:8080/metrics             # Prometheus scrape
 ```
 
@@ -300,31 +311,30 @@ plan after the workspace 0.4.1 republish (session 145). Higher
 items are smaller, closer to shippable, and close gaps explicitly
 named in Known v0.4.0 limitations.
 
-1. **Stream-key CRUD admin API.** Today operators provision
-   stream keys via static config (file + restart). New routes
-   under `/api/v1/streamkeys` would let admin clients list,
-   mint, revoke, and rotate keys without bouncing the server.
-   Single-session ship; lands on `lvqr-admin` + the JS / Python
-   admin clients.
-2. **Hot config reload.** SIGHUP handler on `lvqr serve` that
+Stream-key CRUD admin API shipped in session 146 -- previously
+item 1 on this list, now mounted on every default `lvqr serve`
+under `/api/v1/streamkeys/*` (see Auth section above + the
+detailed checkbox list further down). The remaining ranking:
+
+1. **Hot config reload.** SIGHUP handler on `lvqr serve` that
    re-reads the config file and applies the diff. Subset of
    keys (auth providers, mesh ICE servers, HMAC secrets) reload
    live; structural changes (port bindings, feature flags) still
    need a restart and are surfaced as warnings on the
    `--config-reload` admin route.
-3. **SCTE-35 passthrough.** WebVTT captions already ship via
+2. **SCTE-35 passthrough.** WebVTT captions already ship via
    the WASM agent path (session 96); SCTE-35 ad-marker events
    would land on the same observer surface.
-4. **Dedicated DVR scrub web UI.** Today DVR playback works via
+3. **Dedicated DVR scrub web UI.** Today DVR playback works via
    any HLS-aware player but seek-bar + thumbnail strip require
    integrator work. A drop-in `<lvqr-dvr-player>` web component
    alongside `@lvqr/player` would close the gap.
-5. **One hardware encoder backend** (VideoToolbox on macOS or
+4. **One hardware encoder backend** (VideoToolbox on macOS or
    NVENC on Linux). The three others (VAAPI, QSV, and whichever
    of NVENC or VideoToolbox is not picked first) stay deferred
    to v1.2. Multi-session feature work; needs its own design
    pass against `crates/lvqr-transcode/`'s GStreamer pipeline.
-6. **MoQ egress latency SLO.** Server-side measurement would
+5. **MoQ egress latency SLO.** Server-side measurement would
    require a MoQ wire change that was explicitly rejected in
    the v1.1-B scoping call (keeps foreign MoQ clients
    compatible). Likely path forward: Tier 5 client SDK pushes
@@ -333,6 +343,15 @@ named in Known v0.4.0 limitations.
 
 #### Recently shipped (compact reference)
 
+* **Stream-key CRUD admin API** (session 146) -- runtime mint /
+  list / revoke / rotate over `/api/v1/streamkeys/*` backed by
+  `lvqr_auth::MultiKeyAuthProvider`. Additive over the existing
+  JWT / Static / JWKS / Webhook chain. Tokens are
+  `lvqr_sk_<43-char base64url-no-pad>`. Subscribe + Admin auth
+  always delegate to the wrapped chain so a misconfigured store
+  cannot lock the operator out. Default-on; opt out with
+  `--no-streamkeys`. See
+  [`docs/auth.md#stream-key-crud-admin-api`](docs/auth.md#stream-key-crud-admin-api).
 * **Workspace 0.4.1 republish** (session 145) -- all 26
   publishable Rust crates flipped from 0.4.0 to 0.4.1 so
   sessions 141-144 source reaches `cargo install`; supply-chain
@@ -555,7 +574,15 @@ test.
   partials that roll over every 200 ms).
   See `docs/auth.md#signed-playback-urls` and
   `docs/auth.md#live-hls-+-dash-signed-urls`.
-- [ ] **Stream-key CRUD admin API.**
+- [x] **Stream-key CRUD admin API.** Shipped in session 146.
+  Runtime mint / list / revoke / rotate over
+  `/api/v1/streamkeys/*` backed by `lvqr_auth::MultiKeyAuthProvider`
+  (additive over the existing JWT / Static / JWKS / Webhook chain).
+  Tokens are `lvqr_sk_<43-char base64url-no-pad>`. Subscribe + Admin
+  auth always delegate to the wrapped chain so a misconfigured
+  store cannot lock the operator out. Default-on; opt out with
+  `--no-streamkeys`. See
+  [`docs/auth.md#stream-key-crud-admin-api`](docs/auth.md#stream-key-crud-admin-api).
 - [ ] **Hot config reload.**
 - [ ] **Dedicated DVR scrub web UI.**
 - [ ] **SCTE-35 passthrough.** (WebVTT captions already ship via
@@ -691,6 +718,9 @@ lvqr serve [OPTIONS]
   --admin-token <T>         /api/v1/* bearer
   --publish-key <K>         Required publish credential
   --subscribe-token <T>     Required subscriber credential
+  --no-streamkeys           Disable runtime stream-key CRUD
+                            (`/api/v1/streamkeys/*`). Default on.
+                            Env: LVQR_NO_STREAMKEYS.
   --jwt-secret <S>          Enable HS256 JWT (replaces static tokens)
   --jwt-issuer <I>          Expected iss claim
   --jwt-audience <A>        Expected aud claim

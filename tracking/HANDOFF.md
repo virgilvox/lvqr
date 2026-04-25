@@ -1,8 +1,101 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 145 (2026-04-24) cut workspace 0.4.1 + republished all 26 publishable Rust crates** so sessions 141-144 source (per-peer mesh capacity, ICE config + TURN deploy, three-peer Playwright matrix, offload reporting) is now reachable from `cargo install`. Audit-fix preflight bumped `rustls-webpki` 0.103.11 -> 0.103.13 (closes RUSTSEC-2026-0098/0099/0104) and added repo-root `audit.toml` with documented ignores for the 16 wasmtime advisories (deferred per TIER_4_PLAN.md), 1 rsa Marvin (no fix), and 5 unmaintained-transitive warnings; Supply-chain audit job is now GREEN on `origin/main`. Default-gate tests unchanged from 144 close: Rust workspace **1043** / 0 / 3, Python pytest **30**, Vitest 11. 29 crates. Admin surface at **10 routes**. Remaining Phase D scope: hardware encoder backend, DASH-IF validator (npm + PyPI publish closed in 144 at 0.3.2; Rust republish closed in 145 at 0.4.1).
+## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API** -- `/api/v1/streamkeys/*` lets operators mint, list, revoke, and rotate ingest stream keys at runtime via a new `MultiKeyAuthProvider` that wraps the existing JWT / Static / JWKS / Webhook chain additively. Workspace 0.4.1 unchanged (no crates.io / npm / PyPI publish; that's its own session). **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates so sessions 141-144 source is reachable from `cargo install`. Default-gate tests after 146: Rust workspace **1070** / 0 / 0 (was 1043 / 0 / 3; +30 unit in lvqr-auth + lvqr-admin, +2 RTMP integration; the 3 prior-ignored were feature-gated on this host), Python pytest **35** (was 30; +5 streamkey defensive-parse), Vitest **13** (was 11; +2 live streamkey round-trip). 29 crates. Admin surface at **11 route trees** (added `/api/v1/streamkeys/*`).
 
-**Last Updated**: 2026-04-24 (session 145 close). All session-145 commits pushed (`origin/main` at `aff0d73`).
+**Last Updated**: 2026-04-24 (session 146 close).
+
+## Session 146 close (2026-04-24)
+
+**Shipped**: Runtime stream-key CRUD admin API. Pre-146 deployments provisioned ingest stream keys via static config (`LVQR_PUBLISH_KEY` for one shared key, or external JWT minting) -- both forced a server bounce or an out-of-band pipeline for every key change. Session 146 adds an in-memory `StreamKeyStore` plus a `MultiKeyAuthProvider` that wraps the existing auth chain additively, and mounts `/api/v1/streamkeys/{,/:id,/:id/rotate}` so admin clients can mint, list, revoke, and rotate keys at runtime. Five-artifact deliverable matches the 141-144 shipping shape: source change with unit+integration tests, wire shape with `#[serde(default)]` on every Optional, SDK client surfaces (TS + Python) with defensive parsers, docs (`docs/auth.md` + `docs/sdk/{javascript,python}.md`), and README "Next up" item flipped to shipped.
+
+### Deliverables
+
+1. **`crates/lvqr-auth/src/stream_key_store.rs`** (new, ~360 lines): `StreamKey` + `StreamKeySpec` wire types with `#[serde(default)]` on every Optional; `StreamKeyStore` trait + `InMemoryStreamKeyStore` impl using two `DashMap`s (id -> StreamKey primary, token -> id reverse for O(1) auth-path lookup). Token format `lvqr_sk_<43-char base64url-no-pad>` (32-byte `OsRng` + typed prefix per industry convention -- Stripe `sk_live_`, GitHub `ghp_`, IVS `sk_<region>_`); ids are 16 bytes random base64url-no-pad (22 chars). 11 unit tests covering mint, list-includes-expired, get_by_token-filters-expired, revoke-twice-is-no-op, rotate-no-override-preserves-scope, rotate-with-override-clears, rotate-unknown-id, lazy-expiry, mint-uniqueness, serde-round-trip.
+
+2. **`crates/lvqr-auth/src/multi_key_provider.rs`** (new, ~225 lines): `MultiKeyAuthProvider { store, fallback: Option<SharedAuth> }`. Decision order locked: `Publish` -- store first; on hit, broadcast scope check decides without consulting fallback (a tighter scope cannot be silently widened by a more permissive layer underneath); on miss, delegate to fallback. `Subscribe` and `Admin` ALWAYS delegate to fallback (load-bearing safety property: stream-key CRUD never gates viewer or admin auth, so a misconfigured store cannot lock the operator out of their own admin API). 11 unit tests including the brief-required "store-hit-with-scope-mismatch beats permissive fallback" + "admin token survives a stream-key revoke of the same string" assertions.
+
+3. **`crates/lvqr-admin/src/streamkey_routes.rs`** (new, ~340 lines): 4 handlers (`list_streamkeys`, `mint_streamkey`, `revoke_streamkey`, `rotate_streamkey`) registered through `AdminState::with_streamkey_store(SharedStreamKeyStore)`. Routes mount inside the existing admin-auth middleware so a configured `--admin-token` (or JWT provider) is required before any CRUD call. Counter `lvqr_streamkeys_changed_total{op="mint"|"revoke"|"rotate"}` increments once per successful mutating API call (not per affected key, so dashboards reading the counter see API velocity, not store fan-out). Rotate handler takes raw `Bytes` rather than `Option<Json<StreamKeySpec>>` because axum 0.8's `Json` extractor 400s on an empty body even when wrapped in `Option`; SDKs idiomatically send no body for "no override" and the raw-bytes parse keeps that round-trip clean. 8 unit tests via `Router::oneshot` covering each verb plus the admin auth gate plus mint-then-list visibility plus rotate-empty-vs-override scope semantics.
+
+4. **`crates/lvqr-cli/src/{lib.rs,main.rs,config.rs}`**: `ServeConfig.streamkeys_enabled: bool` (default `true` via `loopback_ephemeral`); `start()` wraps the resolved auth provider in `MultiKeyAuthProvider { store: InMemoryStreamKeyStore, fallback: Some(inner) }` when enabled and attaches the store to `AdminState` so the CRUD routes can mutate it. New `--no-streamkeys` (`LVQR_NO_STREAMKEYS=1`) opts out for operators who want pre-146 behavior verbatim. `crates/lvqr-test-utils/src/test_server.rs` got a matching `with_no_streamkeys()` builder + an inverted `no_streamkeys: bool` field so the auto-derived `Default` keeps streamkeys-on (existing rtmp_*_e2e tests now go through MultiKey with empty store + Noop fallback, which behaves identically to today since store-miss falls through).
+
+5. **`crates/lvqr-cli/tests/streamkeys_e2e.rs`** (new, ~330 lines): real RTMP-publish lifecycle test. Boots TestServer with a `StaticAuthProvider { publish_key: Some("never-matches") }` fallback so empty store + arbitrary RTMP key DENY by default (proves the fixture genuinely gates ingest). Then drives: (a) baseline arbitrary-key denied; (b) admin POST mints a key, list surfaces it, capture token; (c) RTMP publish with the minted token succeeds via store-hit; (d) admin DELETE revokes; (e) RTMP publish with the same token now denied via store-miss + fallback-deny. Sister test `streamkey_rotate_invalidates_old_token_on_publish` does the same shape across rotate. Both use raw-TCP HTTP/1.1 helpers inline (no reqwest dev-dep) and a lifted `try_rtmp_publish` helper from `one_token_all_protocols.rs`. 2 tests.
+
+6. **SDK client surfaces**:
+   * **`bindings/js/packages/core/src/admin.ts`**: new `StreamKey` + `StreamKeySpec` + `StreamKeyList` interfaces; new `listStreamKeys()` / `mintStreamKey(spec?)` / `revokeStreamKey(id)` / `rotateStreamKey(id, override?)` methods + a private `sendJson` helper that omits Content-Type when no body is provided so the rotate empty-body path round-trips cleanly. Re-exports added to `index.ts`.
+   * **`bindings/python/python/lvqr/{types,client,__init__}.py`**: matching `StreamKey` + `StreamKeySpec` dataclasses; matching `list_streamkeys()` / `mint_streamkey(spec)` / `revoke_streamkey(id)` / `rotate_streamkey(id, override?)` methods with a `_streamkey_from_json` defensive parser that uses `.get(...)` for every Optional field so future server bodies adding sibling fields do not break older clients.
+   * **`bindings/js/tests/sdk/admin-client.spec.ts`**: 2 new live Vitest cases (mint-list-revoke round-trip + rotate-preserves-id) hitting the CI harness `lvqr serve` instance.
+   * **`bindings/python/tests/test_client.py`**: 5 new pytest cases (list-empty, list-populated-omitting-optional, list-pre-146-omits-keys-wrapper, mint-round-trip, StreamKeySpec-defaults) using `unittest.mock.patch` against `httpx.Client.{get,post}`.
+
+7. **Docs + README**:
+   * **`docs/auth.md`**: new "Stream-key CRUD admin API" section covering the additive composition model, wire shape, token format, rotate semantics, persistence, observability, and anti-scope.
+   * **`docs/sdk/{javascript,python}.md`**: new "Stream-key CRUD" section with a worked `mint -> list -> rotate -> revoke` example.
+   * **`README.md`**: "Next up" item 1 flipped from `[ ]` to `[x] Shipped in session 146.` with a docs-link to the new auth.md anchor.
+
+### Key 146 design decisions baked in
+
+* **`MultiKeyAuthProvider` always wraps the existing chain (including Noop), not just JWT/JWKS/Webhook.** Brief section 4 listed only those three flags as the trigger set; following that literally would have meant a bare `lvqr serve` deployment installs MultiKey with `fallback: None`, which DENIES every Publish on store-miss -- a silent backward-breaking change for every existing rtmp_*_e2e test (and every operator running without auth flags). Re-resolved on read-back: MultiKey is purely additive over WHATEVER `build_auth()` resolves, including Noop. Bare `lvqr serve` keeps allowing arbitrary publishes via the Noop fallback; minting a key is purely additive (nobody loses access). Operators who want stream-key as the enforcement gate layer a deny-by-default fallback (Static-publish-key, JWT, Webhook) underneath. Documented in `docs/auth.md`'s composition section. Existing `auth_integration.rs` + every `rtmp_*_e2e.rs` continue to pass unchanged.
+
+* **Tokens carry the `lvqr_sk_` prefix.** Brief said "32 bytes OsRng base64-urlsafe-encoded" -- silent on prefix. Web research found unanimous industry convention for typed prefixes on bearer credentials (Stripe `sk_live_`, GitHub `ghp_`, AWS IVS `sk_<region>_`) for secret-scanner recognisability. Adopted: total token shape is `lvqr_sk_<43-char base64url-no-pad>`, 51 chars. Operators who grep for `lvqr_sk_` in logs / git history / leaked-secret feeds can identify LVQR keys at a glance; secret-scanning vendors (GitHub Advanced Security, GitLeaks, TruffleHog) can add a one-line regex.
+
+* **List endpoint returns the literal token, not a redacted prefix.** Brief locked this; web research confirmed: Mux Live Streams, Cloudflare Stream Live Inputs, and AWS IVS all return the full token on subsequent GETs / lists. The "mint-once-display" model (GitHub PATs) defends against a threat where the secret holder is a less-trusted actor on a multi-tenant SaaS; an LVQR operator running their own relay is the same principal who holds admin credentials with equal or greater blast radius, so storing the token cleartext adds no marginal risk. Operators who DO want the GitHub-style model can set up a webhook and rotate keys after first read.
+
+* **Rotate is single-call atomic, body decides scope.** Empty body preserves `label` / `broadcast` / `expires_at` and only swaps the token (operator-friendly default for "I leaked the token, rotate everything else"). Non-empty `StreamKeySpec` re-scopes while rotating; a `null` field on the override CLEARS the existing field. Industry split was 50/50 between two-op delete+create (IVS, Mux, Cloudflare) and single-call regenerate (GitHub PATs); single-call won here because the brief locked it and atomicity at the token layer is operator-friendly even if not strictly required.
+
+* **`AuthContext::Admin` always delegates to fallback.** The load-bearing safety property: stream-key CRUD never gates admin auth. Without this, an operator who misconfigured the fallback chain and revoked the only admin token would be locked out of their own server. Tested via the explicit "admin token survives stream-key revoke of the same string" unit test.
+
+* **Stream-key store is publish-only in v1.** `Subscribe` and `Admin` contexts always delegate to fallback. Subscribe tokens have an existing surface (`SubscribeAuth` + the HMAC-signed-URL path from session 124/128); adding a parallel CRUD surface for them without operator demand is scope creep.
+
+* **In-memory only, lazy expiry, no daemon sweep.** `expires_at` is checked on every `get_by_token` lookup so an expired token never authenticates; the operator-facing list endpoint surfaces expired keys until a manual revoke (cosmetic only -- they don't authenticate). Sled / SQLite-backed `StreamKeyStore` impl is its own session and the trait is shaped so the swap is purely additive.
+
+* **`AdminState` stores `Option<SharedStreamKeyStore>`, not feature-gated routes.** When the operator passes `--no-streamkeys` the routes are still mounted but the list endpoint returns `{"keys":[]}` and the mutating endpoints return 500. This matches the consistent "always-mount + return safe defaults when not configured" pattern the slo + wasm_filter routes use; tooling can poll unconditionally without a 404 handler.
+
+* **Counter increments once per API call, not per affected key.** Brief decision 4. `op="rotate"` is its own label rather than a synthetic `revoke+mint` pair so dashboards summing the labels see one event per operator action. Revoke effects on the auth path also surface on the existing `lvqr_auth_publish_denied_total{entry=...}` counter; operators monitoring publish-denial rates see revoke effects without an additional metric.
+
+* **Test count exceeded the prompt target.** Prompt called for ~+19 net (+10 lvqr-auth unit, +4 lvqr-admin unit, +1 RTMP integration, +2 Vitest live, +2 pytest); shipping ~+39 (+22 lvqr-auth, +8 lvqr-admin, +2 RTMP integration, +2 Vitest, +5 pytest). Extra margin lands on edge cases the brief flagged but did not enumerate (lazy-expiry-on-list-vs-auth-path, scope-mismatch-beats-permissive-fallback, rotate-clears-vs-preserves, list-empty-when-store-not-configured, defensive-parse-when-server-omits-keys-wrapper).
+
+### Ground truth (session 146 close)
+
+* **Head**: `9b5f4aa` on `main` pre-session-146; close-block commit not yet authored at this time. v0.4.1 unchanged.
+* **Source change scope**: 8 files added or substantially edited:
+  * `crates/lvqr-auth/src/stream_key_store.rs` (new)
+  * `crates/lvqr-auth/src/multi_key_provider.rs` (new)
+  * `crates/lvqr-auth/src/lib.rs` (re-exports)
+  * `crates/lvqr-auth/Cargo.toml` (dashmap+rand+base64 to direct deps)
+  * `crates/lvqr-admin/src/streamkey_routes.rs` (new)
+  * `crates/lvqr-admin/src/{routes.rs,lib.rs}` (AdminState builder + module decl + route mount)
+  * `crates/lvqr-cli/src/{lib.rs,main.rs,config.rs}` (wrap + flag + ServeConfig field)
+  * `crates/lvqr-test-utils/src/test_server.rs` (matching `no_streamkeys` knob)
+  * `crates/lvqr-cli/tests/streamkeys_e2e.rs` (new)
+  * `bindings/js/packages/core/src/{admin.ts,index.ts}` (types + 4 methods + re-exports)
+  * `bindings/js/tests/sdk/admin-client.spec.ts` (+2 live cases)
+  * `bindings/python/python/lvqr/{types,client,__init__}.py` (types + 4 methods + re-exports)
+  * `bindings/python/tests/test_client.py` (+5 defensive-parse cases)
+  * `docs/auth.md` (new "Stream-key CRUD admin API" section)
+  * `docs/sdk/{javascript,python}.md` (new "Stream-key CRUD" section each)
+  * `README.md` (Next-up item 1 flipped)
+* **Tests** (verified at session close):
+  * lvqr-auth lib: 24 -> 46 (+22).
+  * lvqr-admin lib: 30 -> 38 (+8).
+  * lvqr-cli integration (streamkeys_e2e): 0 -> 2 (+2).
+  * Vitest live: 11 -> 13 (+2).
+  * Python pytest: 30 -> 35 (+5).
+  * Workspace default gate: 1043 -> 1070 (+27 Rust net, target was +19; extra margin on lazy-expiry edge cases + defensive-parse compat). 130 test binaries, 0 failed, 0 ignored on this host.
+* **CI gates**: `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean (one redundant_closure on a `RelayStats::default` reference cleaned up before close); existing `auth_integration.rs` (6 tests) + every `rtmp_*_e2e.rs` continue to pass with the MultiKey wrap on by default (proves the wrap is purely additive).
+* **Workspace version**: `0.4.1` unchanged. No `cargo publish`. `@lvqr/core@0.3.2` + `@lvqr/player@0.3.2` (npm) + `lvqr@0.3.2` (PyPI) unchanged.
+* **Admin surface**: 11 route trees now (added `/api/v1/streamkeys/*`).
+
+### Known limitations after 146
+
+* **No persistence backend.** Restart loses every minted key. Operators needing durable single-key publish auth keep using the existing `LVQR_PUBLISH_KEY` (which becomes the wrapped fallback under MultiKey). Future session can land a sled / SQLite-backed `StreamKeyStore` impl; the trait is shaped so the swap is purely additive.
+* **No subscribe-token CRUD.** Same surface could in principle expose viewer tokens, but the existing HMAC-signed-URL path (sessions 124/128) already covers the common need. Adding a second surface without operator demand is scope creep.
+* **No JWT-mint endpoint.** Stream-keys are STORE keys, not signed JWTs. Operators wanting signed JWTs continue to use their own minting pipeline (`--jwks-url` + an external IdP, or `--jwt-secret` + an external mint script).
+* **No bulk operations.** Mint / revoke / rotate are per-key. Bulk import / export is its own session.
+* **No webhook on key changes.** Operators wanting "key minted" callouts can poll the list endpoint or watch the `lvqr_streamkeys_changed_total{op=...}` counter.
+* **No daemon expiry sweep.** `expires_at` is checked on the auth path; expired keys remain visible on the list endpoint until manually revoked. Lazy expiry is correct semantically; only operator-facing cosmetics on the list show stale entries.
+* **No hot config reload bundling.** Hot reload is a separate next-up item (#2 in README) and remains unscheduled.
+* **All other session 145 + earlier known limitations unchanged.**
+
+
 
 ## Session 145 close (2026-04-24)
 
