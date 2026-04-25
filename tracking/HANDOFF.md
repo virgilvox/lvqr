@@ -1,6 +1,6 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Mesh ICE servers / HMAC secret / `jwks_url` / `webhook_auth_url` reload deferred to a future increment (route surfaces warnings when present). **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API** -- `/api/v1/streamkeys/*` lets operators mint, list, revoke, and rotate ingest stream keys at runtime via a new `MultiKeyAuthProvider` that wraps the existing JWT / Static / JWKS / Webhook chain additively. Workspace 0.4.1 unchanged (no crates.io / npm / PyPI publish; that's its own session). **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates so sessions 141-144 source is reachable from `cargo install`. Default-gate tests after 146: Rust workspace **1070** / 0 / 0 (was 1043 / 0 / 3; +30 unit in lvqr-auth + lvqr-admin, +2 RTMP integration; the 3 prior-ignored were feature-gated on this host), Python pytest **35** (was 30; +5 streamkey defensive-parse), Vitest **13** (was 11; +2 live streamkey round-trip). 29 crates. Admin surface at **11 route trees** (added `/api/v1/streamkeys/*`).
+## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Mesh ICE servers / HMAC secret / `jwks_url` / `webhook_auth_url` reload deferred to session 148 (route surfaces warnings when present). Default-gate tests after 147: Rust workspace **1099** / 0 / 0 (was 1070 post-146; +29 net), Python pytest **38** (was 35), Vitest unchanged at 13. Admin surface 11 -> **12 route trees** (added `/api/v1/config-reload`). **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API** -- `/api/v1/streamkeys/*` lets operators mint, list, revoke, and rotate ingest stream keys at runtime via a new `MultiKeyAuthProvider` that wraps the existing JWT / Static / JWKS / Webhook chain additively. Workspace 0.4.1 unchanged (no crates.io / npm / PyPI publish; that's its own session). **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates so sessions 141-144 source is reachable from `cargo install`. Default-gate tests after 146: Rust workspace **1070** / 0 / 0 (was 1043 / 0 / 3; +30 unit in lvqr-auth + lvqr-admin, +2 RTMP integration; the 3 prior-ignored were feature-gated on this host), Python pytest **35** (was 30; +5 streamkey defensive-parse), Vitest **13** (was 11; +2 live streamkey round-trip). 29 crates. Admin surface at **11 route trees** (added `/api/v1/streamkeys/*`).
 
 **Last Updated**: 2026-04-25 (session 147 close).
 
@@ -111,10 +111,9 @@ live.
      shipped strikethrough, "Recently shipped" gains a compact 147
      entry, Quickstart curl line, CLI flag listing for `--config`.
 
-10. **`tracking/SESSION_148_BRIEFING.md`** (deferred -- the next
-    incremental work is widening hot reload to cover mesh ICE
-    servers, HMAC playback secret, and `jwks_url` /
-    `webhook_auth_url`. Author at session-148 kickoff).
+10. **`tracking/SESSION_148_BRIEFING.md`** (new; locks the design
+    for the next-session work to widen hot reload to cover mesh
+    ICE servers + HMAC playback secret reload).
 
 ### Key 147 design decisions baked in
 
@@ -187,17 +186,17 @@ live.
   * `bindings/python/python/lvqr/{__init__.py,client.py,types.py}` (dataclass + 2 methods).
   * `bindings/python/tests/test_client.py` (+3 pytest cases).
   * `docs/config-reload.md` (new), `README.md`, `tracking/HANDOFF.md`.
-* **Tests**:
-  * lvqr-auth lib: 51 (was 51 post-146 ship -- session 147's
-    HotReloadAuthProvider ships with the foundational commit at
-    +5 tests; lib totals stay 51 net since the +5 are in-place
-    additions vs the post-146 baseline).
+* **Tests** (verified at session close via
+  `cargo test --workspace --lib --bins --tests`, 131 test
+  binaries, 1099 passed / 0 failed / 0 ignored):
+  * lvqr-auth lib: 46 -> 51 (+5 hot_reload_provider).
   * lvqr-cli lib: 19 -> 34 (+15: 8 config_file + 7 config_reload).
   * lvqr-admin lib: 38 -> 44 (+6 config_reload_routes).
-  * lvqr-cli integration: streamkeys_e2e (2) + config_reload_e2e (3).
+  * lvqr-cli integration: streamkeys_e2e (2) + config_reload_e2e (3, new) + every existing rtmp_*_e2e / auth_integration / cluster / mesh / wasm / etc continue to pass.
   * Python pytest: 35 -> 38 (+3 config-reload cases).
   * Vitest: unchanged at 13 (live tests for config-reload deferred
     -- pytest + Rust integration cover the logic).
+  * **Workspace total**: 1070 -> **1099** (+29 net Rust).
 * **CI gates**: `cargo fmt --all -- --check` clean; `cargo clippy
   --workspace --all-targets -- -D warnings` clean. All existing
   integration tests pass with the always-on
