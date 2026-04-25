@@ -43,6 +43,7 @@ export {
   type StreamKey,
   type StreamKeySpec,
   type StreamKeyList,
+  type ConfigReloadStatus,
 } from './admin';
 export { detectTransport, type TransportType } from './transport';
 export { MoqSubscriber } from './moq';

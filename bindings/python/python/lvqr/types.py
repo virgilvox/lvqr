@@ -229,6 +229,34 @@ class WasmFilterSlotStats:
 
 
 @dataclass
+class ConfigReloadStatus:
+    """Wire shape for ``/api/v1/config-reload`` (session 147).
+
+    Mirrors ``lvqr_admin::ConfigReloadStatus``. Every field is
+    optional with a sensible default so dataclass construction stays
+    sound even against a server that omits a field for forwards
+    compat.
+    """
+
+    #: Resolved path of the ``--config`` file, or ``None`` when the
+    #: server booted without ``--config``.
+    config_path: Optional[str] = None
+    #: Unix milliseconds at the most recent successful reload, or
+    #: ``None`` until the first reload succeeds.
+    last_reload_at_ms: Optional[int] = None
+    #: ``"sighup"``, ``"admin_post"``, ``"boot"``, or ``None`` when
+    #: no reload has occurred yet.
+    last_reload_kind: Optional[str] = None
+    #: Keys the most recent reload effectively re-applied. Currently
+    #: always ``["auth"]`` on success; future increments add
+    #: ``"mesh_ice"`` and ``"hmac_secret"``.
+    applied_keys: list[str] = field(default_factory=list)
+    #: Operator-facing warnings -- e.g. structural-key diffs that
+    #: require a server restart.
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
 class StreamKey:
     """One stream-key as the admin API returns it. Mirrors
     ``lvqr_auth::StreamKey`` (session 146). The ``token`` field

@@ -641,3 +641,65 @@ class TestClient:
         assert spec.label is None
         assert spec.broadcast is None
         assert spec.ttl_seconds is None
+
+    # -----------------------------------------------------------------
+    # Hot config reload (session 147).
+    # -----------------------------------------------------------------
+
+    @patch("httpx.Client.get")
+    def test_config_reload_status_default_when_unconfigured(self, mock_get):
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {},
+            raise_for_status=lambda: None,
+        )
+        client = LvqrClient("http://localhost:8080")
+        status = client.config_reload_status()
+        assert status.config_path is None
+        assert status.last_reload_at_ms is None
+        assert status.last_reload_kind is None
+        assert status.applied_keys == []
+        assert status.warnings == []
+        client.close()
+
+    @patch("httpx.Client.get")
+    def test_config_reload_status_populated(self, mock_get):
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "config_path": "/etc/lvqr.toml",
+                "last_reload_at_ms": 1_700_000_000_000,
+                "last_reload_kind": "sighup",
+                "applied_keys": ["auth"],
+                "warnings": ["jwks_url ignored"],
+            },
+            raise_for_status=lambda: None,
+        )
+        client = LvqrClient("http://localhost:8080")
+        status = client.config_reload_status()
+        assert status.config_path == "/etc/lvqr.toml"
+        assert status.last_reload_at_ms == 1_700_000_000_000
+        assert status.last_reload_kind == "sighup"
+        assert status.applied_keys == ["auth"]
+        assert status.warnings == ["jwks_url ignored"]
+        client.close()
+
+    @patch("httpx.Client.post")
+    def test_trigger_config_reload(self, mock_post):
+        mock_post.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "config_path": "/etc/lvqr.toml",
+                "last_reload_at_ms": 1_700_000_001_000,
+                "last_reload_kind": "admin_post",
+                "applied_keys": ["auth"],
+                "warnings": [],
+            },
+            raise_for_status=lambda: None,
+        )
+        client = LvqrClient("http://localhost:8080")
+        status = client.trigger_config_reload()
+        assert status.last_reload_kind == "admin_post"
+        assert status.applied_keys == ["auth"]
+        mock_post.assert_called_once()
+        client.close()

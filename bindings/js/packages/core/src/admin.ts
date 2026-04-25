@@ -318,6 +318,27 @@ export interface StreamKeyList {
   keys: StreamKey[];
 }
 
+/**
+ * Wire shape for `GET /api/v1/config-reload` and the success body
+ * of `POST /api/v1/config-reload`. Mirrors
+ * `lvqr_admin::ConfigReloadStatus` (session 147). Every Optional
+ * field carries an explicit nullable shape so SDK clients older
+ * than the server keep parsing forward when later sessions add
+ * sibling fields.
+ */
+export interface ConfigReloadStatus {
+  /** Resolved path of the configured `--config` file, or `null` when the server booted without `--config`. */
+  config_path?: string | null;
+  /** Unix milliseconds at the most recent successful reload, or `null` until the first reload succeeds. */
+  last_reload_at_ms?: number | null;
+  /** `"sighup"`, `"admin_post"`, `"boot"`, or `null` when no reload has occurred yet. */
+  last_reload_kind?: string | null;
+  /** Keys the most recent reload effectively re-applied. Currently always `["auth"]` on success. */
+  applied_keys?: string[];
+  /** Operator-facing warnings -- e.g. structural-key diffs that require a server restart. */
+  warnings?: string[];
+}
+
 export interface LvqrAdminClientOptions {
   /**
    * Per-request deadline in milliseconds. Applied to every admin
@@ -493,6 +514,34 @@ export class LvqrAdminClient {
       `/api/v1/streamkeys/${encodeURIComponent(id)}/rotate`,
       override,
     );
+  }
+
+  /**
+   * `GET /api/v1/config-reload` -- status of the configured
+   * `--config` file (path, last reload timestamp + kind, applied
+   * keys, warnings). Returns a default-shaped body when the
+   * server booted without `--config`. Session 147.
+   */
+  async configReload(): Promise<ConfigReloadStatus> {
+    return this.getJson<ConfigReloadStatus>('/api/v1/config-reload');
+  }
+
+  /**
+   * `POST /api/v1/config-reload` -- trigger a reload of the
+   * configured `--config` file. Resolves with the new
+   * `ConfigReloadStatus` on success. Rejects with a 503 error
+   * when the server booted without `--config`, or 500 when the
+   * file is malformed / the rebuild failed (in which case the
+   * prior provider stays live). Session 147.
+   */
+  async triggerConfigReload(): Promise<ConfigReloadStatus> {
+    const resp = await this.fetchWithTimeout(`${this.baseUrl}/api/v1/config-reload`, {
+      method: 'POST',
+    });
+    if (!resp.ok) {
+      throw new Error(`POST /api/v1/config-reload: HTTP ${resp.status} ${resp.statusText}`);
+    }
+    return (await resp.json()) as ConfigReloadStatus;
   }
 
   /**

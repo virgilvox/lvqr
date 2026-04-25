@@ -17,6 +17,7 @@ from .types import (
     BroadcastSummary,
     ClusterNodeView,
     ConfigEntry,
+    ConfigReloadStatus,
     FederationLinkStatus,
     FederationStatus,
     MeshPeerStats,
@@ -300,6 +301,29 @@ class LvqrClient:
         resp.raise_for_status()
         return _streamkey_from_json(resp.json())
 
+    # -----------------------------------------------------------------
+    # Hot config reload (session 147).
+    # -----------------------------------------------------------------
+
+    def config_reload_status(self) -> ConfigReloadStatus:
+        """``GET /api/v1/config-reload`` -- status of the
+        configured ``--config`` file. Returns a default-shaped body
+        (every Optional unset) when the server booted without
+        ``--config``."""
+        data = self._get_json("/api/v1/config-reload")
+        return _config_reload_from_json(data)
+
+    def trigger_config_reload(self) -> ConfigReloadStatus:
+        """``POST /api/v1/config-reload`` -- trigger a reload of
+        the configured ``--config`` file.
+
+        Raises :class:`httpx.HTTPStatusError` on 503 (no
+        ``--config`` was passed at boot) or 500 (file malformed /
+        rebuild failed; the prior provider stays live)."""
+        resp = self._client.post("/api/v1/config-reload")
+        resp.raise_for_status()
+        return _config_reload_from_json(resp.json())
+
     def wasm_filter(self) -> WasmFilterState:
         """``GET /api/v1/wasm-filter`` -- configured WASM filter chain
         shape + per-``(broadcast, track)`` counters. Returns
@@ -346,6 +370,20 @@ class LvqrClient:
         resp = self._client.get(path)
         resp.raise_for_status()
         return resp.json()
+
+
+def _config_reload_from_json(entry: dict) -> ConfigReloadStatus:
+    """Build a :class:`ConfigReloadStatus` from a JSON dict.
+    Defensive ``.get(...)`` so unknown server bodies never crash
+    the dataclass construction (forwards-compat with pre-N
+    servers + post-N additions)."""
+    return ConfigReloadStatus(
+        config_path=entry.get("config_path"),
+        last_reload_at_ms=entry.get("last_reload_at_ms"),
+        last_reload_kind=entry.get("last_reload_kind"),
+        applied_keys=list(entry.get("applied_keys", [])),
+        warnings=list(entry.get("warnings", [])),
+    )
 
 
 def _streamkey_from_json(entry: dict) -> StreamKey:
