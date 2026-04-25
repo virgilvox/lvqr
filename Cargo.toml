@@ -46,7 +46,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 # LVQR is dual-licensed: AGPL-3.0-or-later for open-source use and commercial
 # terms for proprietary / SaaS deployments. See COMMERCIAL-LICENSE.md at the
@@ -204,38 +204,38 @@ glib = "0.20"
 c2pa = { version = "0.80", default-features = false, features = ["rust_native_crypto"] }
 
 # Internal crates
-lvqr-core = { version = "0.4.0", path = "crates/lvqr-core" }
-lvqr-moq = { version = "0.4.0", path = "crates/lvqr-moq" }
-lvqr-fragment = { version = "0.4.0", path = "crates/lvqr-fragment" }
-lvqr-codec = { version = "0.4.0", path = "crates/lvqr-codec" }
-lvqr-cmaf = { version = "0.4.0", path = "crates/lvqr-cmaf" }
-lvqr-hls = { version = "0.4.0", path = "crates/lvqr-hls" }
-lvqr-dash = { version = "0.4.0", path = "crates/lvqr-dash" }
-lvqr-relay = { version = "0.4.0", path = "crates/lvqr-relay" }
-lvqr-mesh = { version = "0.4.0", path = "crates/lvqr-mesh" }
-lvqr-ingest = { version = "0.4.0", path = "crates/lvqr-ingest" }
-lvqr-whep = { version = "0.4.0", path = "crates/lvqr-whep" }
-lvqr-whip = { version = "0.4.0", path = "crates/lvqr-whip" }
-lvqr-archive = { version = "0.4.0", path = "crates/lvqr-archive" }
-lvqr-signal = { version = "0.4.0", path = "crates/lvqr-signal" }
-lvqr-admin = { version = "0.4.0", path = "crates/lvqr-admin" }
-lvqr-auth = { version = "0.4.0", path = "crates/lvqr-auth" }
+lvqr-core = { version = "0.4.1", path = "crates/lvqr-core" }
+lvqr-moq = { version = "0.4.1", path = "crates/lvqr-moq" }
+lvqr-fragment = { version = "0.4.1", path = "crates/lvqr-fragment" }
+lvqr-codec = { version = "0.4.1", path = "crates/lvqr-codec" }
+lvqr-cmaf = { version = "0.4.1", path = "crates/lvqr-cmaf" }
+lvqr-hls = { version = "0.4.1", path = "crates/lvqr-hls" }
+lvqr-dash = { version = "0.4.1", path = "crates/lvqr-dash" }
+lvqr-relay = { version = "0.4.1", path = "crates/lvqr-relay" }
+lvqr-mesh = { version = "0.4.1", path = "crates/lvqr-mesh" }
+lvqr-ingest = { version = "0.4.1", path = "crates/lvqr-ingest" }
+lvqr-whep = { version = "0.4.1", path = "crates/lvqr-whep" }
+lvqr-whip = { version = "0.4.1", path = "crates/lvqr-whip" }
+lvqr-archive = { version = "0.4.1", path = "crates/lvqr-archive" }
+lvqr-signal = { version = "0.4.1", path = "crates/lvqr-signal" }
+lvqr-admin = { version = "0.4.1", path = "crates/lvqr-admin" }
+lvqr-auth = { version = "0.4.1", path = "crates/lvqr-auth" }
 # publish = false; path-only so consumer dev-dep manifests stay strippable on `cargo publish`.
 lvqr-conformance = { path = "crates/lvqr-conformance" }
-lvqr-record = { version = "0.4.0", path = "crates/lvqr-record" }
-lvqr-rtsp = { version = "0.4.0", path = "crates/lvqr-rtsp" }
-lvqr-srt = { version = "0.4.0", path = "crates/lvqr-srt" }
+lvqr-record = { version = "0.4.1", path = "crates/lvqr-record" }
+lvqr-rtsp = { version = "0.4.1", path = "crates/lvqr-rtsp" }
+lvqr-srt = { version = "0.4.1", path = "crates/lvqr-srt" }
 # publish = false; path-only so consumer dev-dep manifests stay strippable on `cargo publish`.
 lvqr-test-utils = { path = "crates/lvqr-test-utils" }
-lvqr-cli = { version = "0.4.0", path = "crates/lvqr-cli" }
-lvqr-cluster = { version = "0.4.0", path = "crates/lvqr-cluster" }
-lvqr-observability = { version = "0.4.0", path = "crates/lvqr-observability" }
+lvqr-cli = { version = "0.4.1", path = "crates/lvqr-cli" }
+lvqr-cluster = { version = "0.4.1", path = "crates/lvqr-cluster" }
+lvqr-observability = { version = "0.4.1", path = "crates/lvqr-observability" }
 # publish = false; path-only on principle (no consumer dev-deps on it today).
 lvqr-soak = { path = "crates/lvqr-soak" }
-lvqr-wasm = { version = "0.4.0", path = "crates/lvqr-wasm" }
-lvqr-agent = { version = "0.4.0", path = "crates/lvqr-agent" }
-lvqr-agent-whisper = { version = "0.4.0", path = "crates/lvqr-agent-whisper" }
-lvqr-transcode = { version = "0.4.0", path = "crates/lvqr-transcode" }
+lvqr-wasm = { version = "0.4.1", path = "crates/lvqr-wasm" }
+lvqr-agent = { version = "0.4.1", path = "crates/lvqr-agent" }
+lvqr-agent-whisper = { version = "0.4.1", path = "crates/lvqr-agent-whisper" }
+lvqr-transcode = { version = "0.4.1", path = "crates/lvqr-transcode" }
 
 [profile.release]
 lto = true

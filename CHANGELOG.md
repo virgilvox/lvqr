@@ -6,7 +6,22 @@ summarises user-visible surface changes between tagged
 releases. For session-by-session engineering notes, see
 `tracking/HANDOFF.md`.
 
-## Unreleased (post-0.4.0, through session 82 -- 2026-04-17)
+## [0.4.1] - 2026-04-24
+
+Workspace republish so the source on `origin/main` becomes
+reachable from `cargo install`. Sessions 83 through 144 landed
+between the 0.4.0 release (2026-04-16) and today but never
+reached crates.io; this release closes that gap. See
+`tracking/HANDOFF.md` for the session-by-session narrative.
+
+The 0.4.0 -> 0.4.1 commit itself is a workspace version bump
+with zero source changes; the published artifact carries the
+full `origin/main` tree at the time of publish. The release
+notes below for the 45-82 window are accurate as written; the
+post-82 narrative through 144 lives only in HANDOFF.md and may
+be folded back into this changelog in a future docs sweep.
+
+## Unreleased-pre-0.4.1 (post-0.4.0, through session 82 -- 2026-04-17)
 
 Sessions 45 through 82 expanded the protocol surface well
 beyond the 0.4.0 release cut, then added a cluster plane and
