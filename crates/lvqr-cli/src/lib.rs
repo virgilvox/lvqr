@@ -36,7 +36,7 @@ pub use signed_url::{LiveScheme, sign_live_url};
 use anyhow::Result;
 use axum::middleware::from_fn_with_state;
 use axum::routing::get;
-use lvqr_auth::{NoopAuthProvider, SharedAuth};
+use lvqr_auth::{InMemoryStreamKeyStore, MultiKeyAuthProvider, NoopAuthProvider, SharedAuth, SharedStreamKeyStore};
 use lvqr_core::{EventBus, RelayEvent};
 use lvqr_dash::{BroadcasterDashBridge, DashConfig};
 use lvqr_fragment::FragmentBroadcasterRegistry;
@@ -111,10 +111,29 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let shutdown = CancellationToken::new();
 
     // Auth provider: caller-provided, or fall back to open access.
-    let auth: SharedAuth = config
+    let inner_auth: SharedAuth = config
         .auth
         .clone()
         .unwrap_or_else(|| Arc::new(NoopAuthProvider) as SharedAuth);
+
+    // Session 146: when stream-key CRUD is enabled (the default),
+    // wrap the resolved auth provider in a `MultiKeyAuthProvider`
+    // backed by an in-memory store. The wrap is purely additive:
+    // every Publish auth check first asks the store, then falls
+    // through to the wrapped chain. Subscribe + Admin contexts
+    // always delegate to the fallback so stream-key CRUD never
+    // gates viewer or admin auth (load-bearing safety property
+    // -- a misconfigured fallback cannot lock the operator out
+    // of their own admin API).
+    let (auth, streamkey_store): (SharedAuth, Option<SharedStreamKeyStore>) = if config.streamkeys_enabled {
+        let store: SharedStreamKeyStore = Arc::new(InMemoryStreamKeyStore::new());
+        let wrapped: SharedAuth = Arc::new(MultiKeyAuthProvider::new(store.clone(), Some(inner_auth)));
+        tracing::info!("stream-key CRUD enabled (/api/v1/streamkeys mounted)");
+        (wrapped, Some(store))
+    } else {
+        tracing::info!("stream-key CRUD disabled (--no-streamkeys)");
+        (inner_auth, None)
+    };
 
     // Shared lifecycle bus: bridge and WS ingest emit
     // BroadcastStarted/Stopped here; recorder subscribes to it.
@@ -780,6 +799,17 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // so `GET /api/v1/slo` returns per-(broadcast, transport)
     // p50 / p95 / p99 / max samples.
     let admin_state = admin_state.with_slo(slo_tracker.clone());
+
+    // Session 146: wire the runtime stream-key store into the
+    // admin router. When streamkeys_enabled is false the store is
+    // None and the routes are still mounted, but list returns
+    // `{"keys":[]}` and mutating ops return 500 with a clear "not
+    // configured" message. The CLI's --no-streamkeys flag is the
+    // only path to that None branch.
+    let admin_state = match streamkey_store.as_ref() {
+        Some(store) => admin_state.with_streamkey_store(store.clone()),
+        None => admin_state,
+    };
 
     // PLAN Phase D session 137: expose the configured WASM filter
     // chain on `GET /api/v1/wasm-filter` when `--wasm-filter` was

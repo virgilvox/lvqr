@@ -218,6 +218,19 @@ struct ServeArgs {
     #[arg(long, env = "LVQR_NO_AUTH_SIGNAL")]
     no_auth_signal: bool,
 
+    /// Disable the runtime stream-key CRUD admin API. When unset
+    /// (default), `start()` wraps the configured auth provider
+    /// in a `MultiKeyAuthProvider` backed by an in-memory store,
+    /// and mounts `/api/v1/streamkeys/*` so an admin client can
+    /// mint, list, revoke, and rotate ingest stream keys at
+    /// runtime. The wrap is purely additive: existing publish
+    /// auth (`LVQR_PUBLISH_KEY`, JWT, JWKS, webhook) keeps
+    /// working unchanged. Set this flag for deployments that
+    /// want the pre-146 behavior exactly: no store, no
+    /// `/streamkeys` routes, no MultiKey wrap. Session 146.
+    #[arg(long, env = "LVQR_NO_STREAMKEYS")]
+    no_streamkeys: bool,
+
     /// JSON array of STUN/TURN servers to push to browser peers
     /// via the mesh `AssignParent` server-push message. Each entry
     /// mirrors WebRTC's `RTCIceServer` shape:
@@ -647,6 +660,7 @@ async fn serve_from_args(
         no_auth_signal: args.no_auth_signal,
         mesh_root_peer_count: args.mesh_root_peer_count,
         mesh_ice_servers,
+        streamkeys_enabled: !args.no_streamkeys,
     };
 
     let handle = start(config).await?;

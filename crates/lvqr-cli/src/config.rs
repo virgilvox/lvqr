@@ -287,6 +287,16 @@ pub struct ServeConfig {
     /// env fallback. Only meaningful when `mesh_enabled` is
     /// `true`. Session 143 -- TURN deployment recipe.
     pub mesh_ice_servers: Vec<lvqr_signal::IceServer>,
+    /// Mount the runtime stream-key CRUD admin API
+    /// (`/api/v1/streamkeys/*`) and wrap the configured auth
+    /// provider in a [`lvqr_auth::MultiKeyAuthProvider`] backed
+    /// by an in-memory store. Default `true`. The wrap is
+    /// additive: existing publish auth (`LVQR_PUBLISH_KEY`, JWT,
+    /// JWKS, webhook) keeps working unchanged; minted stream-keys
+    /// become an additional accept path. Set this to `false`
+    /// (CLI: `--no-streamkeys`) for deployments that want the
+    /// pre-146 behavior exactly. Session 146.
+    pub streamkeys_enabled: bool,
 }
 
 impl ServeConfig {
@@ -339,6 +349,7 @@ impl ServeConfig {
             no_auth_signal: false,
             mesh_root_peer_count: None,
             mesh_ice_servers: Vec::new(),
+            streamkeys_enabled: true,
         }
     }
 }

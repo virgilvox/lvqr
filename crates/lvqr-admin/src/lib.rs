@@ -1,5 +1,6 @@
 pub mod routes;
 pub mod slo;
+pub mod streamkey_routes;
 
 #[cfg(feature = "cluster")]
 pub mod cluster_routes;
@@ -9,6 +10,7 @@ pub use routes::{
     WasmFilterSlotStats, WasmFilterState, build_router,
 };
 pub use slo::{LatencyTracker, SloEntry};
+pub use streamkey_routes::StreamKeyList;
 
 /// Configuration for the admin HTTP server.
 #[derive(Debug, Clone)]

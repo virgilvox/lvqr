@@ -67,6 +67,14 @@ pub struct TestServerConfig {
     no_auth_signal: bool,
     mesh_root_peer_count: Option<usize>,
     mesh_ice_servers: Vec<lvqr_signal::IceServer>,
+    /// Session 146: when true, disable the runtime stream-key CRUD
+    /// admin API. Default `false` means the wrap is on (matches
+    /// `lvqr-cli`'s `lvqr serve` default), so existing tests that
+    /// run `TestServer::start(TestServerConfig::new())` exercise
+    /// the same code path that production deployments take. Tests
+    /// that want pre-146 behavior verbatim flip this with
+    /// `with_no_streamkeys()`.
+    no_streamkeys: bool,
 }
 
 impl TestServerConfig {
@@ -270,6 +278,16 @@ impl TestServerConfig {
         self
     }
 
+    /// Disable the runtime stream-key CRUD admin API. Mirrors the
+    /// CLI's `--no-streamkeys` flag. When unset (default), the
+    /// TestServer wraps the configured auth provider in a
+    /// [`lvqr_auth::MultiKeyAuthProvider`] backed by an in-memory
+    /// store and mounts `/api/v1/streamkeys/*`. Session 146.
+    pub fn with_no_streamkeys(mut self) -> Self {
+        self.no_streamkeys = true;
+        self
+    }
+
     /// Override the mesh `root_peer_count` so tests can exercise
     /// the `AssignParent` path with a small number of peers.
     /// Defaults to the `lvqr_mesh::MeshConfig::default()` value
@@ -359,6 +377,7 @@ impl TestServer {
             no_auth_signal: config.no_auth_signal,
             mesh_root_peer_count: config.mesh_root_peer_count,
             mesh_ice_servers: config.mesh_ice_servers,
+            streamkeys_enabled: !config.no_streamkeys,
         };
         let handle = start(serve_config).await?;
         Ok(Self { handle })

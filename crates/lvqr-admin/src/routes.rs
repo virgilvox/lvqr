@@ -2,8 +2,11 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router, routing::get};
-use lvqr_auth::{AuthContext, AuthDecision, NoopAuthProvider, SharedAuth};
+use axum::{
+    Json, Router,
+    routing::{delete, get, post},
+};
+use lvqr_auth::{AuthContext, AuthDecision, NoopAuthProvider, SharedAuth, SharedStreamKeyStore};
 use lvqr_core::RelayStats;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -163,6 +166,13 @@ pub struct AdminState {
     /// turn off the filter stack pay no graph cost. PLAN Phase D
     /// session 137.
     get_wasm_filter: Arc<dyn Fn() -> WasmFilterState + Send + Sync>,
+    /// Optional runtime stream-key store backing the
+    /// `/api/v1/streamkeys/*` admin routes (session 146). `None`
+    /// means the operator booted with `--no-streamkeys` (or an
+    /// embedder did not wire the store); the list endpoint then
+    /// returns `{"keys":[]}` and the mutating endpoints return
+    /// 500 with a clear "store not configured" message.
+    streamkey_store: Option<SharedStreamKeyStore>,
 }
 
 impl AdminState {
@@ -192,6 +202,7 @@ impl AdminState {
                 broadcasts: Vec::new(),
                 slots: Vec::new(),
             }),
+            streamkey_store: None,
         }
     }
 
@@ -267,6 +278,24 @@ impl AdminState {
         self.get_wasm_filter = Arc::new(get);
         self
     }
+
+    /// Wire the runtime stream-key store backing the
+    /// `/api/v1/streamkeys/*` admin routes (session 146). Without
+    /// this call the list endpoint serves an empty array and the
+    /// mutating endpoints return 500 -- which is what the operator
+    /// gets when they boot with `--no-streamkeys`. The CLI's
+    /// composition root always calls this when streamkeys are
+    /// enabled (the default).
+    pub fn with_streamkey_store(mut self, store: SharedStreamKeyStore) -> Self {
+        self.streamkey_store = Some(store);
+        self
+    }
+
+    /// Borrow the configured stream-key store, if any. Used by
+    /// [`crate::streamkey_routes`] handlers.
+    pub(crate) fn streamkey_store(&self) -> Option<&SharedStreamKeyStore> {
+        self.streamkey_store.as_ref()
+    }
 }
 
 /// Structured error responses for the admin API.
@@ -296,7 +325,19 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/api/v1/streams", get(list_streams))
         .route("/api/v1/mesh", get(get_mesh))
         .route("/api/v1/slo", get(get_slo))
-        .route("/api/v1/wasm-filter", get(get_wasm_filter));
+        .route("/api/v1/wasm-filter", get(get_wasm_filter))
+        .route(
+            "/api/v1/streamkeys",
+            get(crate::streamkey_routes::list_streamkeys).post(crate::streamkey_routes::mint_streamkey),
+        )
+        .route(
+            "/api/v1/streamkeys/{id}",
+            delete(crate::streamkey_routes::revoke_streamkey),
+        )
+        .route(
+            "/api/v1/streamkeys/{id}/rotate",
+            post(crate::streamkey_routes::rotate_streamkey),
+        );
 
     #[cfg(feature = "cluster")]
     {
