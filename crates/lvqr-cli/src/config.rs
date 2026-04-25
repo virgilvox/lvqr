@@ -275,6 +275,18 @@ pub struct ServeConfig {
     /// becomes a child of the first. Only meaningful when
     /// `mesh_enabled` is `true`. Session 111-B1.
     pub mesh_root_peer_count: Option<usize>,
+    /// STUN/TURN servers to push to browser peers via the
+    /// `AssignParent` server-push message. Empty vec (default)
+    /// means "no opinion -- client picks": JS `MeshPeer` falls
+    /// back to whatever was passed to its constructor (or its
+    /// hardcoded Google STUN default). Non-empty vec is
+    /// authoritative: clients rebuild their `RTCPeerConnection`
+    /// `iceServers` list from this snapshot when AssignParent
+    /// lands. Operator-facing CLI flag is
+    /// `--mesh-ice-servers <JSON>` with `LVQR_MESH_ICE_SERVERS`
+    /// env fallback. Only meaningful when `mesh_enabled` is
+    /// `true`. Session 143 -- TURN deployment recipe.
+    pub mesh_ice_servers: Vec<lvqr_signal::IceServer>,
 }
 
 impl ServeConfig {
@@ -326,6 +338,7 @@ impl ServeConfig {
             no_auth_live_playback: false,
             no_auth_signal: false,
             mesh_root_peer_count: None,
+            mesh_ice_servers: Vec::new(),
         }
     }
 }

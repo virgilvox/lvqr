@@ -928,6 +928,12 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             // that open `/signal` without first opening `/ws`
             // fall through to the pre-111-B2 path of
             // `add_peer` + fresh assignment.
+            // Session 143: capture the operator-configured ICE-server
+            // list once. Every AssignParent emitted by this callback
+            // includes a clone of the snapshot. Empty when
+            // `--mesh-ice-servers` was not set; clients then fall
+            // back to their constructor-provided list.
+            let ice_servers_for_signal = config.mesh_ice_servers.clone();
             signal.set_peer_callback(Arc::new(move |peer_id, track, connected| {
                 if connected {
                     if let Some(existing) = mesh_for_signal.get_peer(peer_id) {
@@ -942,6 +948,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                             role: format!("{:?}", existing.role),
                             parent_id: existing.parent.clone(),
                             depth: existing.depth,
+                            ice_servers: ice_servers_for_signal.clone(),
                         });
                     }
                     match mesh_for_signal.add_peer(peer_id.to_string(), track.to_string()) {
@@ -952,6 +959,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                                 role: format!("{:?}", a.role),
                                 parent_id: a.parent,
                                 depth: a.depth,
+                                ice_servers: ice_servers_for_signal.clone(),
                             })
                         }
                         Err(e) => {

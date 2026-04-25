@@ -66,6 +66,7 @@ pub struct TestServerConfig {
     no_auth_live_playback: bool,
     no_auth_signal: bool,
     mesh_root_peer_count: Option<usize>,
+    mesh_ice_servers: Vec<lvqr_signal::IceServer>,
 }
 
 impl TestServerConfig {
@@ -279,6 +280,15 @@ impl TestServerConfig {
         self.mesh_root_peer_count = Some(count);
         self
     }
+
+    /// Configure the mesh `--mesh-ice-servers` snapshot pushed via
+    /// `AssignParent`. Empty (default) emits `ice_servers: []` so
+    /// JS clients fall back to their constructor default. Session
+    /// 143 -- TURN deployment recipe.
+    pub fn with_mesh_ice_servers(mut self, servers: Vec<lvqr_signal::IceServer>) -> Self {
+        self.mesh_ice_servers = servers;
+        self
+    }
 }
 
 /// A running LVQR server bound to ephemeral loopback ports.
@@ -348,6 +358,7 @@ impl TestServer {
             no_auth_live_playback: config.no_auth_live_playback,
             no_auth_signal: config.no_auth_signal,
             mesh_root_peer_count: config.mesh_root_peer_count,
+            mesh_ice_servers: config.mesh_ice_servers,
         };
         let handle = start(serve_config).await?;
         Ok(Self { handle })

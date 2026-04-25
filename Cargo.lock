@@ -3548,6 +3548,7 @@ dependencies = [
  "lvqr-fragment",
  "lvqr-mesh",
  "lvqr-moq",
+ "lvqr-signal",
  "lvqr-transcode",
  "lvqr-wasm",
  "rand 0.8.5",

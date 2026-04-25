@@ -46,6 +46,11 @@ lvqr-cluster = { workspace = true }
 # `lvqr_mesh::MeshCoordinator` directly; the dep must resolve at
 # compile time.
 lvqr-mesh = { workspace = true }
+# Session 143: TestServer.with_mesh_ice_servers names
+# `lvqr_signal::IceServer` directly so the dep must resolve. The
+# crate is already a transitive of lvqr-cli, but naming a public
+# type requires a direct dep at the leaf where the name appears.
+lvqr-signal = { workspace = true }
 # For the MoQ-client-side federation integration test: constructing a
 # broadcast on one server and subscribing from another requires naming
 # moq-lite types directly. lvqr-moq is the facade.

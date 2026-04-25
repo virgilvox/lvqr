@@ -17,6 +17,25 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// One ICE server entry pushed to clients via [`SignalMessage::AssignParent`].
+///
+/// JSON shape mirrors WebRTC's `RTCIceServer` so JS clients can
+/// drop the value straight into `new RTCPeerConnection({ iceServers: [...] })`.
+/// `urls` is always emitted as an array even when only one URL is
+/// configured -- normalizing on the wire keeps the JS-side cast
+/// simple. `username` + `credential` are skipped on serialize when
+/// `None` so STUN-only entries do not carry empty credential
+/// fields. Session 143 -- TURN deployment recipe + server-driven
+/// ICE config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IceServer {
+    pub urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+}
+
 /// WebRTC signaling message types exchanged between peers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -38,11 +57,21 @@ pub enum SignalMessage {
     },
 
     /// Server assigns a parent peer to connect to.
+    ///
+    /// `ice_servers` (added in session 143) carries the operator-
+    /// configured STUN/TURN list from `lvqr serve --mesh-ice-servers
+    /// <JSON>`. Empty when the operator did not configure the flag;
+    /// JS clients fall back to whatever was passed to the `MeshPeer`
+    /// constructor (or its hardcoded Google STUN default). Behind
+    /// `#[serde(default)]` so a pre-143 server body that omits the
+    /// field still deserializes into a new client cleanly.
     AssignParent {
         peer_id: String,
         role: String,
         parent_id: Option<String>,
         depth: u32,
+        #[serde(default)]
+        ice_servers: Vec<IceServer>,
     },
 
     /// Server notifies that a peer has left.
@@ -493,11 +522,13 @@ mod tests {
             role: "Relay".into(),
             parent_id: Some("peer-1".into()),
             depth: 2,
+            ice_servers: Vec::new(),
         };
 
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"AssignParent\""));
         assert!(json.contains("\"parent_id\":\"peer-1\""));
+        assert!(json.contains("\"ice_servers\":[]"));
 
         let parsed: SignalMessage = serde_json::from_str(&json).unwrap();
         match parsed {
@@ -506,14 +537,78 @@ mod tests {
                 role,
                 parent_id,
                 depth,
+                ice_servers,
             } => {
                 assert_eq!(peer_id, "peer-42");
                 assert_eq!(role, "Relay");
                 assert_eq!(parent_id.as_deref(), Some("peer-1"));
                 assert_eq!(depth, 2);
+                assert!(ice_servers.is_empty());
             }
             _ => panic!("expected AssignParent"),
         }
+    }
+
+    #[test]
+    fn assign_parent_carries_ice_servers() {
+        // Session 143: operator-configured STUN/TURN entries flow
+        // through AssignParent down to JS clients, which feed the
+        // list directly into RTCPeerConnection({ iceServers: [...] }).
+        let msg = SignalMessage::AssignParent {
+            peer_id: "peer-7".into(),
+            role: "Relay".into(),
+            parent_id: Some("peer-1".into()),
+            depth: 1,
+            ice_servers: vec![
+                IceServer {
+                    urls: vec!["stun:stun.l.google.com:19302".into()],
+                    username: None,
+                    credential: None,
+                },
+                IceServer {
+                    urls: vec!["turn:turn.example.com:3478".into()],
+                    username: Some("u".into()),
+                    credential: Some("p".into()),
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        // Round-trip preserves urls + credentials exactly.
+        let parsed: SignalMessage = serde_json::from_str(&json).unwrap();
+        let SignalMessage::AssignParent { ice_servers, .. } = parsed else {
+            panic!("expected AssignParent");
+        };
+        assert_eq!(ice_servers.len(), 2);
+        assert_eq!(ice_servers[0].urls, vec!["stun:stun.l.google.com:19302".to_string()]);
+        assert!(ice_servers[0].username.is_none());
+        assert!(ice_servers[0].credential.is_none());
+        assert_eq!(ice_servers[1].urls, vec!["turn:turn.example.com:3478".to_string()]);
+        assert_eq!(ice_servers[1].username.as_deref(), Some("u"));
+        assert_eq!(ice_servers[1].credential.as_deref(), Some("p"));
+
+        // STUN-only entries skip credential fields on the wire so
+        // pre-143 clients that strict-parse on Optional credential
+        // fields do not see a null/empty value where they expect
+        // absence.
+        assert!(!json.contains("\"username\":null"));
+        assert!(!json.contains("\"credential\":null"));
+    }
+
+    #[test]
+    fn assign_parent_deserializes_pre_143_body_without_ice_servers() {
+        // A pre-143 server body that omits ice_servers entirely must
+        // still deserialize into a new client; the #[serde(default)]
+        // on the field makes ice_servers default to an empty vec.
+        let json = r#"{"type":"AssignParent","peer_id":"p","role":"Root","parent_id":null,"depth":0}"#;
+        let parsed: SignalMessage = serde_json::from_str(json).unwrap();
+        let SignalMessage::AssignParent { ice_servers, .. } = parsed else {
+            panic!("expected AssignParent");
+        };
+        assert!(
+            ice_servers.is_empty(),
+            "missing ice_servers field must default to empty"
+        );
     }
 
     #[test]
@@ -553,6 +648,7 @@ mod tests {
                 role: "Root".into(),
                 parent_id: None,
                 depth: 0,
+                ice_servers: Vec::new(),
             },
         );
 
@@ -563,11 +659,13 @@ mod tests {
                 role,
                 parent_id,
                 depth,
+                ice_servers,
             } => {
                 assert_eq!(peer_id, "peer-1");
                 assert_eq!(role, "Root");
                 assert!(parent_id.is_none());
                 assert_eq!(depth, 0);
+                assert!(ice_servers.is_empty());
             }
             _ => panic!("expected AssignParent"),
         }
@@ -583,6 +681,7 @@ mod tests {
                     role: "Root".into(),
                     parent_id: None,
                     depth: 0,
+                    ice_servers: Vec::new(),
                 })
             } else {
                 None

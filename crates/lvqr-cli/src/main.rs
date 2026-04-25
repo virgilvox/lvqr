@@ -218,6 +218,22 @@ struct ServeArgs {
     #[arg(long, env = "LVQR_NO_AUTH_SIGNAL")]
     no_auth_signal: bool,
 
+    /// JSON array of STUN/TURN servers to push to browser peers
+    /// via the mesh `AssignParent` server-push message. Each entry
+    /// mirrors WebRTC's `RTCIceServer` shape:
+    /// `{"urls":["..."],"username":"u","credential":"p"}`. Empty
+    /// (default) means "client decides": JS `MeshPeer` falls back
+    /// to whatever was passed to its constructor (or its hardcoded
+    /// Google STUN default). Non-empty makes the server
+    /// authoritative -- clients rebuild their `RTCPeerConnection`
+    /// `iceServers` from this list when AssignParent lands.
+    /// Required for deployments where peers sit behind symmetric
+    /// NAT and need a TURN relay (see `deploy/turn/` for a
+    /// coturn deployment recipe). Only meaningful when
+    /// `--mesh-enabled`. Session 143.
+    #[arg(long, env = "LVQR_MESH_ICE_SERVERS")]
+    mesh_ice_servers: Option<String>,
+
     /// Directory to record broadcasts into. Omit to disable recording.
     #[arg(long, env = "LVQR_RECORD_DIR")]
     record_dir: Option<PathBuf>,
@@ -569,6 +585,11 @@ async fn serve_from_args(
     #[cfg(feature = "c2pa")]
     let c2pa_config = build_c2pa_config(&args)?;
 
+    // Session 143: parse the operator's --mesh-ice-servers JSON
+    // before the ServeConfig literal. A parse error here surfaces
+    // at boot rather than as a silent server-emits-empty surprise.
+    let mesh_ice_servers = parse_mesh_ice_servers(args.mesh_ice_servers.as_deref())?;
+
     let config = ServeConfig {
         relay_addr: ([0, 0, 0, 0], args.port).into(),
         rtmp_addr: ([0, 0, 0, 0], args.rtmp_port).into(),
@@ -625,6 +646,7 @@ async fn serve_from_args(
         no_auth_live_playback: args.no_auth_live_playback,
         no_auth_signal: args.no_auth_signal,
         mesh_root_peer_count: args.mesh_root_peer_count,
+        mesh_ice_servers,
     };
 
     let handle = start(config).await?;
@@ -726,6 +748,24 @@ fn check_auth_flag_combinations(args: &ServeArgs) -> Result<()> {
 #[cfg(not(any(feature = "jwks", feature = "webhook")))]
 fn check_auth_flag_combinations(_args: &ServeArgs) -> Result<()> {
     Ok(())
+}
+
+/// Parse the `--mesh-ice-servers` JSON blob into a `Vec<IceServer>`.
+/// `None` (flag unset) yields an empty vec; the server then emits
+/// `ice_servers: []` and clients fall back to their constructor
+/// defaults. Parse errors surface at boot with a clear message.
+/// Session 143 -- TURN deployment recipe.
+fn parse_mesh_ice_servers(raw: Option<&str>) -> Result<Vec<lvqr_signal::IceServer>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str::<Vec<lvqr_signal::IceServer>>(trimmed).map_err(|e| {
+        anyhow::anyhow!("--mesh-ice-servers must be a JSON array of {{urls, username?, credential?}} objects: {e}")
+    })
 }
 
 /// Resolve the non-JWKS auth provider from CLI/env: JWT HS256 if
@@ -1174,6 +1214,51 @@ mod wasm_filter_cli_tests {
                 std::path::PathBuf::from("/tmp/a.wasm"),
                 std::path::PathBuf::from("/tmp/b.wasm"),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod mesh_ice_servers_cli_tests {
+    use super::*;
+
+    #[test]
+    fn unset_resolves_to_empty_vec() {
+        let parsed = parse_mesh_ice_servers(None).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn empty_string_resolves_to_empty_vec() {
+        // Whitespace-only payloads also resolve to empty so the env-var
+        // path (LVQR_MESH_ICE_SERVERS="") matches the "unset" semantics.
+        let parsed = parse_mesh_ice_servers(Some("   ")).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parses_full_stun_plus_turn_payload() {
+        let json = r#"[
+            {"urls":["stun:stun.l.google.com:19302"]},
+            {"urls":["turn:turn.example.com:3478"],"username":"u","credential":"p"}
+        ]"#;
+        let parsed = parse_mesh_ice_servers(Some(json)).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].urls, vec!["stun:stun.l.google.com:19302".to_string()]);
+        assert!(parsed[0].username.is_none());
+        assert!(parsed[0].credential.is_none());
+        assert_eq!(parsed[1].urls, vec!["turn:turn.example.com:3478".to_string()]);
+        assert_eq!(parsed[1].username.as_deref(), Some("u"));
+        assert_eq!(parsed[1].credential.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn malformed_json_surfaces_helpful_error() {
+        let err = parse_mesh_ice_servers(Some("not json")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--mesh-ice-servers must be a JSON array"),
+            "expected helpful error, got: {msg}"
         );
     }
 }

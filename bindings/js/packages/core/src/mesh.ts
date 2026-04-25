@@ -197,6 +197,20 @@ export class MeshPeer {
     this.role = msg.role as string;
     this.parentId = (msg.parent_id as string | null) ?? null;
 
+    // Session 143: server-driven ICE config. When the operator
+    // booted lvqr with `--mesh-ice-servers '[...]'`, every
+    // AssignParent carries the configured list. A non-empty list
+    // is authoritative -- rebuild iceConfig from the snapshot so
+    // future RTCPeerConnections (parent-side and child-side) pick
+    // up the operator's STUN/TURN entries automatically. Empty
+    // list (operator did not configure the flag) leaves the
+    // constructor-provided iceConfig untouched, preserving
+    // backward compat for integrators who pass their own list.
+    const serverIceServers = msg.ice_servers as RTCIceServer[] | undefined;
+    if (Array.isArray(serverIceServers) && serverIceServers.length > 0) {
+      this.iceConfig = { iceServers: serverIceServers };
+    }
+
     if (this.parentId) {
       // Non-root: connect to parent via WebRTC
       this.connectToParent(this.parentId);
