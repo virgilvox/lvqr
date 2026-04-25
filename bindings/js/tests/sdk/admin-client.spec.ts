@@ -186,6 +186,48 @@ describe('LvqrAdminClient against a running lvqr', () => {
     expect(state.slots[0].dropped).toBe(0);
   });
 
+  it('streamkeys mint -> list -> revoke round-trips against a live server', async () => {
+    // Session 146: end-to-end shape verification through the SDK
+    // surface. The CI harness boots `lvqr serve` with default
+    // streamkeys-enabled, so the runtime store is empty at start.
+    // Mint a key, assert the shape, list to confirm visibility,
+    // revoke, list to confirm the entry dropped.
+    const mintBefore = await admin.listStreamKeys();
+    const mintBeforeIds = new Set(mintBefore.map((k) => k.id));
+
+    const minted = await admin.mintStreamKey({ label: 'sdk-test', broadcast: 'live/sdk-mint' });
+    expect(typeof minted.id).toBe('string');
+    expect(typeof minted.token).toBe('string');
+    expect(minted.token.startsWith('lvqr_sk_')).toBe(true);
+    expect(minted.label).toBe('sdk-test');
+    expect(minted.broadcast).toBe('live/sdk-mint');
+    expect(typeof minted.created_at).toBe('number');
+    expect(mintBeforeIds.has(minted.id)).toBe(false);
+
+    const listed = await admin.listStreamKeys();
+    const justMinted = listed.find((k) => k.id === minted.id);
+    expect(justMinted).toBeDefined();
+    expect(justMinted?.token).toBe(minted.token);
+
+    await admin.revokeStreamKey(minted.id);
+
+    const after = await admin.listStreamKeys();
+    expect(after.find((k) => k.id === minted.id)).toBeUndefined();
+  });
+
+  it('rotateStreamKey preserves id and changes token', async () => {
+    // Mint -> rotate (no override) -> assert id stable, token differs,
+    // scope preserved. Then revoke for cleanup so other suites see a
+    // clean store.
+    const minted = await admin.mintStreamKey({ label: 'sdk-rotate', broadcast: 'live/sdk-rot' });
+    const rotated = await admin.rotateStreamKey(minted.id);
+    expect(rotated.id).toBe(minted.id);
+    expect(rotated.token).not.toBe(minted.token);
+    expect(rotated.label).toBe('sdk-rotate');
+    expect(rotated.broadcast).toBe('live/sdk-rot');
+    await admin.revokeStreamKey(minted.id);
+  });
+
   it('fetchTimeoutMs aborts hung requests', async () => {
     // Point the client at an IP that accepts TCP but never responds.
     // `203.0.113.1` is TEST-NET-3 (RFC 5737) and should black-hole.

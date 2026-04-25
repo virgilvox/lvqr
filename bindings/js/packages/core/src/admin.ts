@@ -257,6 +257,67 @@ export interface WasmFilterState {
   slots: WasmFilterSlotStats[];
 }
 
+/**
+ * One stream-key as the admin API returns it. Mirrors
+ * `lvqr_auth::StreamKey` (session 146). The token carries the
+ * literal bearer credential a publisher uses; operators copy it
+ * out of the mint response (or `listStreamKeys()`) and hand it
+ * to whatever ingest tool will publish (ffmpeg, OBS, GStreamer).
+ *
+ * Tokens are formatted as `lvqr_sk_<43-char base64url-no-pad>`
+ * (32 bytes of CSPRNG output prefixed for secret-scanning
+ * recognisability).
+ */
+export interface StreamKey {
+  /** Stable handle for revoke + rotate. Never changes. */
+  id: string;
+  /** Bearer credential the publisher sends as the stream key. */
+  token: string;
+  /** Operator-friendly name, or `null` / absent. */
+  label?: string | null;
+  /**
+   * When set, the key only authorises publishes for this exact
+   * broadcast name (e.g. `"live/cam-a"`). Unset means the key
+   * accepts any broadcast under the configured ingest surfaces.
+   */
+  broadcast?: string | null;
+  /** Unix seconds at mint or rotate time. */
+  created_at: number;
+  /**
+   * Unix seconds after which the key stops authenticating publishes.
+   * Unset means no expiry. Lazy: the auth path filters expired
+   * tokens; the list endpoint still surfaces them so operators can
+   * revoke stale entries.
+   */
+  expires_at?: number | null;
+}
+
+/**
+ * Mint / rotate request body. Mirrors `lvqr_auth::StreamKeySpec`
+ * (session 146). Every field is optional; operators only declare
+ * the scoping they actually want.
+ */
+export interface StreamKeySpec {
+  label?: string | null;
+  broadcast?: string | null;
+  /**
+   * Time-to-live in seconds. Server converts to
+   * `expires_at = now + ttl_seconds`. `0` or absent means no
+   * expiry.
+   */
+  ttl_seconds?: number | null;
+}
+
+/**
+ * Outer shape of `GET /api/v1/streamkeys`. Mirrors
+ * `lvqr_admin::StreamKeyList`. The wrapper exists so the response
+ * can grow sibling fields (counts, pagination cursors) without a
+ * breaking schema change.
+ */
+export interface StreamKeyList {
+  keys: StreamKey[];
+}
+
 export interface LvqrAdminClientOptions {
   /**
    * Per-request deadline in milliseconds. Applied to every admin
@@ -379,6 +440,78 @@ export class LvqrAdminClient {
    */
   async wasmFilter(): Promise<WasmFilterState> {
     return this.getJson<WasmFilterState>('/api/v1/wasm-filter');
+  }
+
+  /**
+   * `GET /api/v1/streamkeys` -- every stream-key currently in the
+   * runtime store, including expired entries. Returns
+   * `{ keys: [] }` when the server booted with `--no-streamkeys`
+   * (so polling tooling can run unconditionally). Session 146.
+   */
+  async listStreamKeys(): Promise<StreamKey[]> {
+    const wrapper = await this.getJson<StreamKeyList>('/api/v1/streamkeys');
+    return wrapper.keys ?? [];
+  }
+
+  /**
+   * `POST /api/v1/streamkeys` -- mint a new stream-key. Server
+   * fills `id`, `token`, `created_at`, and `expires_at` (from
+   * `ttl_seconds`). Returns the full minted key including the
+   * bearer token literal. Session 146.
+   */
+  async mintStreamKey(spec: StreamKeySpec = {}): Promise<StreamKey> {
+    return this.sendJson<StreamKey>('POST', '/api/v1/streamkeys', spec);
+  }
+
+  /**
+   * `DELETE /api/v1/streamkeys/{id}` -- hard-delete by id.
+   * Resolves on 204 (success) and rejects on 404 (unknown id) or
+   * any other non-2xx status. Idempotent callers should treat
+   * 404 as "already gone" by catching the rejection. Session 146.
+   */
+  async revokeStreamKey(id: string): Promise<void> {
+    const resp = await this.fetchWithTimeout(
+      `${this.baseUrl}/api/v1/streamkeys/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+    );
+    if (!resp.ok) {
+      throw new Error(`DELETE /api/v1/streamkeys/${id}: HTTP ${resp.status} ${resp.statusText}`);
+    }
+  }
+
+  /**
+   * `POST /api/v1/streamkeys/{id}/rotate` -- swap the token while
+   * preserving `id`. With no `override` argument the existing
+   * `label` / `broadcast` / `expires_at` are preserved; passing
+   * an override `StreamKeySpec` re-scopes the key while rotating
+   * (a `null` field on the override CLEARS the existing field).
+   * Returns the rotated key with the new token. Session 146.
+   */
+  async rotateStreamKey(id: string, override?: StreamKeySpec): Promise<StreamKey> {
+    return this.sendJson<StreamKey>(
+      'POST',
+      `/api/v1/streamkeys/${encodeURIComponent(id)}/rotate`,
+      override,
+    );
+  }
+
+  /**
+   * Shared JSON-body helper for POST + PATCH-like routes. Sends
+   * `JSON.stringify(body)` when `body` is provided, or a
+   * zero-length body otherwise (the rotate route specifically
+   * uses the empty-body branch as "no override -- preserve scope").
+   */
+  private async sendJson<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.body = JSON.stringify(body);
+      init.headers = { 'Content-Type': 'application/json' };
+    }
+    const resp = await this.fetchWithTimeout(`${this.baseUrl}${path}`, init);
+    if (!resp.ok) {
+      throw new Error(`${method} ${path}: HTTP ${resp.status} ${resp.statusText}`);
+    }
+    return (await resp.json()) as T;
   }
 
   /**

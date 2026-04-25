@@ -229,6 +229,48 @@ class WasmFilterSlotStats:
 
 
 @dataclass
+class StreamKey:
+    """One stream-key as the admin API returns it. Mirrors
+    ``lvqr_auth::StreamKey`` (session 146). The ``token`` field
+    carries the literal bearer credential a publisher uses;
+    operators copy it from the mint response (or
+    :meth:`lvqr.LvqrClient.list_streamkeys`) and pass it to
+    whatever ingest tool will publish.
+
+    Tokens are formatted as ``lvqr_sk_<43-char base64url-no-pad>``
+    (32 bytes of CSPRNG output prefixed for secret-scanning
+    recognisability).
+    """
+
+    id: str
+    token: str
+    #: Operator-friendly name. ``None`` when the mint did not set one.
+    label: Optional[str] = None
+    #: When set, the key only authorises publishes for this exact
+    #: broadcast name. ``None`` accepts any broadcast.
+    broadcast: Optional[str] = None
+    #: Unix seconds at mint or rotate time.
+    created_at: int = 0
+    #: Unix seconds after which the key stops authenticating
+    #: publishes. ``None`` means no expiry.
+    expires_at: Optional[int] = None
+
+
+@dataclass
+class StreamKeySpec:
+    """Mint / rotate request body. Mirrors
+    ``lvqr_auth::StreamKeySpec`` (session 146).
+    """
+
+    label: Optional[str] = None
+    broadcast: Optional[str] = None
+    #: TTL in seconds. The server converts this to
+    #: ``expires_at = now + ttl_seconds``. ``0`` or ``None`` means
+    #: no expiry.
+    ttl_seconds: Optional[int] = None
+
+
+@dataclass
 class WasmFilterState:
     """Outer shape of ``/api/v1/wasm-filter``. When
     ``--wasm-filter`` is unset the server returns

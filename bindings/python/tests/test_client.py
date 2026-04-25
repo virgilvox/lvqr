@@ -16,6 +16,8 @@ from lvqr import (
     SloEntry,
     SloSnapshot,
     StreamInfo,
+    StreamKey,
+    StreamKeySpec,
     WasmFilterBroadcastStats,
     WasmFilterSlotStats,
     WasmFilterState,
@@ -541,3 +543,101 @@ class TestClient:
         assert state.chain_length == 1
         assert state.slots == []
         client.close()
+
+    # -----------------------------------------------------------------
+    # Stream-key CRUD admin API (session 146).
+    # -----------------------------------------------------------------
+
+    @patch("httpx.Client.get")
+    def test_list_streamkeys_empty(self, mock_get):
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"keys": []},
+            raise_for_status=lambda: None,
+        )
+        client = LvqrClient("http://localhost:8080")
+        keys = client.list_streamkeys()
+        assert keys == []
+        client.close()
+
+    @patch("httpx.Client.get")
+    def test_list_streamkeys_populated_omitting_optional_fields(self, mock_get):
+        # Defensive parse: server omits `label`, `broadcast`, and
+        # `expires_at` on a key minted with no scope. The dataclass
+        # construction must default each to None and not throw.
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "keys": [
+                    {
+                        "id": "abc123",
+                        "token": "lvqr_sk_xyz",
+                        "created_at": 1_700_000_000,
+                    },
+                    {
+                        "id": "def456",
+                        "token": "lvqr_sk_abc",
+                        "label": "camera-a",
+                        "broadcast": "live/cam-a",
+                        "created_at": 1_700_001_000,
+                        "expires_at": 1_700_005_000,
+                    },
+                ],
+            },
+            raise_for_status=lambda: None,
+        )
+        client = LvqrClient("http://localhost:8080")
+        keys = client.list_streamkeys()
+        assert len(keys) == 2
+        assert isinstance(keys[0], StreamKey)
+        assert keys[0].id == "abc123"
+        assert keys[0].token == "lvqr_sk_xyz"
+        assert keys[0].label is None
+        assert keys[0].broadcast is None
+        assert keys[0].expires_at is None
+        assert keys[1].label == "camera-a"
+        assert keys[1].broadcast == "live/cam-a"
+        assert keys[1].expires_at == 1_700_005_000
+        client.close()
+
+    @patch("httpx.Client.get")
+    def test_list_streamkeys_pre_146_server_omits_keys(self, mock_get):
+        # Defensive: a server that omits the `keys` wrapper field
+        # entirely (or returns an empty {} body) must not throw.
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {},
+            raise_for_status=lambda: None,
+        )
+        client = LvqrClient("http://localhost:8080")
+        assert client.list_streamkeys() == []
+        client.close()
+
+    @patch("httpx.Client.post")
+    def test_mint_streamkey(self, mock_post):
+        mock_post.return_value = MagicMock(
+            status_code=201,
+            json=lambda: {
+                "id": "new123",
+                "token": "lvqr_sk_freshly_minted",
+                "label": "rotated-cam",
+                "broadcast": None,
+                "created_at": 1_700_010_000,
+                "expires_at": None,
+            },
+            raise_for_status=lambda: None,
+        )
+        client = LvqrClient("http://localhost:8080")
+        spec = StreamKeySpec(label="rotated-cam")
+        key = client.mint_streamkey(spec)
+        assert isinstance(key, StreamKey)
+        assert key.id == "new123"
+        assert key.token == "lvqr_sk_freshly_minted"
+        assert key.label == "rotated-cam"
+        client.close()
+
+    def test_streamkeyspec_defaults(self):
+        spec = StreamKeySpec()
+        assert spec.label is None
+        assert spec.broadcast is None
+        assert spec.ttl_seconds is None

@@ -40,6 +40,9 @@ export {
   type WasmFilterBroadcastStats,
   type WasmFilterSlotStats,
   type WasmFilterState,
+  type StreamKey,
+  type StreamKeySpec,
+  type StreamKeyList,
 } from './admin';
 export { detectTransport, type TransportType } from './transport';
 export { MoqSubscriber } from './moq';

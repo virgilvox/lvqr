@@ -26,6 +26,8 @@ from .types import (
     SloEntry,
     SloSnapshot,
     StreamInfo,
+    StreamKey,
+    StreamKeySpec,
     WasmFilterBroadcastStats,
     WasmFilterSlotStats,
     WasmFilterState,
@@ -242,6 +244,62 @@ class LvqrClient:
         ]
         return FederationStatus(links=links)
 
+    # -----------------------------------------------------------------
+    # Stream-key CRUD admin API (session 146).
+    # -----------------------------------------------------------------
+
+    def list_streamkeys(self) -> list[StreamKey]:
+        """``GET /api/v1/streamkeys`` -- every stream-key currently
+        in the runtime store, including expired entries (operators
+        can see what is stale and call :meth:`revoke_streamkey`).
+
+        Returns an empty list when the server booted with
+        ``--no-streamkeys`` so polling tooling can run
+        unconditionally.
+        """
+        data = self._get_json("/api/v1/streamkeys")
+        return [_streamkey_from_json(k) for k in data.get("keys", [])]
+
+    def mint_streamkey(self, spec: Optional[StreamKeySpec] = None) -> StreamKey:
+        """``POST /api/v1/streamkeys`` -- mint a new stream-key.
+
+        Server fills ``id``, ``token``, ``created_at``, and
+        ``expires_at`` (from ``ttl_seconds``). Returns the full
+        :class:`StreamKey` including the literal bearer token.
+        """
+        body = _streamkeyspec_to_json(spec)
+        resp = self._client.post("/api/v1/streamkeys", json=body)
+        resp.raise_for_status()
+        return _streamkey_from_json(resp.json())
+
+    def revoke_streamkey(self, id: str) -> None:
+        """``DELETE /api/v1/streamkeys/{id}`` -- hard-delete by id.
+
+        Raises :class:`httpx.HTTPStatusError` on 404 (unknown id)
+        or any other non-2xx. Idempotent callers can swallow the
+        404 to treat "already gone" as success.
+        """
+        resp = self._client.delete(f"/api/v1/streamkeys/{id}")
+        resp.raise_for_status()
+
+    def rotate_streamkey(self, id: str, override: Optional[StreamKeySpec] = None) -> StreamKey:
+        """``POST /api/v1/streamkeys/{id}/rotate`` -- swap the
+        token while preserving the stable ``id``.
+
+        With ``override`` unset the existing ``label`` /
+        ``broadcast`` / ``expires_at`` are preserved; passing an
+        override re-scopes the key while rotating (a ``None``
+        field on the override CLEARS the existing field).
+        """
+        url = f"/api/v1/streamkeys/{id}/rotate"
+        if override is None:
+            # Empty body: rotate handler treats it as "preserve scope".
+            resp = self._client.post(url)
+        else:
+            resp = self._client.post(url, json=_streamkeyspec_to_json(override))
+        resp.raise_for_status()
+        return _streamkey_from_json(resp.json())
+
     def wasm_filter(self) -> WasmFilterState:
         """``GET /api/v1/wasm-filter`` -- configured WASM filter chain
         shape + per-``(broadcast, track)`` counters. Returns
@@ -288,6 +346,33 @@ class LvqrClient:
         resp = self._client.get(path)
         resp.raise_for_status()
         return resp.json()
+
+
+def _streamkey_from_json(entry: dict) -> StreamKey:
+    """Build a :class:`StreamKey` from a JSON dict. Defensive
+    ``.get(...)`` parsers tolerate a server that omits any future
+    optional field (``#[serde(default)]`` mirroring on the wire)."""
+    return StreamKey(
+        id=entry.get("id", ""),
+        token=entry.get("token", ""),
+        label=entry.get("label"),
+        broadcast=entry.get("broadcast"),
+        created_at=int(entry.get("created_at", 0)),
+        expires_at=entry.get("expires_at"),
+    )
+
+
+def _streamkeyspec_to_json(spec: Optional[StreamKeySpec]) -> dict:
+    """Convert a :class:`StreamKeySpec` to the JSON object shape
+    the admin route expects. ``None`` becomes an empty object
+    (matches the server's "default spec" semantics)."""
+    if spec is None:
+        return {}
+    return {
+        "label": spec.label,
+        "broadcast": spec.broadcast,
+        "ttl_seconds": spec.ttl_seconds,
+    }
 
 
 def _cluster_node_from_json(entry: dict) -> ClusterNodeView:
