@@ -11,6 +11,7 @@
 //! `ServeConfig::transcode_renditions` field's value and because they
 //! are exercised by the in-crate tests at the bottom of this file.
 
+use crate::config_reload::AuthBootDefaults;
 use lvqr_auth::SharedAuth;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -297,6 +298,28 @@ pub struct ServeConfig {
     /// (CLI: `--no-streamkeys`) for deployments that want the
     /// pre-146 behavior exactly. Session 146.
     pub streamkeys_enabled: bool,
+    /// Hot config reload seed (session 147). When `Some`,
+    /// `start()` parses the file at boot, wraps the resolved auth
+    /// in a [`lvqr_auth::HotReloadAuthProvider`], and stands up
+    /// a [`crate::ConfigReloadHandle`] that SIGHUP +
+    /// `POST /api/v1/config-reload` use to swap the live auth
+    /// chain. The `auth_boot_defaults` capture the CLI args'
+    /// auth-shaped fields once so reload can re-merge them with
+    /// the file's `[auth]` section without re-parsing CLI args.
+    /// `None` means no `--config` flag was set; SIGHUP is a
+    /// no-op and the admin POST returns 503.
+    pub config_reload: Option<ConfigReloadSeed>,
+}
+
+/// Seed passed from the CLI parser into `start()` so the
+/// composition root can stand up a [`crate::ConfigReloadHandle`].
+/// Owns the path to the `--config` file plus the snapshot of CLI
+/// auth args at boot (which serve as defaults the file's
+/// `[auth]` section overrides).
+#[derive(Debug, Clone)]
+pub struct ConfigReloadSeed {
+    pub path: PathBuf,
+    pub auth_boot_defaults: AuthBootDefaults,
 }
 
 impl ServeConfig {
@@ -350,6 +373,7 @@ impl ServeConfig {
             mesh_root_peer_count: None,
             mesh_ice_servers: Vec::new(),
             streamkeys_enabled: true,
+            config_reload: None,
         }
     }
 }

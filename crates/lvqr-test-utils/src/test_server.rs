@@ -75,6 +75,13 @@ pub struct TestServerConfig {
     /// that want pre-146 behavior verbatim flip this with
     /// `with_no_streamkeys()`.
     no_streamkeys: bool,
+    /// Session 147: optional config-file path. When `Some`, the
+    /// TestServer's `start()` path applies the file at boot via the
+    /// reload pipeline, installs the SIGHUP listener, and mounts
+    /// `/api/v1/config-reload`. `None` means the routes are still
+    /// mounted but GET returns a default `ConfigReloadStatus` and
+    /// POST returns 503.
+    config_file: Option<PathBuf>,
 }
 
 impl TestServerConfig {
@@ -288,6 +295,15 @@ impl TestServerConfig {
         self
     }
 
+    /// Configure a `--config <path>` for hot reload (session 147).
+    /// The file is applied at boot and re-applied on SIGHUP /
+    /// `POST /api/v1/config-reload`. When unset (default), reload
+    /// is disabled (GET returns default status; POST returns 503).
+    pub fn with_config_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config_file = Some(path.into());
+        self
+    }
+
     /// Override the mesh `root_peer_count` so tests can exercise
     /// the `AssignParent` path with a small number of peers.
     /// Defaults to the `lvqr_mesh::MeshConfig::default()` value
@@ -378,6 +394,14 @@ impl TestServer {
             mesh_root_peer_count: config.mesh_root_peer_count,
             mesh_ice_servers: config.mesh_ice_servers,
             streamkeys_enabled: !config.no_streamkeys,
+            // Session 147: when the test set `with_config_file(path)`,
+            // wire a ConfigReloadSeed with all-None CLI defaults so
+            // the file's `[auth]` section is the sole source of
+            // truth. start()'s boot-time reload applies it.
+            config_reload: config.config_file.map(|path| lvqr_cli::ConfigReloadSeed {
+                path,
+                auth_boot_defaults: lvqr_cli::AuthBootDefaults::default(),
+            }),
         };
         let handle = start(serve_config).await?;
         Ok(Self { handle })

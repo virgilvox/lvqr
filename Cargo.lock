@@ -3207,6 +3207,7 @@ dependencies = [
  "metrics-util",
  "moq-lite",
  "moq-native",
+ "parking_lot",
  "rcgen 0.13.2",
  "rml_rtmp",
  "rustls",

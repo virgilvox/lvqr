@@ -127,6 +127,10 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+# Mutex for ConfigReloadHandle's last-reload state (session 147).
+# parking_lot avoids std-Mutex poisoning + matches the rest of the
+# workspace's locking conventions.
+parking_lot = { workspace = true }
 
 # Signed playback URLs (PLAN row 121). hmac + sha2 implement the
 # HMAC-SHA256 primitive; base64 encodes the signature for the

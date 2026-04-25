@@ -175,6 +175,15 @@ struct ServeArgs {
     #[arg(long, env = "LVQR_MESH_ROOT_PEER_COUNT")]
     mesh_root_peer_count: Option<usize>,
 
+    /// Path to a TOML config file (session 147). When set, the file
+    /// fills any auth-section fields the operator did not pass via
+    /// CLI flag or env var. SIGHUP and `POST /api/v1/config-reload`
+    /// re-read the file and atomically swap the live auth provider
+    /// without bouncing the relay. When unset, SIGHUP is a no-op
+    /// and the admin POST returns 503. See `docs/config-reload.md`.
+    #[arg(long, env = "LVQR_CONFIG")]
+    config: Option<PathBuf>,
+
     /// Path to TLS certificate (PEM). Auto-generates self-signed if omitted.
     #[arg(long, env = "LVQR_TLS_CERT")]
     tls_cert: Option<PathBuf>,
@@ -557,7 +566,37 @@ async fn serve_from_args(
     args: ServeArgs,
     otel_metrics_recorder: Option<lvqr_observability::OtelMetricsRecorder>,
 ) -> Result<()> {
-    // Build auth provider from CLI/env. Order of precedence:
+    // Session 147: when `--config <path>` is set, the file's
+    // `[auth]` section overrides the CLI defaults BEFORE `build_auth`
+    // sees them, and the reload handle captures the boot defaults so
+    // SIGHUP / admin POST can re-merge them with a fresh file read.
+    let auth_boot_defaults = lvqr_cli::AuthBootDefaults {
+        admin_token: args.admin_token.clone(),
+        publish_key: args.publish_key.clone(),
+        subscribe_token: args.subscribe_token.clone(),
+        jwt_secret: args.jwt_secret.clone(),
+        jwt_issuer: args.jwt_issuer.clone(),
+        jwt_audience: args.jwt_audience.clone(),
+    };
+    // The file-merge (file overrides CLI defaults for auth-section
+    // fields) happens inside `start()` via a one-shot
+    // `ConfigReloadHandle::reload("boot")` call right after the
+    // initial auth chain is built. This keeps the merge logic in
+    // ONE place so both this CLI path and `lvqr_test_utils::TestServer`
+    // (which calls `start()` directly) get identical behavior.
+    let config_reload_seed = args.config.clone().map(|path| {
+        tracing::info!(
+            path = %path.display(),
+            "config file declared; will be applied at boot, then re-applied on SIGHUP / POST /api/v1/config-reload"
+        );
+        lvqr_cli::ConfigReloadSeed {
+            path,
+            auth_boot_defaults,
+        }
+    });
+
+    // Build auth provider from CLI/env (now possibly augmented by the
+    // file). Order of precedence:
     //   1. `--jwks-url` (PLAN row 120) -- dynamic asymmetric JWTs.
     //   2. `--webhook-auth-url` (PLAN Phase D) -- external HTTP decision oracle.
     //   3. `--jwt-secret` -- HS256 static secret.
@@ -661,6 +700,7 @@ async fn serve_from_args(
         mesh_root_peer_count: args.mesh_root_peer_count,
         mesh_ice_servers,
         streamkeys_enabled: !args.no_streamkeys,
+        config_reload: config_reload_seed,
     };
 
     let handle = start(config).await?;

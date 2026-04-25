@@ -17,10 +17,17 @@ mod captions;
 #[cfg(feature = "cluster")]
 pub mod cluster_claim;
 mod config;
+mod config_file;
+mod config_reload;
 mod handle;
 mod hls;
 mod signed_url;
 mod ws;
+
+pub use config::ConfigReloadSeed;
+pub use config_file::{AuthSection, ServeConfigFile};
+pub use config_reload::{AuthBootDefaults, ConfigReloadHandle, SharedReloadHandle};
+pub use lvqr_admin::ConfigReloadStatus;
 
 pub use archive::sign_playback_url;
 pub use config::ServeConfig;
@@ -36,7 +43,10 @@ pub use signed_url::{LiveScheme, sign_live_url};
 use anyhow::Result;
 use axum::middleware::from_fn_with_state;
 use axum::routing::get;
-use lvqr_auth::{InMemoryStreamKeyStore, MultiKeyAuthProvider, NoopAuthProvider, SharedAuth, SharedStreamKeyStore};
+use lvqr_auth::{
+    HotReloadAuthProvider, InMemoryStreamKeyStore, MultiKeyAuthProvider, NoopAuthProvider, SharedAuth,
+    SharedStreamKeyStore,
+};
 use lvqr_core::{EventBus, RelayEvent};
 use lvqr_dash::{BroadcasterDashBridge, DashConfig};
 use lvqr_fragment::FragmentBroadcasterRegistry;
@@ -125,14 +135,81 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // gates viewer or admin auth (load-bearing safety property
     // -- a misconfigured fallback cannot lock the operator out
     // of their own admin API).
-    let (auth, streamkey_store): (SharedAuth, Option<SharedStreamKeyStore>) = if config.streamkeys_enabled {
-        let store: SharedStreamKeyStore = Arc::new(InMemoryStreamKeyStore::new());
-        let wrapped: SharedAuth = Arc::new(MultiKeyAuthProvider::new(store.clone(), Some(inner_auth)));
-        tracing::info!("stream-key CRUD enabled (/api/v1/streamkeys mounted)");
-        (wrapped, Some(store))
-    } else {
-        tracing::info!("stream-key CRUD disabled (--no-streamkeys)");
-        (inner_auth, None)
+    let (post_streamkey_auth, streamkey_store): (SharedAuth, Option<SharedStreamKeyStore>) =
+        if config.streamkeys_enabled {
+            let store: SharedStreamKeyStore = Arc::new(InMemoryStreamKeyStore::new());
+            let wrapped: SharedAuth = Arc::new(MultiKeyAuthProvider::new(store.clone(), Some(inner_auth)));
+            tracing::info!("stream-key CRUD enabled (/api/v1/streamkeys mounted)");
+            (wrapped, Some(store))
+        } else {
+            tracing::info!("stream-key CRUD disabled (--no-streamkeys)");
+            (inner_auth, None)
+        };
+
+    // Session 147: always wrap the resolved chain in a
+    // HotReloadAuthProvider so the swap mechanic is in place even
+    // when --config is not set. When --config IS set, the
+    // ConfigReloadHandle below drives the swap from SIGHUP /
+    // admin POST. When --config is unset, the wrap is a transparent
+    // passthrough (one ArcSwap::load per check; single-digit ns).
+    let hot_provider = Arc::new(HotReloadAuthProvider::new(post_streamkey_auth));
+    let auth: SharedAuth = hot_provider.clone();
+
+    let config_reload_handle: Option<config_reload::SharedReloadHandle> = match config.config_reload.clone() {
+        Some(seed) => {
+            let handle = Arc::new(config_reload::ConfigReloadHandle::new(
+                seed.path.clone(),
+                seed.auth_boot_defaults,
+                streamkey_store.clone(),
+                config.streamkeys_enabled,
+                hot_provider.clone(),
+            ));
+            // Apply the file at boot so the merge semantics (file
+            // overrides CLI defaults for auth-section fields) take
+            // effect uniformly across CLI + TestServer.
+            match handle.reload("boot") {
+                Ok(status) => tracing::info!(warnings = status.warnings.len(), "config reload (boot) succeeded"),
+                Err(e) => return Err(anyhow::anyhow!("config reload at boot failed: {e}")),
+            }
+            tracing::info!(
+                path = %seed.path.display(),
+                "config reload enabled (SIGHUP and POST /api/v1/config-reload active)"
+            );
+            // Spawn SIGHUP listener (Unix only; Windows has no
+            // SIGHUP equivalent and operators rely on the admin
+            // POST path there).
+            #[cfg(unix)]
+            {
+                let handle_for_signal = handle.clone();
+                let signal_shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!(error = %e, "config reload: SIGHUP listener install failed");
+                            return;
+                        }
+                    };
+                    loop {
+                        tokio::select! {
+                            _ = signal_shutdown.cancelled() => break,
+                            sig = sighup.recv() => {
+                                if sig.is_none() { break; }
+                                match handle_for_signal.reload("sighup") {
+                                    Ok(status) => tracing::info!(
+                                        warnings = status.warnings.len(),
+                                        "config reload (SIGHUP) succeeded"
+                                    ),
+                                    Err(e) => tracing::error!(error = %e, "config reload (SIGHUP) failed"),
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            Some(handle)
+        }
+        None => None,
     };
 
     // Shared lifecycle bus: bridge and WS ingest emit
@@ -808,6 +885,23 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // only path to that None branch.
     let admin_state = match streamkey_store.as_ref() {
         Some(store) => admin_state.with_streamkey_store(store.clone()),
+        None => admin_state,
+    };
+
+    // Session 147: wire the config-reload status + trigger
+    // closures into the admin router. When `--config` is unset
+    // (handle is None), GET returns a default ConfigReloadStatus
+    // with every Optional field unset and POST returns 503.
+    let admin_state = match config_reload_handle.clone() {
+        Some(handle) => {
+            let status_handle = handle.clone();
+            let trigger_handle = handle;
+            admin_state
+                .with_config_reload_status(Arc::new(move || status_handle.status()))
+                .with_config_reload_trigger(Arc::new(move || {
+                    trigger_handle.reload("admin_post").map_err(|e| format!("{e:#}"))
+                }))
+        }
         None => admin_state,
     };
 
