@@ -108,6 +108,14 @@ jobs:
           prefix-key: audit-v1
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
+      - name: Stage advisory ignores
+        # cargo-audit reads `~/.cargo/audit.toml`; project ignores live
+        # in `audit.toml` at the repo root so they version-track with
+        # Cargo.lock. See the dedicated `Supply-chain audit` workflow
+        # for the same staging step.
+        run: |
+          mkdir -p "$HOME/.cargo"
+          cp audit.toml "$HOME/.cargo/audit.toml"
       - name: Run cargo audit
         # Step failure is intentionally surfaced in the Checks tab so
         # new advisories are visible at a glance. The enclosing job

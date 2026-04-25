@@ -1,0 +1,61 @@
+# cargo-audit configuration -- consumed by `cargo audit` in
+# `.github/workflows/audit.yml` and locally before each release.
+#
+# This file lists advisories the project intentionally tolerates,
+# each with a rationale and (where applicable) a tracking note for
+# the future session that will close it. The default policy is
+# zero ignores; every entry below is a documented exception.
+#
+# Closing-out checklist for an ignore:
+# 1. The named upstream upgrade ships in the workspace.
+# 2. The reason line below stops applying.
+# 3. Remove the ignore. Re-run `cargo audit --deny warnings`.
+
+[advisories]
+ignore = [
+    # rsa Marvin attack: no fixed upgrade exists upstream. LVQR
+    # pulls rsa transitively through c2pa for manifest *signing*
+    # (Tier 4 item 4.3). The Marvin sidechannel requires a chosen-
+    # ciphertext oracle against an in-process RSA *decryption* path
+    # we do not exercise. Revisit if upstream rsa ships a fix.
+    "RUSTSEC-2023-0071",
+
+    # wasmtime advisories -- the workspace pins wasmtime = "25" per
+    # `tracking/TIER_4_PLAN.md`'s "Dependencies to pin" table, and
+    # `Cargo.toml` workspace.dependencies (lines 168-172) records
+    # "any upgrade gets its own session". Closing every wasmtime
+    # row below means jumping to wasmtime >= 36 (or 42/43 for the
+    # post-2026-04 batch), which is a multi-major bump that touches
+    # the lvqr-wasm host-binding generator. Tracked as a planned
+    # Tier 4 maintenance session.
+    "RUSTSEC-2025-0046", # Host panic with `fd_renumber` WASIp1 function
+    "RUSTSEC-2025-0118", # Unsound API access to a WebAssembly shared linear memory
+    "RUSTSEC-2026-0020", # Guest-controlled resource exhaustion in WASI implementations
+    "RUSTSEC-2026-0021", # Panic adding excessive fields to a `wasi:http/types.fields` instance
+    "RUSTSEC-2026-0085", # Panic when lifting `flags` component value
+    "RUSTSEC-2026-0086", # Host data leakage with 64-bit tables and Winch
+    "RUSTSEC-2026-0087", # Wasmtime segfault with `f64x2.splat` operator on Cranelift x86-64
+    "RUSTSEC-2026-0088", # Data leakage between pooling allocator instances
+    "RUSTSEC-2026-0089", # Host panic when Winch compiler executes `table.fill`
+    "RUSTSEC-2026-0091", # Out-of-bounds write or crash when transcoding component model strings
+    "RUSTSEC-2026-0092", # Panic when transcoding misaligned component model UTF-16 strings
+    "RUSTSEC-2026-0093", # Heap OOB read in component model UTF-16 to latin1+utf16 string transcoding
+    "RUSTSEC-2026-0094", # Improperly masked return value from `table.grow` with Winch compiler backend
+    "RUSTSEC-2026-0095", # Wasmtime with Winch compiler backend may allow a sandbox-escaping memory access
+    "RUSTSEC-2026-0096", # Miscompiled guest heap access enables sandbox escape on aarch64 Cranelift
+
+    # Unmaintained transitive dependencies. Each is brought in by a
+    # crate the project does not control directly; replacing them
+    # is gated on the upstream ecosystem migrating off.
+    "RUSTSEC-2024-0370", # proc-macro-error -- unmaintained; transitive
+    "RUSTSEC-2024-0436", # paste -- unmaintained; transitive
+    "RUSTSEC-2025-0134", # rustls-pemfile -- unmaintained; superseded by rustls-pki-types upstream
+
+    # Soundness advisories on transitives. Neither is reachable from
+    # LVQR's call sites: lru's IterMut is not used through any LVQR
+    # API, and rand's custom-logger unsoundness requires a `log`
+    # facade configuration LVQR does not run. Tracked alongside the
+    # next routine dep-bump session.
+    "RUSTSEC-2026-0002", # lru -- IterMut violates Stacked Borrows
+    "RUSTSEC-2026-0097", # rand -- unsound with a custom logger using `rand::rng()`
+]

@@ -38,6 +38,15 @@ jobs:
           key: audit
       - name: Install cargo-audit
         run: cargo install --locked cargo-audit
+      - name: Stage advisory ignores
+        # cargo-audit reads `~/.cargo/audit.toml` for the ignore list;
+        # the project-of-record copy lives at `audit.toml` in the repo
+        # root so it tracks alongside Cargo.lock. Each ignore there
+        # carries a rationale + a tracking note for the session that
+        # will close it.
+        run: |
+          mkdir -p "$HOME/.cargo"
+          cp audit.toml "$HOME/.cargo/audit.toml"
       - name: Run cargo audit
         # --deny warnings upgrades unmaintained and unsound advisories
         # to failures so the job stays informative. Lockfile mode
