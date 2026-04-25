@@ -90,6 +90,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 parking_lot = "0.12"
 dashmap = "6"
+# Atomic Arc swap for hot-reloadable config state (session 147).
+# RCU-style readers (single-digit ns load on x86) so the auth-check
+# hot path stays uncontended.
+arc-swap = "1"
 
 # HTTP
 axum = { version = "0.8", features = ["ws"] }

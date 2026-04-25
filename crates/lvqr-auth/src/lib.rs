@@ -21,6 +21,7 @@
 
 mod error;
 pub mod extract;
+mod hot_reload_provider;
 mod multi_key_provider;
 mod noop;
 mod provider;
@@ -37,6 +38,7 @@ mod jwks_provider;
 mod webhook_provider;
 
 pub use error::AuthError;
+pub use hot_reload_provider::HotReloadAuthProvider;
 pub use multi_key_provider::MultiKeyAuthProvider;
 pub use noop::NoopAuthProvider;
 pub use provider::{AuthContext, AuthDecision, AuthProvider, AuthScope, SharedAuth};
