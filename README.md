@@ -155,13 +155,13 @@ in-process AI agents, cross-cluster federation, peer mesh).
 - **Peer mesh**: topology planner + WebSocket signaling server
   + server-side subscriber registration + client-side WebRTC
   DataChannel parent/child relay ship today
-  (`--mesh-enabled`, `--max-peers`, `--mesh-root-peer-count`).
-  A two-browser Playwright E2E (`bindings/js/tests/e2e/mesh/`)
-  exercises the full signal-to-DataChannel-delivery chain on
-  every CI run. Operator-grade completion (actual-vs-intended
-  offload reporting, per-peer capacity advertisement, TURN
-  deployment recipe, three-peer matrix) is on the phase-D
-  roadmap; see [`docs/mesh.md`](docs/mesh.md).
+  (`--mesh-enabled`, `--max-peers`, `--mesh-root-peer-count`,
+  `--mesh-ice-servers`). Two-browser AND three-peer (depth-2
+  chain) Playwright E2Es exercise signal-to-DataChannel delivery
+  on every CI run. Actual-vs-intended offload reporting (session
+  141), three-peer matrix (142), and TURN deployment recipe
+  (143) all ship; per-peer capacity advertisement remains the
+  one open phase-D row; see [`docs/mesh.md`](docs/mesh.md).
 
 ## Quickstart
 
@@ -338,10 +338,12 @@ gaps explicitly named in Known v0.4.0 limitations.
    200 ms. Scheme tag (`hls:` / `dash:`) is baked into the
    signed input so a sig minted for HLS cannot be replayed
    against DASH.
-5. **Mesh data-plane phase D**: actual-vs-intended offload
-   reporting, per-peer capacity advertisement, TURN deployment
-   recipe, three-peer Playwright E2E. Unblocks flipping
-   `docs/mesh.md` to IMPLEMENTED.
+5. **Mesh data-plane phase D**: per-peer capacity advertisement
+   is the one open row. Actual-vs-intended offload reporting
+   (session 141), three-peer Playwright E2E (142), and TURN
+   deployment recipe + server-driven ICE config (143) all ship.
+   Closing capacity unblocks flipping `docs/mesh.md` to
+   IMPLEMENTED.
 6. **One hardware encoder backend** (VideoToolbox on macOS or
    NVENC on Linux). The three others stay deferred to v1.2.
 7. **WASM filter chain composition shipped in session 136** --
@@ -436,9 +438,15 @@ test.
   into the mesh tree; `MeshConfig.onChildOpen(id, dc)` was
   added as a post-116 follow-up for integrators who need a
   deterministic one-shot push on DataChannel open.
-- [ ] **Actual-vs-intended offload reporting**: clients report
+- [x] ~~**Actual-vs-intended offload reporting**: clients report
   "served by peer X"; coordinator aggregates; `/api/v1/mesh`
-  returns measured offload.
+  returns measured offload.~~ Shipped in session 141. Browser
+  peers maintain a cumulative forwarded-frame counter and emit a
+  `ForwardReport` signal message every second
+  (skip-on-unchanged); the coordinator aggregates and surfaces
+  the values via a new `peers: MeshPeerStats[]` array on
+  `/api/v1/mesh` alongside the topology planner's
+  `intended_children` count.
 - [ ] **Per-peer capacity advertisement** so rebalancing uses
   bandwidth + CPU instead of hardcoded `max-children`.
 - [x] ~~**TURN deployment recipe** + STUN fallback config. Document
