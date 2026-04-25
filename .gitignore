@@ -54,3 +54,6 @@ Thumbs.db
 # Coverage
 lcov.info
 tarpaulin-report.html
+
+# Claude Code harness state (per-machine; never commit)
+.claude/

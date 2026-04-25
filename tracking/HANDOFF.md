@@ -71,8 +71,64 @@
 * **Sessions 83-144 are not folded into CHANGELOG.md.** The 0.4.1 entry points readers at `tracking/HANDOFF.md` for the narrative. A future docs-sweep session can fold them back; until then `Unreleased-pre-0.4.1` is a partial-release-notes entry valid only for the 45-82 window.
 * **No git tag pushed for 0.4.1.** The kickoff prompt did not request a `v0.4.1` tag and the session shipped without one; consumers depending on a tagged-release workflow should rely on the crates.io 0.4.1 publish or the `chore(release): bump workspace 0.4.0 -> 0.4.1` commit hash (`6b38e20`) as the release marker.
 * **Three publishable rows in the post-0.4.0 work were deliberately left at 0.3.2 on their respective registries.** `@lvqr/core` and `@lvqr/player` (npm) and `lvqr` (PyPI) carry sessions 141-144 source but version-skew with the Rust workspace; a future session can align numbering if helpful, or each track can keep its independent cadence.
-* **`.claude/` is in the working tree as untracked.** Local Claude harness state. No publish surface, no CI surface. Could be `.gitignore`d in a follow-up if the project wants to assert "never commit harness state".
+* **`.claude/` was in the working tree as untracked during the publish events.** Subsequently `.gitignore`d in the post-145 cleanup commit (see "Session 146 entry point" below). Every `cargo publish` in 145 ran with `--allow-dirty` to step over it; future sessions will not need the flag.
 * **All other session 144 + earlier known limitations unchanged.**
+
+### Session 146 entry point
+
+Post-release cleanup landed on `origin/main` after the 145 close
+block: README "Next up" list pruned (shipped items 1-5 + 7 moved
+to a compact "Recently shipped" subsection; pending items
+re-ranked by ship-ability so single-session items lead and
+multi-session feature work follows); `.gitignore` grew a
+`.claude/` line so future `cargo publish` invocations do not
+need `--allow-dirty`; "2026-04-22 codebase audit" reference
+flipped to 2026-04-24.
+
+**Next deliverable: Stream-key CRUD admin API** (README "Next
+up" item 1, post-cleanup ranking). Today RTMP / SRT / WHIP
+stream keys are static config: operators provision them at
+boot via `--auth-secret-jwt` or a JWKS endpoint, and rotation /
+revocation requires a server bounce. The session-146 ship adds
+`/api/v1/streamkeys` admin routes (list, mint, revoke, rotate)
+backed by a stream-key store that lives alongside the existing
+`AuthProvider` chain, plus matching JS + Python admin-client
+methods.
+
+Expected scope (locked when SESSION_146_BRIEFING.md lands):
+
+1. New `StreamKeyStore` trait in `lvqr-auth` with at least an
+   in-memory implementation (file-backed persistence is a
+   follow-up). Methods: `list()`, `mint(spec) -> StreamKey`,
+   `revoke(id)`, `rotate(id) -> StreamKey`.
+2. New routes on `lvqr-admin` under `/api/v1/streamkeys`. JSON
+   schema mirrors `MeshPeerStats` shape pattern from session 144.
+3. `lvqr-cli` boot wires the in-memory store unconditionally;
+   future sessions can swap in a Sled / SQLite backing.
+4. `@lvqr/core` admin client grows `streamkeys()` family.
+5. `bindings/python` client grows `stream_keys()` family +
+   matching `@dataclass StreamKey`.
+6. Real integration test (no mocks): `lvqr-cli` boots, admin
+   mints a key, RTMP publish authenticates with that key,
+   admin revokes the key, next publish attempt is rejected.
+
+Anti-scope: persistence backend (in-memory only for v1; real
+backing is its own session), per-key rate limits (counter
+machinery already exists for fragments / bytes; per-key splits
+need richer data model), expiry sweep (a future session can
+add a background task; v1 mint accepts an `exp` field but the
+sweep runs on first-use rather than as a daemon).
+
+Read `crates/lvqr-auth/src/lib.rs` first to map the existing
+`AuthProvider` shape; the `StreamKeyStore` should compose
+alongside it, not replace it. Then `crates/lvqr-admin/src/
+routes.rs` for the admin-route pattern.
+
+**Other pending Phase D items** (per README post-cleanup
+ordering): hot config reload (#2), SCTE-35 passthrough (#3),
+DVR scrub web UI (#4), one hardware encoder backend (#5,
+multi-session), MoQ egress latency SLO (#6, blocked on Tier 5
+SDK). Sessions can pick from this list based on operator demand.
 
 
 ## Session 144 close (2026-04-24)

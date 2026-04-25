@@ -295,68 +295,70 @@ PLAN row state.
 
 ### Next up (ranked by impact / ship-ability)
 
-Ordering reflects a 2026-04-22 codebase audit against the v1.1
-plan. Higher items are smaller, closer to shippable, and close
-gaps explicitly named in Known v0.4.0 limitations.
+Ordering reflects a 2026-04-24 codebase audit against the v1.1
+plan after the workspace 0.4.1 republish (session 145). Higher
+items are smaller, closer to shippable, and close gaps explicitly
+named in Known v0.4.0 limitations.
 
-1. ~~**Expand `@lvqr/core` admin client to cover the 6 missing
-   `/api/v1/*` routes**.~~ **Shipped in session 122.** All 9
-   admin routes now ship on `LvqrAdminClient` (`healthz`,
-   `stats`, `listStreams`, `mesh`, `slo`, `clusterNodes`,
-   `clusterBroadcasts`, `clusterConfig`, `clusterFederation`),
-   each with a declared TypeScript response type. Lands on
-   npm at the next publish cycle.
-2. ~~**Wire Vitest + pytest into CI.**~~ **Shipped in session
-   122.** New `.github/workflows/sdk-tests.yml` runs the
-   `@lvqr/core` Vitest suite (10 admin-client shape tests
-   against a live `lvqr serve`) and the Python client pytest
-   suite (8 type + mocked-httpx tests) on every push + PR.
-   Soft-fail (`continue-on-error: true`) during its initial
-   weeks on `main`.
-3. ~~**Feature-flag CI matrix.**~~ **Shipped in session 123.**
-   New [`feature-matrix.yml`](.github/workflows/feature-matrix.yml)
-   has three jobs: `c2pa` (runs `c2pa_verify_e2e` +
-   `c2pa_cli_flags_e2e` + `lvqr-archive --features c2pa`),
-   `transcode` (installs GStreamer + ffmpeg, runs `aac_opus_roundtrip`
-   + `software_ladder` + `transcode_ladder_e2e` +
-   `rtmp_whep_audio_e2e`), and `whisper` (compile-check +
-   `whisper_basic` unit tests; full `whisper_cli_e2e` remains
-   `#[ignore]` pending a cached-model workflow). Each cell
-   explicitly lists every feature-gated test target so new ones
-   get a visible cell to update.
-4. ~~**HMAC-signed playback URLs**~~ **Shipped in session 124**
-   (DVR `/playback/*`) **and session 128** (live `/hls/*` +
-   `/dash/*`). `--hmac-playback-secret` activates a
-   short-circuit auth path on every playback route via
-   `?exp=<unix_ts>&sig=<base64url>`; tampered / expired returns
-   403 (not 401). Operator helpers `lvqr_cli::sign_playback_url`
-   (DVR) and `lvqr_cli::sign_live_url(secret, LiveScheme::Hls|Dash,
-   broadcast, exp)` (live) generate the query suffix. Live
-   signatures are broadcast-scoped -- one sig grants access to
-   the master playlist + every numbered / partial segment under
-   the broadcast -- because LL-HLS partial URIs roll over every
-   200 ms. Scheme tag (`hls:` / `dash:`) is baked into the
-   signed input so a sig minted for HLS cannot be replayed
-   against DASH.
-5. **Mesh data-plane phase D shipped in full** -- offload
-   reporting (141), three-peer Playwright E2E (142), TURN recipe
-   + server-driven ICE config (143), and per-peer capacity
-   advertisement (144) all land; `docs/mesh.md` flipped to
-   IMPLEMENTED.
-6. **One hardware encoder backend** (VideoToolbox on macOS or
-   NVENC on Linux). The three others stay deferred to v1.2.
-7. **WASM filter chain composition shipped in session 136** --
-   `--wasm-filter` accepts multiple paths (repeated flag or
-   comma-separated) and installs an ordered `ChainFilter` whose
-   first drop short-circuits the rest. Each slot keeps its own
-   hot-reload watcher. Downstream propagation of filter output
-   (true stream-modifying pipeline) is still anti-scope; see
-   `crates/lvqr-wasm/src/observer.rs` for the tap-mode contract.
-8. **Stream-key CRUD admin API**, **hot config reload**,
-   **dedicated DVR scrub web UI**, **SCTE-35 passthrough** --
-   smaller or more-speculative items; pick based on operator
-   demand. (The **webhook auth provider** also listed here v1
-   shipped in session 135; see `docs/auth.md#webhook-auth-provider`.)
+1. **Stream-key CRUD admin API.** Today operators provision
+   stream keys via static config (file + restart). New routes
+   under `/api/v1/streamkeys` would let admin clients list,
+   mint, revoke, and rotate keys without bouncing the server.
+   Single-session ship; lands on `lvqr-admin` + the JS / Python
+   admin clients.
+2. **Hot config reload.** SIGHUP handler on `lvqr serve` that
+   re-reads the config file and applies the diff. Subset of
+   keys (auth providers, mesh ICE servers, HMAC secrets) reload
+   live; structural changes (port bindings, feature flags) still
+   need a restart and are surfaced as warnings on the
+   `--config-reload` admin route.
+3. **SCTE-35 passthrough.** WebVTT captions already ship via
+   the WASM agent path (session 96); SCTE-35 ad-marker events
+   would land on the same observer surface.
+4. **Dedicated DVR scrub web UI.** Today DVR playback works via
+   any HLS-aware player but seek-bar + thumbnail strip require
+   integrator work. A drop-in `<lvqr-dvr-player>` web component
+   alongside `@lvqr/player` would close the gap.
+5. **One hardware encoder backend** (VideoToolbox on macOS or
+   NVENC on Linux). The three others (VAAPI, QSV, and whichever
+   of NVENC or VideoToolbox is not picked first) stay deferred
+   to v1.2. Multi-session feature work; needs its own design
+   pass against `crates/lvqr-transcode/`'s GStreamer pipeline.
+6. **MoQ egress latency SLO.** Server-side measurement would
+   require a MoQ wire change that was explicitly rejected in
+   the v1.1-B scoping call (keeps foreign MoQ clients
+   compatible). Likely path forward: Tier 5 client SDK pushes
+   sampled render-side timestamps to a future
+   `POST /api/v1/slo/client-sample` endpoint.
+
+#### Recently shipped (compact reference)
+
+* **Workspace 0.4.1 republish** (session 145) -- all 26
+  publishable Rust crates flipped from 0.4.0 to 0.4.1 so
+  sessions 141-144 source reaches `cargo install`; supply-chain
+  audit cleaned up (rustls-webpki bumped + `audit.toml` ignores
+  for deferred wasmtime / rsa / unmaintained transitives).
+* **Mesh data-plane Phase D** (sessions 141-144) -- offload
+  reporting, three-peer Playwright E2E, TURN recipe +
+  server-driven ICE config, per-peer capacity advertisement.
+  `docs/mesh.md` is IMPLEMENTED.
+* **WASM filter chain composition** (session 136) --
+  `--wasm-filter` accepts multiple paths; ordered `ChainFilter`
+  with short-circuit drop semantics; per-slot hot-reload.
+* **Webhook auth provider** (session 135) --
+  `--webhook-auth-url` delegates publish / subscribe / admin
+  decisions to an operator HTTP endpoint with TTL-cached
+  allow / deny. See `docs/auth.md#webhook-auth-provider`.
+* **HMAC-signed playback URLs** (sessions 124, 128) --
+  `--hmac-playback-secret` short-circuits auth on DVR + live
+  HLS + DASH routes via `?exp=<unix_ts>&sig=<base64url>`.
+  `lvqr_cli::sign_playback_url` + `sign_live_url` mint URLs.
+* **Feature-flag CI matrix** (session 123) --
+  `feature-matrix.yml` runs `c2pa`, `transcode`, and `whisper`
+  cells per push + PR.
+* **SDK CI** (session 122) -- `sdk-tests.yml` runs Vitest +
+  pytest against a live `lvqr serve`. `@lvqr/core` admin client
+  expanded from 3 to 9 of 9 routes in the same session.
 
 The list below groups the same remaining work by logical area.
 
