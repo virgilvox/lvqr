@@ -37,6 +37,13 @@ export interface MeshPeerStats {
   intended_children: number;
   /** Cumulative frames this peer has forwarded to its children. */
   forwarded_frames: number;
+  /**
+   * Per-peer self-reported relay capacity (max children this peer is
+   * willing to serve), clamped to the operator's global max-peers.
+   * `undefined` when the client did not advertise a value (the planner
+   * falls back to the global ceiling for that peer). Session 144.
+   */
+  capacity?: number;
 }
 
 /**

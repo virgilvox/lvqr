@@ -41,7 +41,21 @@ pub struct IceServer {
 #[serde(tag = "type")]
 pub enum SignalMessage {
     /// Register this peer with the signaling server.
-    Register { peer_id: String, track: String },
+    ///
+    /// `capacity` (added in session 144) carries the client's
+    /// self-reported max-children value. `None` -- omitted on the
+    /// wire -- tells the server to fall back to the operator's
+    /// global `MeshConfig.max_children`. The server clamps the
+    /// claim to `[0, max_children]` at register time so a misbehaving
+    /// client cannot exceed the operator's ceiling. Behind
+    /// `#[serde(default)]` so a pre-144 Register body that omits
+    /// the field still deserializes cleanly.
+    Register {
+        peer_id: String,
+        track: String,
+        #[serde(default)]
+        capacity: Option<u32>,
+    },
 
     /// SDP offer from a peer.
     Offer { from: String, to: String, sdp: String },
@@ -141,9 +155,24 @@ struct PeerSession {
     track: String,
 }
 
+/// Context delivered to [`PeerCallback`] on register and unregister.
+///
+/// `capacity` carries the client's self-reported max-children claim
+/// from the [`SignalMessage::Register`] message. `None` on
+/// disconnect (no capacity is meaningful when a peer leaves) and on
+/// pre-144 clients that omit the field.
+///
+/// Session 144 -- per-peer capacity advertisement.
+pub struct PeerEvent<'a> {
+    pub peer_id: &'a str,
+    pub track: &'a str,
+    pub capacity: Option<u32>,
+    pub connected: bool,
+}
+
 /// Callback invoked when a peer registers or unregisters.
 /// Returns an optional message to send back to the peer.
-pub type PeerCallback = Arc<dyn Fn(&str, &str, bool) -> Option<SignalMessage> + Send + Sync>;
+pub type PeerCallback = Arc<dyn Fn(&PeerEvent<'_>) -> Option<SignalMessage> + Send + Sync>;
 
 /// Callback invoked when a registered peer sends a `ForwardReport`.
 /// The first argument is the peer_id as resolved from the WS session
@@ -207,7 +236,12 @@ impl SignalServer {
         Router::new().route("/signal", get(ws_handler)).with_state(self)
     }
 
-    fn register_peer(&self, peer_id: &str, track: &str) -> mpsc::UnboundedReceiver<SignalMessage> {
+    fn register_peer(
+        &self,
+        peer_id: &str,
+        track: &str,
+        capacity: Option<u32>,
+    ) -> mpsc::UnboundedReceiver<SignalMessage> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.peers.insert(
             peer_id.to_string(),
@@ -220,7 +254,13 @@ impl SignalServer {
 
         // Notify callback and send response
         if let Some(ref cb) = self.on_peer {
-            if let Some(response) = cb(peer_id, track, true) {
+            let event = PeerEvent {
+                peer_id,
+                track,
+                capacity,
+                connected: true,
+            };
+            if let Some(response) = cb(&event) {
                 self.send_to_peer(peer_id, response);
             }
         }
@@ -232,7 +272,13 @@ impl SignalServer {
         if let Some((_, session)) = self.peers.remove(peer_id) {
             debug!(peer = peer_id, "peer removed");
             if let Some(ref cb) = self.on_peer {
-                cb(peer_id, &session.track, false);
+                let event = PeerEvent {
+                    peer_id,
+                    track: &session.track,
+                    capacity: None,
+                    connected: false,
+                };
+                cb(&event);
             }
         }
     }
@@ -371,7 +417,11 @@ async fn wait_for_register(
     };
 
     match signal {
-        SignalMessage::Register { peer_id, track } => {
+        SignalMessage::Register {
+            peer_id,
+            track,
+            capacity,
+        } => {
             if !is_valid_peer_id(&peer_id) {
                 // Do not log the bad peer_id at info level: it is
                 // attacker-controlled and may contain control chars that
@@ -400,7 +450,7 @@ async fn wait_for_register(
                 let _ = send_signal(socket, &err).await;
                 return None;
             }
-            let rx = server.register_peer(&peer_id, &track);
+            let rx = server.register_peer(&peer_id, &track, capacity);
             Some((peer_id, rx))
         }
         _ => {
@@ -502,14 +552,59 @@ mod tests {
         let msg = SignalMessage::Register {
             peer_id: "abc123".into(),
             track: "live/test".into(),
+            capacity: Some(3),
         };
 
         let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"capacity\":3"));
         let parsed: SignalMessage = serde_json::from_str(&json).unwrap();
         match parsed {
-            SignalMessage::Register { peer_id, track } => {
+            SignalMessage::Register {
+                peer_id,
+                track,
+                capacity,
+            } => {
                 assert_eq!(peer_id, "abc123");
                 assert_eq!(track, "live/test");
+                assert_eq!(capacity, Some(3));
+            }
+            _ => panic!("expected Register"),
+        }
+    }
+
+    /// Session 144: a pre-144 Register body that omits the
+    /// `capacity` field must deserialize cleanly into a new
+    /// SignalMessage with capacity = None via `#[serde(default)]`.
+    #[test]
+    fn register_deserializes_pre_144_body_without_capacity() {
+        let json = r#"{"type":"Register","peer_id":"abc","track":"live/test"}"#;
+        let parsed: SignalMessage = serde_json::from_str(json).unwrap();
+        match parsed {
+            SignalMessage::Register {
+                peer_id,
+                track,
+                capacity,
+            } => {
+                assert_eq!(peer_id, "abc");
+                assert_eq!(track, "live/test");
+                assert!(capacity.is_none());
+            }
+            _ => panic!("expected Register"),
+        }
+    }
+
+    /// Session 144: a Register body with a wildly inflated capacity
+    /// claim still deserializes -- the wire shape accepts any u32 and
+    /// the lvqr-cli signal bridge clamps at register time. This test
+    /// only proves the serde layer is permissive; the clamp itself is
+    /// covered by the integration test in `lvqr-cli`.
+    #[test]
+    fn register_accepts_oversize_capacity_claim() {
+        let json = r#"{"type":"Register","peer_id":"abc","track":"live/test","capacity":4294967295}"#;
+        let parsed: SignalMessage = serde_json::from_str(json).unwrap();
+        match parsed {
+            SignalMessage::Register { capacity, .. } => {
+                assert_eq!(capacity, Some(u32::MAX));
             }
             _ => panic!("expected Register"),
         }
@@ -615,8 +710,8 @@ mod tests {
     fn server_register_and_forward() {
         let server = SignalServer::new();
 
-        let mut rx1 = server.register_peer("peer-1", "live/test");
-        let _rx2 = server.register_peer("peer-2", "live/test");
+        let mut rx1 = server.register_peer("peer-1", "live/test", None);
+        let _rx2 = server.register_peer("peer-2", "live/test", None);
         assert_eq!(server.peer_count(), 2);
 
         let msg = SignalMessage::Offer {
@@ -639,7 +734,7 @@ mod tests {
     #[test]
     fn server_push_to_peer() {
         let server = SignalServer::new();
-        let mut rx = server.register_peer("peer-1", "live/test");
+        let mut rx = server.register_peer("peer-1", "live/test", None);
 
         server.send_to_peer(
             "peer-1",
@@ -674,10 +769,10 @@ mod tests {
     #[test]
     fn peer_callback_on_register() {
         let mut server = SignalServer::new();
-        server.set_peer_callback(Arc::new(|peer_id, _track, connected| {
-            if connected {
+        server.set_peer_callback(Arc::new(|event: &PeerEvent<'_>| {
+            if event.connected {
                 Some(SignalMessage::AssignParent {
-                    peer_id: peer_id.to_string(),
+                    peer_id: event.peer_id.to_string(),
                     role: "Root".into(),
                     parent_id: None,
                     depth: 0,
@@ -688,7 +783,7 @@ mod tests {
             }
         }));
 
-        let mut rx = server.register_peer("peer-1", "live/test");
+        let mut rx = server.register_peer("peer-1", "live/test", None);
 
         // Should have received AssignParent via callback
         let received = rx.try_recv().unwrap();
@@ -704,11 +799,43 @@ mod tests {
     #[test]
     fn remove_peer_cleans_up() {
         let server = SignalServer::new();
-        server.register_peer("peer-1", "live/test");
+        server.register_peer("peer-1", "live/test", None);
         assert_eq!(server.peer_count(), 1);
 
         server.remove_peer("peer-1");
         assert_eq!(server.peer_count(), 0);
+    }
+
+    /// Session 144: the `PeerEvent` passed to `PeerCallback` must
+    /// carry the capacity claim from the wire on register, and
+    /// must carry `None` on disconnect.
+    #[test]
+    fn peer_callback_receives_capacity_on_register_and_none_on_disconnect() {
+        use std::sync::Mutex;
+        type Capture = (String, Option<u32>, bool);
+        let captured: Arc<Mutex<Vec<Capture>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_cb = Arc::clone(&captured);
+
+        let mut server = SignalServer::new();
+        server.set_peer_callback(Arc::new(move |event: &PeerEvent<'_>| {
+            captured_cb
+                .lock()
+                .unwrap()
+                .push((event.peer_id.to_string(), event.capacity, event.connected));
+            None
+        }));
+
+        let _rx = server.register_peer("peer-1", "live/test", Some(2));
+        server.remove_peer("peer-1");
+
+        let snapshot = captured.lock().unwrap().clone();
+        assert_eq!(
+            snapshot,
+            vec![
+                ("peer-1".to_string(), Some(2), true),
+                ("peer-1".to_string(), None, false),
+            ]
+        );
     }
 
     #[test]
@@ -784,7 +911,7 @@ mod tests {
             captured_cb.lock().unwrap().push((peer_id.to_string(), frames));
         }));
 
-        let _rx = server.register_peer("peer-alpha", "live/test");
+        let _rx = server.register_peer("peer-alpha", "live/test", None);
 
         // Route a ForwardReport through the private dispatcher as if it
         // arrived on peer-alpha's WebSocket.
@@ -813,8 +940,8 @@ mod tests {
     #[test]
     fn forward_report_does_not_leak_to_other_peers() {
         let server = SignalServer::new();
-        let _rx_a = server.register_peer("peer-a", "live/test");
-        let mut rx_b = server.register_peer("peer-b", "live/test");
+        let _rx_a = server.register_peer("peer-a", "live/test", None);
+        let mut rx_b = server.register_peer("peer-b", "live/test", None);
 
         handle_signal_message(&server, "peer-a", SignalMessage::ForwardReport { forwarded_frames: 7 });
 

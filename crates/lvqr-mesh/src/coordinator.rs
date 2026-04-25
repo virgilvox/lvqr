@@ -63,8 +63,17 @@ impl MeshCoordinator {
     }
 
     /// Add a new peer to the mesh and assign it a position in the tree.
-    pub fn add_peer(&self, id: PeerId, track: String) -> Result<PeerAssignment, MeshError> {
+    ///
+    /// `capacity` is the per-peer self-reported child cap. `None`
+    /// falls back to `MeshConfig.max_children`. Callers MUST clamp
+    /// the value to `[0, MeshConfig.max_children]` before invoking
+    /// (the lvqr-cli signal bridge does so at register time).
+    /// `effective_capacity` clamps again as a defense in depth, so a
+    /// missed clamp at the call site cannot exceed the ceiling.
+    /// Session 144.
+    pub fn add_peer(&self, id: PeerId, track: String, capacity: Option<u32>) -> Result<PeerAssignment, MeshError> {
         let mut peer = PeerInfo::new(id.clone(), track);
+        peer.capacity = capacity;
 
         // Count current root peers
         let root_count = self
@@ -354,12 +363,12 @@ mod tests {
     fn add_root_peers() {
         let coord = default_coordinator();
 
-        let a1 = coord.add_peer("peer-1".into(), "live/test".into()).unwrap();
+        let a1 = coord.add_peer("peer-1".into(), "live/test".into(), None).unwrap();
         assert_eq!(a1.role, PeerRole::Root);
         assert!(a1.parent.is_none());
         assert_eq!(a1.depth, 0);
 
-        let a2 = coord.add_peer("peer-2".into(), "live/test".into()).unwrap();
+        let a2 = coord.add_peer("peer-2".into(), "live/test".into(), None).unwrap();
         assert_eq!(a2.role, PeerRole::Root);
 
         assert_eq!(coord.peer_count(), 2);
@@ -371,11 +380,11 @@ mod tests {
         let coord = default_coordinator();
 
         // Fill root slots
-        coord.add_peer("root-1".into(), "live/test".into()).unwrap();
-        coord.add_peer("root-2".into(), "live/test".into()).unwrap();
+        coord.add_peer("root-1".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("root-2".into(), "live/test".into(), None).unwrap();
 
         // Next peer should be assigned as relay child of a root
-        let a3 = coord.add_peer("peer-3".into(), "live/test".into()).unwrap();
+        let a3 = coord.add_peer("peer-3".into(), "live/test".into(), None).unwrap();
         assert_eq!(a3.role, PeerRole::Relay);
         assert!(a3.parent.is_some());
         assert_eq!(a3.depth, 1);
@@ -390,12 +399,12 @@ mod tests {
     fn tree_balances_across_parents() {
         let coord = default_coordinator();
 
-        coord.add_peer("root-1".into(), "live/test".into()).unwrap();
-        coord.add_peer("root-2".into(), "live/test".into()).unwrap();
+        coord.add_peer("root-1".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("root-2".into(), "live/test".into(), None).unwrap();
 
         // Add 4 relay peers - should balance across the 2 roots
         for i in 0..4 {
-            coord.add_peer(format!("relay-{i}"), "live/test".into()).unwrap();
+            coord.add_peer(format!("relay-{i}"), "live/test".into(), None).unwrap();
         }
 
         let r1 = coord.get_peer("root-1").unwrap();
@@ -416,14 +425,14 @@ mod tests {
             heartbeat_timeout_secs: 10,
         });
 
-        coord.add_peer("root".into(), "live/test".into()).unwrap();
+        coord.add_peer("root".into(), "live/test".into(), None).unwrap();
 
         // Fill root's children
-        coord.add_peer("c1".into(), "live/test".into()).unwrap();
-        coord.add_peer("c2".into(), "live/test".into()).unwrap();
+        coord.add_peer("c1".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("c2".into(), "live/test".into(), None).unwrap();
 
         // Next peer should go deeper (child of c1 or c2)
-        let a = coord.add_peer("c3".into(), "live/test".into()).unwrap();
+        let a = coord.add_peer("c3".into(), "live/test".into(), None).unwrap();
         assert_eq!(a.depth, 2); // grandchild of root
     }
 
@@ -431,10 +440,10 @@ mod tests {
     fn remove_peer_returns_orphans() {
         let coord = default_coordinator();
 
-        coord.add_peer("root-1".into(), "live/test".into()).unwrap();
-        coord.add_peer("root-2".into(), "live/test".into()).unwrap();
-        coord.add_peer("child-1".into(), "live/test".into()).unwrap();
-        coord.add_peer("child-2".into(), "live/test".into()).unwrap();
+        coord.add_peer("root-1".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("root-2".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("child-1".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("child-2".into(), "live/test".into(), None).unwrap();
 
         // Find which root has children
         let r1 = coord.get_peer("root-1").unwrap();
@@ -453,9 +462,9 @@ mod tests {
     fn reassign_orphaned_peer() {
         let coord = default_coordinator();
 
-        coord.add_peer("root-1".into(), "live/test".into()).unwrap();
-        coord.add_peer("root-2".into(), "live/test".into()).unwrap();
-        coord.add_peer("child-1".into(), "live/test".into()).unwrap();
+        coord.add_peer("root-1".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("root-2".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("child-1".into(), "live/test".into(), None).unwrap();
 
         // Get child-1's parent
         let child = coord.get_peer("child-1").unwrap();
@@ -478,15 +487,15 @@ mod tests {
         // No peers = 0% offload
         assert_eq!(coord.offload_percentage(), 0.0);
 
-        coord.add_peer("root-1".into(), "live/test".into()).unwrap();
-        coord.add_peer("root-2".into(), "live/test".into()).unwrap();
+        coord.add_peer("root-1".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("root-2".into(), "live/test".into(), None).unwrap();
 
         // All roots = 0% offload
         assert_eq!(coord.offload_percentage(), 0.0);
 
         // Add relay peers
-        coord.add_peer("relay-1".into(), "live/test".into()).unwrap();
-        coord.add_peer("relay-2".into(), "live/test".into()).unwrap();
+        coord.add_peer("relay-1".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("relay-2".into(), "live/test".into(), None).unwrap();
 
         // 2 roots + 2 relays = 50% offload
         assert_eq!(coord.offload_percentage(), 50.0);
@@ -501,12 +510,12 @@ mod tests {
             heartbeat_timeout_secs: 10,
         });
 
-        coord.add_peer("root".into(), "live/test".into()).unwrap();
-        coord.add_peer("d1".into(), "live/test".into()).unwrap();
-        coord.add_peer("d2".into(), "live/test".into()).unwrap();
+        coord.add_peer("root".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("d1".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("d2".into(), "live/test".into(), None).unwrap();
 
         // d2 is at depth 2, which equals max_depth. Next peer should fail.
-        let result = coord.add_peer("d3".into(), "live/test".into());
+        let result = coord.add_peer("d3".into(), "live/test".into(), None);
         assert!(result.is_err());
     }
 
@@ -514,9 +523,9 @@ mod tests {
     fn tree_snapshot() {
         let coord = default_coordinator();
 
-        coord.add_peer("root-1".into(), "live/test".into()).unwrap();
-        coord.add_peer("root-2".into(), "live/test".into()).unwrap();
-        coord.add_peer("relay-1".into(), "live/test".into()).unwrap();
+        coord.add_peer("root-1".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("root-2".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("relay-1".into(), "live/test".into(), None).unwrap();
 
         let snapshot = coord.tree_snapshot();
         assert_eq!(snapshot.len(), 3);
@@ -534,7 +543,7 @@ mod tests {
             heartbeat_timeout_secs: 1,
         });
 
-        coord.add_peer("peer-1".into(), "live/test".into()).unwrap();
+        coord.add_peer("peer-1".into(), "live/test".into(), None).unwrap();
 
         // PeerInfo::new stamps last_heartbeat at construction time, so a
         // freshly registered peer is alive until the timeout elapses.
@@ -576,9 +585,9 @@ mod tests {
         });
 
         // Two roots and one child attached to one of them.
-        coord.add_peer("root-A".into(), "live/test".into()).unwrap();
-        coord.add_peer("root-B".into(), "live/test".into()).unwrap();
-        coord.add_peer("child".into(), "live/test".into()).unwrap();
+        coord.add_peer("root-A".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("root-B".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("child".into(), "live/test".into(), None).unwrap();
 
         let child = coord.get_peer("child").unwrap();
         let original_parent = child.parent.clone().unwrap();
@@ -622,7 +631,7 @@ mod tests {
     #[test]
     fn record_forward_report_sets_counter() {
         let coord = default_coordinator();
-        coord.add_peer("peer-1".into(), "live/test".into()).unwrap();
+        coord.add_peer("peer-1".into(), "live/test".into(), None).unwrap();
 
         // Default is zero.
         assert_eq!(coord.get_peer("peer-1").unwrap().forwarded_frames, 0);
@@ -639,7 +648,7 @@ mod tests {
     #[test]
     fn record_forward_report_on_unknown_peer_is_noop() {
         let coord = default_coordinator();
-        coord.add_peer("peer-1".into(), "live/test".into()).unwrap();
+        coord.add_peer("peer-1".into(), "live/test".into(), None).unwrap();
 
         // Should not panic; unknown IDs are silently ignored.
         coord.record_forward_report("nonexistent", 999);
@@ -651,7 +660,7 @@ mod tests {
     #[test]
     fn record_forward_report_handles_reconnect_reset() {
         let coord = default_coordinator();
-        coord.add_peer("peer-1".into(), "live/test".into()).unwrap();
+        coord.add_peer("peer-1".into(), "live/test".into(), None).unwrap();
 
         // Client reports a running total, then reconnects (counter
         // drops back to zero on the client side). The server-visible
@@ -666,14 +675,89 @@ mod tests {
     #[test]
     fn record_forward_report_isolates_peers() {
         let coord = default_coordinator();
-        coord.add_peer("peer-a".into(), "live/test".into()).unwrap();
-        coord.add_peer("peer-b".into(), "live/test".into()).unwrap();
+        coord.add_peer("peer-a".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("peer-b".into(), "live/test".into(), None).unwrap();
 
         coord.record_forward_report("peer-a", 100);
         coord.record_forward_report("peer-b", 250);
 
         assert_eq!(coord.get_peer("peer-a").unwrap().forwarded_frames, 100);
         assert_eq!(coord.get_peer("peer-b").unwrap().forwarded_frames, 250);
+    }
+
+    /// Session 144 regression: a peer that self-reports a capacity
+    /// smaller than `MeshConfig.max_children` must cap its own
+    /// children at that lower number, forcing find_best_parent to
+    /// descend to the next available parent rather than over-loading
+    /// the constrained peer.
+    #[test]
+    fn find_best_parent_respects_per_peer_capacity() {
+        let coord = MeshCoordinator::new(MeshConfig {
+            max_children: 5,
+            root_peer_count: 1,
+            max_depth: 4,
+            heartbeat_timeout_secs: 10,
+        });
+
+        // peer-1 is the only Root; it self-reports capacity=1 so it
+        // can host at most one child.
+        let a1 = coord.add_peer("peer-1".into(), "live/test".into(), Some(1)).unwrap();
+        assert_eq!(a1.role, PeerRole::Root);
+
+        // peer-2 (no capacity) joins as the lone child of peer-1.
+        let a2 = coord.add_peer("peer-2".into(), "live/test".into(), None).unwrap();
+        assert_eq!(a2.role, PeerRole::Relay);
+        assert_eq!(a2.parent.as_deref(), Some("peer-1"));
+        assert_eq!(a2.depth, 1);
+
+        // peer-3 must descend to peer-2 because peer-1 is at its
+        // self-reported capacity of 1, even though MeshConfig.max_children
+        // is 5.
+        let a3 = coord.add_peer("peer-3".into(), "live/test".into(), None).unwrap();
+        assert_eq!(a3.role, PeerRole::Relay);
+        assert_eq!(
+            a3.parent.as_deref(),
+            Some("peer-2"),
+            "peer-3 should descend to peer-2 because peer-1 hit capacity=1"
+        );
+        assert_eq!(a3.depth, 2);
+
+        // PeerInfo.capacity is preserved on the Root entry.
+        assert_eq!(coord.get_peer("peer-1").unwrap().capacity, Some(1));
+        assert_eq!(coord.get_peer("peer-2").unwrap().capacity, None);
+    }
+
+    /// Session 144: a self-reported capacity larger than
+    /// `MeshConfig.max_children` is automatically clamped at consult
+    /// time by `effective_capacity`. Lvqr-cli also clamps at register
+    /// time so on-disk values are bounded; this test exercises the
+    /// defense-in-depth path where a programmatic caller forgot to
+    /// clamp.
+    #[test]
+    fn find_best_parent_clamps_oversize_capacity() {
+        let coord = MeshCoordinator::new(MeshConfig {
+            max_children: 2,
+            root_peer_count: 1,
+            max_depth: 4,
+            heartbeat_timeout_secs: 10,
+        });
+
+        // peer-1 claims a wildly inflated capacity. effective_capacity
+        // clamps to MeshConfig.max_children = 2.
+        coord
+            .add_peer("peer-1".into(), "live/test".into(), Some(u32::MAX))
+            .unwrap();
+
+        // Two children fit on peer-1.
+        coord.add_peer("peer-2".into(), "live/test".into(), None).unwrap();
+        coord.add_peer("peer-3".into(), "live/test".into(), None).unwrap();
+
+        // The next peer must descend, proving the clamp held.
+        let a4 = coord.add_peer("peer-4".into(), "live/test".into(), None).unwrap();
+        assert_eq!(
+            a4.depth, 2,
+            "expected descent because peer-1 must respect global ceiling"
+        );
     }
 
     #[test]
@@ -687,7 +771,7 @@ mod tests {
 
         // Add 50 peers
         for i in 0..50 {
-            let result = coord.add_peer(format!("peer-{i}"), "live/test".into());
+            let result = coord.add_peer(format!("peer-{i}"), "live/test".into(), None);
             assert!(result.is_ok(), "failed to add peer-{i}: {:?}", result.err());
         }
 

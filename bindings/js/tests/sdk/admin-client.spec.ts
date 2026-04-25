@@ -84,6 +84,10 @@ describe('LvqrAdminClient against a running lvqr', () => {
       expect(typeof peer.depth).toBe('number');
       expect(typeof peer.intended_children).toBe('number');
       expect(typeof peer.forwarded_frames).toBe('number');
+      // Session 144: capacity is optional; the harness has no peers
+      // advertising a value, so any registered peer's field comes
+      // through as either a number or undefined.
+      expect(peer.capacity === undefined || typeof peer.capacity === 'number').toBe(true);
     }
   });
 

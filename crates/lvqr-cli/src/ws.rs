@@ -144,7 +144,10 @@ async fn ws_relay_session(mut socket: WebSocket, state: WsRelayState, broadcast:
     // state so the subscriber still gets served MoQ frames.
     let mesh_peer_id = if let Some(mesh) = state.mesh.as_ref() {
         let peer_id = format!("ws-{}", MESH_PEER_COUNTER.fetch_add(1, Ordering::Relaxed));
-        match mesh.add_peer(peer_id.clone(), broadcast.clone()) {
+        // /ws subscribers do not advertise relay capacity in v1; the
+        // signaling-driven /signal path is the only producer.
+        // Session 144 -- per-peer capacity advertisement.
+        match mesh.add_peer(peer_id.clone(), broadcast.clone(), None) {
             Ok(assignment) => {
                 let payload = MeshAssignment {
                     kind: "peer_assignment",

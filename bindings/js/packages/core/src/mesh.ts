@@ -20,6 +20,13 @@ export interface MeshConfig {
   track: string;
   /** STUN servers for ICE. */
   iceServers?: RTCIceServer[];
+  /**
+   * Self-reported relay capacity (max children this peer can serve).
+   * The server clamps the claim to its operator-configured global
+   * max-peers. Omit the field for the server default. Session 144 --
+   * per-peer capacity advertisement.
+   */
+  capacity?: number;
   /** Called when a media frame is received from the parent. */
   onFrame?: (data: Uint8Array) => void;
   /**
@@ -84,10 +91,15 @@ export class MeshPeer {
       this.signal = new WebSocket(this.config.signalUrl);
 
       this.signal.onopen = () => {
+        // Session 144: include the self-reported capacity when set;
+        // JSON.stringify drops undefined values, so an unset config
+        // produces a Register without the field and the server falls
+        // back to its global ceiling.
         this.signal!.send(JSON.stringify({
           type: 'Register',
           peer_id: this.config.peerId,
           track: this.config.track,
+          capacity: this.config.capacity,
         }));
         this.startForwardReportLoop();
         resolve();

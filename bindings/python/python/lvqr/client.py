@@ -137,7 +137,10 @@ class LvqrClient:
         The ``peers`` array was added in session 141 for
         actual-vs-intended offload reporting; pre-141 servers omit
         the field and the defensive ``.get("peers", [])`` fallback
-        keeps parsing sound against older deployments.
+        keeps parsing sound against older deployments. Session 144
+        added ``MeshPeerStats.capacity``; pre-144 servers omit the
+        per-peer field and the ``.get("capacity")`` lookup returns
+        ``None``.
         """
         data = self._get_json("/api/v1/mesh")
         peers = [
@@ -148,6 +151,7 @@ class LvqrClient:
                 depth=int(p.get("depth", 0)),
                 intended_children=int(p.get("intended_children", 0)),
                 forwarded_frames=int(p.get("forwarded_frames", 0)),
+                capacity=p.get("capacity"),
             )
             for p in data.get("peers", [])
         ]

@@ -49,6 +49,7 @@ class TestTypes:
         assert peer.depth == 0
         assert peer.intended_children == 0
         assert peer.forwarded_frames == 0
+        assert peer.capacity is None
 
     def test_slo_snapshot_defaults(self):
         snapshot = SloSnapshot()
@@ -160,6 +161,7 @@ class TestClient:
                         "depth": 0,
                         "intended_children": 3,
                         "forwarded_frames": 1200,
+                        "capacity": 5,
                     },
                     {
                         "peer_id": "relay-7",
@@ -187,6 +189,40 @@ class TestClient:
         assert mesh.peers[1].parent == "root-1"
         assert mesh.peers[1].depth == 1
         assert mesh.peers[1].forwarded_frames == 400
+        # Session 144: per-peer capacity round-trips. The Root advertised
+        # 5; the Relay omitted the field (None on the wire).
+        assert mesh.peers[0].capacity == 5
+        assert mesh.peers[1].capacity is None
+        client.close()
+
+    @patch("httpx.Client.get")
+    def test_mesh_pre_session_144_server_omits_capacity(self, mock_get):
+        # Session 144 defensive-parse: pre-144 servers omit the per-peer
+        # `capacity` field. `.get("capacity")` returns None and the
+        # dataclass picks up the default.
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "enabled": True,
+                "peer_count": 1,
+                "offload_percentage": 0.0,
+                "peers": [
+                    {
+                        "peer_id": "root-1",
+                        "role": "Root",
+                        "parent": None,
+                        "depth": 0,
+                        "intended_children": 0,
+                        "forwarded_frames": 0,
+                    },
+                ],
+            },
+            raise_for_status=lambda: None,
+        )
+        client = LvqrClient("http://localhost:8080")
+        mesh = client.mesh()
+        assert len(mesh.peers) == 1
+        assert mesh.peers[0].capacity is None
         client.close()
 
     @patch("httpx.Client.get")

@@ -72,6 +72,12 @@ class MeshPeerStats:
     depth: int = 0
     intended_children: int = 0
     forwarded_frames: int = 0
+    #: Per-peer self-reported relay capacity (max children this peer
+    #: is willing to serve), clamped at register time to the
+    #: operator's global ``--max-peers``. ``None`` means the client
+    #: did not advertise a value and the planner uses the global
+    #: ceiling. Session 144 -- per-peer capacity advertisement.
+    capacity: Optional[int] = None
 
 
 @dataclass

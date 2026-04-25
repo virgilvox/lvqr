@@ -46,6 +46,15 @@ pub struct MeshState {
 /// `/signal` `ForwardReport` message; the server replaces rather
 /// than accumulates so a client reconnect cannot inflate the
 /// displayed value indefinitely. Session 141.
+///
+/// `capacity` (added in session 144) is the per-peer self-reported
+/// max-children value the client advertised on its
+/// `SignalMessage::Register`, clamped at register time to the
+/// operator-configured `MeshConfig.max_children`. `None` means the
+/// client did not advertise a value and the planner uses the global
+/// ceiling for that peer. Behind `#[serde(default)]` so pre-144
+/// admin clients deserializing new-server bodies (and new clients
+/// parsing pre-144 bodies) both work without a schema-version bump.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MeshPeerStats {
     pub peer_id: String,
@@ -54,6 +63,9 @@ pub struct MeshPeerStats {
     pub depth: u32,
     pub intended_children: usize,
     pub forwarded_frames: u64,
+    /// Per-peer self-reported relay capacity. Session 144.
+    #[serde(default)]
+    pub capacity: Option<u32>,
 }
 
 /// WASM filter chain state returned by `GET /api/v1/wasm-filter`.
@@ -508,6 +520,7 @@ mod tests {
                     depth: 0,
                     intended_children: 3,
                     forwarded_frames: 1200,
+                    capacity: Some(5),
                 },
                 MeshPeerStats {
                     peer_id: "relay-7".into(),
@@ -516,6 +529,7 @@ mod tests {
                     depth: 1,
                     intended_children: 1,
                     forwarded_frames: 400,
+                    capacity: None,
                 },
             ],
         });
@@ -545,6 +559,10 @@ mod tests {
         assert_eq!(root.depth, 0);
         assert_eq!(root.intended_children, 3);
         assert_eq!(root.forwarded_frames, 1200);
+        // Session 144: the admin body now also surfaces the per-peer
+        // self-reported capacity. The Root advertised 5; the Relay
+        // omitted the field (None on the wire).
+        assert_eq!(root.capacity, Some(5));
 
         let relay = mesh
             .peers
@@ -556,6 +574,24 @@ mod tests {
         assert_eq!(relay.depth, 1);
         assert_eq!(relay.intended_children, 1);
         assert_eq!(relay.forwarded_frames, 400);
+        assert!(relay.capacity.is_none(), "relay omitted capacity on the wire");
+    }
+
+    /// Session 144: a pre-144 admin body that omits the per-peer
+    /// `capacity` field must deserialize into a new client with
+    /// `capacity = None` via `#[serde(default)]`.
+    #[tokio::test]
+    async fn mesh_peer_stats_deserializes_pre_144_body_without_capacity() {
+        let body = br#"{"enabled":true,"peer_count":1,"offload_percentage":0.0,"peers":[
+            {"peer_id":"root-1","role":"Root","parent":null,"depth":0,
+             "intended_children":0,"forwarded_frames":0}
+        ]}"#;
+        let mesh: MeshState = serde_json::from_slice(body).unwrap();
+        assert_eq!(mesh.peers.len(), 1);
+        assert!(
+            mesh.peers[0].capacity.is_none(),
+            "missing capacity field must default to None"
+        );
     }
 
     #[tokio::test]

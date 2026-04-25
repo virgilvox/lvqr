@@ -45,6 +45,13 @@ pub struct PeerInfo {
     /// tree snapshots still deserialize.
     #[serde(default)]
     pub forwarded_frames: u64,
+    /// Self-reported relay capacity (max children this peer is
+    /// willing to serve). `None` means "use the operator's global
+    /// `MeshConfig.max_children`". Clamped to `[0, max_children]` at
+    /// register time by the lvqr-cli signal bridge so on-disk values
+    /// are always within the operator's ceiling. Session 144.
+    #[serde(default)]
+    pub capacity: Option<u32>,
     /// When this peer joined.
     #[serde(skip)]
     pub joined_at: Option<Instant>,
@@ -64,14 +71,32 @@ impl PeerInfo {
             depth: 0,
             upload_kbps: 5000, // default 5 Mbps
             forwarded_frames: 0,
+            capacity: None,
             joined_at: Some(Instant::now()),
             last_heartbeat: Some(Instant::now()),
         }
     }
 
-    /// Whether this peer can accept more children.
-    pub fn can_accept_child(&self, max_children: usize) -> bool {
-        self.children.len() < max_children
+    /// Whether this peer can accept more children given the operator's
+    /// configured ceiling. Consults the per-peer
+    /// [`PeerInfo::capacity`] when set, otherwise falls back to
+    /// `default_max`. The capacity is also clamped against
+    /// `default_max`, so a misbehaving client claim cannot exceed
+    /// the operator's ceiling here even if it slipped past
+    /// register-time clamping.
+    pub fn can_accept_child(&self, default_max: usize) -> bool {
+        self.children.len() < self.effective_capacity(default_max)
+    }
+
+    /// Effective per-peer capacity: the operator's ceiling
+    /// (`default_max`) by default, reduced to whatever the peer
+    /// self-reported via [`PeerInfo::capacity`] when that value is
+    /// smaller. The min ensures no capacity ever exceeds the
+    /// operator's ceiling. Session 144.
+    pub fn effective_capacity(&self, default_max: usize) -> usize {
+        self.capacity
+            .map(|c| (c as usize).min(default_max))
+            .unwrap_or(default_max)
     }
 
     /// Number of children this peer is relaying to.
@@ -107,6 +132,7 @@ mod tests {
         assert_eq!(peer.depth, 0);
         assert_eq!(peer.upload_kbps, 5000);
         assert_eq!(peer.forwarded_frames, 0);
+        assert!(peer.capacity.is_none());
     }
 
     #[test]
@@ -117,5 +143,49 @@ mod tests {
         peer.children.push("child-2".into());
         peer.children.push("child-3".into());
         assert!(!peer.can_accept_child(3));
+    }
+
+    #[test]
+    fn effective_capacity_uses_global_when_unset() {
+        let peer = PeerInfo::new("peer-1".into(), "live/test".into());
+        assert_eq!(peer.effective_capacity(3), 3);
+        assert_eq!(peer.effective_capacity(0), 0);
+    }
+
+    #[test]
+    fn effective_capacity_clamps_oversize_claim() {
+        let mut peer = PeerInfo::new("peer-1".into(), "live/test".into());
+        peer.capacity = Some(u32::MAX);
+        assert_eq!(peer.effective_capacity(5), 5);
+    }
+
+    #[test]
+    fn effective_capacity_uses_smaller_of_claim_and_default() {
+        let mut peer = PeerInfo::new("peer-1".into(), "live/test".into());
+        peer.capacity = Some(2);
+        assert_eq!(peer.effective_capacity(5), 2);
+        assert_eq!(peer.effective_capacity(1), 1);
+    }
+
+    #[test]
+    fn can_accept_child_respects_capacity_zero() {
+        let mut peer = PeerInfo::new("peer-1".into(), "live/test".into());
+        peer.capacity = Some(0);
+        assert!(
+            !peer.can_accept_child(10),
+            "capacity=0 must reject children even with default_max=10"
+        );
+    }
+
+    #[test]
+    fn can_accept_child_respects_per_peer_cap_below_default() {
+        let mut peer = PeerInfo::new("peer-1".into(), "live/test".into());
+        peer.capacity = Some(1);
+        assert!(peer.can_accept_child(5));
+        peer.children.push("child-1".into());
+        assert!(
+            !peer.can_accept_child(5),
+            "peer with capacity=1 must refuse a second child even when default_max=5"
+        );
     }
 }

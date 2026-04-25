@@ -876,7 +876,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             relay.set_connection_callback(Arc::new(move |conn_id, connected| {
                 let peer_id = format!("conn-{conn_id}");
                 if connected {
-                    match mesh_for_cb.add_peer(peer_id.clone(), "default".to_string()) {
+                    match mesh_for_cb.add_peer(peer_id.clone(), "default".to_string(), None) {
                         Ok(a) => {
                             tracing::info!(peer = %peer_id, role = ?a.role, depth = a.depth, "mesh: peer assigned");
                         }
@@ -934,8 +934,15 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             // `--mesh-ice-servers` was not set; clients then fall
             // back to their constructor-provided list.
             let ice_servers_for_signal = config.mesh_ice_servers.clone();
-            signal.set_peer_callback(Arc::new(move |peer_id, track, connected| {
-                if connected {
+            // Session 144: clamp the client's self-reported capacity to
+            // the operator's configured global ceiling at register time
+            // so on-disk PeerInfo.capacity never exceeds it.
+            // `effective_capacity` clamps again as a defense in depth.
+            let global_max_children = config.max_peers as u32;
+            signal.set_peer_callback(Arc::new(move |event: &lvqr_signal::PeerEvent<'_>| {
+                let peer_id = event.peer_id;
+                let track = event.track;
+                if event.connected {
                     if let Some(existing) = mesh_for_signal.get_peer(peer_id) {
                         tracing::debug!(
                             peer = %peer_id,
@@ -951,9 +958,16 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                             ice_servers: ice_servers_for_signal.clone(),
                         });
                     }
-                    match mesh_for_signal.add_peer(peer_id.to_string(), track.to_string()) {
+                    let clamped_capacity = event.capacity.map(|c| c.min(global_max_children));
+                    match mesh_for_signal.add_peer(peer_id.to_string(), track.to_string(), clamped_capacity) {
                         Ok(a) => {
-                            tracing::info!(peer = %peer_id, role = ?a.role, depth = a.depth, "mesh: signal peer assigned");
+                            tracing::info!(
+                                peer = %peer_id,
+                                role = ?a.role,
+                                depth = a.depth,
+                                capacity = ?clamped_capacity,
+                                "mesh: signal peer assigned"
+                            );
                             Some(lvqr_signal::SignalMessage::AssignParent {
                                 peer_id: peer_id.to_string(),
                                 role: format!("{:?}", a.role),
@@ -1002,6 +1016,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                         depth: p.depth,
                         intended_children: p.children.len(),
                         forwarded_frames: p.forwarded_frames,
+                        capacity: p.capacity,
                     })
                     .collect();
                 lvqr_admin::MeshState {
