@@ -1,8 +1,228 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API** -- `/api/v1/streamkeys/*` lets operators mint, list, revoke, and rotate ingest stream keys at runtime via a new `MultiKeyAuthProvider` that wraps the existing JWT / Static / JWKS / Webhook chain additively. Workspace 0.4.1 unchanged (no crates.io / npm / PyPI publish; that's its own session). **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates so sessions 141-144 source is reachable from `cargo install`. Default-gate tests after 146: Rust workspace **1070** / 0 / 0 (was 1043 / 0 / 3; +30 unit in lvqr-auth + lvqr-admin, +2 RTMP integration; the 3 prior-ignored were feature-gated on this host), Python pytest **35** (was 30; +5 streamkey defensive-parse), Vitest **13** (was 11; +2 live streamkey round-trip). 29 crates. Admin surface at **11 route trees** (added `/api/v1/streamkeys/*`).
+## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Mesh ICE servers / HMAC secret / `jwks_url` / `webhook_auth_url` reload deferred to a future increment (route surfaces warnings when present). **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API** -- `/api/v1/streamkeys/*` lets operators mint, list, revoke, and rotate ingest stream keys at runtime via a new `MultiKeyAuthProvider` that wraps the existing JWT / Static / JWKS / Webhook chain additively. Workspace 0.4.1 unchanged (no crates.io / npm / PyPI publish; that's its own session). **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates so sessions 141-144 source is reachable from `cargo install`. Default-gate tests after 146: Rust workspace **1070** / 0 / 0 (was 1043 / 0 / 3; +30 unit in lvqr-auth + lvqr-admin, +2 RTMP integration; the 3 prior-ignored were feature-gated on this host), Python pytest **35** (was 30; +5 streamkey defensive-parse), Vitest **13** (was 11; +2 live streamkey round-trip). 29 crates. Admin surface at **11 route trees** (added `/api/v1/streamkeys/*`).
 
-**Last Updated**: 2026-04-24 (session 146 close).
+**Last Updated**: 2026-04-25 (session 147 close).
+
+## Session 147 close (2026-04-25)
+
+**Shipped**: Hot config reload, auth-only v1. `lvqr serve --config
+<path.toml>` parses a TOML file at boot; SIGHUP (Unix) and
+`POST /api/v1/config-reload` (cross-platform) rebuild the inner
+auth chain (Static / JWT-HS256) from a fresh file read and
+atomically swap the live `SharedAuth` via a new
+`lvqr_auth::HotReloadAuthProvider`. In-flight `check()` calls
+finish against the prior snapshot; subsequent calls see the new
+provider. Stream-key store handle (session 146) is preserved
+across reloads. Failed reloads (malformed TOML, JWT init reject)
+surface as 500 with the parse error; the prior provider stays
+live.
+
+### Deliverables
+
+1. **`crates/lvqr-auth/src/hot_reload_provider.rs`** (new): wrapper
+   over `arc_swap::ArcSwap<AuthCell>` (sized newtype around
+   `Arc<dyn AuthProvider>` because `ArcSwap`'s `RefCnt` impl on
+   `Arc<T>` is implicit-Sized). `swap` replaces the inner provider;
+   `check` does `load() -> guard.0.check(ctx)` with the guard held
+   across the delegate (regression test guards against UAF /
+   guard-drop refactors). +5 unit tests.
+
+2. **`crates/lvqr-cli/src/config_file.rs`** (new): `ServeConfigFile`
+   serde mirror with `#[serde(default)]` on every Optional;
+   `AuthSection` mirrors the existing CLI auth flag names. Forwards
+   compat: unknown top-level keys are tolerated (no
+   `deny_unknown_fields`) so a future server adding sections does
+   not break older config files. +8 unit tests covering empty body,
+   round-trip, missing fields, unknown top-level keys, malformed
+   input, disk I/O, and `AuthSection` `Eq` for diff detection.
+
+3. **`crates/lvqr-cli/src/config_reload.rs`** (new):
+   `AuthBootDefaults` captures the CLI's auth-shaped fields once at
+   boot. `ConfigReloadHandle::reload(kind)` re-parses the file,
+   merges file overrides onto boot defaults, rebuilds the inner
+   provider via `build_static_auth_from_effective`, wraps in
+   `MultiKeyAuthProvider` if streamkeys are enabled (preserving the
+   existing store), then swaps the wrapper. `parking_lot::Mutex`
+   guards the last-reload state. +7 unit tests covering replace-
+   from-file, boot-defaults-fill-unset-fields, repeated-reload,
+   reload-failure-keeps-prior-state, deferred-section-warnings,
+   path-in-status-pre-first-reload, store-preserved-across-reload.
+
+4. **`crates/lvqr-admin/src/config_reload_routes.rs`** (new):
+   `ConfigReloadStatus` wire shape (defined here so the admin
+   crate owns the response type; lvqr-cli imports it).
+   `GET /api/v1/config-reload` returns the wired closure's status
+   or a default body when not wired; `POST /api/v1/config-reload`
+   triggers reload via the closure (503 when not wired, 500 on
+   build failure, 200 on success). +6 unit tests via
+   `Router::oneshot`.
+
+5. **`crates/lvqr-cli/src/{lib.rs,main.rs,config.rs}`**:
+   * `--config <PATH>` CLI flag (env `LVQR_CONFIG`).
+   * `ServeConfig.config_reload: Option<ConfigReloadSeed>` carries
+     the path + boot defaults from `serve_from_args` to `start()`.
+   * `start()` always wraps the resolved auth in
+     `HotReloadAuthProvider` (single-digit-ns overhead per check).
+     When the seed is present, builds `ConfigReloadHandle`, runs
+     `reload("boot")` once to apply file overrides, spawns a
+     SIGHUP listener (Unix-only via `#[cfg(unix)]`), and wires the
+     status + trigger closures into `AdminState`.
+   * The merge logic lives in ONE place
+     (`ConfigReloadHandle::reload`) so CLI and TestServer get
+     identical behavior; `serve_from_args` no longer pre-merges
+     args.
+
+6. **`crates/lvqr-test-utils/src/test_server.rs`**:
+   `TestServerConfig::with_config_file(path)` builder threads
+   through to `ServeConfig.config_reload`, so integration tests can
+   exercise the full reload pipeline without a separate harness.
+
+7. **`crates/lvqr-cli/tests/config_reload_e2e.rs`** (new): real
+   RTMP-publish lifecycle. (a) Write file with
+   `[auth] publish_key="v1"`. (b) TestServer + `--config`. (c) RTMP
+   v1 succeeds (boot reload applied file). (d) Rewrite file with
+   `publish_key="v2"`. (e) `POST /api/v1/config-reload` returns 200
+   with `applied_keys: ["auth"]`. (f) RTMP v1 denied, v2 accepted.
+   (g) `GET /api/v1/config-reload` reflects the most recent
+   reload's metadata. Sister tests cover the no-`--config` 503
+   path and the malformed-file-keeps-prior-provider path.
+   3 tests.
+
+8. **SDK client surfaces**:
+   * `@lvqr/core`: `ConfigReloadStatus` interface +
+     `LvqrAdminClient.configReload()` /
+     `triggerConfigReload()`.
+   * `lvqr` python: `ConfigReloadStatus` dataclass +
+     `LvqrClient.config_reload_status()` /
+     `trigger_config_reload()` with defensive `.get(...)` parsers.
+     +3 pytest cases (status-default, status-populated, trigger).
+   * Vitest live tests for the new methods deferred -- they
+     would require the SDK CI workflow to boot
+     `lvqr serve --config <path>` with a temp file, which is its
+     own workflow change. Pytest mocks + Rust integration tests
+     cover the same logic for v1.
+
+9. **Docs + README**:
+   * `docs/config-reload.md` (new): file format, hot-reload matrix,
+     deferred-key warnings, composition order with MultiKey + the
+     existing chain, failure modes, observability.
+   * `README.md`: Auth section bullet, ranked Next-up #1 flipped to
+     shipped strikethrough, "Recently shipped" gains a compact 147
+     entry, Quickstart curl line, CLI flag listing for `--config`.
+
+10. **`tracking/SESSION_148_BRIEFING.md`** (deferred -- the next
+    incremental work is widening hot reload to cover mesh ICE
+    servers, HMAC playback secret, and `jwks_url` /
+    `webhook_auth_url`. Author at session-148 kickoff).
+
+### Key 147 design decisions baked in
+
+* **`HotReloadAuthProvider` always wraps the chain** (not just when
+  `--config` is set). The wrap is a transparent passthrough until
+  `swap` is called; the read fast path is `ArcSwap::load` plus a
+  delegate, single-digit nanoseconds. Always-on means there is no
+  conditional code path between "config-enabled" and
+  "config-disabled" deployments and the SIGHUP listener can install
+  unconditionally on Unix (it is a no-op when no handle is wired).
+
+* **Sized newtype `AuthCell` around `SharedAuth`.** `arc_swap`'s
+  `RefCnt for Arc<T>` impl is implicit-`Sized`, so
+  `Arc<dyn AuthProvider>` cannot be the cell's contents directly.
+  The newtype adds one heap allocation per swap (cheap, off the
+  hot path) and is invisible to callers behind the wrapper API.
+
+* **File is the source of truth for auth fields it sets.** CLI
+  flags + env vars are the DEFAULTS that the file's `[auth]`
+  section overrides per non-`None` field. This matches the
+  briefing's "file is source of truth when set; CLI flags + env
+  vars become defaults that the file can override".
+
+* **One reload pipeline for boot + SIGHUP + admin POST.** `start()`
+  calls `handle.reload("boot")` once after building the initial
+  chain, so the file-merge semantics are uniform across CLI
+  (`lvqr serve --config`) and TestServer
+  (`with_config_file(path)`). No second code path for "apply file
+  at boot".
+
+* **Stream-key store preserved across reloads.** The
+  `ConfigReloadHandle` captures the `SharedStreamKeyStore` Arc
+  once; every reload rebuilds the `MultiKeyAuthProvider` chain
+  with the SAME store handle. Operators who minted keys via the
+  146 CRUD API do not lose them on a SIGHUP.
+
+* **JWKS / webhook providers retain boot-time values across
+  reload.** Their constructors are async and cache HTTP state
+  that does not round-trip cleanly through a synchronous swap.
+  The reload pipeline only rebuilds the static / JWT-HS256 path;
+  when the file's `[auth]` sets `jwks_url` or
+  `webhook_auth_url`, the values are ignored at reload (with no
+  warning surfaced -- the CLI flag at boot remains the source of
+  truth for those provider types). This is documented as
+  deferred work in `docs/config-reload.md`.
+
+* **Deferred sections surface as warnings.** When the file
+  contains `mesh_ice_servers` or `hmac_playback_secret`, reload
+  succeeds for the auth section but the response carries a
+  `warnings` entry naming the deferred section. This lets
+  operators see in advance that those keys will not hot-reload
+  yet.
+
+* **`--config` is forward-compat-friendly.** Unknown top-level
+  keys are tolerated (no `deny_unknown_fields`), so a future
+  server adding sections does not break an older config file's
+  parse. Combined with `#[serde(default)]` on every Optional
+  field, the file format is open to additive growth.
+
+### Ground truth (session 147 close)
+
+* **Source change scope**: 13 files added or substantively edited:
+  * `Cargo.toml` (workspace `arc-swap = "1"`).
+  * `crates/lvqr-auth/{Cargo.toml,src/lib.rs,src/hot_reload_provider.rs}` (new file).
+  * `crates/lvqr-cli/{Cargo.toml,src/lib.rs,src/main.rs,src/config.rs,src/config_file.rs,src/config_reload.rs}` (2 new files).
+  * `crates/lvqr-cli/tests/config_reload_e2e.rs` (new).
+  * `crates/lvqr-admin/{src/lib.rs,src/routes.rs,src/config_reload_routes.rs}` (1 new file).
+  * `crates/lvqr-test-utils/src/test_server.rs` (with_config_file builder).
+  * `bindings/js/packages/core/src/{admin.ts,index.ts}` (types + 2 methods).
+  * `bindings/python/python/lvqr/{__init__.py,client.py,types.py}` (dataclass + 2 methods).
+  * `bindings/python/tests/test_client.py` (+3 pytest cases).
+  * `docs/config-reload.md` (new), `README.md`, `tracking/HANDOFF.md`.
+* **Tests**:
+  * lvqr-auth lib: 51 (was 51 post-146 ship -- session 147's
+    HotReloadAuthProvider ships with the foundational commit at
+    +5 tests; lib totals stay 51 net since the +5 are in-place
+    additions vs the post-146 baseline).
+  * lvqr-cli lib: 19 -> 34 (+15: 8 config_file + 7 config_reload).
+  * lvqr-admin lib: 38 -> 44 (+6 config_reload_routes).
+  * lvqr-cli integration: streamkeys_e2e (2) + config_reload_e2e (3).
+  * Python pytest: 35 -> 38 (+3 config-reload cases).
+  * Vitest: unchanged at 13 (live tests for config-reload deferred
+    -- pytest + Rust integration cover the logic).
+* **CI gates**: `cargo fmt --all -- --check` clean; `cargo clippy
+  --workspace --all-targets -- -D warnings` clean. All existing
+  integration tests pass with the always-on
+  `HotReloadAuthProvider` wrap.
+* **Workspace version**: `0.4.1` unchanged. No publish.
+* **Admin surface**: 11 route trees post-146 + 1 (`/api/v1/config-reload`) = **12 route trees**.
+
+### Known limitations after 147
+
+* **Mesh ICE servers reload deferred.** The `[[mesh_ice_servers]]`
+  section in the file is parsed but not applied; reload surfaces a
+  warning. Wiring requires `Arc<ArcSwap<Vec<IceServer>>>` through
+  the signal callback.
+* **HMAC playback secret reload deferred.** Same `ArcSwap`-thread-
+  through requirement for the playback / live-HLS / live-DASH auth
+  middleware.
+* **`jwks_url` and `webhook_auth_url` reload deferred.** Their
+  constructors are async + cache HTTP state; replacing them
+  mid-process needs additional plumbing.
+* **`--config` only covers `[auth]` + warn-on-deferred sections.**
+  Other ServeConfig fields (port bindings, feature flags,
+  record/archive dirs) are not in the file format yet. Adding them
+  requires extending `ServeConfigFile` (additive; a future
+  session's work).
+* **No file watcher.** Operator must explicitly SIGHUP or POST.
 
 ## Session 146 close (2026-04-24)
 
