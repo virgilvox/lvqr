@@ -42,7 +42,6 @@ high-fan-out broadcasts.
 > - Per-peer capacity advertisement (bandwidth + CPU) so
 >   rebalancing uses measured capacity instead of hardcoded
 >   `max-children`.
-> - TURN deployment recipe for peers behind symmetric NAT.
 >
 > **Actual-vs-intended offload reporting** shipped in session 141.
 > Browser peers report their cumulative forwarded-frame count to
@@ -53,6 +52,18 @@ high-fan-out broadcasts.
 > planner assign to peer X" against "how many frames has peer X
 > actually forwarded". See the "Per-peer offload snapshot" block
 > below.
+>
+> **TURN deployment recipe + server-driven ICE config** shipped
+> in session 143. New `--mesh-ice-servers <JSON>` CLI flag (env
+> `LVQR_MESH_ICE_SERVERS`) accepts an array of `RTCIceServer`
+> objects; the list flows down to every browser peer via a new
+> `ice_servers` field on the existing `AssignParent` message,
+> and `MeshPeer` rebuilds its `RTCPeerConnection({ iceServers })`
+> from the snapshot when non-empty. Operators configure once on
+> the server; clients pick up STUN/TURN entries automatically.
+> Empty (default) preserves the constructor-provided fallback,
+> so existing integrators see no behavior change. The runbook +
+> sample `coturn.conf` ship in [`deploy/turn/`](../deploy/turn/).
 >
 > **Three-peer Playwright matrix** shipped in session 142
 > (`bindings/js/tests/e2e/mesh/three-peer-chain.spec.ts`). Three
@@ -115,11 +126,60 @@ This starts:
 |------|---------|-------------|
 | `--mesh-enabled` | false | Enable peer mesh relay |
 | `--max-peers` | 3 | Max children per peer |
+| `--mesh-root-peer-count` | 30 | Cap on direct-from-origin peers |
+| `--mesh-ice-servers` | none | JSON array of `RTCIceServer` entries pushed to every browser peer via `AssignParent` (session 143) |
 
 Internal defaults (hardcoded, will be configurable):
-- Root peer count: 30
 - Max tree depth: 6
 - Heartbeat timeout: 10s
+
+## TURN / STUN configuration (session 143)
+
+Two ways to give browser peers their ICE-server list:
+
+1. **Constructor-provided** (legacy / per-integrator). Pass
+   `iceServers` to `new MeshPeer({...})`. Always works; no
+   server config required. Each integrator threads the list
+   through their own code.
+
+2. **Server-driven** (preferred for operator deployments). Boot
+   `lvqr serve` with `--mesh-ice-servers '[...]'`; every peer
+   that registers on `/signal` receives the list via a new
+   `ice_servers` field on the `AssignParent` server-push
+   message and rebuilds its `RTCPeerConnection({ iceServers })`
+   from the snapshot. Operators configure once on the server;
+   clients pick up STUN/TURN entries automatically.
+
+```sh
+lvqr serve --mesh-enabled --mesh-ice-servers '[
+  {"urls":["stun:stun.l.google.com:19302"]},
+  {"urls":["turn:turn.example.com:3478"],"username":"u","credential":"p"}
+]'
+```
+
+The shape is WebRTC's `RTCIceServer` JSON verbatim. Each entry
+must carry `urls` (a string array), and TURN entries also carry
+`username` + `credential`. `LVQR_MESH_ICE_SERVERS` is the env-
+variable equivalent for systemd / docker units.
+
+Empty (default) means "no opinion": `MeshPeer` uses its
+constructor-provided list (or its hardcoded Google STUN
+fallback). When `--mesh-ice-servers` is set, the server's list
+is **authoritative** -- it replaces whatever the constructor
+provided.
+
+### When you need TURN
+
+Most home and office deployments work with STUN-only ICE.
+Symmetric NAT (carrier-grade NAT, some corporate firewalls)
+allocates a different external port per destination, defeating
+server-reflexive candidates. Add a TURN server in those cases.
+
+The operator runbook + a minimal `coturn.conf` ship in
+[`deploy/turn/`](../deploy/turn/) and walk through install,
+config, the `--mesh-ice-servers` wiring, sanity-check via
+`turnutils_uclient`, and the cost shape (TURN traffic flows
+through the relay's NIC; plan capacity).
 
 ## Bandwidth offload (intended, not measured)
 

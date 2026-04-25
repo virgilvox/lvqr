@@ -441,8 +441,12 @@ test.
   returns measured offload.
 - [ ] **Per-peer capacity advertisement** so rebalancing uses
   bandwidth + CPU instead of hardcoded `max-children`.
-- [ ] **TURN deployment recipe** + STUN fallback config. Document
-  coturn integration for peers behind symmetric NAT.
+- [x] ~~**TURN deployment recipe** + STUN fallback config. Document
+  coturn integration for peers behind symmetric NAT.~~ Shipped in
+  session 143. New `--mesh-ice-servers <JSON>` CLI flag pushes
+  operator-configured STUN/TURN entries to every browser peer via
+  the `AssignParent` message; the runbook + sample `coturn.conf`
+  ship in [`deploy/turn/`](deploy/turn/).
 - [x] ~~**Three-peer browser Playwright E2E** feeding the
   5-artifact test contract.~~ Shipped in session 142 as
   [`bindings/js/tests/e2e/mesh/three-peer-chain.spec.ts`](bindings/js/tests/e2e/mesh/three-peer-chain.spec.ts).

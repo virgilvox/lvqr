@@ -1,8 +1,109 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D 8 sessions deep** -- WASM chain thread (135-140) closed + mesh data-plane rows 1 (offload reporting, 141) and 2 (three-peer Playwright matrix, 142) shipped. **Session 142 (2026-04-24) added the three-peer Playwright matrix** -- new `bindings/js/tests/e2e/mesh/three-peer-chain.spec.ts` spawns three Chromium contexts forming a depth-2 chain `peer-1 -> peer-2 -> peer-3`, asserts byte-equality at the leaf AND session-141 per-peer offload counters across the chain (the middle peer's `forwarded_frames > 0` is the load-bearing assertion that proves multi-hop relay works). Playwright webServer config gains `--max-peers 1` so the assignment is deterministic. New `parentPeerId` getter on `MeshPeer`. Sessions 138-141 pushed in this session (`origin/main` advanced from `1a1667e` to `0c2320d`); session 142 local. Default-gate Rust workspace unchanged at **1022/0/3** (no Rust changes). Python pytest unchanged at **29**. Vitest unchanged at 11. 29 crates. Admin surface at **10 routes**. Remaining Phase D scope: per-peer capacity advertisement, TURN recipe, hardware encoder backend, DASH-IF validator, npm + PyPI publish.
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D 9 sessions deep** -- WASM chain thread (135-140) closed + mesh data-plane rows 1 (offload reporting, 141), 2 (three-peer Playwright matrix, 142), and 3 (TURN deployment recipe + server-driven ICE config, 143) shipped. **Session 143 (2026-04-24) added server-driven ICE config** -- new `--mesh-ice-servers <JSON>` CLI flag with `LVQR_MESH_ICE_SERVERS` env fallback; new `IceServer` type in `lvqr-signal`; `SignalMessage::AssignParent` grows `ice_servers: Vec<IceServer>` with `#[serde(default)]`; JS `MeshPeer.handleAssignment` rebuilds `RTCPeerConnection({ iceServers })` from the snapshot when non-empty. Operator-facing `deploy/turn/` ships a coturn install runbook + minimal `coturn.conf`. Default-gate Rust workspace **1022 -> 1030** (+8: 3 new signal serde tests + 4 CLI parse tests + 2 new integration tests; the 2 integration tests are in a new file). Python pytest unchanged at **29**. Vitest 11 unchanged. 29 crates. Admin surface at **10 routes**. Remaining Phase D scope: per-peer capacity advertisement, hardware encoder backend, DASH-IF validator, npm + PyPI publish, mesh.md "IMPLEMENTED" flip (gated on capacity).
 
-**Last Updated**: 2026-04-24 (session 142 close). Sessions 135-141 are pushed (`origin/main` at `0c2320d`); session 142 local pending push.
+**Last Updated**: 2026-04-24 (session 143 close). Sessions 135-142 pushed (`origin/main` at `8c28ca2`); session 143 local pending push.
+
+## Session 143 close (2026-04-24)
+
+**Shipped**: TURN deployment recipe + server-driven ICE configuration. Closes the third of the four unshipped bullets under README's "Peer mesh data plane" checklist (line 444-445). New `--mesh-ice-servers <JSON>` CLI flag (env `LVQR_MESH_ICE_SERVERS`) accepts an array of `RTCIceServer` objects; the list flows down to every browser peer via a new `ice_servers: Vec<IceServer>` field on the existing `AssignParent` server-push message, and `MeshPeer.handleAssignment` rebuilds its `RTCPeerConnection({ iceServers })` from the snapshot when non-empty. Operators configure once on the server; clients pick up STUN/TURN entries automatically. Operator-facing `deploy/turn/` ships a coturn install runbook + minimal `coturn.conf`. Live smoke verified: `curl /api/v1/mesh` against an lvqr booted with the flag returns the expected mesh body, and the new Rust integration test (`crates/lvqr-signal/tests/ice_servers_e2e.rs`) drives a real WebSocket through the production admin router and asserts the configured list arrives in the AssignParent body verbatim.
+
+### Deliverables
+
+1. **`crates/lvqr-signal/src/signaling.rs`**:
+   * New `pub struct IceServer { urls: Vec<String>, username: Option<String>, credential: Option<String> }`. Mirrors WebRTC's `RTCIceServer` JSON shape; `username` + `credential` carry `#[serde(skip_serializing_if = "Option::is_none")]` so STUN-only entries do not emit empty credential fields. `urls` is always emitted as an array even when one URL is configured -- normalizing on the wire keeps JS-side casts simple.
+   * `SignalMessage::AssignParent` grows `#[serde(default)] ice_servers: Vec<IceServer>` so pre-143 server bodies that omit the field still deserialize cleanly into a new client.
+   * 3 new unit tests: `assign_parent_carries_ice_servers` (round-trip with STUN + TURN entries, asserts the no-credential entry skips username/credential on the wire), `assign_parent_deserializes_pre_143_body_without_ice_servers` (proves `#[serde(default)]` fallback), `assign_parent_serialization` extended with `assert!(json.contains("\"ice_servers\":[]"))` and a check on the `ice_servers` field in the unpacked body.
+
+2. **`crates/lvqr-signal/src/lib.rs`**: re-exports `IceServer`, plus the previously-internal `ForwardReportCallback` and `PeerCallback` types (drive-by; the bridge in `lvqr-cli` already uses them via path-qualified names but downstream callers benefit from the cleaner re-export surface).
+
+3. **`crates/lvqr-cli/src/config.rs`**:
+   * `ServeConfig` grows `mesh_ice_servers: Vec<lvqr_signal::IceServer>`. Default loopback config initializes it to `Vec::new()`.
+
+4. **`crates/lvqr-cli/src/main.rs`**:
+   * New `--mesh-ice-servers <JSON>` flag with `LVQR_MESH_ICE_SERVERS` env fallback; field type is `Option<String>` parsed at boot.
+   * New `parse_mesh_ice_servers(raw: Option<&str>) -> Result<Vec<IceServer>>` helper. `None` and whitespace-only resolve to empty vec; valid JSON parses; malformed JSON surfaces `--mesh-ice-servers must be a JSON array of {urls, username?, credential?} objects: <serde error>` so operators can fix the input.
+   * New `mod mesh_ice_servers_cli_tests`: 4 tests covering unset / empty-string / full-payload / malformed-json paths.
+
+5. **`crates/lvqr-cli/src/lib.rs::start()`**:
+   * Captures `config.mesh_ice_servers.clone()` into the signal callback closure once at boot. Both AssignParent constructions in the closure (the reuse-existing-peer branch and the fresh-add_peer branch) include `ice_servers: ice_servers_for_signal.clone()`.
+
+6. **`crates/lvqr-test-utils/src/test_server.rs`**:
+   * `TestServerConfig` grows `mesh_ice_servers: Vec<lvqr_signal::IceServer>` field + new `with_mesh_ice_servers(servers)` builder method.
+   * `TestServer::start` plumbs the field into `ServeConfig`.
+
+7. **`crates/lvqr-test-utils/Cargo.toml`**: new `lvqr-signal = { workspace = true }` direct dep so the public `with_mesh_ice_servers` signature can name the type. The crate is already a transitive of lvqr-cli; this is purely a public-API-surface dep.
+
+8. **`crates/lvqr-signal/tests/ice_servers_e2e.rs`** (new):
+   * `assign_parent_carries_configured_ice_servers`: spins up a TestServer with `--mesh-ice-servers` configured (one STUN entry + one TURN entry with credentials), opens a real `tokio-tungstenite` WebSocket to `/signal`, sends `Register`, reads `AssignParent`, asserts `ice_servers` matches the configured list verbatim.
+   * `assign_parent_omits_ice_servers_when_unconfigured`: same flow without `--mesh-ice-servers`, asserts the AssignParent body has an empty `ice_servers` vec.
+
+9. **`bindings/js/packages/core/src/mesh.ts::handleAssignment`**:
+   * After applying `role` and `parentId`, reads `msg.ice_servers as RTCIceServer[] | undefined`. If non-empty, rebuilds `this.iceConfig = { iceServers: serverIceServers }` so subsequent `RTCPeerConnection` constructions (parent-side and child-side) pick up the operator's list. Empty or missing leaves the constructor-provided `iceConfig` untouched.
+
+10. **`deploy/turn/coturn.conf`** (new): minimal coturn config with realm + long-term creds + UDP-only + sane port range + quotas. ~50 lines with inline comments. Operators copy + edit `realm`, `user`, and ranges before starting.
+
+11. **`deploy/turn/README.md`** (new): operator runbook. Sections: why TURN (symmetric NAT), what ships in the dir, install on Debian / Alpine / Docker, how to wire the running coturn into LVQR via `--mesh-ice-servers`, sanity check via `turnutils_uclient`, cost shape, anti-scope (no TLS, no short-lived creds, no autoscaling).
+
+12. **`docs/mesh.md`**:
+   * "What is still phase-D scope" subsection trimmed to one bullet (per-peer capacity advertisement only).
+   * New shipped-in-143 paragraph documenting `--mesh-ice-servers` + the AssignParent extension + `MeshPeer` rebuild semantics + a link to `deploy/turn/`.
+   * Configuration table grows the `--mesh-root-peer-count` and `--mesh-ice-servers` rows (the former was already valid; documented here for the first time).
+   * New "TURN / STUN configuration (session 143)" section with the constructor-vs-server-driven tradeoff, an example command line, and a "When you need TURN" subsection that links to `deploy/turn/` for the runbook.
+
+13. **`README.md`**: "TURN deployment recipe" bullet flipped from `[ ]` to `[x]` with the strikethrough + shipped-in-143 prose linking `deploy/turn/`.
+
+14. **`tracking/SESSION_143_BRIEFING.md`** (new): locked design before any source touched. Documents the wire shape, the CLI flag shape, the JS rebuild semantics, the testing strategy (unit + integration + relying-on-existing-Playwright happy path with empty ice_servers), and an explicit anti-scope list (no mid-session updates, no credential rotation, no `relay`-only iceTransportPolicy, no actual coturn boot in CI, no JS unit test of the rebuild path).
+
+### Key 143 design decisions baked in
+
+* **Server-driven, not constructor-only.** Both paths exist: `MeshPeer({iceServers: [...]})` still works for integrators who prefer to thread the list themselves. The new path adds operator ergonomics without breaking the integrator path. Empty server list = "no opinion, client decides", preserving backward compat.
+
+* **Single CLI flag carrying the full JSON array, not repeated `--ice-server` flags.** Repeated flags carrying JSON objects are awkward to escape on a shell command line; a single JSON-array string parses once at boot and matches the env-var `LVQR_MESH_ICE_SERVERS` shape that systemd/docker units want.
+
+* **Wire field is `ice_servers: Vec<IceServer>` with `#[serde(default)]`.** Same cross-version pattern as session 140 (`slots`) and session 141 (`peers`). Pre-143 servers omit the field; new clients deserialize them with empty vec. Pre-143 clients ignore the new field on a new server's body (JS structural typing is lenient on extra; Rust enum matches keep working since the default exists).
+
+* **`IceServer` type is crate-public on `lvqr-signal`, not `lvqr-mesh` or a new crate.** It is purely a wire-shape concern in `SignalMessage::AssignParent`. Putting it in `lvqr-signal` keeps the dep graph tidy: lvqr-cli already depends on lvqr-signal, and the test-utils crate now adds a direct dep so `with_mesh_ice_servers` can name the type publicly.
+
+* **Server-list is authoritative when non-empty.** Clients rebuild `iceConfig` rather than merging the lists. Merging would invite ordering questions (priority? dedup by url?) and add no operator value: the operator who sets `--mesh-ice-servers` already knows what they want clients to use. Preserves the "single knob" property.
+
+* **No mid-session reconfiguration.** Operators set `--mesh-ice-servers` at boot; clients see the snapshot the first time they register on `/signal`. Existing `RTCPeerConnection` instances keep their config; the rebuilt `iceConfig` only affects future PCs. Acceptable for v1; a future session could close existing PCs on list-changed if operators ask.
+
+* **`urls` is `Vec<String>` on the wire even when one URL is configured.** WebRTC's spec allows a single string OR an array; normalizing to array on the wire keeps the JS-side cast simple (`msg.ice_servers as RTCIceServer[]`) and avoids a `OneOrMany<String>` helper. CLI parser still accepts only the array form per the JSON Schema; operators always pass arrays.
+
+* **STUN entries skip credential fields on the wire.** `username` and `credential` carry `#[serde(skip_serializing_if = "Option::is_none")]`. The `assign_parent_carries_ice_servers` test asserts `!json.contains("\"username\":null")` to lock the contract: a STUN-only entry produces `{"urls":["..."]}`, not `{"urls":["..."],"username":null,"credential":null}`. Pre-143 clients that strict-parse on Optional credential fields do not see a null where they expect absence.
+
+* **Real integration test, not unit test of the closure.** The closure that captures `config.mesh_ice_servers` and calls `.clone()` on every AssignParent could regress without a unit test catching it (e.g. someone refactors the closure and forgets the clone). The integration test drives a real WebSocket through the production admin router so the regression would be visible immediately.
+
+* **Live smoke verified the boot path.** Started lvqr with `--mesh-ice-servers '[...]'` locally; the binary booted cleanly and `/api/v1/mesh` answered the expected shape. The integration test covers the wire path from server to client.
+
+### Ground truth (session 143 close)
+
+* **Head (pre-push)**: `feat(mesh+signal+sdk)` + docs close (pending). Sessions 135-142 pushed (origin `8c28ca2`); session 143 local pending push.
+* **Tests**:
+  * Rust workspace default gate: **1030** passed / 0 failed / 3 ignored (1022 -> 1030; +3 new signal serde tests + 4 new CLI parse tests + 2 new integration tests = 9 net; the existing assign_parent_serialization test grew assertions in place rather than adding a new entry).
+  * `lvqr-signal --lib`: 18 passed (16 pre + 2 new: `assign_parent_carries_ice_servers`, `assign_parent_deserializes_pre_143_body_without_ice_servers`). Note: `assign_parent_serialization` grew assertions but is not a new test.
+  * `lvqr-signal --test ice_servers_e2e`: 2 passed (new file).
+  * `lvqr-cli --lib`: tests pass; new `mesh_ice_servers_cli_tests` module adds 4 cases.
+  * `bindings/python pytest`: **29** passed / 0 failed (UNCHANGED; no Python touched).
+  * `@lvqr/core` tsc: clean. Vitest case count unchanged at 11.
+  * `@lvqr/player` tsc: clean.
+* **CI gates locally clean**:
+  * `cargo fmt --all -- --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `tsc` clean on `@lvqr/core` + `@lvqr/player`.
+* **Workspace**: **29 crates**, unchanged.
+
+### Known limitations / documented v1 shape (after 143 close)
+
+* **No mid-session reconfiguration of `--mesh-ice-servers`.** Operators must restart lvqr to change the list; in-flight peers keep their stale `iceConfig` until their session reconnects. Closing existing PCs on list-changed is a v1.2 candidate.
+* **No short-lived TURN credentials.** The static user-pass pair lives on disk in `coturn.conf` and on the lvqr command line. coturn supports REST-API HMAC-derived ephemeral creds; LVQR does not yet implement the credential-refresh wire path, so static-only is the supported shape.
+* **No TLS-wrapped TURN (`turns:` URLs).** The recipe ships with `no-tls` in `coturn.conf`. Deployments that need TURN-over-TLS add the cert + key paths and remove the `no-tls` line; LVQR passes whatever URLs it sees in the JSON unchanged, so there is no server-side blocker.
+* **No `iceTransportPolicy: 'relay'` enforcement.** `MeshPeer` continues to use the default `'all'` policy; clients try host + reflexive candidates first and fall through to relay only when needed.
+* **No JS unit test of the `iceConfig` rebuild path.** A non-trivial WebSocket mock + RTC-stub harness would be needed; the integration test at the Rust layer + the existing Playwright happy-path coverage are the v1 confidence story.
+* **`deploy/turn/coturn.conf` is unverified in CI.** The runbook is documented; actual coturn boot is operator-side. A future session could add a docker-compose-based smoke test if operator feedback asks.
+* **All other session 142 + earlier known limitations unchanged.**
+
 
 ## Session 142 close (2026-04-24)
 
