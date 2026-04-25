@@ -3137,7 +3137,9 @@ name = "lvqr-auth"
 version = "0.4.1"
 dependencies = [
  "base64",
+ "dashmap",
  "jsonwebtoken",
+ "rand 0.8.5",
  "rcgen 0.13.2",
  "reqwest",
  "serde",

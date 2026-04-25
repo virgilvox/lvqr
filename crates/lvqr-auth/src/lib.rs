@@ -21,9 +21,11 @@
 
 mod error;
 pub mod extract;
+mod multi_key_provider;
 mod noop;
 mod provider;
 mod static_provider;
+mod stream_key_store;
 
 #[cfg(feature = "jwt")]
 mod jwt_provider;
@@ -35,9 +37,13 @@ mod jwks_provider;
 mod webhook_provider;
 
 pub use error::AuthError;
+pub use multi_key_provider::MultiKeyAuthProvider;
 pub use noop::NoopAuthProvider;
 pub use provider::{AuthContext, AuthDecision, AuthProvider, AuthScope, SharedAuth};
 pub use static_provider::{StaticAuthConfig, StaticAuthProvider};
+pub use stream_key_store::{
+    InMemoryStreamKeyStore, STREAM_KEY_TOKEN_PREFIX, SharedStreamKeyStore, StreamKey, StreamKeySpec, StreamKeyStore,
+};
 
 #[cfg(feature = "jwt")]
 pub use jwt_provider::{JwtAuthConfig, JwtAuthProvider, JwtClaims};

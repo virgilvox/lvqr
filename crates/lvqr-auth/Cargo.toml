@@ -31,6 +31,13 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+# Stream-key store (session 146): DashMap backs the InMemoryStreamKeyStore;
+# rand+base64 generate the typed-prefix token (`lvqr_sk_<32-byte CSPRNG>`)
+# and the operator-facing key id.
+dashmap = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+
 jsonwebtoken = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
@@ -40,8 +47,7 @@ url = { workspace = true, optional = true }
 # JWKS integration tests need a localhost HTTP mock server + a real key pair
 # for signing tokens + the async runtime for driving the provider's async new().
 # `base64` encodes the JWK `x` parameter from the rcgen-generated raw public
-# key bytes.
+# key bytes (workspace dep above already pulls it in for the stream-key store).
 wiremock = { workspace = true }
 rcgen = { workspace = true }
-base64 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
