@@ -584,6 +584,30 @@ async fn serve_from_args(
     // initial auth chain is built. This keeps the merge logic in
     // ONE place so both this CLI path and `lvqr_test_utils::TestServer`
     // (which calls `start()` directly) get identical behavior.
+    // Session 149: capture JWKS / webhook boot tunables alongside
+    // the auth seed so the reload pipeline can rebuild either
+    // provider against a new URL without losing the operator's
+    // chosen refresh interval / cache TTL / fetch timeout. `None`
+    // when the corresponding feature is off OR no boot URL was set.
+    #[cfg(feature = "jwks")]
+    let jwks_boot = args.jwks_url.clone().map(|url| lvqr_cli::JwksBootDefaults {
+        jwks_url: Some(url),
+        refresh_interval: std::time::Duration::from_secs(args.jwks_refresh_interval_seconds),
+        fetch_timeout: std::time::Duration::from_secs(10),
+    });
+    #[cfg(not(feature = "jwks"))]
+    let jwks_boot: Option<lvqr_cli::JwksBootDefaults> = None;
+    #[cfg(feature = "webhook")]
+    let webhook_boot = args.webhook_auth_url.clone().map(|url| lvqr_cli::WebhookBootDefaults {
+        webhook_url: Some(url),
+        allow_cache_ttl: std::time::Duration::from_secs(args.webhook_auth_cache_ttl_seconds),
+        deny_cache_ttl: std::time::Duration::from_secs(args.webhook_auth_deny_cache_ttl_seconds),
+        fetch_timeout: std::time::Duration::from_secs(args.webhook_auth_fetch_timeout_seconds),
+        cache_capacity: 4096,
+    });
+    #[cfg(not(feature = "webhook"))]
+    let webhook_boot: Option<lvqr_cli::WebhookBootDefaults> = None;
+
     let config_reload_seed = args.config.clone().map(|path| {
         tracing::info!(
             path = %path.display(),
@@ -592,6 +616,8 @@ async fn serve_from_args(
         lvqr_cli::ConfigReloadSeed {
             path,
             auth_boot_defaults,
+            jwks_boot: jwks_boot.clone(),
+            webhook_boot: webhook_boot.clone(),
         }
     });
 

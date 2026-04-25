@@ -1,14 +1,19 @@
 # Hot config reload
 
 `lvqr serve --config <path>` plus an admin route let operators
-rotate auth providers, mesh ICE servers, and the HMAC playback
-secret without bouncing the relay. SIGHUP (Unix) and `POST
-/api/v1/config-reload` (cross-platform) feed into the same reload
-pipeline.
+rotate auth providers, mesh ICE servers, the HMAC playback secret,
+JWKS endpoint URLs, and webhook auth URLs without bouncing the
+relay. SIGHUP (Unix) and `POST /api/v1/config-reload`
+(cross-platform) feed into the same reload pipeline.
 
 Session 147 shipped the auth-section reload (v1, auth-only).
-Session 148 closes the deferred-key gap by hot-reloading
-`mesh_ice_servers` and `hmac_playback_secret` alongside auth.
+Session 148 added `mesh_ice_servers` and `hmac_playback_secret`
+(v2). Session 149 closed the final deferred-key gap by adding
+`jwks_url` and `webhook_auth_url` (v3): the reload pipeline is now
+async so it can run `JwksAuthProvider::new` /
+`WebhookAuthProvider::new` constructors mid-process and atomically
+swap the resulting provider into the auth chain. Every key the
+file format defines is honored at runtime.
 
 ## Quick start
 
@@ -79,8 +84,8 @@ subscribe_token = "..."    # mirrors LVQR_SUBSCRIBE_TOKEN
 jwt_secret = "..."         # HS256 secret
 jwt_issuer = "..."         # expected `iss` claim
 jwt_audience = "..."       # expected `aud` claim
-jwks_url = "..."           # NOT hot-reloaded (boot-only)
-webhook_auth_url = "..."   # NOT hot-reloaded (boot-only)
+jwks_url = "..."           # JWKS endpoint URL; hot-reloads (session 149, requires --features jwks)
+webhook_auth_url = "..."   # decision-webhook URL; hot-reloads (session 149, requires --features webhook)
 
 # Mesh ICE servers. Hot-reloads (session 148).
 [[mesh_ice_servers]]
@@ -111,6 +116,32 @@ credential = "p"
   `?sig=...&exp=...`. Reload swaps the secret atomically; the next
   request loads the new value. URLs signed under the prior secret
   stop verifying (the documented intent of a secret rotation).
+* **`jwks_url`** (session 149, requires `--features jwks`) -- the
+  JWKS discovery endpoint URL. Reload's async pipeline calls
+  `JwksAuthProvider::new(...)` (which performs an initial HTTP
+  fetch of the new URL's JWK set) and atomically swaps the
+  resulting provider into the auth chain. The old provider's
+  `Drop` aborts its periodic refresh task; its key cache is
+  dropped wholesale (the new URL gets a fresh cache). Operators
+  rotating keys at the SAME URL rely on the existing periodic
+  refresh task; no reload required for that case.
+* **`webhook_auth_url`** (session 149, requires `--features
+  webhook`) -- the operator decision-webhook URL. Reload's async
+  pipeline calls `WebhookAuthProvider::new(...)` (URL-syntax
+  validation only; no probe of the endpoint) and swaps the
+  resulting provider in. The old provider's `Drop` aborts its
+  fetcher task; its decision cache is dropped wholesale.
+  Outstanding cached `Allow` decisions for the prior URL stop
+  applying.
+
+The `jwks_url` and `webhook_auth_url` rebuilds happen
+unconditionally on every reload when their URL is set
+(meaning each reload triggers one HTTP fetch for JWKS users,
+and one URL validation for webhook users). Operators who want
+to skip the rebuild on no-op reloads should use SIGHUP or admin
+POST sparingly; both providers' background tasks already keep
+the cache fresh on the operator's chosen `refresh_interval` /
+`allow_cache_ttl` cadence.
 
 ## Clear semantics
 
@@ -139,13 +170,12 @@ runtime state on the next reload:
 
 ## What is NOT hot-reloaded
 
-* **`jwks_url`, `webhook_auth_url`** -- their constructors are async
-  and cache HTTP state; rebuilding mid-process needs additional
-  plumbing that is its own session. Operators using these providers
-  retain their boot-time values across reloads. The reload route
-  does NOT emit a warning when these keys appear in the file (the
-  boot-time apply already wired them); a future session will close
-  this gap.
+* **Feature-disabled URLs** -- when the file names `jwks_url` but
+  `lvqr-cli` was built without `--features jwks`, the reload route
+  surfaces a `warnings` entry naming the file value plus the
+  feature flag the operator needs to rebuild with. Same shape for
+  `webhook_auth_url` without `--features webhook`. The reload still
+  succeeds; the auth chain falls through to static / JWT / Noop.
 * **Structural keys** -- port bindings, feature flags, record /
   archive directories, `mesh_enabled`, cluster topology. Reload
   never rebinds sockets or restarts subsystems. Operators changing
@@ -158,9 +188,16 @@ runtime state on the next reload:
 ```
 HotReloadAuthProvider
   -> MultiKeyAuthProvider (session 146; if --no-streamkeys is unset)
-       -> Static / Jwt (rebuilds from file on reload)
-       (or boot-time Jwks / Webhook -- not rebuilt)
+       -> JWKS (session 149; rebuilds on URL change, --features jwks)
+          OR Webhook (session 149; rebuilds on URL change, --features webhook)
+          OR Static / Jwt (rebuilds from file on reload)
+          OR Noop (no auth configured)
 ```
+
+Precedence within the rebuild path: JWKS > Webhook > JWT > Static
+> Noop. The file cannot set both `jwks_url` and `webhook_auth_url`
+in the same `[auth]` section; the reload route returns an error
+naming both keys when this combination is detected.
 
 The wrap is purely additive. When `--config` is unset the wrapper
 is still in place but reload is a no-op (SIGHUP listener installs
@@ -181,6 +218,13 @@ HMAC swaps now that they share the `arc_swap::ArcSwap` pattern.
 * **Provider rebuild rejects**: e.g. JWT init fails because the
   secret rejected by `jsonwebtoken`. Same shape as malformed TOML --
   500, prior state intact.
+* **JWKS initial fetch fails** (session 149): the reload pipeline
+  awaits the new provider's HTTP fetch of the JWK set with the
+  configured `fetch_timeout` (default 10 s). If the fetch errors
+  (DNS resolution, TCP timeout, malformed response), the reload
+  returns 500 and the prior auth chain stays live. Operators
+  should monitor the `lvqr_config_reload_failures_total` metric +
+  the route's response body for the specific failure reason.
 
 ## Observability
 
@@ -196,15 +240,17 @@ metadata for dashboards + scripted polling. The `last_reload_kind`
 field distinguishes SIGHUP-driven reloads from admin-API-driven
 reloads in audit logs.
 
-## Anti-scope (session 148)
+## Anti-scope (sessions 148 + 149)
 
 * No file watcher (operator must explicitly SIGHUP or POST).
-* No partial reload within a category -- the `[auth]` section, the
-  `mesh_ice_servers` list, and the `hmac_playback_secret` each
-  reload atomically. A failure during build leaves the prior state
-  in place.
-* No `jwks_url` / `webhook_auth_url` reload (deferred to a future
-  session because of async-builder + HTTP-cache complexity).
+* No partial reload within a category -- each of the five hot-
+  reloadable categories (`[auth]`, `mesh_ice_servers`,
+  `hmac_playback_secret`, `jwks_url`, `webhook_auth_url`) reloads
+  atomically. A failure during build leaves all prior state in
+  place.
+* No JWKS / webhook cache preservation across URL change. Rotating
+  the URL drops the old key cache / decision cache wholesale; new
+  cache builds from scratch.
 * No federation / cluster topology reload.
 * No version bump; workspace stays at 0.4.1, SDK packages stay at
   0.3.2.

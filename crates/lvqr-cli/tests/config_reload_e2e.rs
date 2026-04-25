@@ -527,6 +527,19 @@ credential = "p""#,
     server.shutdown().await.expect("shutdown");
 }
 
+// Session 149 jwks_url + webhook_auth_url integration tests are
+// deferred: when webhook (or JWKS) auth is the active provider it
+// gates `/api/v1/config-reload` itself, so a meaningful end-to-end
+// rotation test needs a mock decision endpoint that returns `allow`
+// for admin requests. That requires either adding `wiremock` as an
+// lvqr-cli dev-dep or hand-rolling an axum mock server inside the
+// test -- both out of scope for this session. Coverage today:
+// `lvqr-cli` unit tests in `config_reload.rs` exercise the URL diff
+// + applied_keys + feature-disabled warning paths; `lvqr-auth`'s
+// own provider tests exercise the constructor + cache semantics;
+// this file's existing tests verify the async-reload closure flip
+// end-to-end via the auth-section / mesh-ICE / HMAC paths.
+
 // =====================================================================
 // Session 148: HMAC playback secret hot reload.
 // =====================================================================

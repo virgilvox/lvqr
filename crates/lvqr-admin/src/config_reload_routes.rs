@@ -20,6 +20,8 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 /// Wire shape for `GET /api/v1/config-reload` and the success body
@@ -40,15 +42,16 @@ pub struct ConfigReloadStatus {
     /// reload has occurred yet.
     #[serde(default)]
     pub last_reload_kind: Option<String>,
-    /// Keys the most recent reload effectively re-applied.
-    /// Currently always `["auth"]` on success; future increments
-    /// add `mesh_ice` and `hmac_secret`.
+    /// Keys the most recent reload effectively re-applied. Always
+    /// includes `"auth"`; sessions 148 + 149 added `"mesh_ice"`,
+    /// `"hmac_secret"`, `"jwks"`, `"webhook"` (each present only
+    /// when its underlying value diffs against the prior snapshot).
     #[serde(default)]
     pub applied_keys: Vec<String>,
-    /// Operator-facing warnings -- e.g. structural-key diffs that
-    /// require a server restart, or deferred-reload sections
-    /// (`jwks_url`, `webhook_auth_url`, `mesh_ice_servers`,
-    /// `hmac_playback_secret`).
+    /// Operator-facing warnings -- e.g. file naming a hot-reload
+    /// key whose feature was disabled at build time
+    /// (`jwks_url` without `--features jwks`,
+    /// `webhook_auth_url` without `--features webhook`).
     #[serde(default)]
     pub warnings: Vec<String>,
 }
@@ -58,9 +61,14 @@ pub struct ConfigReloadStatus {
 pub type ConfigReloadStatusFn = Arc<dyn Fn() -> ConfigReloadStatus + Send + Sync>;
 
 /// Closure shape for the `POST` handler. lvqr-cli installs a closure
-/// that calls `ConfigReloadHandle::reload("admin_post")`. Returns
-/// the new status on success or a string error on failure.
-pub type ConfigReloadTriggerFn = Arc<dyn Fn() -> Result<ConfigReloadStatus, String> + Send + Sync>;
+/// that calls `ConfigReloadHandle::reload("admin_post").await`. The
+/// closure is sync but returns a boxed future so the route handler
+/// can `.await` the actual reload work; session 149 widened the type
+/// from sync `Fn() -> Result<...>` so the JWKS / webhook async
+/// constructors can run inside the reload pipeline without blocking
+/// the runtime.
+pub type ConfigReloadFuture = Pin<Box<dyn Future<Output = Result<ConfigReloadStatus, String>> + Send>>;
+pub type ConfigReloadTriggerFn = Arc<dyn Fn() -> ConfigReloadFuture + Send + Sync>;
 
 /// `GET /api/v1/config-reload`. Always returns 200; the response
 /// distinguishes "no config-reload wired" (no path, no last
@@ -88,7 +96,7 @@ pub async fn trigger_config_reload(State(state): State<AdminState>) -> Result<Re
         )
             .into_response());
     };
-    match trigger() {
+    match trigger().await {
         Ok(status) => Ok((StatusCode::OK, Json(status)).into_response()),
         Err(reason) => Err(AdminError::Internal(format!("config reload failed: {reason}"))),
     }
@@ -116,15 +124,18 @@ mod tests {
                 warnings: Vec::new(),
             }))
             .with_config_reload_trigger(Arc::new(move || {
-                let mut n = calls_for_trigger.lock().unwrap();
-                *n += 1;
-                Ok(ConfigReloadStatus {
-                    config_path: Some("/etc/lvqr.toml".into()),
-                    last_reload_at_ms: Some(*n as u64 * 1000),
-                    last_reload_kind: Some("admin_post".into()),
-                    applied_keys: vec!["auth".into()],
-                    warnings: Vec::new(),
-                })
+                let calls = calls_for_trigger.clone();
+                Box::pin(async move {
+                    let mut n = calls.lock().unwrap();
+                    *n += 1;
+                    Ok(ConfigReloadStatus {
+                        config_path: Some("/etc/lvqr.toml".into()),
+                        last_reload_at_ms: Some(*n as u64 * 1000),
+                        last_reload_kind: Some("admin_post".into()),
+                        applied_keys: vec!["auth".into()],
+                        warnings: Vec::new(),
+                    })
+                }) as ConfigReloadFuture
             }));
         (state, calls)
     }
@@ -210,7 +221,9 @@ mod tests {
     #[tokio::test]
     async fn post_returns_500_when_trigger_returns_err() {
         let state = AdminState::new(lvqr_core::RelayStats::default, Vec::<crate::StreamInfo>::new)
-            .with_config_reload_trigger(Arc::new(|| Err("forced reload failure for test".into())));
+            .with_config_reload_trigger(Arc::new(|| {
+                Box::pin(async move { Err("forced reload failure for test".into()) }) as ConfigReloadFuture
+            }));
         let app = build_router(state);
         let resp = app
             .oneshot(

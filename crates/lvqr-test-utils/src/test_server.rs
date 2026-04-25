@@ -401,6 +401,8 @@ impl TestServer {
             config_reload: config.config_file.map(|path| lvqr_cli::ConfigReloadSeed {
                 path,
                 auth_boot_defaults: lvqr_cli::AuthBootDefaults::default(),
+                jwks_boot: None,
+                webhook_boot: None,
             }),
         };
         let handle = start(serve_config).await?;

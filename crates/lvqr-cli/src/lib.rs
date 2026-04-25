@@ -26,7 +26,9 @@ mod ws;
 
 pub use config::ConfigReloadSeed;
 pub use config_file::{AuthSection, ServeConfigFile};
-pub use config_reload::{AuthBootDefaults, ConfigReloadHandle, SharedReloadHandle};
+pub use config_reload::{
+    AuthBootDefaults, ConfigReloadHandle, JwksBootDefaults, SharedReloadHandle, WebhookBootDefaults,
+};
 pub use lvqr_admin::ConfigReloadStatus;
 
 pub use archive::sign_playback_url;
@@ -171,6 +173,8 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             let handle = Arc::new(config_reload::ConfigReloadHandle::new(
                 seed.path.clone(),
                 seed.auth_boot_defaults,
+                seed.jwks_boot,
+                seed.webhook_boot,
                 streamkey_store.clone(),
                 config.streamkeys_enabled,
                 hot_provider.clone(),
@@ -180,7 +184,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             // Apply the file at boot so the merge semantics (file
             // overrides CLI defaults for auth-section fields) take
             // effect uniformly across CLI + TestServer.
-            match handle.reload("boot") {
+            match handle.reload("boot").await {
                 Ok(status) => tracing::info!(warnings = status.warnings.len(), "config reload (boot) succeeded"),
                 Err(e) => return Err(anyhow::anyhow!("config reload at boot failed: {e}")),
             }
@@ -208,7 +212,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                             _ = signal_shutdown.cancelled() => break,
                             sig = sighup.recv() => {
                                 if sig.is_none() { break; }
-                                match handle_for_signal.reload("sighup") {
+                                match handle_for_signal.reload("sighup").await {
                                     Ok(status) => tracing::info!(
                                         warnings = status.warnings.len(),
                                         "config reload (SIGHUP) succeeded"
@@ -912,7 +916,9 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             admin_state
                 .with_config_reload_status(Arc::new(move || status_handle.status()))
                 .with_config_reload_trigger(Arc::new(move || {
-                    trigger_handle.reload("admin_post").map_err(|e| format!("{e:#}"))
+                    let h = trigger_handle.clone();
+                    Box::pin(async move { h.reload("admin_post").await.map_err(|e| format!("{e:#}")) })
+                        as lvqr_admin::ConfigReloadFuture
                 }))
         }
         None => admin_state,

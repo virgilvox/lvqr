@@ -1,8 +1,239 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 148 (2026-04-25) shipped hot config reload v2 (mesh ICE + HMAC secret)** -- `mesh_ice_servers` and `hmac_playback_secret` join the hot-reloadable surface alongside auth, swapped atomically via `arc_swap::ArcSwap` handles threaded through the `/signal` callback (per-Register `load_full`) and the live HLS / DASH / DVR `/playback/*` middlewares (per-request `load_full`). The session 147 deferred-warning emissions for these two keys drop; `applied_keys` on the route response grows entries (`"mesh_ice"` / `"hmac_secret"`) only when the new value diffs from the prior snapshot. `jwks_url` / `webhook_auth_url` reload remain deferred (async-builder + HTTP-cache complexity, separate session). **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Default-gate tests after 148: Rust workspace **1107** / 0 / 0 (was 1099 post-147; +8 net: 8 new lvqr-cli unit covering ice + hmac + applied_keys diff paths + clear semantics + no-deferred-warnings regression, 2 new RTMP-shape integration cases in `config_reload_e2e.rs` mesh ICE + HMAC rotation; the workshop-148 step rewrote one prior unit test from warnings-shape to applied_keys-shape, net unit delta = 8). Python pytest **38** unchanged. Vitest unchanged at 13. Admin surface unchanged at **12 route trees**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API**; **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates.
+## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 149 (2026-04-25) shipped hot config reload v3 (JWKS + webhook URL rotation)** -- `ConfigReloadHandle::reload` flipped to `async`; the reload pipeline now calls `JwksAuthProvider::new` and `WebhookAuthProvider::new` asynchronously and swaps the resulting provider into the `HotReloadAuthProvider` chain. Drop-old-on-swap leverages each provider's existing `Drop` to abort their spawned refresh / fetcher task. `applied_keys` grows entries (`"jwks"` / `"webhook"`) on URL diff. Feature-disabled builds emit a warning when the file names a feature-gated URL. `jwks_url` and `webhook_auth_url` are mutually exclusive within the same `[auth]` section (the route returns an error). The admin route closure shape widened from sync `Fn -> Result<...>` to async-flavored `Fn -> BoxFuture<Result<...>>` (internal-API change; SDK wire shape unchanged). With session 149, hot config reload is feature-complete -- every key the file format defines is honored at runtime. **Session 148 (2026-04-25) shipped hot config reload v2 (mesh ICE + HMAC secret)** -- `mesh_ice_servers` and `hmac_playback_secret` join the hot-reloadable surface alongside auth, swapped atomically via `arc_swap::ArcSwap` handles threaded through the `/signal` callback and the live HLS / DASH / DVR `/playback/*` middlewares. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Default-gate tests after 148: Rust workspace **1107** / 0 / 0 (was 1099 post-147; +8 net: 8 new lvqr-cli unit covering ice + hmac + applied_keys diff paths + clear semantics + no-deferred-warnings regression, 2 new RTMP-shape integration cases in `config_reload_e2e.rs` mesh ICE + HMAC rotation; the workshop-148 step rewrote one prior unit test from warnings-shape to applied_keys-shape, net unit delta = 8). Python pytest **38** unchanged. Vitest unchanged at 13. Admin surface unchanged at **12 route trees**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API**; **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates.
 
-**Last Updated**: 2026-04-25 (session 148 close).
+**Last Updated**: 2026-04-25 (session 149 close).
+
+## Session 149 close (2026-04-25)
+
+**Shipped**: Hot config reload v3 -- `jwks_url` and
+`webhook_auth_url` join the hot-reloadable surface alongside the
+auth section / mesh ICE / HMAC secret. The reload pipeline became
+`async` so it can call the JWKS / webhook providers' async
+constructors mid-process and atomically swap the resulting provider
+into the `HotReloadAuthProvider` chain. The old provider's `Drop`
+aborts its spawned refresh / fetcher task; its key cache /
+decision cache is dropped wholesale. `applied_keys` grows entries
+(`"jwks"` / `"webhook"`) only when the URL diffs against the prior
+snapshot. After session 149, hot config reload is feature-complete:
+every key the file format defines is honored at runtime.
+
+### Deliverables
+
+1. **`crates/lvqr-admin/src/config_reload_routes.rs`**
+   (closure-type widening): `ConfigReloadTriggerFn` flipped from
+   sync `Arc<dyn Fn() -> Result<ConfigReloadStatus, String>>` to
+   async-flavored `Arc<dyn Fn() -> ConfigReloadFuture>` where
+   `ConfigReloadFuture = Pin<Box<dyn Future<Output = Result<...>>
+   + Send>>`. The route handler `.await`s the trigger. Test
+   closures updated to return `Box::pin(async move { ... })`. Wire
+   shape on `ConfigReloadStatus` unchanged. New public type
+   `ConfigReloadFuture` re-exported from `lvqr-admin`'s `lib.rs`.
+
+2. **`crates/lvqr-cli/src/config_reload.rs`** (extended):
+   * Two new public types: `JwksBootDefaults` + `WebhookBootDefaults`
+     capture provider tunables (refresh interval, fetch timeout,
+     cache TTLs, capacity) at boot so the reload pipeline can rebuild
+     a fresh provider on URL change without losing the operator's
+     chosen values.
+   * `ConfigReloadHandle::new` widened with two new params (`jwks_boot`
+     + `webhook_boot`, both `Option<...>`); fields stored alongside
+     `boot_defaults`.
+   * `ReloadState` extended with `prior_jwks_url` /
+     `prior_webhook_url` (Option<String>) for diff detection.
+   * `reload(&self, kind)` flipped to `async fn`. New helper
+     `build_inner_auth_from_effective` (async) layers JWKS / webhook
+     ahead of the existing sync `build_static_auth_from_effective`.
+     The cascade picks JWKS > webhook > JWT-HS256 > static > Noop.
+     The file's `jwks_url` and `webhook_auth_url` cannot both be set
+     in the same `[auth]` (returns `Err` if combined).
+   * Diff: `jwks_url` / `webhook_auth_url` change pushes
+     `"jwks"` / `"webhook"` into `applied_keys`. Feature-disabled
+     URL pushes a warning into the route's `warnings` field.
+   * Reload always rebuilds the JWKS / webhook provider when its URL
+     is set (one HTTP fetch per reload for JWKS users; URL validation
+     only for webhook users). Operators rotating JWKS keys at the
+     same URL rely on the existing periodic refresh task -- no
+     reload needed for that case.
+
+3. **`crates/lvqr-cli/src/config.rs`**: `ConfigReloadSeed`
+   extended with `jwks_boot` + `webhook_boot` Optional fields.
+
+4. **`crates/lvqr-cli/src/main.rs`**: `serve_from_args` captures
+   `JwksBootDefaults` / `WebhookBootDefaults` from CLI args
+   (gated on `#[cfg(feature = "jwks")]` / `#[cfg(feature =
+   "webhook")]`) and threads them into `ConfigReloadSeed`.
+
+5. **`crates/lvqr-cli/src/lib.rs`**:
+   * Boot-time `handle.reload("boot").await`.
+   * SIGHUP listener `handle_for_signal.reload("sighup").await`.
+   * Admin route closure flipped to return `Box::pin(async move
+     { h.reload("admin_post").await.map_err(...) }) as
+     ConfigReloadFuture`.
+   * `pub use` for the new types: `JwksBootDefaults`,
+     `WebhookBootDefaults`.
+
+6. **`crates/lvqr-test-utils/src/test_server.rs`**:
+   `ConfigReloadSeed` construction passes `jwks_boot: None,
+   webhook_boot: None` (TestServer paths use
+   `with_config_file(path)` only and rely on the file for these
+   keys).
+
+7. **Tests**:
+   * `crates/lvqr-cli/src/config_reload.rs` unit tests:
+     - All existing tests flipped to `#[tokio::test] async fn` +
+       `.await` on every `handle.reload(...)` call.
+     - +4 new unit tests:
+       `jwks_and_webhook_in_same_file_errors` (always-runs),
+       `jwks_url_emits_warning_when_feature_disabled` (default
+       features only), `webhook_url_emits_warning_when_feature_
+       disabled` (default features only),
+       `applied_keys_omits_jwks_when_url_unchanged` (default
+       features only -- the with-jwks path is exercised by
+       lvqr-auth's wiremock unit tests).
+   * Workspace test totals (default features): 1107 -> 1111
+     (+4 net).
+   * Feature-gated tests: `cargo test -p lvqr-cli --features jwks`
+     and `--features webhook` both green (with the corresponding
+     feature-disabled-only tests skipped via `#[cfg(not(...))]`).
+   * Integration tests for actual JWKS / webhook URL rotation
+     deferred: when those providers are the active auth chain
+     they gate `/api/v1/config-reload` itself, so a meaningful
+     end-to-end rotation test needs a mock decision endpoint
+     returning `allow` for admin requests. That requires either
+     adding `wiremock` as an `lvqr-cli` dev-dep or hand-rolling
+     an axum mock server inside the test -- both out of scope for
+     session 149. Coverage today: lvqr-cli unit tests verify the
+     URL diff + applied_keys + feature-disabled warning paths;
+     lvqr-auth's own provider tests exercise the constructor +
+     cache semantics; the existing `config_reload_e2e.rs`
+     integration tests verify the async-reload closure flip end-
+     to-end via the auth-section / mesh-ICE / HMAC paths.
+
+8. **Docs**: `docs/config-reload.md` rewritten -- jwks/webhook
+   move from "What is NOT hot-reloaded" to "What hot-reloads".
+   New "Failure modes" entry for JWKS initial fetch failure. New
+   "What is NOT hot-reloaded" entry for feature-disabled URL +
+   the warning-on-diff shape. Composition-order diagram updated
+   to show JWKS / webhook in the rebuild path. Anti-scope
+   updated: hot config reload is now feature-complete.
+
+9. **README**: `### Auth` bullet list gains a "Hot config reload"
+   entry. Next-up #1 fully strikethrough'd (hot config reload is
+   shipped end-to-end). "Recently shipped" gains a session 149
+   entry. The `[x] Hot config reload` checkbox sub-bullet adds a
+   session-149 line.
+
+### Key 149 design decisions baked in
+
+* **Async `reload` is the right abstraction.** Inserting an async
+  builder into the sync reload pipeline would have required a
+  `tokio::runtime::Handle::block_on` or a `LocalPool` punt that
+  cleanly couples the reload thread to the runtime. Instead the
+  whole pipeline went `async`; the boot path (`pub async fn
+  start()`) and SIGHUP listener (`tokio::spawn(async move
+  { ... })`) and admin route handler (`async fn`) all already
+  awaited their work. The route closure type flipped from sync
+  `Fn -> Result<...>` to async-flavored `Fn -> BoxFuture` --
+  internal-API change only.
+
+* **Drop-old-on-swap leverages existing `Drop` semantics.** Both
+  `JwksAuthProvider` and `WebhookAuthProvider` already implement
+  `Drop` to `abort()` their spawned tasks on the operator's
+  behalf (so a server bounce cleans up cleanly). On reload, the
+  swap drops the old `Arc<...>` to zero, `Drop::drop` runs, the
+  task aborts. No new shutdown protocol needed.
+
+* **URL is the diff trigger; tunables ride along.** `applied_keys`
+  pushes `"jwks"` / `"webhook"` only when the effective URL
+  differs from the prior snapshot. Rotating refresh interval or
+  cache TTLs without changing the URL does NOT re-trigger
+  rebuild. Documented as the rebuild semantic.
+
+* **Always rebuild on every reload (when URL is set + feature on).**
+  Even when the URL didn't change, the reload pipeline re-runs
+  `JwksAuthProvider::new` / `WebhookAuthProvider::new`. Cost:
+  one HTTP fetch per reload for JWKS users; URL validation only
+  for webhook users. The simplification (no skip-when-unchanged
+  branch) trades one HTTP fetch on no-op reload for clearer
+  always-fresh semantics. Operators rotating JWKS keys at the
+  same URL rely on the existing periodic refresh -- they don't
+  need to reload for key rotation.
+
+* **JWKS+webhook combination errors at reload.** Mirror the
+  boot-time `check_auth_flag_combinations` rejection: two
+  decision strategies cannot coexist. The reload route returns
+  `Err` if the file names both URLs in the same `[auth]` section;
+  the prior chain stays live.
+
+* **Feature-disabled URLs warn, don't error.** When the file
+  names `jwks_url` and `lvqr-cli` was built without `--features
+  jwks`, the reload returns `Ok(...)` with a `warnings` entry
+  naming the feature flag the operator needs to rebuild with.
+  This mirrors session 147's deferred-key warning shape (now
+  repurposed for the feature-disabled case). The auth chain
+  falls through to static / JWT / Noop.
+
+### Ground truth (session 149 close)
+
+* **Source change scope**: 8 files substantively edited:
+  * `crates/lvqr-admin/src/config_reload_routes.rs` (closure type
+    flip + handler `.await`).
+  * `crates/lvqr-admin/src/lib.rs` (`pub use` for `ConfigReloadFuture`).
+  * `crates/lvqr-cli/src/config_reload.rs` (~150 line additions:
+    swap types, async reload, build_inner_auth_from_effective,
+    diff logic, +5 unit tests, all existing tests flipped to async).
+  * `crates/lvqr-cli/src/config.rs` (`ConfigReloadSeed`
+    extension).
+  * `crates/lvqr-cli/src/main.rs` (boot-time defaults capture).
+  * `crates/lvqr-cli/src/lib.rs` (boot/SIGHUP `.await` + admin
+    closure flip + `pub use` extension).
+  * `crates/lvqr-test-utils/src/test_server.rs` (seed
+    construction with `None`s for jwks/webhook).
+  * `docs/config-reload.md`, `README.md`,
+    `tracking/HANDOFF.md`.
+* **Tests** verified at session close:
+  - `cargo test -p lvqr-cli --lib`: 44 passed (was 40 post-148;
+    +4 net, with 1 feature-disabled-gated test that runs only on
+    default features).
+  - `cargo test -p lvqr-cli --features jwks --lib`: 42 passed
+    (`jwks_url_emits_warning_when_feature_disabled` and
+    `applied_keys_omits_jwks_when_url_unchanged` properly gated
+    out via `#[cfg(not(feature = "jwks"))]`).
+  - `cargo test -p lvqr-cli --features webhook --lib`: 43 passed.
+  - `cargo test -p lvqr-cli --test config_reload_e2e`: 5 passed
+    (unchanged; existing async-flip integration coverage stable).
+  - `cargo test -p lvqr-admin --lib`: 44 passed.
+  - `cargo test --workspace --lib --bins --tests`: 1111 / 0 / 0
+    (was 1107 post-148; +4 net).
+* **CI gates**: `cargo fmt --all -- --check` clean;
+  `cargo clippy --workspace --all-targets -- -D warnings` clean;
+  `cargo clippy --workspace --all-targets --features jwks,webhook
+  -- -D warnings` clean.
+* **Workspace version**: `0.4.1` unchanged. No publish.
+* **Admin surface**: unchanged at 12 route trees (the wire shape
+  on `/api/v1/config-reload` is unchanged; `applied_keys` simply
+  grows entries).
+* **SDK packages**: unchanged at 0.3.2 (the array-of-strings shape
+  for `applied_keys` already accepts the new entries on both TS +
+  Python clients).
+
+### Known limitations after 149
+
+* **Structural keys still bounce-required.** Port bindings,
+  feature flags, record / archive directories, `mesh_enabled`,
+  cluster topology -- none of these are in the file format yet,
+  and reload never rebinds sockets. Operators changing these
+  keys still bounce the relay.
+* **No file watcher.** Operator must explicitly SIGHUP or POST.
+* **No JWKS / webhook integration test for actual URL rotation.**
+  When those providers are the active auth chain, they gate
+  `/api/v1/config-reload` itself; a meaningful rotation test
+  needs a mock decision endpoint returning `allow` for admin
+  requests. Adding `wiremock` as an `lvqr-cli` dev-dep would
+  enable such tests; deferred to a future increment when an
+  operator-driven need surfaces. The unit tests + lvqr-auth's
+  own provider tests cover the construction + diff semantics.
 
 ## Session 148 close (2026-04-25)
 

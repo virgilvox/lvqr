@@ -111,17 +111,19 @@ in-process AI agents, cross-cluster federation, peer mesh).
   so a misconfigured store cannot lock the operator out. Default
   on; opt out with `--no-streamkeys`.
   See [`docs/auth.md#stream-key-crud-admin-api`](docs/auth.md#stream-key-crud-admin-api).
-- **Hot config reload** (sessions 147 + 148):
+- **Hot config reload** (sessions 147 + 148 + 149):
   `lvqr serve --config <path.toml>` plus SIGHUP and
-  `POST /api/v1/config-reload` rotate the auth chain
-  (Static / HS256 JWT), mesh ICE servers, and HMAC playback
-  secret atomically without restarting the relay. The swap
-  uses `arc_swap::ArcSwap` handles with single-digit-ns reads;
-  in-flight requests finish against the prior snapshot. Stream-
-  key store handles are preserved across reloads. `jwks_url` /
-  `webhook_auth_url` reload deferred (async-builder + HTTP-cache
-  complexity, future session). See
-  [`docs/config-reload.md`](docs/config-reload.md).
+  `POST /api/v1/config-reload` rotate the full auth chain
+  (Static / HS256 JWT / JWKS / webhook), mesh ICE servers, and
+  HMAC playback secret atomically without restarting the relay.
+  The swap uses `arc_swap::ArcSwap` handles with single-digit-ns
+  reads; in-flight requests finish against the prior snapshot.
+  Stream-key store handles are preserved across reloads. The
+  reload pipeline is async (session 149) so it can call the JWKS
+  /webhook providers' async constructors mid-process and drop the
+  old provider (whose `Drop` aborts its background refresh /
+  fetcher task). Every key the file format defines is honored at
+  runtime. See [`docs/config-reload.md`](docs/config-reload.md).
 - **One token, every ingest.** The same JWT admits a publisher
   across RTMP (stream key IS the JWT), WHIP
   (`Authorization: Bearer`), SRT (`streamid=m=publish,r=<broadcast>,t=<jwt>`),
@@ -324,18 +326,14 @@ items are smaller, closer to shippable, and close gaps explicitly
 named in Known v0.4.0 limitations.
 
 Stream-key CRUD admin API shipped in session 146; hot config
-reload (auth-only v1) shipped in session 147; mesh ICE +
-HMAC-secret reload (v2) shipped in session 148. The remaining
-ranking:
+reload v1 (auth-only) shipped in session 147; v2 (mesh ICE +
+HMAC secret) shipped in session 148; v3 (JWKS + webhook URL
+rotation, async reload pipeline) shipped in session 149. Hot
+config reload is now feature-complete -- every key the file
+format defines is honored at runtime. The remaining ranking:
 
-1. ~~**Hot config reload.**~~ Auth-only v1 shipped in session 147;
-   v2 (mesh ICE servers + HMAC playback secret) shipped in session
-   148 (`lvqr serve --config <path.toml>` + SIGHUP +
-   `POST /api/v1/config-reload` swap the auth chain, mesh ICE list,
-   and HMAC secret atomically via `arc_swap::ArcSwap` handles).
-   `jwks_url` / `webhook_auth_url` reload remain deferred (their
-   constructors are async + cache HTTP state). See
-   [`docs/config-reload.md`](docs/config-reload.md).
+1. ~~**Hot config reload.**~~ v1 / v2 / v3 shipped across
+   sessions 147 + 148 + 149.
 2. **SCTE-35 passthrough.** WebVTT captions already ship via
    the WASM agent path (session 96); SCTE-35 ad-marker events
    would land on the same observer surface.
@@ -357,6 +355,21 @@ ranking:
 
 #### Recently shipped (compact reference)
 
+* **Hot config reload v3: JWKS + webhook URL rotation** (session 149)
+  -- `ConfigReloadHandle::reload` flips to `async` so it can call
+  `JwksAuthProvider::new` / `WebhookAuthProvider::new`
+  asynchronously inside the reload pipeline; the resulting provider
+  is atomically swapped into the `HotReloadAuthProvider` chain. The
+  old provider's `Drop` aborts its background refresh / fetcher
+  task. `applied_keys` grows entries `"jwks"` / `"webhook"` when
+  their URL diffs against the prior snapshot. Feature-disabled
+  builds emit a warning when the file names a feature-gated URL.
+  `jwks_url` and `webhook_auth_url` are mutually exclusive in the
+  same `[auth]` section (the route returns an error). The route
+  closure shape widened from sync `Fn -> Result<...>` to async-
+  flavored `Fn -> BoxFuture<Result<...>>` (internal-API change; SDK
+  wire shape unchanged). See
+  [`docs/config-reload.md`](docs/config-reload.md).
 * **Hot config reload v2: mesh ICE + HMAC secret** (session 148)
   -- `mesh_ice_servers` and `hmac_playback_secret` join the
   hot-reloadable surface. The `/signal` callback `load_full`s the
@@ -622,6 +635,11 @@ test.
     session 148 (the deferred-warning emissions session 147 added
     for those keys drop; `applied_keys` grows entries when they
     reload effectively).
+  - JWKS + webhook URL rotation shipped in session 149 (the reload
+    pipeline became async; provider rebuild + drop-old-on-swap
+    leverages each provider's existing `Drop`-aborts-spawned-task
+    semantics). Hot config reload is feature-complete: every key
+    the file format defines is honored at runtime.
   See [`docs/config-reload.md`](docs/config-reload.md).
 - [ ] **Dedicated DVR scrub web UI.**
 - [ ] **SCTE-35 passthrough.** (WebVTT captions already ship via

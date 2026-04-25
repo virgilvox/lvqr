@@ -315,11 +315,23 @@ pub struct ServeConfig {
 /// composition root can stand up a [`crate::ConfigReloadHandle`].
 /// Owns the path to the `--config` file plus the snapshot of CLI
 /// auth args at boot (which serve as defaults the file's
-/// `[auth]` section overrides).
+/// `[auth]` section overrides). Session 149 added
+/// `jwks_boot` + `webhook_boot` so the reload pipeline can rebuild
+/// either provider against a new URL without losing operator-
+/// configured tunables (refresh interval, fetch timeout, cache
+/// TTLs, capacity).
 #[derive(Debug, Clone)]
 pub struct ConfigReloadSeed {
     pub path: PathBuf,
     pub auth_boot_defaults: AuthBootDefaults,
+    /// Session 149: JWKS provider boot tunables. `None` when
+    /// `--features jwks` is off OR when no `--jwks-url` was set
+    /// at boot.
+    pub jwks_boot: Option<crate::config_reload::JwksBootDefaults>,
+    /// Session 149: webhook provider boot tunables. `None` when
+    /// `--features webhook` is off OR when no `--webhook-auth-url`
+    /// was set at boot.
+    pub webhook_boot: Option<crate::config_reload::WebhookBootDefaults>,
 }
 
 impl ServeConfig {
