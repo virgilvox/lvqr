@@ -262,7 +262,7 @@ full model, ops recipes, and tuning knobs.
 
 | Language | Install | Version | Description |
 |---|---|---|---|
-| Rust | `cargo add lvqr-core` | 0.4.0 (crates.io) | Shared types, `EventBus`, admin client |
+| Rust | `cargo add lvqr-core` | 0.4.1 (crates.io) | Shared types, `EventBus`, admin client |
 | JavaScript | `npm i @lvqr/core` | 0.3.2 (npm) | MoQ-Lite subscriber over WebTransport, WebSocket fMP4 fallback, admin client (9/9 routes), `MeshPeer` WebRTC DataChannel relay with `pushFrame`, `onChildOpen`, `parentPeerId`, `forwardedFrameCount`, and `MeshConfig.capacity?: number` (per-peer relay capacity advertisement, session 144). Mesh data plane fully implemented as of session 144. |
 | JavaScript | `npm i @lvqr/player` | 0.3.2 (npm) | Drop-in `<lvqr-player>` web component with MSE fallback |
 | Python | `pip install lvqr` | 0.3.2 (PyPI) | Admin API client (9/9 routes), `MeshPeerStats.capacity` per-peer field (session 144), `bearer_token` kwarg, 16 dataclasses |
@@ -363,7 +363,7 @@ The list below groups the same remaining work by logical area.
 ### Client SDKs (shipped; completion work pending)
 JavaScript (`@lvqr/core`, `@lvqr/player` at 0.3.2 on npm), Python
 (`lvqr` at 0.3.2 on PyPI, admin client only), and Rust
-(`lvqr-core` at 0.4.0 on crates.io) already ship. Remaining work:
+(`lvqr-core` at 0.4.1 on crates.io) already ship. Remaining work:
 - [x] ~~**Expand `@lvqr/core` admin client** from 3 of 9
   `/api/v1/*` routes to all 9.~~ Shipped in session 122:
   `LvqrAdminClient` now exposes `mesh()`, `slo()`,
