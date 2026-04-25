@@ -128,6 +128,18 @@ export class MeshPeer {
     return this.role;
   }
 
+  /**
+   * The peer_id of the assigned parent, or `null` for Root peers
+   * that connect directly to the origin server. Driven by the
+   * server-pushed `AssignParent` message; reads `null` until the
+   * first assignment lands. Session 142 -- exposed as a getter so
+   * deterministic chain-formation waits in tests no longer have
+   * to fish in private state.
+   */
+  get parentPeerId(): string | null {
+    return this.parentId;
+  }
+
   get childCount(): number {
     return this.children.size;
   }

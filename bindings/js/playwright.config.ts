@@ -46,6 +46,12 @@ export default defineConfig({
       '../../target/debug/lvqr serve',
       '--mesh-enabled',
       '--mesh-root-peer-count 1',
+      // Session 142: cap each peer at one child so the three-peer
+      // chain test (peer-1 -> peer-2 -> peer-3) forms deterministic-
+      // ally. Peer-2 attaches to peer-1 (its only slot); peer-3
+      // descends to peer-2. The two-peer-relay spec is unaffected
+      // because it only ever has one child on peer-1.
+      '--max-peers 1',
       '--no-auth-signal',
       `--admin-port ${ADMIN_PORT}`,
       '--hls-port 0',
