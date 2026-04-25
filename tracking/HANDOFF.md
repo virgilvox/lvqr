@@ -1,8 +1,105 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D 9 sessions deep** -- WASM chain thread (135-140) closed + mesh data-plane rows 1 (offload reporting, 141), 2 (three-peer Playwright matrix, 142), and 3 (TURN deployment recipe + server-driven ICE config, 143) shipped. **Session 143 (2026-04-24) added server-driven ICE config** -- new `--mesh-ice-servers <JSON>` CLI flag with `LVQR_MESH_ICE_SERVERS` env fallback; new `IceServer` type in `lvqr-signal`; `SignalMessage::AssignParent` grows `ice_servers: Vec<IceServer>` with `#[serde(default)]`; JS `MeshPeer.handleAssignment` rebuilds `RTCPeerConnection({ iceServers })` from the snapshot when non-empty. Operator-facing `deploy/turn/` ships a coturn install runbook + minimal `coturn.conf`. Default-gate Rust workspace **1022 -> 1030** (+8: 3 new signal serde tests + 4 CLI parse tests + 2 new integration tests; the 2 integration tests are in a new file). Python pytest unchanged at **29**. Vitest 11 unchanged. 29 crates. Admin surface at **10 routes**. Remaining Phase D scope: per-peer capacity advertisement, hardware encoder backend, DASH-IF validator, npm + PyPI publish, mesh.md "IMPLEMENTED" flip (gated on capacity).
+## Project Status: v0.4.0 -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED** -- WASM chain thread (135-140) shipped + mesh data-plane rows 1 (offload reporting, 141), 2 (three-peer Playwright matrix, 142), 3 (TURN deployment recipe + server-driven ICE config, 143), and 4 (per-peer capacity advertisement, 144) all shipped; `docs/mesh.md` flipped from "topology planner +..." status line to **IMPLEMENTED** in 144. **Session 144 (2026-04-24) added per-peer capacity** -- `SignalMessage::Register` grows `capacity: Option<u32>` behind `#[serde(default)]`; new `PeerEvent` struct reshapes the `PeerCallback` so the lvqr-cli bridge can clamp the client claim to `--max-peers` at register time and thread it into `MeshCoordinator::add_peer`; `find_best_parent` consults `PeerInfo.capacity` so a peer self-reporting `capacity: 1` forces descent past it; `GET /api/v1/mesh` surfaces the per-peer capacity column. JS `MeshConfig.capacity?: number` is the integrator-side knob. Default-gate Rust workspace **1030 -> 1043** (+13: 5 mesh tree + 2 mesh coordinator + 3 signal serde + 1 admin + 2 integration). Python pytest **29 -> 30** (+1 defensive parse). Vitest 11 unchanged. 29 crates. Admin surface at **10 routes**. Remaining Phase D scope: hardware encoder backend, DASH-IF validator, npm + PyPI publish.
 
-**Last Updated**: 2026-04-24 (session 143 close). Sessions 135-142 pushed (`origin/main` at `8c28ca2`); session 143 local pending push.
+**Last Updated**: 2026-04-24 (session 144 close). Sessions 135-143 pushed (`origin/main` at `9f91763`); session 144 local pending push.
+
+## Session 144 close (2026-04-24)
+
+**Shipped**: Per-peer capacity advertisement. Closes the LAST of the four mesh-data-plane bullets under README's "Peer mesh data plane" checklist (line 450-451). Browser peers can self-report a static `capacity: u32` value on their `Register` signal message naming the maximum children they are willing to relay to. The lvqr-cli signal-callback bridge clamps the claim to the operator's configured global `--max-peers` ceiling at register time so on-disk `PeerInfo.capacity` values are always within bounds; `MeshCoordinator::find_best_parent` consults `PeerInfo.capacity` via the new `effective_capacity` helper so a peer with `capacity: 1` is treated as full after one child even when the global ceiling is higher. `GET /api/v1/mesh` surfaces the per-peer capacity alongside the existing `intended_children` (planner) and `forwarded_frames` (session 141) columns. With this row landed, `docs/mesh.md` flips from "topology planner + signaling + ..." to "IMPLEMENTED" status; the four phase-D mesh-data-plane bullets all close.
+
+### Deliverables
+
+1. **`crates/lvqr-mesh/src/tree.rs`**: `PeerInfo` grows `capacity: Option<u32>` behind `#[serde(default)]`; `PeerInfo::new` initializes it to `None`. New `effective_capacity(default_max)` returns `min(self.capacity.unwrap_or(default_max), default_max)` so the value is always within the operator ceiling -- defense-in-depth against a missed clamp at the call site. `can_accept_child` consults `effective_capacity` instead of the bare default. 5 new unit tests cover the helper plus the can_accept_child capacity-zero and per-peer-cap-below-default paths.
+
+2. **`crates/lvqr-mesh/src/coordinator.rs`**: `MeshCoordinator::add_peer` signature grows a `capacity: Option<u32>` argument; the field lands on `PeerInfo.capacity` before the find_best_parent dispatch. 2 new unit tests: `find_best_parent_respects_per_peer_capacity` (3 peers under root_peer_count=1, max_children=5, capacities (1, 5, 5), peer-3 must descend to peer-2 even though MeshConfig allows 5 children per peer) + `find_best_parent_clamps_oversize_capacity` (proves the effective_capacity defense-in-depth even when a programmatic caller forgot to clamp). Existing 38+ test sites updated to pass `None`.
+
+3. **`crates/lvqr-signal/src/signaling.rs`**: `SignalMessage::Register` grows `capacity: Option<u32>` behind `#[serde(default)]` so pre-144 clients omitting the field deserialize cleanly. New `PeerEvent<'a> { peer_id, track, capacity, connected }` struct delivered to the reshaped `PeerCallback` (`Fn(&PeerEvent<'_>) -> Option<SignalMessage>`); the named-struct shape avoids a positional `None`-on-disconnect that would have been pure noise in the tuple form. `register_peer` and `wait_for_register` thread the capacity claim through; `remove_peer` constructs a `PeerEvent` with `capacity: None` and `connected: false`. 3 new unit tests: `register_deserializes_pre_144_body_without_capacity` / `register_accepts_oversize_capacity_claim` / `peer_callback_receives_capacity_on_register_and_none_on_disconnect`.
+
+4. **`crates/lvqr-signal/src/lib.rs`**: re-exports `PeerEvent`.
+
+5. **`crates/lvqr-cli/src/lib.rs::start()`**:
+   * Captures `config.max_peers as u32` into the signal callback closure as the global ceiling.
+   * Signal callback unpacks the new `PeerEvent`, clamps `event.capacity.map(|c| c.min(global_max_children))`, and threads the clamped value into `MeshCoordinator::add_peer(.., clamped_capacity)`.
+   * `with_mesh` admin closure surfaces `p.capacity` on every `MeshPeerStats` row alongside the existing `intended_children` + `forwarded_frames` columns.
+
+6. **`crates/lvqr-cli/src/ws.rs`**: /ws subscriber path passes `None` (no capacity advertisement for /ws-side peers in v1; they typically consume media as leaves).
+
+7. **`crates/lvqr-admin/src/routes.rs`**: `MeshPeerStats` grows `capacity: Option<u32>` behind `#[serde(default)]`. `mesh_with_peers` test extended to assert per-peer capacity round-trips. New `mesh_peer_stats_deserializes_pre_144_body_without_capacity` test proves the defensive `#[serde(default)]` fallback.
+
+8. **`crates/lvqr-cli/tests/mesh_capacity_e2e.rs`** (new):
+   * `capacity_one_forces_descent_for_third_peer`: spins up a TestServer with `--max-peers 5 --mesh-root-peer-count 1`, opens 3 real `tokio-tungstenite` WebSocket clients to `/signal`, sends `Register` with capacities (1, none, none), reads the AssignParents, and asserts peer-3 descends to peer-2 (proving the per-peer cap of 1 on peer-1 forces descent even though `MeshConfig.max_children = 5`). Also polls `/api/v1/mesh` and asserts the configured capacity round-trips onto the admin row.
+   * `oversize_capacity_claim_is_clamped_to_global_max`: sends `capacity: u32::MAX` on the Register, asserts `/api/v1/mesh` reports `capacity: Some(2)` (the operator's `--max-peers 2`).
+
+9. **`bindings/js/packages/core/src/mesh.ts`**:
+   * `MeshConfig` grows `capacity?: number`. Documented as "self-reported relay capacity ... server clamps to its operator-configured global max-peers".
+   * `connect()` includes the field on the Register payload. `JSON.stringify` drops undefined fields so an unset config produces a Register without the field and the server falls back to its global ceiling.
+
+10. **`bindings/js/packages/core/src/admin.ts`**: `MeshPeerStats.capacity?: number` mirrors the Rust shape.
+
+11. **`bindings/js/tests/sdk/admin-client.spec.ts`**: existing mesh assertion grows a `peer.capacity === undefined || typeof peer.capacity === 'number'` check.
+
+12. **`bindings/python/python/lvqr/types.py`**: `MeshPeerStats.capacity: Optional[int] = None`. Docstring updated.
+
+13. **`bindings/python/python/lvqr/client.py::mesh()`**: defensive `.get("capacity")` parse so a pre-144 server that omits the field produces `MeshPeerStats(capacity=None)` rather than failing.
+
+14. **`bindings/python/tests/test_client.py`**: `test_mesh_peer_stats_defaults` extended with `capacity is None`. Existing `test_mesh` body extended with `capacity: 5` on the Root row + `capacity is None` on the Relay row to lock the round-trip. New `test_mesh_pre_session_144_server_omits_capacity` proves the defensive `.get("capacity")` parse.
+
+15. **Docs**:
+    * `docs/mesh.md`: status line flipped from "topology planner +..." to **IMPLEMENTED**. New "**Per-peer capacity advertisement** shipped in session 144" paragraph in the status block. "What is still phase-D scope" subsection removed (last row closed). New "Per-peer capacity (session 144)" body section with wire-shape, browser SDK example, and anti-scope. Per-peer offload-snapshot table grows the `capacity` row.
+    * `docs/sdk/javascript.md`: `MeshPeerStats` interface grows the optional `capacity?: number` field. Peer-mesh narrative updated: "mesh data plane is fully implemented as of session 144". Constructor example shows `capacity: 3`.
+    * `docs/sdk/python.md`: `MeshPeerStats` dataclass grows `capacity: Optional[int] = None`. Docstring inline notes the session-144 origin and clamping semantics.
+
+16. **`README.md`**: "Per-peer capacity advertisement" bullet flipped from `[ ]` to `[x]` with the strikethrough + shipped-in-144 prose. "Flip docs/mesh.md to IMPLEMENTED" bullet also flipped (shipped in same session). "Next up #5" line rewritten to reflect that the entire mesh-data-plane phase D shipped in full.
+
+17. **`tracking/SESSION_144_BRIEFING.md`** (new): locked design before any source touched. Documents what "capacity" means in v1 (static client-self-report; no bandwidth probing or CPU-headroom heuristic), wire shape (Register-extension over a separate `Capacity` variant, with rationale), coordinator integration, the `PeerEvent` struct decision, the clamp-at-ingest-vs-consult tradeoff, admin route exposure, and an explicit anti-scope list (no mid-session updates, no browser-bandwidth measurement, no CPU heuristic, no PeerRole::Leaf transition for capacity=0, no Playwright capacity test, no /ws-subscriber capacity advertisement).
+
+### Key 144 design decisions baked in
+
+* **What "capacity" means in v1.** Static, client-self-reported integer "I can serve up to N children". The web platform does not honestly expose either upload-bandwidth or CPU headroom across browsers; bandwidth probing is heavyweight and changes the wire shape. The integrator picks the value from their own profile knowledge (mobile / laptop / etc.). Empirical capacity discovery is anti-scope; v1.2 candidate.
+
+* **Register-extension, not new `Capacity` variant.** Capacity is part of the registration contract: the server must know it AT THE MOMENT of computing the assignment, not in a follow-up message. A separate variant would either (a) force a round-trip delay on first AssignParent or (b) require an immediate reassign-on-Capacity, churning the tree on every join. Mid-session capacity revisions remain anti-scope; if/when needed, a sibling `Capacity` variant can coexist with the Register-extension.
+
+* **`PeerEvent` struct over positional callback extension.** The `PeerCallback` shape switched from `Fn(&str, &str, bool) -> Option<SignalMessage>` to `Fn(&PeerEvent<'_>) -> Option<SignalMessage>`. Positional extension would have introduced a `None` capacity on disconnect that reads as noise; the named-struct form makes each field self-describing and matches the project's evident preference for named-field structs (see `IceServer` in 143).
+
+* **Clamp at register time, not at consult time.** lvqr-cli's signal-callback closure clamps the client claim to `min(claim, config.max_peers as u32)` BEFORE storing into `PeerInfo.capacity`. Alternative considered: store-as-claimed, clamp at find_best_parent consult time. Cheaper to implement, but exposes raw client claims on the admin route. A misbehaving client claiming `u32::MAX` would appear on the operator's dashboard with a wildly inflated capacity. Clamp-at-ingest preserves the invariant that `PeerInfo.capacity` is always within the operator's ceiling. `effective_capacity` clamps again at consult time as defense in depth.
+
+* **No new CLI flag.** `--max-peers <N>` already serves as the operator's global ceiling and the default-when-unset; one knob is enough.
+
+* **No JS `MeshPeer.capacity` getter.** Integrator passes the value in once at construct time and does not need to read it back.
+
+* **/ws subscribers stay capacity-less in v1.** /ws-side peers register through `add_peer(.., None)`. The /ws path is typically consumed by server-side or non-browser subscribers without a clear "I can serve K children" semantics. If operators ask, capacity-on-/ws is a future row; not v1.
+
+* **Live smoke verified the boot path.** Started lvqr with `--mesh-enabled --max-peers 5` locally; the binary booted cleanly and `curl /api/v1/mesh` returned `{"enabled":true,"peer_count":0,"offload_percentage":0.0,"peers":[]}` -- the empty-mesh shape the new serde round-trip expects.
+
+### Ground truth (session 144 close)
+
+* **Head (pre-push)**: `feat(mesh+signal+sdk)` + docs close (pending). Sessions 135-143 pushed (origin `9f91763`). Local main will be 2 ahead of origin after this session's docs-close commit.
+* **Tests**:
+  * Rust workspace default gate: **1043** passed / 0 failed / 3 ignored (1030 -> 1043; +5 mesh tree + 2 mesh coordinator + 3 signal serde + 1 admin + 2 integration = 13 net).
+  * `lvqr-mesh --lib`: 25 passed (18 pre + 5 new tree + 2 new coordinator).
+  * `lvqr-signal --lib`: 21 passed (18 pre + 3 new).
+  * `lvqr-admin --lib`: 30 passed (29 pre + 1 new).
+  * `lvqr-cli --test mesh_capacity_e2e`: 2 passed (new file).
+  * `bindings/python pytest`: **30** passed / 0 failed (29 pre + 1 new defensive parse).
+  * `@lvqr/core` tsc: clean. `@lvqr/player` tsc: clean. Vitest case count unchanged at 11; existing `mesh returns a MeshState shape` grew the optional-capacity assertion in place.
+* **CI gates locally clean**:
+  * `cargo fmt --all -- --check` clean.
+  * `cargo clippy --workspace --all-targets -- -D warnings` clean on Rust 1.95.
+  * `tsc` clean on `@lvqr/core` + `@lvqr/player`.
+* **Workspace**: **29 crates**, unchanged.
+
+### Known limitations / documented v1 shape (after 144 close)
+
+* **No mid-session capacity revisions.** Register-time only. A client that wants to lower its capacity after a tab switch / network change would need to reconnect or the future-session `SignalMessage::Capacity` variant.
+* **No browser-bandwidth or CPU-headroom auto-detection.** The integrator picks the value from their own profile knowledge.
+* **Existing tree is not rebalanced on capacity changes.** Capacity is captured in `PeerInfo` at register time; subsequent peer joins consider it; current children stay assigned to their current parents until they reconnect.
+* **No Prometheus per-peer capacity metric.** High-cardinality `peer_id` labels would not help dashboards; the JSON admin route is the answer.
+* **No JS unit test of the `capacity` field on Register.** A non-trivial WebSocket mock would be needed; the Rust integration test covers the wire path end to end.
+* **No Playwright capacity test.** The three-peer-chain regression run covers the no-capacity path; the Rust integration test covers the with-capacity path. A 4+ peer mixed-capacity Playwright would add proportional flake risk for incremental signal.
+* **/ws subscribers stay capacity-less.** The /ws path passes `None` unconditionally; capacity is a /signal-path-only feature in v1.
+* **All other session 143 + earlier known limitations unchanged.**
+
 
 ## Session 143 close (2026-04-24)
 

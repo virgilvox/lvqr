@@ -338,11 +338,10 @@ gaps explicitly named in Known v0.4.0 limitations.
    200 ms. Scheme tag (`hls:` / `dash:`) is baked into the
    signed input so a sig minted for HLS cannot be replayed
    against DASH.
-5. **Mesh data-plane phase D**: per-peer capacity advertisement
-   is the one open row. Actual-vs-intended offload reporting
-   (session 141), three-peer Playwright E2E (142), and TURN
-   deployment recipe + server-driven ICE config (143) all ship.
-   Closing capacity unblocks flipping `docs/mesh.md` to
+5. **Mesh data-plane phase D shipped in full** -- offload
+   reporting (141), three-peer Playwright E2E (142), TURN recipe
+   + server-driven ICE config (143), and per-peer capacity
+   advertisement (144) all land; `docs/mesh.md` flipped to
    IMPLEMENTED.
 6. **One hardware encoder backend** (VideoToolbox on macOS or
    NVENC on Linux). The three others stay deferred to v1.2.
@@ -447,8 +446,18 @@ test.
   the values via a new `peers: MeshPeerStats[]` array on
   `/api/v1/mesh` alongside the topology planner's
   `intended_children` count.
-- [ ] **Per-peer capacity advertisement** so rebalancing uses
-  bandwidth + CPU instead of hardcoded `max-children`.
+- [x] ~~**Per-peer capacity advertisement** so rebalancing uses
+  bandwidth + CPU instead of hardcoded `max-children`.~~ Shipped in
+  session 144. `SignalMessage::Register` grows an optional
+  `capacity: Option<u32>` field; the lvqr-cli signal-callback
+  bridge clamps the client claim to `--max-peers` at register
+  time; `MeshCoordinator::find_best_parent` consults
+  `PeerInfo.capacity` so a peer self-reporting `capacity: 1`
+  forces subsequent peers to descend even when the global ceiling
+  is higher. `@lvqr/core`'s `MeshConfig.capacity?: number`
+  threads the value through to the wire; `GET /api/v1/mesh`
+  surfaces it on the `MeshPeerStats` row alongside
+  `intended_children` and `forwarded_frames`.
 - [x] ~~**TURN deployment recipe** + STUN fallback config. Document
   coturn integration for peers behind symmetric NAT.~~ Shipped in
   session 143. New `--mesh-ice-servers <JSON>` CLI flag pushes
@@ -463,9 +472,11 @@ test.
   equality at the leaf and the session-141 per-peer offload-report
   shape across the chain. Browser matrix beyond Chromium remains
   v1.2 scope.
-- [ ] Flip [`docs/mesh.md`](docs/mesh.md) from "topology planner
-  only" to "IMPLEMENTED". (The two-peer slice ships; the phase-D
-  items above gate the "IMPLEMENTED" flip.)
+- [x] ~~Flip [`docs/mesh.md`](docs/mesh.md) from "topology planner
+  only" to "IMPLEMENTED".~~ Flipped in session 144 alongside the
+  per-peer capacity row; the four phase-D mesh-data-plane bullets
+  (offload reporting, three-peer Playwright, TURN recipe, capacity)
+  all ship and the doc status line is now IMPLEMENTED.
 
 ### Egress + encoders
 - [x] ~~**WHEP audio transcoder (AAC to Opus)** atop the 4.6

@@ -141,6 +141,8 @@ interface MeshPeerStats {
   depth: number;
   intended_children: number;  // from the topology planner
   forwarded_frames: number;   // from the peer's ForwardReport
+  capacity?: number;          // self-reported relay cap (session 144);
+                              // undefined when the client did not advertise
 }
 
 interface SloEntry {
@@ -378,10 +380,12 @@ const transport = detectTransport();
 
 `MeshPeer` connects to the server's `/signal` WebSocket, opens
 an `RTCPeerConnection` to an assigned parent peer, and relays
-incoming DataChannel frames to its own children. The
-two-browser happy path ships; remaining operator-grade
-completion (per-peer capacity advertisement, TURN recipe,
-three-peer matrix) is on the phase-D roadmap.
+incoming DataChannel frames to its own children. The mesh data
+plane is fully implemented as of session 144: two-browser E2E
+(115), actual-vs-intended offload reporting (141), three-peer
+Playwright matrix (142), TURN recipe with server-driven ICE
+config (143), and per-peer capacity advertisement (144) all
+ship.
 
 **Actual-vs-intended offload reporting** shipped in session 141.
 `MeshPeer` maintains a private cumulative forwarded-frame
@@ -399,6 +403,15 @@ session 142 alongside the three-peer Playwright matrix). Returns
 `AssignParent` message; once the assignment lands, the value is
 the parent's peer_id.
 
+**Per-peer capacity advertisement** shipped in session 144. Pass
+`MeshConfig.capacity?: number` to declare the maximum children
+this peer is willing to relay to. The server clamps the claim to
+its operator-configured global `--max-peers` ceiling, so a client
+cannot exceed the operator's limit even by mis-claiming. Omit the
+field to fall back to the global default. Common values:
+`capacity: 0` for known-mobile peers (do not relay), `capacity: 5`
+for known-laptop peers, omitted for "let the server decide".
+
 ```typescript
 import { MeshPeer } from '@lvqr/core';
 
@@ -406,6 +419,9 @@ const peer = new MeshPeer({
   signalUrl: 'wss://relay.example.com:8080/signal',
   peerId: 'peer-one',
   iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+  // Session 144: serve up to 3 children. Omit for the
+  // operator's global default.
+  capacity: 3,
   // Fires once per child when its DataChannel opens on the
   // parent side. Use for deterministic one-shot push (e.g.
   // init segment for a late-joining subscriber).

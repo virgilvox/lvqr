@@ -5,10 +5,13 @@ are meant to relay media to other viewers via WebRTC
 DataChannels, offloading the bulk of server bandwidth for
 high-fan-out broadcasts.
 
-> **Status as of main (post v0.4.0): topology planner +
-> signaling + subscribe-auth + server-side subscriber
+> **Status as of main (post v0.4.0): IMPLEMENTED.** Topology
+> planner + signaling + subscribe-auth + server-side subscriber
 > registration + client-side WebRTC relay + two-peer
-> DataChannel media relay end-to-end test all ship.** The Rust
+> DataChannel E2E + actual-vs-intended offload reporting +
+> three-peer Playwright matrix + TURN deployment recipe with
+> server-driven ICE config + per-peer capacity advertisement
+> all ship. The Rust
 > side (`lvqr-mesh`, `lvqr-signal`) assigns peer positions in a
 > relay tree, detects dead peers, reassigns orphans, pushes
 > `AssignParent` messages over `/signal` at Register time, and
@@ -38,10 +41,18 @@ high-fan-out broadcasts.
 > observed in `peer-two`'s `onFrame` callback. Completes in
 > under a second on loopback.
 >
-> What is still phase-D scope:
-> - Per-peer capacity advertisement (bandwidth + CPU) so
->   rebalancing uses measured capacity instead of hardcoded
->   `max-children`.
+> **Per-peer capacity advertisement** shipped in session 144.
+> Browser peers can self-report a static `capacity` field on the
+> `Register` signal message naming the maximum children they are
+> willing to relay to. The server clamps the claim to the
+> operator-configured `--max-peers` ceiling and threads it into
+> the topology planner so a low-bandwidth peer (e.g. a known-
+> mobile profile) can advertise `capacity: 0` or `capacity: 1`
+> and the planner descends past it instead of over-loading it.
+> `GET /api/v1/mesh` surfaces the per-peer `capacity` alongside
+> the existing `intended_children` and `forwarded_frames` columns
+> for dashboard visibility. See the "Per-peer capacity (session
+> 144)" block below.
 >
 > **Actual-vs-intended offload reporting** shipped in session 141.
 > Browser peers report their cumulative forwarded-frame count to
@@ -78,11 +89,13 @@ high-fan-out broadcasts.
 > the `--features` cell sweep across WebRTC-heavy engines remain
 > v1.2 candidates.
 >
-> Until the remaining phase-D rows land, a deployment that sets
-> `--mesh-enabled` still serves every subscriber directly from
-> the server; the `offload_percentage` field on `/api/v1/mesh`
-> remains the intended offload based on tree shape, not measured
-> traffic.
+> A deployment that sets `--mesh-enabled` and pushes media into
+> root peers via `MeshPeer.pushFrame` realizes the planner's
+> `offload_percentage` once those root peers complete their
+> WebRTC handshakes with their assigned children. The
+> `offload_percentage` field on `/api/v1/mesh` is the planner's
+> intended offload based on tree shape; per-peer
+> `forwarded_frames` is the actual measured signal.
 >
 > Tracking in
 > [`tracking/PLAN_V1.1.md`](../tracking/PLAN_V1.1.md) under
@@ -329,6 +342,7 @@ forwards?"
 | `depth` | Distance from origin (0 = Root) |
 | `intended_children` | Count of tree children the planner assigned to this peer |
 | `forwarded_frames` | Cumulative frames the peer has reported forwarding via DataChannel |
+| `capacity` | Per-peer self-reported relay capacity (clamped to global `--max-peers`); `null` when the client did not advertise one (session 144) |
 
 #### ForwardReport wire message
 
@@ -356,3 +370,58 @@ callers upgrading the SDK do not need a coordinated server bump.
 
 `offload_percentage` is intended offload based on tree shape,
 not measured traffic, until the data plane ships.
+
+### Per-peer capacity (session 144)
+
+The `capacity` column on `peers` is the per-peer self-reported
+maximum-children value the client advertised on its `Register`
+signal message. The server clamps the claim to the operator's
+configured global `--max-peers` ceiling so a misbehaving client
+cannot exceed the operator's limit. The topology planner consults
+the per-peer cap in `find_best_parent`: a peer with `capacity: 1`
+is treated as full after one child even when the global ceiling
+is higher, which forces subsequent peers to descend past it.
+
+#### Wire shape
+
+`SignalMessage::Register` grows an optional `capacity: u32` field
+behind `#[serde(default)]`:
+
+```json
+{ "type": "Register", "peer_id": "abc", "track": "live/test", "capacity": 3 }
+```
+
+Pre-144 clients omit the field entirely. The server treats `null`
+or missing as "use the operator's global cap for this peer".
+
+#### Browser SDK (`@lvqr/core`)
+
+`MeshConfig.capacity?: number` is the integrator-side knob.
+JSON.stringify drops undefined fields, so an unset config
+produces a Register without the field and the server falls back
+to its global ceiling.
+
+```ts
+const mesh = new MeshPeer({
+  signalUrl: 'ws://localhost:8080/signal',
+  peerId: crypto.randomUUID(),
+  track: 'live/my-stream',
+  capacity: 1,            // mobile profile: serve at most one child
+});
+```
+
+#### Anti-scope (v1)
+
+* No mid-session capacity revisions. The client advertises a
+  static value at register time; tab-switch or network-change
+  triggered updates would need either a separate `Capacity`
+  signal variant or a re-register flow, both of which are v1.2
+  candidates.
+* No bandwidth-probing or CPU-headroom auto-detection. The
+  browser platform does not expose an upload-bandwidth API, and
+  CPU-headroom heuristics are unreliable across browsers; the
+  integrator picks the value from their own profile knowledge.
+* No `iceTransportPolicy: 'relay'` enforcement coupled to
+  capacity=0. A peer that advertises capacity=0 is simply
+  ineligible to host children; it still consumes media as a
+  leaf.

@@ -105,13 +105,17 @@ class MeshPeerStats:
     # Per-peer intended-vs-actual offload stats. intended_children
     # comes from the topology planner; forwarded_frames is the
     # cumulative count the peer reported via the /signal
-    # ForwardReport message. Session 141.
+    # ForwardReport message. Session 141. capacity is the per-peer
+    # self-reported relay cap (clamped to the operator's global
+    # --max-peers); None when the client did not advertise a value.
+    # Session 144.
     peer_id: str = ""
     role: str = "Leaf"              # "Root" | "Relay" | "Leaf"
     parent: Optional[str] = None
     depth: int = 0
     intended_children: int = 0
     forwarded_frames: int = 0
+    capacity: Optional[int] = None
 
 @dataclass
 class SloEntry:
