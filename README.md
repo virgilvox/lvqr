@@ -357,10 +357,11 @@ remaining ranking:
    (both ingest paths + both egress wire shapes;
    splice_info_section passthrough verbatim, no semantic
    interpretation). See [`docs/scte35.md`](docs/scte35.md).
-3. **Dedicated DVR scrub web UI.** Today DVR playback works via
-   any HLS-aware player but seek-bar + thumbnail strip require
-   integrator work. A drop-in `<lvqr-dvr-player>` web component
-   alongside `@lvqr/player` would close the gap.
+3. ~~**Dedicated DVR scrub web UI.**~~ v1 shipped in session 153
+   (`@lvqr/dvr-player` web component, vanilla `HTMLElement` + hls.js,
+   custom seek bar with HH:MM:SS percentile labels, LIVE pill,
+   Go Live button, client-side hover thumbnails). See
+   [`docs/dvr-scrub.md`](docs/dvr-scrub.md).
 4. **One hardware encoder backend** (VideoToolbox on macOS or
    NVENC on Linux). The three others (VAAPI, QSV, and whichever
    of NVENC or VideoToolbox is not picked first) stay deferred
@@ -374,6 +375,64 @@ remaining ranking:
    `POST /api/v1/slo/client-sample` endpoint.
 
 #### Recently shipped (compact reference)
+
+* **Dedicated DVR scrub web UI v1** (session 153) -- new
+  `@lvqr/dvr-player` package at `bindings/js/packages/dvr-player/`
+  ships as a sister to `@lvqr/player`. Vanilla `class extends
+  HTMLElement` (no Lit, no Stencil; structured-vanilla pattern
+  with template-literal HTML strings + small attribute helpers
+  + shadow DOM + `attributeChangedCallback`-driven reactivity).
+  Wraps hls.js against the relay's existing live HLS endpoint
+  (`/hls/{broadcast}/master.m3u8`) with the sliding-window DVR
+  depth driven by `--hls-dvr-window-secs`; **no new server route
+  was added**. Custom seek bar with HH:MM:SS percentile labels
+  (or MM:SS for sub-hour spans), LIVE pill that toggles based
+  on `seekable.end - currentTime` crossing
+  `max(6, 3 * #EXT-X-TARGETDURATION)` (configurable via
+  `live-edge-threshold-secs`), explicit "Go Live" button (no
+  implicit live-snap on resume), client-side hover thumbnails
+  via canvas `drawImage` against a lazy second hls.js instance
+  (LRU-capped at 60 entries, opt-out via `thumbnails="disabled"`),
+  bearer-token auth via hls.js `xhrSetup` (`Authorization: Bearer`
+  header) plus query-string fallback for native HLS. Public events
+  `lvqr-dvr-seek`, `lvqr-dvr-live-edge-changed`, `lvqr-dvr-error`;
+  programmatic API `play()` / `pause()` / `seek(time)` / `goLive()`
+  / `getHlsInstance()`. ESM-only via tsc, MIT OR Apache-2.0,
+  initial version 0.3.2 lockstep with the rest of the SDK.
+  Vitest suite split across three SDK specs in
+  `bindings/js/tests/sdk/`: 14 tests over the seek-bar pure
+  arithmetic (`dvr-player-seekbar.spec.ts` -- fraction-time round-
+  trip + clamping + degenerate range + MM:SS / HH:MM:SS
+  formatting + percentile labels + threshold checks), 14 tests
+  over the attribute helpers (`dvr-player-attrs.spec.ts` --
+  boolean / numeric / string getters with fallback semantics
+  including NaN / Infinity / empty-string edge cases), and 4
+  tests over the typed event dispatcher
+  (`dvr-player-dispatch.spec.ts` -- detail-shape preservation
+  for all three event names + `bubbles: true` flag). 32 unit
+  tests total. Playwright project at
+  `bindings/js/tests/e2e/dvr-player/` runs 15 tests across two
+  spec files: `mount.spec.ts` covers custom-element registration,
+  13 shadow-DOM part landmarks, `muted` attribute reflection,
+  `controls=native` toggle, programmatic `seek()` event flow;
+  `interactions.spec.ts` covers `goLive()` jumping to seekable
+  end + user-source event, `seek()` clamping at both endpoints,
+  multi-seek event chaining (fromTime threading), keyboard
+  `ArrowLeft` / `ArrowRight` (+/-5 s scrub) + `Home` / `End`
+  (range endpoints), `live-edge-threshold-secs` attribute
+  driving the `isLiveEdge` classification at default vs
+  custom thresholds, `controls="custom"` restoration after a
+  prior `native` set + default-fallback when removed,
+  pointer-drag (pointerdown + move + up) on the seek bar
+  updating currentTime + firing user-source events, hover
+  preview show / hide on pointermove + pointerleave,
+  `getHlsInstance()` returning null pre-playback, and event
+  bubbling past the host element to `document`. New docs at [`docs/dvr-scrub.md`](docs/dvr-scrub.md)
+  cover the operator embedding recipe, signed-URL / bearer-token
+  semantics, theming via CSS custom properties + `::part()`, and
+  the relationship between `--hls-dvr-window-secs` and the
+  seekable range the component renders. Workspace 0.4.1
+  unchanged; `@lvqr/player` and `@lvqr/core` stay at 0.3.2.
 
 * **SCTE-35 ad-marker passthrough v1** (session 152) -- ingest
   on both **SRT MPEG-TS** (PMT stream_type 0x86 with private-
@@ -727,7 +786,21 @@ test.
     semantics). Hot config reload is feature-complete: every key
     the file format defines is honored at runtime.
   See [`docs/config-reload.md`](docs/config-reload.md).
-- [ ] **Dedicated DVR scrub web UI.**
+- [x] **Dedicated DVR scrub web UI.** Shipped in session 153.
+  New `@lvqr/dvr-player` web component at
+  `bindings/js/packages/dvr-player/`; vanilla `HTMLElement` with
+  shadow DOM (no Lit / no Stencil) wrapping hls.js against the
+  relay's existing live HLS endpoint with the
+  `--hls-dvr-window-secs` sliding window. Custom seek bar with
+  HH:MM:SS percentile labels, LIVE pill with configurable
+  threshold, "Go Live" button, client-side hover thumbnails
+  via canvas `drawImage` against a lazy second hls.js instance.
+  Typed events `lvqr-dvr-seek` / `lvqr-dvr-live-edge-changed` /
+  `lvqr-dvr-error`. Programmatic API
+  `play/pause/seek/goLive/getHlsInstance`. Vitest unit suite
+  + Playwright e2e mount suite. No new server route; the
+  `/playback/*` JSON surface and the `/hls/*` live endpoint are
+  unchanged. See [`docs/dvr-scrub.md`](docs/dvr-scrub.md).
 - [x] **SCTE-35 passthrough.** Shipped in session 152.
   Splice events injected on the publisher side (SRT MPEG-TS
   PID 0x86 OR RTMP onCuePoint scte35-bin64) flow ingest ->

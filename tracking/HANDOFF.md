@@ -1,8 +1,285 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 152 (2026-04-25 / 26) shipped SCTE-35 ad-marker passthrough v1** -- both ingest paths land in the same session: SRT MPEG-TS (PMT stream_type 0x86 with private-section reassembly across TS packet boundaries) and RTMP onCuePoint scte35-bin64 (Adobe AMF0 convention used by AWS Elemental, Wirecast, vMix, ffmpeg). RTMP required vendoring `rml_rtmp` v0.8.0 at `vendor/rml_rtmp/` with a 25-line patch adding `ServerSessionEvent::Amf0DataReceived` (upstream silently drops every AMF0 Data message that is not `@setDataFrame`-wrapped onMetaData); fork loads via `[patch.crates-io]` and passes 170/0/0 tests (168 upstream + 2 LVQR defense). Splice events flow through a reserved `"scte35"` parallel track on `FragmentBroadcasterRegistry` (mirroring the whisper-captions pattern under `lvqr_fragment::SCTE35_TRACK`); LL-HLS render adds `#EXT-X-DATERANGE` per HLS spec section 4.4.5.1 with `CLASS="urn:scte:scte35:2014:bin"` (industry convention) + SCTE35-OUT/IN/CMD attributes; DASH MPD render adds Period-level `<EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin">` per ISO/IEC 23009-1 G.7 + SCTE 214-1. New `lvqr-codec/src/scte35.rs` parses splice_info_section per ANSI/SCTE 35-2024 section 8.1 with CRC_32 verification; proptest harness (1536 random inputs) + libfuzzer target prove panic-free on adversarial input. Counter metrics `lvqr_scte35_events_total{ingest,command}` + `lvqr_scte35_drops_total{ingest,reason}`. All 8 CI workflows GREEN end-to-end (LL-HLS Conformance + MPEG-DASH Conformance + Feature matrix + Supply-chain audit + Tier 4 demos + SDK tests + Test Contract + CI). Workspace lib **824 / 0 / 0** + 8 SCTE-35 e2e tests through TestServer + real HTTP/1.1. Splice_info_section bytes preserved verbatim through both egress wire shapes; no semantic interpretation. New docs at `docs/scte35.md` (~430 lines) cover standards refs, ingest table, publisher quickstart (ffmpeg/AWS Elemental/Wirecast/vMix/OBS), wire shape examples, internal architecture diagram, client-side consumption snippets (hls.js/dash.js/Shaka/native HLS), anti-scope, metrics, operator runbook. README "Next up" #2 (SCTE-35 passthrough) flips to strikethrough; Phase A v1.1 roadmap row flips `[ ] -> [x]`. **Session 151 (2026-04-25) hardens lvqr-agent runner-test polling** -- replaces 4 fixed-100 ms `tokio::time::sleep` sites with a `poll_until` helper (10 ms tick, 2 s timeout) so the spawned drain-task's panic-counter increment can settle on a loaded macos-latest CI runner. The flake surfaced on session 150's substantive CI run but is orthogonal to the wasmtime upgrade (lvqr-agent has zero wasmtime deps); the OTHER 7 session-150 workflows including Feature matrix and Supply-chain audit landed green on the original push. **Session 150 (2026-04-25) closed the dominant audit-ignore cluster** -- wasmtime v25 -> v43 upgrade removes 16 RustSec advisories from `audit.toml` (including 2x CVSS-9 sandbox-escape entries), down from 22 ignores to 6. `lvqr-wasm` only uses the core WASM API surface (Engine/Module/Store/Instance/TypedFunc) which is stable across the upgrade range; total source diff was 7 lines (two Module::new error-conversion callsites). **Session 149 (2026-04-25) shipped hot config reload v3 (JWKS + webhook URL rotation)** -- `ConfigReloadHandle::reload` flipped to `async`; the reload pipeline now calls `JwksAuthProvider::new` and `WebhookAuthProvider::new` asynchronously and swaps the resulting provider into the `HotReloadAuthProvider` chain. Drop-old-on-swap leverages each provider's existing `Drop` to abort their spawned refresh / fetcher task. `applied_keys` grows entries (`"jwks"` / `"webhook"`) on URL diff. Feature-disabled builds emit a warning when the file names a feature-gated URL. `jwks_url` and `webhook_auth_url` are mutually exclusive within the same `[auth]` section (the route returns an error). The admin route closure shape widened from sync `Fn -> Result<...>` to async-flavored `Fn -> BoxFuture<Result<...>>` (internal-API change; SDK wire shape unchanged). With session 149, hot config reload is feature-complete -- every key the file format defines is honored at runtime. **Session 148 (2026-04-25) shipped hot config reload v2 (mesh ICE + HMAC secret)** -- `mesh_ice_servers` and `hmac_playback_secret` join the hot-reloadable surface alongside auth, swapped atomically via `arc_swap::ArcSwap` handles threaded through the `/signal` callback and the live HLS / DASH / DVR `/playback/*` middlewares. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Default-gate tests after 148: Rust workspace **1107** / 0 / 0 (was 1099 post-147; +8 net: 8 new lvqr-cli unit covering ice + hmac + applied_keys diff paths + clear semantics + no-deferred-warnings regression, 2 new RTMP-shape integration cases in `config_reload_e2e.rs` mesh ICE + HMAC rotation; the workshop-148 step rewrote one prior unit test from warnings-shape to applied_keys-shape, net unit delta = 8). Python pytest **38** unchanged. Vitest unchanged at 13. Admin surface unchanged at **12 route trees**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API**; **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates.
+## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 153 (2026-04-25) shipped Dedicated DVR scrub web UI v1** -- new `@lvqr/dvr-player` package at `bindings/js/packages/dvr-player/` ships as a sister to `@lvqr/player`, version 0.3.2 lockstep with the rest of the SDK. Vanilla `class extends HTMLElement` (no Lit, no Stencil; "structured-vanilla" pattern with template-literal HTML strings + small attribute helpers in `src/internals/attrs.ts` + typed `CustomEvent` dispatcher in `src/internals/dispatch.ts` + shadow DOM + `attributeChangedCallback`-driven reactivity). Pure-arithmetic helpers (time-to-x mapping, percentile labels, threshold checks, formatting) extracted into `src/seekbar.ts` and unit-tested via Vitest. **32 unit tests** across three SDK specs in `bindings/js/tests/sdk/` -- 14 over the seek-bar arithmetic (`dvr-player-seekbar.spec.ts`), 14 over the attribute helpers (`dvr-player-attrs.spec.ts` -- boolean / numeric / string getters with fallback semantics including NaN / Infinity / empty-string / "0"-not-fallback edge cases), 4 over the typed event dispatcher (`dvr-player-dispatch.spec.ts` -- detail-shape preservation + bubbles flag for all three event names). Playwright project under `bindings/js/tests/e2e/dvr-player/` runs **15 tests** across `mount.spec.ts` (4 -- registration + 13 part landmarks + muted + controls=native + programmatic seek) and `interactions.spec.ts` (11 -- goLive() event + source classification, seek() clamping at both endpoints, multi-seek fromTime chaining, keyboard ArrowLeft / ArrowRight scrub, keyboard Home / End jumps, live-edge-threshold-secs custom-value classification, controls toggle round-trip native -> custom -> default, pointer-drag interaction with user-source event firing, hover preview show / hide, getHlsInstance pre-playback null, host->document event bubbling). Wraps hls.js (^1.5.0 direct dep) against the relay's existing live HLS endpoint (`/hls/{broadcast}/master.m3u8`) with the sliding-window DVR depth driven by `--hls-dvr-window-secs`; **no new server route** -- the kickoff prompt's `/playback/{broadcast}/master.m3u8` URL was a misread (the actual `/playback/*` surface returns JSON, not HLS), corrected at brief read-back. Custom seek bar with HH:MM:SS percentile labels (or MM:SS for sub-hour spans) at 0/25/50/75/100% of the seekable range, LIVE pill that toggles based on `seekable.end - currentTime` crossing `max(6, 3 * #EXT-X-TARGETDURATION)` (configurable via `live-edge-threshold-secs`), explicit "Go Live" button that only renders when behind the live edge (no implicit live-snap on resume; explicitly rejected because operators report it surprises viewers who paused with intent). Client-side hover thumbnails via canvas `drawImage` against a lazy second hls.js instance (LRU-capped at 60 entries; opt-out via `thumbnails="disabled"`; image bitmaps cached for instant re-hover). Bearer-token auth via hls.js `xhrSetup` (`Authorization: Bearer` header) plus query-string fallback for native HLS in Safari MSE-less mode. Public events `lvqr-dvr-seek` / `lvqr-dvr-live-edge-changed` / `lvqr-dvr-error` (typed via the `LvqrDvrPlayerEvents` map; debounced 250 ms on the live-edge crossing); programmatic API `play()` / `pause()` / `seek(time)` / `goLive()` / `getHlsInstance()`. Component-level web research (April 2026): Mux Player + Media Chrome (the canonical streaming-infra public web component, ~9 billion requests served) ships **vanilla**, not Lit; Vidstack's `lit-html + Maverick signals` stack is being publicly retired in 2026 by its own author (cf. mux.com "6 Years Building Video Players" retrospective). LVQR adopts the structured-vanilla pattern without the Mux dependency on strategic-peer grounds. Playwright project at `bindings/js/tests/e2e/dvr-player/` adds a second `webServer` profile in `playwright.config.ts` on non-overlapping ports (admin 18089, hls 18190, rtmp 11936, lvqr 14444) with `--archive-dir` + `--hls-dvr-window-secs=300` + `--no-auth-live-playback`; spec mounts the dist via importmap-routed `page.route` handlers and asserts custom-element registration, shadow-DOM structure (13 part landmarks), `muted` + `controls=native` attribute reflection, and programmatic `seek()` event flow. New docs at `docs/dvr-scrub.md` cover the operator embedding recipe, signed-URL / bearer-token auth precedence, theming via CSS custom properties (`--lvqr-accent`, `--lvqr-control-bg`, etc.) + `::part()` access (`video`, `seekbar`, `live-badge`, `go-live-button`, `play-button`, `mute-button`, `time-display`, `labels`, `preview`, `controls`, `live-overlay`, `status`), and the relationship between `--hls-dvr-window-secs` and the seekable range the component renders. README "Next up" #3 (Dedicated DVR scrub web UI) flips to strikethrough with a forward link to `docs/dvr-scrub.md`; Phase A v1.1 roadmap row flips `[ ] -> [x]`. Workspace 0.4.1 unchanged; `@lvqr/player` and `@lvqr/core` stay at 0.3.2; no Rust-side changes touched in this session. **Session 152 (2026-04-25 / 26) shipped SCTE-35 ad-marker passthrough v1** -- both ingest paths land in the same session: SRT MPEG-TS (PMT stream_type 0x86 with private-section reassembly across TS packet boundaries) and RTMP onCuePoint scte35-bin64 (Adobe AMF0 convention used by AWS Elemental, Wirecast, vMix, ffmpeg). RTMP required vendoring `rml_rtmp` v0.8.0 at `vendor/rml_rtmp/` with a 25-line patch adding `ServerSessionEvent::Amf0DataReceived` (upstream silently drops every AMF0 Data message that is not `@setDataFrame`-wrapped onMetaData); fork loads via `[patch.crates-io]` and passes 170/0/0 tests (168 upstream + 2 LVQR defense). Splice events flow through a reserved `"scte35"` parallel track on `FragmentBroadcasterRegistry` (mirroring the whisper-captions pattern under `lvqr_fragment::SCTE35_TRACK`); LL-HLS render adds `#EXT-X-DATERANGE` per HLS spec section 4.4.5.1 with `CLASS="urn:scte:scte35:2014:bin"` (industry convention) + SCTE35-OUT/IN/CMD attributes; DASH MPD render adds Period-level `<EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin">` per ISO/IEC 23009-1 G.7 + SCTE 214-1. New `lvqr-codec/src/scte35.rs` parses splice_info_section per ANSI/SCTE 35-2024 section 8.1 with CRC_32 verification; proptest harness (1536 random inputs) + libfuzzer target prove panic-free on adversarial input. Counter metrics `lvqr_scte35_events_total{ingest,command}` + `lvqr_scte35_drops_total{ingest,reason}`. All 8 CI workflows GREEN end-to-end (LL-HLS Conformance + MPEG-DASH Conformance + Feature matrix + Supply-chain audit + Tier 4 demos + SDK tests + Test Contract + CI). Workspace lib **824 / 0 / 0** + 8 SCTE-35 e2e tests through TestServer + real HTTP/1.1. Splice_info_section bytes preserved verbatim through both egress wire shapes; no semantic interpretation. New docs at `docs/scte35.md` (~430 lines) cover standards refs, ingest table, publisher quickstart (ffmpeg/AWS Elemental/Wirecast/vMix/OBS), wire shape examples, internal architecture diagram, client-side consumption snippets (hls.js/dash.js/Shaka/native HLS), anti-scope, metrics, operator runbook. README "Next up" #2 (SCTE-35 passthrough) flips to strikethrough; Phase A v1.1 roadmap row flips `[ ] -> [x]`. **Session 151 (2026-04-25) hardens lvqr-agent runner-test polling** -- replaces 4 fixed-100 ms `tokio::time::sleep` sites with a `poll_until` helper (10 ms tick, 2 s timeout) so the spawned drain-task's panic-counter increment can settle on a loaded macos-latest CI runner. The flake surfaced on session 150's substantive CI run but is orthogonal to the wasmtime upgrade (lvqr-agent has zero wasmtime deps); the OTHER 7 session-150 workflows including Feature matrix and Supply-chain audit landed green on the original push. **Session 150 (2026-04-25) closed the dominant audit-ignore cluster** -- wasmtime v25 -> v43 upgrade removes 16 RustSec advisories from `audit.toml` (including 2x CVSS-9 sandbox-escape entries), down from 22 ignores to 6. `lvqr-wasm` only uses the core WASM API surface (Engine/Module/Store/Instance/TypedFunc) which is stable across the upgrade range; total source diff was 7 lines (two Module::new error-conversion callsites). **Session 149 (2026-04-25) shipped hot config reload v3 (JWKS + webhook URL rotation)** -- `ConfigReloadHandle::reload` flipped to `async`; the reload pipeline now calls `JwksAuthProvider::new` and `WebhookAuthProvider::new` asynchronously and swaps the resulting provider into the `HotReloadAuthProvider` chain. Drop-old-on-swap leverages each provider's existing `Drop` to abort their spawned refresh / fetcher task. `applied_keys` grows entries (`"jwks"` / `"webhook"`) on URL diff. Feature-disabled builds emit a warning when the file names a feature-gated URL. `jwks_url` and `webhook_auth_url` are mutually exclusive within the same `[auth]` section (the route returns an error). The admin route closure shape widened from sync `Fn -> Result<...>` to async-flavored `Fn -> BoxFuture<Result<...>>` (internal-API change; SDK wire shape unchanged). With session 149, hot config reload is feature-complete -- every key the file format defines is honored at runtime. **Session 148 (2026-04-25) shipped hot config reload v2 (mesh ICE + HMAC secret)** -- `mesh_ice_servers` and `hmac_playback_secret` join the hot-reloadable surface alongside auth, swapped atomically via `arc_swap::ArcSwap` handles threaded through the `/signal` callback and the live HLS / DASH / DVR `/playback/*` middlewares. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Default-gate tests after 148: Rust workspace **1107** / 0 / 0 (was 1099 post-147; +8 net: 8 new lvqr-cli unit covering ice + hmac + applied_keys diff paths + clear semantics + no-deferred-warnings regression, 2 new RTMP-shape integration cases in `config_reload_e2e.rs` mesh ICE + HMAC rotation; the workshop-148 step rewrote one prior unit test from warnings-shape to applied_keys-shape, net unit delta = 8). Python pytest **38** unchanged. Vitest unchanged at 13. Admin surface unchanged at **12 route trees**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API**; **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates.
 
-**Last Updated**: 2026-04-26 (session 152 polish round close).
+**Last Updated**: 2026-04-25 (session 153 close).
+
+## Session 153 close (2026-04-25)
+
+Shipped the Dedicated DVR scrub web UI v1: a new `@lvqr/dvr-player`
+package at `bindings/js/packages/dvr-player/`, version 0.3.2,
+sister to `@lvqr/player`. The session is JS-SDK-only -- no Rust
+code was touched; the Cargo workspace, all 26 publishable crates,
+the admin route count (12 trees), and the published v0.4.1 are
+all unchanged. The lock-in decisions and the brief read-back are
+documented at `tracking/SESSION_153_BRIEFING.md` (~600 lines after
+the read-back updates locked decisions 1 + 2 in place).
+
+### What landed
+
+* `bindings/js/packages/dvr-player/package.json` -- new package,
+  version 0.3.2, license `MIT OR Apache-2.0`, ESM-only via tsc.
+  Direct dep on `hls.js@^1.5.0`. Sub-path export `./seekbar`
+  exposes the pure-arithmetic helpers for downstream consumers
+  who want to reuse the time-formatting / threshold logic
+  without the component shell.
+
+* `bindings/js/packages/dvr-player/tsconfig.json` -- mirrors the
+  `@lvqr/player` profile (ES2022, strict, `lib: ["ES2022", "DOM"]`,
+  `outDir: dist`, `rootDir: src`).
+
+* `bindings/js/packages/dvr-player/src/index.ts` -- the
+  `LvqrDvrPlayerElement` web component (~480 LOC). Class
+  `extends HTMLElement` with shadow DOM constructed once via a
+  shared `<template>` element + `cloneNode(true)` per instance
+  (the template-literal HTML body is parsed once at first call
+  to `getTemplate()`). `static observedAttributes` lists
+  `src` / `autoplay` / `muted` / `token` / `thumbnails` /
+  `live-edge-threshold-secs` / `controls`. `attributeChangedCallback`
+  dispatches per-property updates. `connectedCallback` starts
+  playback if `src` is set and starts the live-edge poll
+  interval (4 Hz). hls.js bootstrap configures
+  `lowLatencyMode: true`, `backBufferLength: 60`, and an
+  `xhrSetup` that sets `Authorization: Bearer <token>` when the
+  `token` attribute is present. The MANIFEST_PARSED handler
+  triggers autoplay; the LEVEL_LOADED handler captures
+  `targetduration` for the live-edge threshold; the ERROR
+  handler re-emits fatal errors as `lvqr-dvr-error`. Native HLS
+  fallback path (Safari without MSE) sets `videoEl.src` directly
+  with token applied as a query-string param.
+
+* `bindings/js/packages/dvr-player/src/seekbar.ts` -- pure
+  arithmetic helpers (5 exports: `fractionToTime`,
+  `timeToFraction`, `formatTime`, `generatePercentileLabels`,
+  `isAtLiveEdge`). Total + side-effect-free.
+
+* `bindings/js/packages/dvr-player/src/internals/attrs.ts` --
+  the four attribute helpers (`getBooleanAttr`,
+  `setBooleanAttr`, `getStringAttr`, `getNumericAttr`).
+
+* `bindings/js/packages/dvr-player/src/internals/dispatch.ts` --
+  the `LvqrDvrPlayerEvents` typed map + `dispatchTyped` helper.
+  Detail shapes for the three custom events are exported as
+  named TypeScript interfaces so consumers get strong types when
+  wiring listeners.
+
+* `bindings/js/packages/dvr-player/README.md` -- usage,
+  attributes, events, programmatic API, bundle-size note,
+  Safari note, importmap-based CDN drop-in recipe, theming via
+  CSS custom properties + `::part()` access, anti-scope.
+
+* `bindings/js/tests/sdk/dvr-player-seekbar.spec.ts` -- Vitest
+  unit suite. 14 tests across the 5 pure-function exports:
+  endpoint round-trip, fraction clamping, time clamping,
+  degenerate range; MM:SS vs HH:MM:SS formatting incl. negative
+  clamp; 5-label default at 0/25/50/75/100%; HH:MM:SS span
+  switch; `range.start`-relative labels (so a 60-second range
+  starting at t=1000 still renders 00:00 -> 01:00, not the
+  absolute clock time); custom percentile lists; live-edge
+  threshold above / at / below + negative-delta handling.
+
+* `bindings/js/tests/sdk/dvr-player-attrs.spec.ts` -- Vitest
+  unit suite over `src/internals/attrs.ts`. 14 tests covering
+  `getBooleanAttr` present / absent + ignores attribute value;
+  `setBooleanAttr` add / idempotent-when-present / remove /
+  no-op-when-absent; `getStringAttr` value / fallback /
+  empty-string-not-fallback; `getNumericAttr` parsed number
+  (int + float + negative), fallback when absent / empty /
+  not-finite (NaN, Infinity, garbage), zero-is-not-fallback.
+
+* `bindings/js/tests/sdk/dvr-player-dispatch.spec.ts` -- Vitest
+  unit suite over `src/internals/dispatch.ts`. 4 tests
+  asserting CustomEvent shape for `lvqr-dvr-seek` /
+  `lvqr-dvr-live-edge-changed` / `lvqr-dvr-error` event names
+  (typed detail payload preservation; type / bubbles / composed
+  flags). All 32 unit tests pass; `npm run test:sdk` confirmed
+  clean (the unrelated admin-client suite skips its 13 tests
+  cleanly when no `lvqr serve` is bound on this machine).
+
+* `bindings/js/playwright.config.ts` -- restructured from a
+  single `chromium` project + single `webServer` to two named
+  projects (`mesh`, `dvr-player`) gated by `testMatch` regex,
+  with the `webServer` field expanded to an array of two
+  profiles. The mesh profile is unchanged from sessions 116 +
+  142. The new dvr-player profile launches `lvqr serve` on
+  non-overlapping ports (admin 18089, hls 18190, rtmp 11936,
+  lvqr 14444) with `--archive-dir <tmp>/lvqr-dvr-player-e2e-<pid>`,
+  `--hls-dvr-window-secs 300`, `--no-auth-signal`,
+  `--no-auth-live-playback`. The two profiles can run in
+  parallel without port collision; the row-115 mesh test is
+  unaffected.
+
+* `bindings/js/tests/e2e/dvr-player/mount.spec.ts` +
+  `interactions.spec.ts` -- Playwright e2e under the new
+  `dvr-player` project. Both files mount the compiled package
+  dist + hls.js ESM bundle via routed importmap (`page.route`
+  handlers serving `**/_lvqr_test_/pkg/**` from
+  `packages/dvr-player/dist/` and `**/_lvqr_test_/hls/**` from
+  `node_modules/hls.js/dist/hls.mjs`). 15 tests total. mount.spec
+  (4): custom-element registration + 13 shadow-DOM part
+  landmarks; `muted` attribute reflection (forward + reverse);
+  `controls="native"` toggle hides custom UI + adds native
+  controls; programmatic `seek(time)` event flow.
+  interactions.spec (11): `goLive()` jumps to seekable.end +
+  fires user-source `lvqr-dvr-seek` with `isLiveEdge: true`;
+  `seek()` clamps inputs below seekable.start + above
+  seekable.end (asserts both endpoints); multiple programmatic
+  seeks dispatch chained events (each fromTime equals the
+  previous toTime); keyboard `ArrowLeft` / `ArrowRight` scrubs
+  +/-5 s; keyboard `Home` / `End` jumps to range endpoints;
+  `live-edge-threshold-secs` attribute drives the `isLiveEdge`
+  classification at default (6 s) vs custom (30 s) thresholds;
+  `controls="custom"` toggle restores the custom UI after a
+  prior native set + remove-attribute returns to default;
+  pointer drag (pointerdown + move + up) on the seek bar
+  updates currentTime to ~25% then ~75% of the synthetic
+  range + every dispatched event carries `source: 'user'`;
+  hover pointermove shows the preview overlay + pointerleave
+  hides it; `getHlsInstance()` returns null pre-playback;
+  `lvqr-dvr-seek` bubbles past the host element to `document`.
+  Helper `setupSyntheticVideo` injects an explicit
+  `Object.defineProperty(v, 'seekable', ...)` so each test
+  drives the component without a real HLS stream attached.
+  Live-stream-driven assertions (LIVE badge state transitions
+  driven by real `seekable.end` deltas, hover thumbnail
+  rendering against a real second hls.js instance) are
+  deferred to a follow-up suite that wires ffmpeg-driven
+  RTMP push.
+
+* `docs/dvr-scrub.md` -- new operator-side document. What ships
+  in v1, relay configuration (`--archive-dir`,
+  `--hls-dvr-window-secs`, `--hmac-playback-secret`), embed
+  recipes (CDN drop-in via importmap, npm-bundled deployment,
+  signed-URL deployments, bearer-token deployments), theming,
+  implementation notes, anti-scope (no archived-broadcast
+  scrub, no DASH, no SCTE-35 marker tick rendering, no server-
+  side thumbnail spritesheets, no analytics).
+
+* README.md -- "Next up" #3 (Dedicated DVR scrub web UI) flipped
+  to strikethrough with a forward link to `docs/dvr-scrub.md`.
+  "Recently shipped" gains a session-153 entry as the new lead
+  (above the SCTE-35 v1 entry). Phase A v1.1 roadmap row flips
+  `[ ] -> [x]` with a one-paragraph summary.
+
+* `tracking/SESSION_153_BRIEFING.md` -- the brief itself,
+  ~600 lines. Section "Decisions (locked at brief read-back,
+  2026-04-25)" describes the two read-back corrections:
+  decision 1 (wire shape was a misread of the existing
+  `/playback/*` JSON surface; the v1 source URL is the live
+  HLS endpoint instead, no new server route) and decision 2
+  (component mechanism deepened from "vanilla `HTMLElement`"
+  to "structured vanilla" with template-literal HTML strings +
+  small attribute helpers, after researching what production
+  media players ship: Mux + Media Chrome are vanilla; Vidstack's
+  Lit-based stack is being publicly retired). All 8 decisions
+  + anti-scope + execution order + risks + ground truth.
+
+### Decisions intentionally rejected
+
+* **Lit (or any web-component framework runtime).** Vidstack's
+  Jan-2026 retrospective was the deciding evidence; LVQR is a
+  single-maintainer project where every runtime dep is a future
+  CVE / version-bump bill (cf. session 150's wasmtime 16-advisory
+  audit-driven upgrade). Vanilla preserves the unified shape
+  across `@lvqr/core` (zero deps) + `@lvqr/player` (vanilla) +
+  `@lvqr/dvr-player` (structured vanilla).
+
+* **Composition with Mux Media Chrome + hls-video-element.**
+  The architecturally-cleanest path; rejected on strategic-
+  peer grounds (Mux is a streaming-infrastructure peer; LVQR
+  ships its own UI primitives rather than depending on theirs).
+  The structured-vanilla pattern is borrowed in *style* from
+  Mux's source -- template-literal HTML strings + attribute
+  reflection -- without the actual `media-chrome` dep.
+
+* **A new `/playback/{broadcast}.m3u8` server route rendering
+  HLS VOD playlists from the redb segment index.** Would have
+  unlocked scrub of post-finalize archived broadcasts that
+  aged out of the live sliding window. Rejected for v1 on
+  scope grounds (would require ~80 LOC of Rust + tests in
+  `lvqr-cli`); candidate v1.1 work. v1 ships against the
+  existing `/hls/{broadcast}/master.m3u8` live endpoint with
+  whatever DVR depth `--hls-dvr-window-secs` was configured
+  with.
+
+* **Server-side thumbnail spritesheets.** WEBVTT
+  `#EXT-X-IMAGE-STREAM-INF` sprites would require new
+  thumbnailing in `lvqr-record` / `lvqr-archive`; v1.2 work.
+  v1 uses client-side canvas `drawImage` against a lazy
+  second hls.js instance.
+
+* **DASH / Shaka engine.** v1 is HLS-only. Candidate v1.2
+  behind an `engine="dash"` attribute.
+
+### What is NOT touched
+
+* Rust workspace -- 824 lib / 0 / 0 unchanged from session 152
+  close (the workspace number reflects the default-feature
+  lib slice on this machine; the full default-features matrix
+  remains 1129+/0/0 across 131 binaries). Admin surface 12
+  route trees unchanged. v0.4.1 unchanged. CI workflows
+  unchanged.
+
+* `@lvqr/core` and `@lvqr/player` remain at 0.3.2; no source
+  changes.
+
+* `/playback/*` JSON surface unchanged; `/hls/*` master + variant
+  + segment surfaces unchanged; signed-URL HMAC gate unchanged.
+
+* No CHANGELOG entry beyond the SDK package list in the README;
+  no version bump on the workspace; no `cargo publish`; no
+  `npm publish`.
+
+### Verification status
+
+* `npm run build` at the bindings/js workspace root -- clean.
+  Produces `dist/` for `@lvqr/core`, `@lvqr/player`, and the
+  new `@lvqr/dvr-player` (`dist/index.js` + `dist/seekbar.js`
+  + `dist/internals/{attrs,dispatch}.js` + matching `.d.ts`).
+* `npm run test:sdk` -- 32/32 dvr-player unit tests pass
+  across the seekbar / attrs / dispatch specs. The
+  `admin-client.spec.ts` suite cannot run on this developer
+  machine because no `lvqr serve` is bound to
+  `127.0.0.1:18090`; its 13 tests are correctly skipped (the
+  `beforeAll` health probe times out and the suite reports
+  "failed" on the hook, but no individual test executed). The
+  CI sdk-tests workflow boots the binary with the right flags
+  before invoking Vitest, so this is not a regression.
+* `npx playwright test --list` -- 17 tests across 4 spec
+  files (mesh: 2, dvr-player: 15) parse cleanly. Actual
+  execution is not run locally (would require `cargo build -p
+  lvqr-cli` for the dvr-player webServer profile + Chromium
+  launch); CI runs them via the updated `mesh-e2e.yml`
+  workflow.
+* `.github/workflows/mesh-e2e.yml` updated for the new
+  Playwright project: path filters expanded to cover
+  `bindings/js/packages/**` + `crates/lvqr-archive/**` +
+  `crates/lvqr-hls/**` (in addition to the prior mesh + signal
+  + cli list); the build step swapped from
+  `bindings/js/packages/core` `npm run build:ts` to bindings/js-
+  root `npm run build` (which dispatches to
+  `npm --workspaces --if-present run build`, picking up the
+  dvr-player and player workspaces alongside core); the
+  workflow header comment updated to describe both project
+  profiles and the dual-webServer harness shape.
+
+### Pending follow-ups (NOT in this session)
+
+* Live-stream-driven Playwright assertions (LIVE badge state
+  transitions, drag against a real seekable range, hover
+  thumbnail strip rendering against a real second hls.js
+  instance). Requires an ffmpeg push helper alongside the
+  existing test scaffolding.
+* Cross-browser Playwright matrix (Firefox + WebKit). Phase D
+  scope per the brief.
+* SCTE-35 `#EXT-X-DATERANGE` marker visualization on the seek
+  bar (ad-break ticks). Candidate v1.1; advanced consumers can
+  subscribe via `getHlsInstance()` for now.
+* Server-side WEBVTT thumbnail spritesheet (v1.2; requires
+  `lvqr-record` / `lvqr-archive` work).
+* Possible new `/playback/{broadcast}.m3u8` server route for
+  archived (post-finalize, post-window-expiry) broadcast scrub.
+* Mobile-touch polish on the seek bar.
 
 ## Session 152 polish round (2026-04-26)
 

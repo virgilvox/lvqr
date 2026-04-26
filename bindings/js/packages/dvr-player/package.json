@@ -1,0 +1,49 @@
+{
+  "name": "@lvqr/dvr-player",
+  "version": "0.3.2",
+  "description": "LVQR DVR scrub Web Component - drop-in HLS DVR player with custom seek bar, LIVE indicator, and client-side hover thumbnails",
+  "license": "MIT OR Apache-2.0",
+  "author": "Moheeb Zara <hackbuildvideo@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/virgilvox/lvqr",
+    "directory": "bindings/js/packages/dvr-player"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./seekbar": {
+      "types": "./dist/seekbar.d.ts",
+      "import": "./dist/seekbar.js",
+      "default": "./dist/seekbar.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "streaming",
+    "video",
+    "player",
+    "dvr",
+    "hls",
+    "web-component",
+    "lvqr"
+  ],
+  "dependencies": {
+    "hls.js": "^1.5.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

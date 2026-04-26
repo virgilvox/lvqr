@@ -1,50 +1,61 @@
 name: Mesh E2E
 
-# Playwright end-to-end for the @lvqr/core MeshPeer client under
-# bindings/js/tests/e2e/. Distinct from .github/workflows/e2e.yml
-# (which covers the Tier 1 test-app shell under tests/e2e/) because
-# the mesh suite owns a separate npm workspace (bindings/js/), its
-# own playwright.config.ts, and boots a real `lvqr serve` subprocess
-# via Playwright's webServer block. Landed alongside session 116
-# row 115 (two-peer DataChannel relay).
+# Playwright end-to-end suites under bindings/js/tests/e2e/. Two
+# Playwright projects share this workflow because they share the
+# bindings/js npm workspace, the same `playwright.config.ts`
+# (multi-project + multi-webServer shape since session 153), and
+# the same `lvqr serve` debug binary:
 #
-# Triggers: changes to the @lvqr/core source, the test spec, the
-# signal / mesh / CLI crates that the test exercises end-to-end, or
-# this workflow file.
+#   * `mesh` (sessions 116 / 142) -- two- and three-peer DataChannel
+#     relay E2E. Boots `lvqr serve --mesh-enabled` on port 18088.
+#   * `dvr-player` (session 153) -- mounts the @lvqr/dvr-player web
+#     component against a live HLS endpoint with --archive-dir +
+#     --hls-dvr-window enabled, asserting custom-element
+#     registration, shadow DOM, attribute reflection, programmatic
+#     API + event flow, keyboard scrub, pointer drag, and hover
+#     preview overlay. Boots a second `lvqr serve` on port 18089.
 #
-# Soft-fail for now via continue-on-error. WebRTC on a clean Linux
-# CI runner is mostly reliable but ICE + DataChannel negotiation has
-# environment-sensitive edge cases (IPv6, loopback routing, nested
-# virtualization) that are worth flagging rather than blocking PRs
-# on during the first few weeks of this workflow's life. Promote to
-# required once the green-run streak is established.
+# Triggers: changes to either suite's spec or source under test, the
+# shared playwright config / package metadata, the underlying CLI /
+# signal / mesh / archive / HLS crates that the tests exercise, or
+# this workflow file. Distinct from .github/workflows/e2e.yml (which
+# covers the Tier 1 test-app shell under tests/e2e/).
+#
+# Soft-fail for now via continue-on-error. WebRTC + browser-side
+# media interactions have environment-sensitive edge cases (IPv6,
+# loopback routing, nested virtualization, GPU-less Chromium MSE
+# corners) that are worth flagging rather than blocking PRs on
+# during the first few weeks of each suite's life. Promote to
+# required once green-run streaks are established.
 
 on:
   pull_request:
     branches: [main]
     paths:
-      - "bindings/js/packages/core/src/mesh.ts"
-      - "bindings/js/packages/core/src/index.ts"
+      - "bindings/js/packages/**"
       - "bindings/js/tests/e2e/**"
       - "bindings/js/playwright.config.ts"
       - "bindings/js/package.json"
       - "bindings/js/package-lock.json"
       - "crates/lvqr-signal/**"
       - "crates/lvqr-mesh/**"
+      - "crates/lvqr-archive/**"
+      - "crates/lvqr-hls/**"
       - "crates/lvqr-cli/src/main.rs"
       - "crates/lvqr-cli/src/lib.rs"
       - ".github/workflows/mesh-e2e.yml"
   push:
     branches: [main]
     paths:
-      - "bindings/js/packages/core/src/mesh.ts"
-      - "bindings/js/packages/core/src/index.ts"
+      - "bindings/js/packages/**"
       - "bindings/js/tests/e2e/**"
       - "bindings/js/playwright.config.ts"
       - "bindings/js/package.json"
       - "bindings/js/package-lock.json"
       - "crates/lvqr-signal/**"
       - "crates/lvqr-mesh/**"
+      - "crates/lvqr-archive/**"
+      - "crates/lvqr-hls/**"
       - "crates/lvqr-cli/src/main.rs"
       - "crates/lvqr-cli/src/lib.rs"
       - ".github/workflows/mesh-e2e.yml"
@@ -68,9 +79,11 @@ jobs:
       - name: Build lvqr-cli (debug)
         run: cargo build -p lvqr-cli
 
-      # Rebuild @lvqr/core dist/ so the test's `addInitScript` pulls
-      # the latest MeshPeer (including any pushFrame / onChildOpen
-      # additions that motivated the workflow trigger).
+      # Rebuild every workspace dist/ so the suites pull the latest
+      # source: the mesh suite's `addInitScript` injects
+      # @lvqr/core's compiled MeshPeer; the dvr-player suite's
+      # importmap-routed page.route handlers serve the compiled
+      # @lvqr/dvr-player bundle.
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -82,9 +95,9 @@ jobs:
         working-directory: bindings/js
         run: npm install --no-audit --no-fund
 
-      - name: Build @lvqr/core dist/
-        working-directory: bindings/js/packages/core
-        run: npm run build:ts
+      - name: Build all bindings/js workspace dist/
+        working-directory: bindings/js
+        run: npm run build
 
       - name: Install Chromium (with system deps)
         working-directory: bindings/js
