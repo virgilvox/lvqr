@@ -461,13 +461,15 @@ mod tests {
         let prefix = default_prefix(CMD_TIME_SIGNAL);
         // splice_time: time_specified_flag=1, reserved=63, pts_time=0x12345678.
         let pts: u64 = 0x1_2345_6789;
-        let mut command_body = Vec::new();
-        // First byte: 1xxxxxx | (pts >> 32 & 1)  with reserved bits = 1.
-        command_body.push(0xFE | ((pts >> 32) as u8 & 0x01));
-        command_body.push((pts >> 24) as u8);
-        command_body.push((pts >> 16) as u8);
-        command_body.push((pts >> 8) as u8);
-        command_body.push(pts as u8);
+        // splice_time(): time_specified=1 | reserved | pts high bit, then
+        // 32 lower PTS bits.
+        let command_body = vec![
+            0xFE | ((pts >> 32) as u8 & 0x01),
+            (pts >> 24) as u8,
+            (pts >> 16) as u8,
+            (pts >> 8) as u8,
+            pts as u8,
+        ];
         let bytes = build_section(&prefix, &command_body, &[]);
         let info = parse_splice_info_section(&bytes).expect("time_signal parses");
         assert_eq!(info.command_type, CMD_TIME_SIGNAL);
@@ -490,33 +492,33 @@ mod tests {
         let event_id: u32 = 0xDEAD_BEEF;
         let pts: u64 = 0x0_FFFF_FFFF;
         let duration: u64 = 0x1_0000_0000;
-        let mut command_body = Vec::new();
-        command_body.push((event_id >> 24) as u8);
-        command_body.push((event_id >> 16) as u8);
-        command_body.push((event_id >> 8) as u8);
-        command_body.push(event_id as u8);
-        // cancel=0, reserved=0x7F (per spec all reserved bits are 1).
-        command_body.push(0x7F);
-        // out_of_network=1, program_splice=1, duration_flag=1,
-        // splice_immediate=0, reserved=1111.
-        command_body.push(0xEF);
-        // splice_time(): time_specified=1 | reserved | pts high bit.
-        command_body.push(0xFE | ((pts >> 32) as u8 & 0x01));
-        command_body.push((pts >> 24) as u8);
-        command_body.push((pts >> 16) as u8);
-        command_body.push((pts >> 8) as u8);
-        command_body.push(pts as u8);
-        // break_duration: auto_return=1, reserved=63, duration high bit.
-        command_body.push(0xFE | ((duration >> 32) as u8 & 0x01));
-        command_body.push((duration >> 24) as u8);
-        command_body.push((duration >> 16) as u8);
-        command_body.push((duration >> 8) as u8);
-        command_body.push(duration as u8);
-        // unique_program_id, avail_num, avails_expected.
-        command_body.push(0x00);
-        command_body.push(0x01);
-        command_body.push(0x00);
-        command_body.push(0x00);
+        // splice_insert body fields per SCTE 35-2024 section 9.7.3:
+        // event_id(4) + flags(1: cancel=0, reserved=7) + flags(1: out=1,
+        // program=1, duration=1, immediate=0, reserved=4) +
+        // splice_time(5) + break_duration(5) + unique_program_id(2) +
+        // avail_num(1) + avails_expected(1).
+        let command_body = vec![
+            (event_id >> 24) as u8,
+            (event_id >> 16) as u8,
+            (event_id >> 8) as u8,
+            event_id as u8,
+            0x7F, // cancel=0, reserved=0x7F (all reserved bits set per spec)
+            0xEF, // out=1, program=1, duration=1, immediate=0, reserved=1111
+            0xFE | ((pts >> 32) as u8 & 0x01),
+            (pts >> 24) as u8,
+            (pts >> 16) as u8,
+            (pts >> 8) as u8,
+            pts as u8,
+            0xFE | ((duration >> 32) as u8 & 0x01),
+            (duration >> 24) as u8,
+            (duration >> 16) as u8,
+            (duration >> 8) as u8,
+            duration as u8,
+            0x00,
+            0x01, // unique_program_id
+            0x00, // avail_num
+            0x00, // avails_expected
+        ];
         let bytes = build_section(&prefix, &command_body, &[]);
         let info = parse_splice_info_section(&bytes).expect("splice_insert parses");
         assert_eq!(info.command_type, CMD_SPLICE_INSERT);
@@ -531,13 +533,14 @@ mod tests {
     fn parses_splice_insert_cancel_no_body() {
         let prefix = default_prefix(CMD_SPLICE_INSERT);
         let event_id: u32 = 0x1234_5678;
-        let mut command_body = Vec::new();
-        command_body.push((event_id >> 24) as u8);
-        command_body.push((event_id >> 16) as u8);
-        command_body.push((event_id >> 8) as u8);
-        command_body.push(event_id as u8);
-        // cancel=1 | reserved=0x7F.
-        command_body.push(0xFF);
+        // splice_insert body with cancel_indicator=1 (no further fields).
+        let command_body = vec![
+            (event_id >> 24) as u8,
+            (event_id >> 16) as u8,
+            (event_id >> 8) as u8,
+            event_id as u8,
+            0xFF, // cancel=1 | reserved=0x7F
+        ];
         let bytes = build_section(&prefix, &command_body, &[]);
         let info = parse_splice_info_section(&bytes).expect("splice_insert cancel parses");
         assert_eq!(info.event_id, Some(event_id));

@@ -1876,3 +1876,97 @@ fn verify_is_onstatus(subject: &RtmpMessage, expected_status: &str, expected_cod
         x => panic!("Expected Amf0Command command, instead received: {:?}", x),
     }
 }
+
+// ---------------------------------------------------------------
+// LVQR session 152 patch: tests for the new
+// `ServerSessionEvent::Amf0DataReceived` variant. The patched
+// `handle_amf0_data` raises this event for every non-`@setDataFrame`
+// AMF0 Data message so consumers (notably LVQR's RTMP path
+// surfacing SCTE-35 onCuePoint scte35-bin64 carriages) can route
+// them. Defensive coverage: if a future upstream merge changes
+// `handle_amf0_data` we want these to fail loudly.
+// ---------------------------------------------------------------
+
+#[test]
+fn lvqr_amf0_data_received_fires_for_oncuepoint() {
+    let mut deserializer = ChunkDeserializer::new();
+    let mut serializer = ChunkSerializer::new();
+    let (mut session, _initial) = ServerSession::new(get_basic_config()).unwrap();
+
+    // Feed an AMF0 Data message with method "onCuePoint" -- not
+    // wrapped in @setDataFrame, so the patched fallthrough must fire
+    // Amf0DataReceived. The session does not need to be in any
+    // particular publish state for the event to surface (app_name
+    // and stream_key default to empty strings when no publish is
+    // active).
+    let mut props = HashMap::new();
+    props.insert(
+        "name".to_string(),
+        Amf0Value::Utf8String("scte35-bin64".to_string()),
+    );
+    props.insert(
+        "data".to_string(),
+        Amf0Value::Utf8String("/DARAA==".to_string()),
+    );
+    let amf0 = vec![
+        Amf0Value::Utf8String("onCuePoint".to_string()),
+        Amf0Value::Object(props),
+    ];
+    let message = RtmpMessage::Amf0Data {
+        values: amf0.clone(),
+    };
+    let payload = message
+        .into_message_payload(RtmpTimestamp::new(0), 1)
+        .unwrap();
+    let packet = serializer.serialize(&payload, false, false).unwrap();
+    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let (_, events) = split_results(&mut deserializer, results);
+
+    let mut saw = false;
+    for ev in &events {
+        if let ServerSessionEvent::Amf0DataReceived { data, .. } = ev {
+            saw = true;
+            assert_eq!(
+                data, &amf0,
+                "Amf0DataReceived must surface the AMF0 values verbatim"
+            );
+        }
+    }
+    assert!(
+        saw,
+        "Amf0DataReceived must fire for non-@setDataFrame AMF0 Data; events={:?}",
+        events
+    );
+}
+
+#[test]
+fn lvqr_setdataframe_onmetadata_does_not_fire_amf0_data_received() {
+    // Regression guard: the @setDataFrame onMetaData path must NOT
+    // surface as Amf0DataReceived. It still routes to the existing
+    // StreamMetadataChanged event (covered by the upstream
+    // `publish_metadata_can_be_received_by_server` test).
+    let mut deserializer = ChunkDeserializer::new();
+    let mut serializer = ChunkSerializer::new();
+    let (mut session, _initial) = ServerSession::new(get_basic_config()).unwrap();
+
+    let mut props = HashMap::new();
+    props.insert("width".to_string(), Amf0Value::Number(1920.0));
+    let amf0 = vec![
+        Amf0Value::Utf8String("@setDataFrame".to_string()),
+        Amf0Value::Utf8String("onMetaData".to_string()),
+        Amf0Value::Object(props),
+    ];
+    let message = RtmpMessage::Amf0Data { values: amf0 };
+    let payload = message
+        .into_message_payload(RtmpTimestamp::new(0), 1)
+        .unwrap();
+    let packet = serializer.serialize(&payload, false, false).unwrap();
+    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let (_, events) = split_results(&mut deserializer, results);
+
+    for ev in &events {
+        if matches!(ev, ServerSessionEvent::Amf0DataReceived { .. }) {
+            panic!("@setDataFrame onMetaData must NOT surface as Amf0DataReceived; got {:?}", ev);
+        }
+    }
+}

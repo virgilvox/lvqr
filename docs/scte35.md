@@ -196,6 +196,86 @@ then exits cleanly.
 | `lvqr_scte35_drops_total` | counter | `ingest`, `reason` (`crc` / `malformed` / `truncated` / `other`) | Sections dropped at the parser boundary. |
 | `lvqr_scte35_bridge_drops_total` | counter | `broadcast`, `reason` (`parse`) | Sections that reached the cli-side bridge but failed parse on the second pass. |
 
+## Publisher quickstart
+
+How to actually emit SCTE-35 from the common publisher tools. The
+LVQR side accepts whatever the encoder emits as long as the wire
+shape matches the convention documented in the ingest-paths table
+above; nothing in the relay configuration needs to change to enable
+the feature.
+
+### ffmpeg over SRT
+
+ffmpeg's MPEG-TS muxer carries SCTE-35 sections on a dedicated PID
+when the input source produces them. The simplest path is to stream
+a TS file that already contains a SCTE-35 PID (e.g. one generated
+by an upstream encoder) straight into LVQR via SRT:
+
+```bash
+ffmpeg -re -i source-with-scte35.ts \
+  -c copy \
+  -f mpegts srt://relay.example.com:8890?streamid=publish:live/cam1
+```
+
+To inject SCTE-35 sections programmatically, use ffmpeg's
+`-bsf:v scte35_data` bitstream filter (contributed in FFmpeg 6.0+)
+or a patched ffmpeg build with the `--enable-libklscte35`
+configuration. Verify the output PMT has stream_type 0x86 with
+`ffprobe -hide_banner -show_streams source.ts | grep -i scte`.
+
+### ffmpeg over RTMP (onCuePoint)
+
+ffmpeg does not natively emit AMF0 onCuePoint scte35-bin64 data
+messages on its RTMP output. Use a wrapper such as
+[`rtmpdump`-style scriptdata injection](https://wiki.multimedia.cx/index.php/RTMP)
+or a custom muxer. Pipelines using
+[`klscte35`](https://github.com/LTNGlobal-opensource/libklscte35) +
+the `nginx-rtmp-module` `oncuepoint` directive are the most common
+in-the-wild route.
+
+### AWS Elemental MediaLive / MediaConnect
+
+* MediaLive: enable "SCTE-35 ad-marker passthrough" on the MPEG-TS
+  output group. The encoder muxes SCTE-35 on the configured PID
+  (default 0x1FFB). Send to LVQR via SRT.
+* MediaConnect: SCTE-35 is preserved when the entitlement specifies
+  `output: SRT` with `Source: SRT-listener`. No additional
+  configuration on the LVQR side.
+
+### Wirecast + vMix
+
+* Wirecast: open the encoder presets, enable "SCTE-35 in-band
+  metadata" on the broadcast output. RTMP target invokes the
+  patched onCuePoint path; SRT target uses PID 0x1FFB.
+* vMix: the "SCTE-35 Trigger" plugin emits onCuePoint for RTMP and
+  PID-carried sections for SRT. Default convention is the
+  scte35-bin64 / 0x1FFB pair LVQR expects.
+
+### OBS Studio
+
+OBS does not natively emit SCTE-35. Use the
+[`obs-scte35` script](https://github.com/scte-35/obs-scte35) which
+hooks the `onCuePoint` AMF0 output during a live RTMP push.
+Operators who only need passthrough from a downstream source
+(e.g. a hardware encoder feeding OBS) typically bypass OBS for the
+SCTE-35 path and let the encoder drive it directly.
+
+### Verification (after wiring)
+
+```bash
+# HLS: a DATERANGE line should appear at the playlist head
+# during a known ad break.
+curl -s https://relay/hls/<broadcast>/video/playlist.m3u8 \
+    | grep -E "EXT-X-DATERANGE|SCTE35"
+
+# DASH: an EventStream element should appear at the Period level.
+curl -s https://relay/dash/<broadcast>/manifest.mpd \
+    | xmllint --xpath "//*[local-name()='EventStream']" -
+
+# Metrics: counters increment per ingest path.
+curl -s https://relay/metrics | grep scte35
+```
+
 ## Operator runbook
 
 * Confirm the publisher's SCTE-35 PID. Most broadcast encoders

@@ -102,6 +102,14 @@ impl DateRangeKind {
     }
 }
 
+/// CLASS attribute value for SCTE-35 ad-marker DATERANGE entries.
+/// Industry convention (Wowza, Akamai, AWS Elemental, JW Player) so
+/// client-side ad-decisioning pipelines recognise the entry as a
+/// SCTE-35 marker without parsing the SCTE35-* hex blob. Per
+/// SCTE 35-2024 section 12.1 + HLS spec section 4.4.5.1.3 (CLASS is
+/// OPTIONAL but RECOMMENDED for SCTE-35 carriages).
+pub const SCTE35_DATERANGE_CLASS: &str = "urn:scte:scte35:2014:bin";
+
 /// One `#EXT-X-DATERANGE` entry per HLS spec section 4.4.5
 /// (draft-pantos-hls-rfc8216bis). Used by LVQR to surface SCTE-35
 /// splice events as in-playlist ad markers; the egress-side drain
@@ -113,6 +121,11 @@ pub struct DateRange {
     /// range pair. LVQR derives it from the SCTE-35 splice_event_id
     /// when available, falling back to the splice PTS when not.
     pub id: String,
+    /// `CLASS` attribute. `None` omits the attribute on the wire;
+    /// `Some` renders as a quoted-string. SCTE-35 ad markers should
+    /// set this to [`SCTE35_DATERANGE_CLASS`] so client-side ad
+    /// pipelines can filter for it.
+    pub class: Option<String>,
     /// `START-DATE` attribute as wall-clock milliseconds since the
     /// UNIX epoch. Rendered as an RFC 3339 ISO 8601 string at
     /// playlist render time.
@@ -275,10 +288,13 @@ impl Manifest {
             let _ = writeln!(out, "#EXT-X-SKIP:SKIPPED-SEGMENTS={skip_count}");
         }
         for dr in &self.date_ranges {
+            let _ = write!(out, "#EXT-X-DATERANGE:ID=\"{}\"", escape_attr(&dr.id));
+            if let Some(class) = &dr.class {
+                let _ = write!(out, ",CLASS=\"{}\"", escape_attr(class));
+            }
             let _ = write!(
                 out,
-                "#EXT-X-DATERANGE:ID=\"{}\",START-DATE=\"{}\"",
-                escape_attr(&dr.id),
+                ",START-DATE=\"{}\"",
                 format_program_date_time(dr.start_date_millis),
             );
             if let Some(d) = dr.duration_secs {
@@ -767,6 +783,7 @@ mod tests {
     fn mk_date_range(id: &str, start_ms: u64, kind: DateRangeKind) -> DateRange {
         DateRange {
             id: id.into(),
+            class: Some(SCTE35_DATERANGE_CLASS.into()),
             start_date_millis: start_ms,
             duration_secs: Some(30.0),
             kind,
@@ -775,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn date_range_renders_with_id_start_date_duration_and_scte35_attr() {
+    fn date_range_renders_with_id_class_start_date_duration_and_scte35_attr() {
         let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
         b.push(&mk_chunk(0, 30_000, CmafChunkKind::Segment)).unwrap();
         b.push_date_range(mk_date_range("splice-1", 1_700_000_000_000, DateRangeKind::SpliceOut));
@@ -785,11 +802,35 @@ mod tests {
             "playlist:\n{rendered}"
         );
         assert!(
+            rendered.contains("CLASS=\"urn:scte:scte35:2014:bin\""),
+            "playlist:\n{rendered}"
+        );
+        assert!(
             rendered.contains("START-DATE=\"2023-11-14T22:13:20.000Z\""),
             "playlist:\n{rendered}"
         );
         assert!(rendered.contains("DURATION=30.000"), "playlist:\n{rendered}");
         assert!(rendered.contains("SCTE35-OUT=0xFC301100"), "playlist:\n{rendered}");
+    }
+
+    #[test]
+    fn date_range_omits_class_when_none() {
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        b.push(&mk_chunk(0, 30_000, CmafChunkKind::Segment)).unwrap();
+        b.push_date_range(DateRange {
+            id: "no-class".into(),
+            class: None,
+            start_date_millis: 1_700_000_000_000,
+            duration_secs: None,
+            kind: DateRangeKind::Cmd,
+            scte35_hex: "0xFC".into(),
+        });
+        let rendered = b.manifest().render();
+        assert!(
+            rendered.contains("#EXT-X-DATERANGE:ID=\"no-class\",START-DATE="),
+            "playlist:\n{rendered}"
+        );
+        assert!(!rendered.contains("CLASS="), "no class attribute expected:\n{rendered}");
     }
 
     #[test]

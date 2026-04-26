@@ -35,7 +35,7 @@
 use lvqr_codec::scte35::{CMD_SPLICE_INSERT, SpliceInfo};
 use lvqr_dash::{DashEvent, MultiDashServer};
 use lvqr_fragment::{BroadcasterStream, FragmentBroadcasterRegistry, FragmentStream, SCTE35_TRACK};
-use lvqr_hls::{DateRange, DateRangeKind, MultiHlsServer};
+use lvqr_hls::{DateRange, DateRangeKind, MultiHlsServer, SCTE35_DATERANGE_CLASS};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 
@@ -113,6 +113,7 @@ impl BroadcasterScte35Bridge {
                 &broadcast,
                 DateRange {
                     id: id.clone(),
+                    class: Some(SCTE35_DATERANGE_CLASS.into()),
                     start_date_millis: start_ms,
                     duration_secs,
                     kind,
