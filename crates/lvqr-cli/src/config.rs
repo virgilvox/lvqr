@@ -244,6 +244,13 @@ pub struct ServeConfig {
     /// Tier 4 item 4.6 session 106 C.
     #[cfg(feature = "transcode")]
     pub source_bandwidth_kbps: Option<u32>,
+    /// Encoder backend the composition root constructs per rendition.
+    /// Default `Software` (existing 105 B behavior, `x264enc`). The
+    /// `VideoToolbox` value is only valid when the binary was built
+    /// with the `hw-videotoolbox` feature; otherwise the CLI rejects
+    /// the flag value at parse time. Tier 4 item 4.6 session 156.
+    #[cfg(feature = "transcode")]
+    pub transcode_encoder: TranscodeEncoderKind,
     /// Escape hatch for deployments that want open live HLS +
     /// DASH playback with auth scoped to ingest, admin, and
     /// DVR only. When `false` (default), the composition root
@@ -380,6 +387,8 @@ impl ServeConfig {
             transcode_renditions: Vec::new(),
             #[cfg(feature = "transcode")]
             source_bandwidth_kbps: None,
+            #[cfg(feature = "transcode")]
+            transcode_encoder: TranscodeEncoderKind::default(),
             no_auth_live_playback: false,
             no_auth_signal: false,
             mesh_root_peer_count: None,
@@ -389,6 +398,67 @@ impl ServeConfig {
         }
     }
 }
+/// Encoder backend the composition root constructs per rendition.
+/// Session 156 introduces the choice between the pre-existing
+/// software (`x264enc`) ladder and the new VideoToolbox HW-only
+/// ladder (`vtenc_h264_hw`, macOS-only). Future hardware backends
+/// (NVENC, VAAPI, QSV) become additional variants under their own
+/// per-encoder Cargo features.
+#[cfg(feature = "transcode")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum TranscodeEncoderKind {
+    /// `x264enc`-backed software ladder (existing 105 B behavior).
+    #[default]
+    Software,
+    /// `vtenc_h264_hw`-backed VideoToolbox HW ladder. Only available
+    /// when the binary was built with `--features hw-videotoolbox`;
+    /// the CLI parser rejects this value at parse time on builds
+    /// that lack the feature.
+    #[cfg(feature = "hw-videotoolbox")]
+    VideoToolbox,
+}
+
+#[cfg(feature = "transcode")]
+impl TranscodeEncoderKind {
+    /// Stable identifier used in CLI parsing + diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TranscodeEncoderKind::Software => "software",
+            #[cfg(feature = "hw-videotoolbox")]
+            TranscodeEncoderKind::VideoToolbox => "videotoolbox",
+        }
+    }
+}
+
+/// Parse a `--transcode-encoder` CLI / env value into a
+/// [`TranscodeEncoderKind`]. The accepted values depend on the
+/// build's feature set: `software` is always available;
+/// `videotoolbox` is gated on the `hw-videotoolbox` feature. An
+/// unknown value surfaces a parse error at CLI time so misconfigured
+/// deployments do not silently fall back to software when the
+/// operator asked for HW.
+#[cfg(feature = "transcode")]
+pub fn parse_transcode_encoder(value: &str) -> anyhow::Result<TranscodeEncoderKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "software" | "x264" | "" => Ok(TranscodeEncoderKind::Software),
+        #[cfg(feature = "hw-videotoolbox")]
+        "videotoolbox" | "vt" | "vtenc" => Ok(TranscodeEncoderKind::VideoToolbox),
+        #[cfg(not(feature = "hw-videotoolbox"))]
+        "videotoolbox" | "vt" | "vtenc" => Err(anyhow::anyhow!(
+            "--transcode-encoder=videotoolbox requires the lvqr-cli binary to be built \
+             with the `hw-videotoolbox` feature (e.g. `cargo build --features hw-videotoolbox`)"
+        )),
+        other => Err(anyhow::anyhow!(
+            "--transcode-encoder: unknown value {other:?}; expected one of `software`{vt_hint}",
+            vt_hint = if cfg!(feature = "hw-videotoolbox") {
+                " / `videotoolbox`"
+            } else {
+                ""
+            },
+        )),
+    }
+}
+
 /// Resolve a single `--transcode-rendition` CLI / env value into a
 /// [`lvqr_transcode::RenditionSpec`]. Session 106 C accepts three short
 /// preset names (`"720p"`, `"480p"`, `"240p"`) and a path ending in
@@ -430,13 +500,68 @@ pub fn parse_transcode_renditions(values: &[String]) -> anyhow::Result<Vec<lvqr_
 
 #[cfg(all(test, feature = "transcode"))]
 mod transcode_serve_config_tests {
-    use super::{ServeConfig, parse_one_transcode_rendition, parse_transcode_renditions};
+    use super::{
+        ServeConfig, TranscodeEncoderKind, parse_one_transcode_rendition, parse_transcode_encoder,
+        parse_transcode_renditions,
+    };
 
     #[test]
     fn loopback_ephemeral_defaults_transcode_renditions_to_empty() {
         let cfg = ServeConfig::loopback_ephemeral();
         assert!(cfg.transcode_renditions.is_empty());
         assert!(cfg.source_bandwidth_kbps.is_none());
+        assert_eq!(cfg.transcode_encoder, TranscodeEncoderKind::Software);
+    }
+
+    #[test]
+    fn parse_transcode_encoder_software_aliases() {
+        assert_eq!(
+            parse_transcode_encoder("software").unwrap(),
+            TranscodeEncoderKind::Software
+        );
+        assert_eq!(parse_transcode_encoder("x264").unwrap(), TranscodeEncoderKind::Software);
+        // Empty string also falls back to the default.
+        assert_eq!(parse_transcode_encoder("").unwrap(), TranscodeEncoderKind::Software);
+        // Case-insensitive.
+        assert_eq!(
+            parse_transcode_encoder("SOFTWARE").unwrap(),
+            TranscodeEncoderKind::Software
+        );
+    }
+
+    #[cfg(feature = "hw-videotoolbox")]
+    #[test]
+    fn parse_transcode_encoder_videotoolbox_aliases_when_feature_on() {
+        assert_eq!(
+            parse_transcode_encoder("videotoolbox").unwrap(),
+            TranscodeEncoderKind::VideoToolbox,
+        );
+        assert_eq!(
+            parse_transcode_encoder("vt").unwrap(),
+            TranscodeEncoderKind::VideoToolbox
+        );
+        assert_eq!(
+            parse_transcode_encoder("vtenc").unwrap(),
+            TranscodeEncoderKind::VideoToolbox,
+        );
+    }
+
+    #[cfg(not(feature = "hw-videotoolbox"))]
+    #[test]
+    fn parse_transcode_encoder_videotoolbox_errors_without_feature() {
+        let err = parse_transcode_encoder("videotoolbox").expect_err("must error without feature");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("hw-videotoolbox"),
+            "error must direct operator to the feature flag; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn parse_transcode_encoder_rejects_unknown_value() {
+        let err = parse_transcode_encoder("nvenc").expect_err("nvenc is v1.2 deferred");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown value"), "got: {msg}");
     }
 
     #[test]

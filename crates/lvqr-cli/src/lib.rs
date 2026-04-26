@@ -35,6 +35,8 @@ pub use lvqr_admin::ConfigReloadStatus;
 pub use archive::sign_playback_url;
 pub use config::ServeConfig;
 #[cfg(feature = "transcode")]
+pub use config::{TranscodeEncoderKind, parse_transcode_encoder};
+#[cfg(feature = "transcode")]
 pub use config::{parse_one_transcode_rendition, parse_transcode_renditions};
 pub use handle::ServerHandle;
 /// Re-export of [`lvqr_admin::LatencyTracker`] so downstream callers
@@ -566,12 +568,27 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         let mut runner = lvqr_transcode::TranscodeRunner::new();
         let skip_suffixes: Vec<String> = config.transcode_renditions.iter().map(|r| r.name.clone()).collect();
         for spec in &config.transcode_renditions {
-            let video_factory = lvqr_transcode::SoftwareTranscoderFactory::new(spec.clone(), shared_registry.clone())
-                .skip_source_suffixes(skip_suffixes.clone());
+            // Session 156: switch the per-rendition video factory on
+            // the operator's `--transcode-encoder` choice. The
+            // VideoToolbox arm only exists when the binary was built
+            // with `--features hw-videotoolbox`; CLI parsing already
+            // rejected the `videotoolbox` value on builds without it,
+            // so the match is exhaustive at the live cfg.
+            runner = match config.transcode_encoder {
+                config::TranscodeEncoderKind::Software => runner.with_factory(
+                    lvqr_transcode::SoftwareTranscoderFactory::new(spec.clone(), shared_registry.clone())
+                        .skip_source_suffixes(skip_suffixes.clone()),
+                ),
+                #[cfg(feature = "hw-videotoolbox")]
+                config::TranscodeEncoderKind::VideoToolbox => runner.with_factory(
+                    lvqr_transcode::VideoToolboxTranscoderFactory::new(spec.clone(), shared_registry.clone())
+                        .skip_source_suffixes(skip_suffixes.clone()),
+                ),
+            };
             let audio_factory =
                 lvqr_transcode::AudioPassthroughTranscoderFactory::new(spec.clone(), shared_registry.clone())
                     .skip_source_suffixes(skip_suffixes.clone());
-            runner = runner.with_factory(video_factory).with_factory(audio_factory);
+            runner = runner.with_factory(audio_factory);
         }
         tracing::info!(
             renditions = ?config
@@ -579,6 +596,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                 .iter()
                 .map(|r| r.name.clone())
                 .collect::<Vec<_>>(),
+            encoder = config.transcode_encoder.as_str(),
             "transcode ladder enabled",
         );
         // Publish ladder metadata to the HLS master-playlist composer.

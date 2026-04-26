@@ -115,6 +115,9 @@ mod software;
 #[cfg(feature = "transcode")]
 pub mod test_support;
 
+#[cfg(feature = "hw-videotoolbox")]
+mod videotoolbox;
+
 pub use audio_passthrough::{AudioPassthroughTranscoder, AudioPassthroughTranscoderFactory};
 pub use passthrough::{PassthroughTranscoder, PassthroughTranscoderFactory};
 pub use rendition::RenditionSpec;
@@ -125,3 +128,6 @@ pub use transcoder::{Transcoder, TranscoderContext, TranscoderFactory};
 pub use aac_opus::{AacAudioConfig, AacToOpusEncoder, AacToOpusEncoderFactory, OpusFrame};
 #[cfg(feature = "transcode")]
 pub use software::{SoftwareTranscoder, SoftwareTranscoderFactory};
+
+#[cfg(feature = "hw-videotoolbox")]
+pub use videotoolbox::{VideoToolboxTranscoder, VideoToolboxTranscoderFactory};

@@ -25,6 +25,14 @@ transcode = [
     "dep:gstreamer-video",
     "dep:glib",
 ]
+# Tier 4 item 4.6 session 156: VideoToolbox HW encoder backend on macOS.
+# Implies `transcode` (the new module reuses gstreamer-rs); additionally
+# requires the `applemedia` plugin from gst-plugins-bad which ships
+# `vtenc_h264_hw`. Default OFF so non-mac builds (and macos builds that
+# stick to x264) do not pay the gstreamer-bad applemedia surface. Install:
+# `brew install gstreamer gst-plugins-bad` (or the official .framework
+# installer at https://gstreamer.freedesktop.org/download/).
+hw-videotoolbox = ["transcode"]
 
 [dependencies]
 bytes = { workspace = true }

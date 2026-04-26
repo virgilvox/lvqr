@@ -68,6 +68,12 @@ transcode = [
     "lvqr-test-utils/transcode",
     "lvqr-whep/aac-opus",
 ]
+# Tier 4 item 4.6 session 156: forwards the `hw-videotoolbox` feature
+# from `lvqr-transcode` so a binary built with this flag exposes the
+# `--transcode-encoder videotoolbox` CLI value. Implies `transcode`
+# (the new module reuses gstreamer-rs); macOS-only by element
+# requirement (`vtenc_h264_hw` lives in `applemedia` from gst-plugins-bad).
+hw-videotoolbox = ["transcode", "lvqr-transcode/hw-videotoolbox"]
 
 [dependencies]
 lvqr-core = { workspace = true }

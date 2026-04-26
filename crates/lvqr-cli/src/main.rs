@@ -421,6 +421,21 @@ struct ServeArgs {
     #[arg(long, env = "LVQR_SOURCE_BANDWIDTH_KBPS")]
     source_bandwidth_kbps: Option<u32>,
 
+    /// Encoder backend the composition root constructs for every
+    /// rendition in `--transcode-rendition`. `software` (default)
+    /// uses the GStreamer `x264enc` pipeline shipped in session
+    /// 105 B. `videotoolbox` uses the `vtenc_h264_hw` HW-only
+    /// pipeline shipped in session 156 (macOS-only; only valid when
+    /// the binary was built with the `hw-videotoolbox` feature; the
+    /// CLI rejects this value otherwise). Tier 4 item 4.6 session 156.
+    #[cfg(feature = "transcode")]
+    #[arg(
+        long = "transcode-encoder",
+        env = "LVQR_TRANSCODE_ENCODER",
+        default_value = "software"
+    )]
+    transcode_encoder: String,
+
     /// HS256 shared secret enabling JWT authentication. When set, the JWT
     /// provider replaces the static-token provider and all auth surfaces
     /// validate bearer tokens as signed JWTs.
@@ -703,6 +718,8 @@ async fn serve_from_args(
         transcode_renditions: parse_transcode_renditions(&args.transcode_rendition)?,
         #[cfg(feature = "transcode")]
         source_bandwidth_kbps: args.source_bandwidth_kbps,
+        #[cfg(feature = "transcode")]
+        transcode_encoder: lvqr_cli::parse_transcode_encoder(&args.transcode_encoder)?,
         wasm_filter: args.wasm_filter,
         install_prometheus: true,
         otel_metrics_recorder,

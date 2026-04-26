@@ -370,6 +370,15 @@ impl TestServer {
             whisper_model: config.whisper_model,
             #[cfg(feature = "transcode")]
             transcode_renditions: config.transcode_renditions,
+            // Session 156: TestServer always uses the software encoder
+            // for the transcode ladder; HW-encoder coverage rides the
+            // dedicated `videotoolbox_ladder.rs` integration test in
+            // lvqr-transcode, gated on cfg(target_os="macos") + the
+            // `hw-videotoolbox` feature. The field is gated on the
+            // `transcode` feature in `lvqr-cli`, so this assignment
+            // must mirror the gate.
+            #[cfg(feature = "transcode")]
+            transcode_encoder: lvqr_cli::TranscodeEncoderKind::Software,
             #[cfg(feature = "transcode")]
             source_bandwidth_kbps: config.source_bandwidth_kbps,
             wasm_filter: config.wasm_filter,

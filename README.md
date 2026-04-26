@@ -367,11 +367,11 @@ ranking:
    custom seek bar with HH:MM:SS percentile labels, LIVE pill,
    Go Live button, client-side hover thumbnails). See
    [`docs/dvr-scrub.md`](docs/dvr-scrub.md).
-4. **One hardware encoder backend** (VideoToolbox on macOS or
-   NVENC on Linux). The three others (VAAPI, QSV, and whichever
-   of NVENC or VideoToolbox is not picked first) stay deferred
-   to v1.2. Multi-session feature work; needs its own design
-   pass against `crates/lvqr-transcode/`'s GStreamer pipeline.
+4. ~~**One hardware encoder backend** (VideoToolbox on macOS).~~
+   Shipped in session 156. The three others (NVENC for Linux,
+   VAAPI, QSV) stay deferred to v1.2. See
+   [`crates/lvqr-transcode/src/videotoolbox.rs`](crates/lvqr-transcode/src/videotoolbox.rs)
+   and the operator quickstart below.
 5. **MoQ egress latency SLO.** Server-side measurement would
    require a MoQ wire change that was explicitly rejected in
    the v1.1-B scoping call (keeps foreign MoQ clients
@@ -380,6 +380,56 @@ ranking:
    `POST /api/v1/slo/client-sample` endpoint.
 
 #### Recently shipped (compact reference)
+
+* **Hardware encoder backend v1 -- VideoToolbox on macOS**
+  (session 156) -- new `lvqr_transcode::VideoToolboxTranscoderFactory`
+  ships behind a per-encoder `hw-videotoolbox` Cargo feature on
+  `lvqr-transcode` + `lvqr-cli`. Mirrors the existing
+  `SoftwareTranscoderFactory` (105 B / 106 C) shape verbatim --
+  same `Transcoder` trait, same lifecycle, same
+  `<source>/<rendition>` output broadcast naming -- but swaps the
+  `x264enc bitrate=... tune=zerolatency speed-preset=superfast
+  key-int-max=60` GStreamer encoder element for `vtenc_h264_hw
+  bitrate=... realtime=true allow-frame-reordering=false
+  max-keyframe-interval=60` (Apple's HW-only H.264 encoder via
+  the `applemedia` plugin from `gst-plugins-bad`). HW-only path
+  is intentional: a HW factory that silently falls back to CPU
+  encoding under load defeats the purpose of an operator-pickable
+  hardware tier; missing-element probe at factory construction
+  opts out cleanly with a warn log when `vtenc_h264_hw` is absent.
+  Per-rendition output broadcasts ride the same
+  `FragmentBroadcasterRegistry` flow as the software ladder; HLS
+  master-playlist composition + DASH MPD + archive indexer + MoQ
+  fanout all see the new outputs without per-protocol wiring.
+  CLI flag `--transcode-encoder software|videotoolbox` (default
+  `software`); the `videotoolbox` value is rejected at parse time
+  on builds without the `hw-videotoolbox` feature with a clear
+  error pointing at the build command. Six new Vitest-style unit
+  tests in `crates/lvqr-transcode/src/videotoolbox.rs` (factory
+  build / opt-out / naming / metric label / suffix-skip /
+  pipeline string), one new Rust integration test
+  `crates/lvqr-transcode/tests/videotoolbox_ladder.rs` (gated on
+  `cfg(target_os = "macos")` + the feature; drives the CMAF H.264
+  baseline 360p conformance fixture through the full HW pipeline,
+  asserts three renditions emit non-empty fragments + 720p output
+  exceeds 240p output bytes), four new lvqr-cli config tests
+  covering both feature variants of the
+  `--transcode-encoder` parser. Default-feature workspace
+  unchanged (the new module + bin only compile under
+  `--features hw-videotoolbox`); CI matrix unchanged
+  (ubuntu-latest cannot exercise VideoToolbox; a future macos-runner
+  CI lane is unrelated workflow scope). Workspace `0.4.1`
+  unchanged; SDK packages unchanged. The `[ ] One hardware
+  encoder backend` checkbox under Phase A v1.1 (above) flips to
+  `[x]`. NVENC / VAAPI / QSV stay deferred to v1.2 per the README's
+  prior language. Operator quickstart: `cargo build --release
+  --features hw-videotoolbox -p lvqr-cli` then `lvqr serve
+  --transcode-rendition 720p,480p,240p --transcode-encoder
+  videotoolbox`. Requires GStreamer 1.22+ with the `applemedia`
+  plugin (the official `.framework` installer at
+  `https://gstreamer.freedesktop.org/download/` ships it; on a
+  Homebrew-based dev box `brew install gstreamer
+  gst-plugins-base gst-plugins-good gst-plugins-bad`).
 
 * **Session 154 test-coverage close-out** (session 155) -- closes
   the three test-coverage follow-ups from session 154's HANDOFF in
@@ -794,10 +844,17 @@ test.
   `--no-auth-live-playback` is the escape hatch for deployments
   that want open live playback with auth scoped to ingest,
   admin, and DVR.
-- [ ] **One hardware encoder backend** (VideoToolbox for macOS or
-  NVENC for Linux, picked per deployment target). Remaining
-  three backends (VAAPI, QSV, and whichever of NVENC or
-  VideoToolbox is not picked first) deferred to v1.2.
+- [x] ~~**One hardware encoder backend** (VideoToolbox for macOS).~~
+  Shipped in session 156. New `[[bin]]` factory
+  `lvqr_transcode::VideoToolboxTranscoderFactory` parallels the
+  existing `SoftwareTranscoderFactory` (105 B / 106 C shape) but
+  swaps `x264enc` for `vtenc_h264_hw` (HW-only path; falls out
+  loud when the host's VideoToolbox HW is unavailable). Gated on
+  the new `hw-videotoolbox` Cargo feature; CLI exposes
+  `--transcode-encoder software|videotoolbox` (default software,
+  videotoolbox value rejected at parse time on builds without the
+  feature). Remaining three backends (NVENC for Linux, VAAPI,
+  QSV) stay deferred to v1.2.
 - [x] ~~**WASM filter chain composition.**~~ Shipped in session
   136. `--wasm-filter` now accepts multiple values (repeat the
   flag or comma-separate) and installs a `lvqr_wasm::ChainFilter`
