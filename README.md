@@ -355,6 +355,20 @@ format defines is honored at runtime. The remaining ranking:
 
 #### Recently shipped (compact reference)
 
+* **lvqr-agent test polling** (session 151) -- four
+  `tokio::time::sleep(Duration::from_millis(100))` sites in
+  `crates/lvqr-agent/src/runner.rs` tests replaced with a
+  `poll_until` helper (10 ms tick, 2 s timeout). The fixed-100
+  ms shape raced the spawned drain task's panic-counter
+  increment under macos-latest CI runner load (surfaced as a
+  flake on the session 150 push: `panic_in_on_start_skips_drain
+  _loop` and `panic_in_on_fragment_is_caught_and_counted_loop_
+  continues` reported `left: 0, right: 1` on `assert_eq!(handle.
+  panics(...), 1)`). The flake was unrelated to the wasmtime
+  upgrade -- `lvqr-agent` has zero wasmtime / wasi / wasm
+  references in its dep tree -- but the upgrade's CI run
+  surfaced it. Polling lets a heavily-loaded runner take up to
+  2 s while a fast runner finishes in tens of ms.
 * **wasmtime v25 -> v43 upgrade** (session 150) -- closes 16
   RustSec advisories on the workspace's WASM filter host crate,
   including 2x CVSS-9 sandbox-escape entries

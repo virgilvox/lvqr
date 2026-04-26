@@ -320,6 +320,31 @@ mod tests {
         FragmentMeta::new("avc1.640028", 90_000)
     }
 
+    /// Poll `cond` every 10 ms until it returns true or `timeout`
+    /// elapses. Used in place of fixed-duration sleeps in tests
+    /// that block on the drain task processing emitted fragments,
+    /// firing on_start, or catching a panic. The fixed-100ms
+    /// shape that lived here pre-session-150 raced under
+    /// macos-latest CI runner load (panic counter increment vs.
+    /// the 100ms read window); polling lets a heavily-loaded
+    /// runner take up to `timeout` while a fast runner finishes
+    /// in tens of ms.
+    async fn poll_until(mut cond: impl FnMut() -> bool, timeout: Duration) {
+        let start = std::time::Instant::now();
+        while !cond() {
+            if start.elapsed() >= timeout {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Sensible-large default timeout for `poll_until` in this
+    /// module's tests. Matches the longest plausible drain-task
+    /// startup + panic-catch + counter-increment latency on a
+    /// loaded GitHub-hosted macos runner.
+    const POLL_TIMEOUT: Duration = Duration::from_secs(2);
+
     fn frag(idx: u64) -> Fragment {
         Fragment::new(
             "0.mp4",
@@ -401,8 +426,19 @@ mod tests {
         // Also remove the registry-side handle so no clone
         // keeps the broadcaster alive.
         registry.remove("live", "0.mp4");
-        // Yield long enough for the drain task to finish.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Wait for the drain task to finish: on_start fires, every
+        // emitted fragment threads through, and on_stop fires once
+        // the broadcaster Closes.
+        let cap_for_poll = Arc::clone(&capture);
+        poll_until(
+            move || {
+                cap_for_poll.starts.lock().len() == 1
+                    && cap_for_poll.fragments.lock().len() == 5
+                    && *cap_for_poll.stops.lock() == 1
+            },
+            POLL_TIMEOUT,
+        )
+        .await;
 
         let starts = capture.starts.lock().clone();
         assert_eq!(starts.len(), 1, "on_start fires exactly once");
@@ -436,7 +472,8 @@ mod tests {
         bc_video.emit(frag(0));
         let bc_audio = registry.get_or_create("live", "1.mp4", FragmentMeta::new("mp4a.40.2", 48_000));
         bc_audio.emit(frag(7));
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let cap_for_poll = Arc::clone(&capture);
+        poll_until(move || cap_for_poll.fragments.lock().len() == 1, POLL_TIMEOUT).await;
 
         let frags = capture.fragments.lock().clone();
         assert_eq!(frags.len(), 1, "agent only saw the audio fragment");
@@ -490,7 +527,11 @@ mod tests {
         for i in 0..3 {
             bc.emit(frag(i));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        poll_until(
+            || seen.load(Ordering::Relaxed) == 3 && handle.panics("panicky", "live", "0.mp4") == 1,
+            POLL_TIMEOUT,
+        )
+        .await;
 
         // All 3 fragments were handed to on_fragment (the
         // counter increments before the panic fires).
@@ -533,7 +574,7 @@ mod tests {
         let bc = registry.get_or_create("live", "0.mp4", meta());
         bc.emit(frag(0));
         bc.emit(frag(1));
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        poll_until(|| handle.panics("panic_start", "live", "0.mp4") == 1, POLL_TIMEOUT).await;
 
         // No fragments processed because on_start panicked.
         assert_eq!(handle.fragments_seen("panic_start", "live", "0.mp4"), 0);
@@ -573,7 +614,14 @@ mod tests {
         let bc = registry.get_or_create("live", "0.mp4", meta());
         bc.emit(frag(0));
         bc.emit(frag(1));
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        poll_until(
+            || {
+                handle.fragments_seen("alpha", "live", "0.mp4") == 2
+                    && handle.fragments_seen("beta", "live", "0.mp4") == 2
+            },
+            POLL_TIMEOUT,
+        )
+        .await;
 
         assert_eq!(handle.fragments_seen("alpha", "live", "0.mp4"), 2);
         assert_eq!(handle.fragments_seen("beta", "live", "0.mp4"), 2);

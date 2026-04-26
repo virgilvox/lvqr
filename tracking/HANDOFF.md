@@ -1,8 +1,110 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 150 (2026-04-25) closed the dominant audit-ignore cluster** -- wasmtime v25 -> v43 upgrade removes 16 RustSec advisories from `audit.toml` (including 2x CVSS-9 sandbox-escape entries), down from 22 ignores to 6. `lvqr-wasm` only uses the core WASM API surface (Engine/Module/Store/Instance/TypedFunc) which is stable across the upgrade range; total source diff was 7 lines (two Module::new error-conversion callsites). **Session 149 (2026-04-25) shipped hot config reload v3 (JWKS + webhook URL rotation)** -- `ConfigReloadHandle::reload` flipped to `async`; the reload pipeline now calls `JwksAuthProvider::new` and `WebhookAuthProvider::new` asynchronously and swaps the resulting provider into the `HotReloadAuthProvider` chain. Drop-old-on-swap leverages each provider's existing `Drop` to abort their spawned refresh / fetcher task. `applied_keys` grows entries (`"jwks"` / `"webhook"`) on URL diff. Feature-disabled builds emit a warning when the file names a feature-gated URL. `jwks_url` and `webhook_auth_url` are mutually exclusive within the same `[auth]` section (the route returns an error). The admin route closure shape widened from sync `Fn -> Result<...>` to async-flavored `Fn -> BoxFuture<Result<...>>` (internal-API change; SDK wire shape unchanged). With session 149, hot config reload is feature-complete -- every key the file format defines is honored at runtime. **Session 148 (2026-04-25) shipped hot config reload v2 (mesh ICE + HMAC secret)** -- `mesh_ice_servers` and `hmac_playback_secret` join the hot-reloadable surface alongside auth, swapped atomically via `arc_swap::ArcSwap` handles threaded through the `/signal` callback and the live HLS / DASH / DVR `/playback/*` middlewares. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Default-gate tests after 148: Rust workspace **1107** / 0 / 0 (was 1099 post-147; +8 net: 8 new lvqr-cli unit covering ice + hmac + applied_keys diff paths + clear semantics + no-deferred-warnings regression, 2 new RTMP-shape integration cases in `config_reload_e2e.rs` mesh ICE + HMAC rotation; the workshop-148 step rewrote one prior unit test from warnings-shape to applied_keys-shape, net unit delta = 8). Python pytest **38** unchanged. Vitest unchanged at 13. Admin surface unchanged at **12 route trees**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API**; **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates.
+## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 151 (2026-04-25) hardens lvqr-agent runner-test polling** -- replaces 4 fixed-100 ms `tokio::time::sleep` sites with a `poll_until` helper (10 ms tick, 2 s timeout) so the spawned drain-task's panic-counter increment can settle on a loaded macos-latest CI runner. The flake surfaced on session 150's substantive CI run but is orthogonal to the wasmtime upgrade (lvqr-agent has zero wasmtime deps); the OTHER 7 session-150 workflows including Feature matrix and Supply-chain audit landed green on the original push. **Session 150 (2026-04-25) closed the dominant audit-ignore cluster** -- wasmtime v25 -> v43 upgrade removes 16 RustSec advisories from `audit.toml` (including 2x CVSS-9 sandbox-escape entries), down from 22 ignores to 6. `lvqr-wasm` only uses the core WASM API surface (Engine/Module/Store/Instance/TypedFunc) which is stable across the upgrade range; total source diff was 7 lines (two Module::new error-conversion callsites). **Session 149 (2026-04-25) shipped hot config reload v3 (JWKS + webhook URL rotation)** -- `ConfigReloadHandle::reload` flipped to `async`; the reload pipeline now calls `JwksAuthProvider::new` and `WebhookAuthProvider::new` asynchronously and swaps the resulting provider into the `HotReloadAuthProvider` chain. Drop-old-on-swap leverages each provider's existing `Drop` to abort their spawned refresh / fetcher task. `applied_keys` grows entries (`"jwks"` / `"webhook"`) on URL diff. Feature-disabled builds emit a warning when the file names a feature-gated URL. `jwks_url` and `webhook_auth_url` are mutually exclusive within the same `[auth]` section (the route returns an error). The admin route closure shape widened from sync `Fn -> Result<...>` to async-flavored `Fn -> BoxFuture<Result<...>>` (internal-API change; SDK wire shape unchanged). With session 149, hot config reload is feature-complete -- every key the file format defines is honored at runtime. **Session 148 (2026-04-25) shipped hot config reload v2 (mesh ICE + HMAC secret)** -- `mesh_ice_servers` and `hmac_playback_secret` join the hot-reloadable surface alongside auth, swapped atomically via `arc_swap::ArcSwap` handles threaded through the `/signal` callback and the live HLS / DASH / DVR `/playback/*` middlewares. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Default-gate tests after 148: Rust workspace **1107** / 0 / 0 (was 1099 post-147; +8 net: 8 new lvqr-cli unit covering ice + hmac + applied_keys diff paths + clear semantics + no-deferred-warnings regression, 2 new RTMP-shape integration cases in `config_reload_e2e.rs` mesh ICE + HMAC rotation; the workshop-148 step rewrote one prior unit test from warnings-shape to applied_keys-shape, net unit delta = 8). Python pytest **38** unchanged. Vitest unchanged at 13. Admin surface unchanged at **12 route trees**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API**; **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates.
 
-**Last Updated**: 2026-04-25 (session 150 close).
+**Last Updated**: 2026-04-25 (session 151 close).
+
+## Session 151 close (2026-04-25)
+
+**Shipped**: `lvqr-agent` runner-test polling fix. Replaces four
+`tokio::time::sleep(Duration::from_millis(100))` sites in
+`crates/lvqr-agent/src/runner.rs` tests with a new module-private
+`poll_until` helper (10 ms tick, 2 s timeout). Surgical patch
+against a pre-existing test flake that surfaced on session 150's
+substantive CI run.
+
+### Why it surfaced now (and why it is unrelated to the wasmtime upgrade)
+
+Session 150's CI workflow (24944145839, run 1) failed with
+`panic_in_on_start_skips_drain_loop` and
+`panic_in_on_fragment_is_caught_and_counted_loop_continues`
+asserting `left: 0, right: 1` on `assert_eq!(handle.panics
+("panic_start", "live", "0.mp4"), 1)`. The 100 ms sleep before
+the assertion raced the spawned drain task on a loaded macos-
+latest runner: the drain task was scheduled, on_start panicked,
+the panic was caught via `catch_unwind`, but the counter
+increment hadn't yet flushed to the `Arc<AtomicU64>` reader by
+the time the test thread polled it.
+
+`lvqr-agent`'s dep tree has zero wasmtime / wasi / wasm
+references (just dashmap, lvqr-fragment, metrics, parking_lot,
+tokio, tracing). The wasmtime v43 upgrade has no causal
+connection to the panic-catch path. The 7 OTHER session 150 CI
+workflows (Test Contract, Supply-chain audit, SDK tests, Mesh
+E2E, MPEG-DASH Conformance, LL-HLS Conformance, Tier 4 demos,
+plus the Feature matrix that is the only workflow exercising
+`--features full` builds) ALL landed green on the original
+session 150 push, directly verifying the wasmtime upgrade is
+sound at the resolver + compile + matrix-test level. The flake
+was orthogonal noise that this push happened to surface; CI
+history shows the same workflow flaked on
+24923693777 (post-145 cleanup) and 24918750739 (session 142
+docs-only push) too.
+
+### Deliverables
+
+1. **`crates/lvqr-agent/src/runner.rs`** -- new module-private
+   `poll_until(cond: impl FnMut() -> bool, timeout: Duration)`
+   helper + a `POLL_TIMEOUT = 2s` constant near the top of the
+   `mod tests` block. Four assertion sites updated:
+   - `agent_receives_every_emitted_fragment_then_stops` (waits
+     for `starts.len() == 1 && fragments.len() == 5 && stops ==
+     1`, was `sleep(150ms)`).
+   - `factory_returning_none_is_skipped` (waits for filtered
+     `fragments.len() == 1`, was `sleep(100ms)`).
+   - `panic_in_on_fragment_is_caught_and_counted_loop_continues`
+     (waits for `seen == 3 && panics == 1`, was `sleep(100ms)`).
+   - `panic_in_on_start_skips_drain_loop` (waits for `panics
+     == 1`, was `sleep(100ms)`).
+   - `multiple_factories_each_get_their_own_drain_per_broadcast`
+     (waits for both alpha + beta `fragments_seen == 2`, was
+     `sleep(100ms)`).
+
+   The lone remaining fixed sleep in the test module
+   (`empty_runner_installs_callback_but_spawns_nothing`'s 50 ms)
+   is a NEGATIVE check (`assert!(handle.tracked().is_empty())`)
+   where polling for absence over a short window is the right
+   semantic; left as-is.
+
+### Decisions baked in
+
+* **Polling helper stays local to `runner.rs`'s `mod tests`.**
+  No promotion to `lvqr-test-utils`. The cross-workspace audit
+  showed fixed-millisecond sleeps elsewhere (mostly
+  integration tests under `crates/lvqr-cli/tests/`) but those
+  wait for legitimate network / ingest pipeline timing rather
+  than tightly-bound state-machine counters; promoting
+  `poll_until` would be premature abstraction.
+
+* **2-second timeout is generous on purpose.** The fastest
+  local Mac runs the post-emit drain in <10 ms; the loaded
+  GitHub-hosted macos runner that flaked the 100 ms version
+  was at least 10x slower. 2 s gives the runner ~200x headroom
+  while still bounding test runtime if the drain genuinely
+  hangs.
+
+* **Re-run on the wasmtime commit was the verification path,
+  not the commit-the-fix path.** While the patch was prepared
+  locally during the wait, the re-run was given priority to
+  produce direct evidence about flake vs. real regression.
+  Committing the fix without that evidence would have been
+  papering over an unknown.
+
+### Ground truth (session 151 close)
+
+* **Source change scope**: 1 file, 1 crate. The diff adds the
+  `poll_until` helper + 5 call-site refactors. No production
+  code paths touched.
+* **Tests**: `cargo test -p lvqr-agent --lib` passes 8/8 (was
+  8/8 pre-patch on local Mac; the patch makes the timing
+  assertion robust under load instead of just lucky on fast
+  runners). Workspace tests stay at 1111 / 0 / 0 across 131
+  binaries.
+* **CI gates**: `cargo fmt --all -- --check` clean; `cargo
+  clippy -p lvqr-agent --all-targets -- -D warnings` clean.
+* **Workspace version**: `0.4.1` unchanged.
+* **Admin surface**: unchanged at 12 route trees.
+* **SDK packages**: unchanged at 0.3.2.
 
 ## Session 150 close (2026-04-25)
 
