@@ -10,6 +10,39 @@ releases. For session-by-session engineering notes, see
 
 ### Added
 
+* **`@lvqr/dvr-player` web component v0.3.2** (session 153). New
+  npm package at `bindings/js/packages/dvr-player/`, sister to
+  `@lvqr/player`, drops in as `<lvqr-dvr-player>` for HLS DVR
+  scrub against the relay's existing `/hls/{broadcast}/master.m3u8`
+  endpoint with the `--hls-dvr-window` sliding-window depth.
+  Vanilla `class extends HTMLElement` (structured-vanilla pattern;
+  template-literal HTML strings + small attribute helpers + shadow
+  DOM + `attributeChangedCallback`-driven reactivity; no Lit, no
+  Stencil). Wraps hls.js (`^1.5.0` direct dep). Custom seek bar
+  with HH:MM:SS percentile labels (or MM:SS for sub-hour spans),
+  LIVE pill toggling on `seekable.end - currentTime` crossing
+  `max(6, 3 * #EXT-X-TARGETDURATION)` (configurable via
+  `live-edge-threshold-secs`), explicit Go Live button, client-
+  side hover thumbnails via canvas `drawImage` against a lazy
+  second hls.js instance (LRU-capped at 60 entries; opt-out via
+  `thumbnails="disabled"`). Bearer-token auth via hls.js
+  `xhrSetup` with query-string fallback for native HLS in Safari
+  MSE-less mode. Public events: `lvqr-dvr-seek`,
+  `lvqr-dvr-live-edge-changed`, `lvqr-dvr-error`. Programmatic
+  API: `play / pause / seek / goLive / getHlsInstance`. ESM-only
+  via `tsc`, `MIT OR Apache-2.0`. **No new server route** -- the
+  component consumes the existing `/hls/*` surface unchanged.
+  32 Vitest unit tests (seekbar arithmetic + attrs helpers +
+  typed dispatcher) + 15 Playwright e2e tests (mount + interaction
+  flows including pointer drag, keyboard scrub, threshold
+  customization, hover preview, programmatic seek + goLive +
+  multi-seek event chaining, host-to-document event bubbling).
+  New docs at `docs/dvr-scrub.md` covering the operator embedding
+  recipe, signed-URL / bearer-token auth precedence, theming via
+  CSS custom properties + `::part()` access. `@lvqr/core` and
+  `@lvqr/player` stay at 0.3.2; workspace 0.4.1 unchanged; no
+  Rust source touched.
+
 * **SCTE-35 ad-marker passthrough v1** (session 152). Splice events
   injected on the publisher side flow ingest -> parser -> parallel
   `"scte35"` track on the existing `FragmentBroadcasterRegistry` ->

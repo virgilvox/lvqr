@@ -119,7 +119,9 @@ WebSocket fMP4.
 
 Add `--archive-dir /var/lib/lvqr/archive` and every ingested
 fragment is written to disk with a `redb` index entry. The
-admin HTTP API grows three routes:
+admin HTTP API grows three routes (JSON segment-list surface,
+useful for operator tooling and post-finalize archive
+indexing):
 
 ```bash
 # Every archived video segment for a broadcast, oldest first
@@ -131,6 +133,28 @@ curl 'http://localhost:8080/playback/live/demo?track=0.mp4&from=0&to=1800000'
 # Most-recent segment anchor (for "jump to live minus N seconds")
 curl 'http://localhost:8080/playback/latest/live/demo'
 ```
+
+**For end-viewer DVR scrub in the browser**, install
+`@lvqr/dvr-player` and embed the component against the relay's
+live HLS endpoint. The DVR window depth is whatever
+`--hls-dvr-window` was configured with on `lvqr serve` (default
+120 s; bump to 3600 for a one-hour scrub window):
+
+```html
+<script type="module">
+  import '@lvqr/dvr-player';
+</script>
+<lvqr-dvr-player
+  src="http://localhost:8080/hls/live/demo/master.m3u8"
+  muted
+  autoplay
+></lvqr-dvr-player>
+```
+
+The component renders a custom seek bar with HH:MM:SS labels,
+a LIVE pill, a Go Live button, and client-side hover
+thumbnails. See [`docs/dvr-scrub.md`](dvr-scrub.md) for the
+full operator embedding recipe and theming surface.
 
 Auth and CORS defaults: if `--subscribe-token` or
 `--jwt-secret` is set, playback routes inherit the same

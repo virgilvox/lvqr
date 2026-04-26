@@ -1,12 +1,21 @@
 # JavaScript SDK
 
-Two npm packages for browser integration:
+Three npm packages for browser integration:
 
 - `@lvqr/core` -- Low-level client library (WebTransport + WebSocket
   fMP4 fallback, admin API client, WebRTC DataChannel peer mesh)
-- `@lvqr/player` -- Drop-in `<lvqr-player>` Web Component
+- `@lvqr/player` -- Drop-in `<lvqr-player>` Web Component for the
+  MoQ-Lite over WebTransport / WebSocket live path
+- `@lvqr/dvr-player` -- Drop-in `<lvqr-dvr-player>` Web Component
+  for HLS DVR scrub (custom seek bar, LIVE pill, Go Live button,
+  client-side hover thumbnails). Wraps hls.js against the relay's
+  live HLS endpoint with the `--hls-dvr-window` sliding-window
+  DVR depth. See [`../dvr-scrub.md`](../dvr-scrub.md) for the
+  operator embedding recipe.
 
-Both ship at `0.3.2` on npm (released 2026-04-24). Features added on `main` after the
+All three ship at `0.3.2` on npm. The `@lvqr/dvr-player` package
+landed in session 153 (2026-04-25) and ships alongside the other
+two on the next release cycle. Features added on `main` after the
 last publish (listed below under **Timeouts + reconnect** and
 **Admin API**) land for consumers at the next release cycle.
 
@@ -14,8 +23,10 @@ last publish (listed below under **Timeouts + reconnect** and
 
 ```bash
 npm install @lvqr/core
-# or for the player component:
+# or for the live-only player component:
 npm install @lvqr/player
+# or for the HLS DVR scrub component:
+npm install @lvqr/dvr-player
 ```
 
 ## Player component (simplest)
@@ -47,6 +58,56 @@ npm install @lvqr/player
 lvqr-player::part(video) { /* style the video element */ }
 lvqr-player::part(status) { /* style the status overlay */ }
 ```
+
+## DVR scrub component
+
+For the HLS DVR scrub experience -- pause, scrub through a
+sliding window of the broadcast, jump to live -- use
+`@lvqr/dvr-player` against the relay's live HLS endpoint:
+
+```html
+<script type="module">
+  import '@lvqr/dvr-player';
+</script>
+
+<lvqr-dvr-player
+  src="https://relay.example.com:8080/hls/live/cam1/master.m3u8"
+  token="<bearer-token-or-omit>"
+  autoplay
+  muted
+></lvqr-dvr-player>
+```
+
+### Attributes
+
+| Attribute | Description |
+|-----------|-------------|
+| `src` | Master playlist URL (required) |
+| `autoplay` | Start playback when manifest is parsed |
+| `muted` | Start muted (required for autoplay) |
+| `token` | Bearer token forwarded as `Authorization: Bearer` |
+| `live-edge-threshold-secs` | Live-edge detection threshold (default `max(6, 3 * #EXT-X-TARGETDURATION)`) |
+| `thumbnails` | `enabled` (default) or `disabled` |
+| `controls` | `custom` (default) or `native` |
+
+### Custom events
+
+```typescript
+player.addEventListener('lvqr-dvr-seek', (e) => {
+  const { fromTime, toTime, isLiveEdge, source } = e.detail;
+});
+player.addEventListener('lvqr-dvr-live-edge-changed', (e) => {
+  const { isAtLiveEdge, deltaSecs, thresholdSecs } = e.detail;
+});
+player.addEventListener('lvqr-dvr-error', (e) => {
+  const { code, message, fatal, source } = e.detail;
+});
+```
+
+See [`../dvr-scrub.md`](../dvr-scrub.md) for the full surface
+including the programmatic API
+(`play / pause / seek / goLive / getHlsInstance`), CSS theming,
+and the importmap-based CDN drop-in recipe.
 
 ## Core client (low-level)
 
