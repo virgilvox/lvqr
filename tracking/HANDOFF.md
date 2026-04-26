@@ -104,23 +104,50 @@ G.7 + SCTE 214-1).
     to strikethrough; "Recently shipped" gains a session 152
     entry covering all of the above.
 
-### RTMP onCuePoint deferral (the rml_rtmp gap)
+### RTMP onCuePoint UNBLOCKED via vendored rml_rtmp patch
 
 The brief's step 2 (verify rml_rtmp `ServerSessionEvent` surface)
-turned up a hard blocker. `rml_rtmp` v0.8 `handle_amf0_data`
-(server/mod.rs:920) only routes `@setDataFrame`-wrapped onMetaData;
-all other AMF0 Data messages -- including the standard
-`onCuePoint` carriage that OBS, Wirecast, vMix, and ffmpeg use for
-SCTE-35 -- return `Ok(Vec::new())` from the ServerSession with no
-event raised. There is NO path for LVQR's `rtmp.rs` to see those
-messages without forking the library or replacing the dep.
+turned up a hard blocker that the initial 1205163 commit deferred
+RTMP behind: `rml_rtmp` v0.8 `handle_amf0_data` (server/mod.rs:920)
+only routes `@setDataFrame`-wrapped onMetaData; all other AMF0
+Data messages -- including the standard `onCuePoint` carriage that
+OBS, Wirecast, vMix, and ffmpeg use for SCTE-35 -- return
+`Ok(Vec::new())` from the ServerSession with no event raised.
 
-Decision: ship SRT-only v1 (the brief's anti-scope tolerates this
-ingest-by-ingest staging). The deferral is documented in
-`docs/scte35.md` ingest-paths table. A future session that bumps
-or replaces the dep can land RTMP onCuePoint behind the same
-parser + parallel-track + bridge plumbing without changes to the
-egress side.
+Follow-up commit fixes this by vendoring `rml_rtmp` at
+`vendor/rml_rtmp/` (MIT-licensed upstream, license preserved) with
+a minimal patch:
+
+* `vendor/rml_rtmp/src/sessions/server/events.rs` adds a new
+  `ServerSessionEvent::Amf0DataReceived { app_name, stream_key,
+  data }` variant.
+* `vendor/rml_rtmp/src/sessions/server/mod.rs`'s `handle_amf0_data`
+  fallthrough now raises that event instead of returning
+  `Ok(Vec::new())`. The `@setDataFrame`-wrapped onMetaData path is
+  unchanged so OBS / ffmpeg publishers do not regress (the
+  `at_setdataframe_onmetadata_still_routes_to_stream_metadata_changed`
+  regression test in
+  `crates/lvqr-ingest/tests/scte35_rtmp_oncuepoint_e2e.rs`
+  enforces this).
+
+The fork is loaded via `[patch.crates-io] rml_rtmp = { path =
+"vendor/rml_rtmp" }` in the workspace root `Cargo.toml`. All 168
+upstream rml_rtmp tests still pass on the patched copy; the diff
+is ~25 lines including comments. Total source diff to lift: 25
+lines.
+
+LVQR-side wiring: `lvqr-ingest/src/rtmp.rs` adds a
+`Scte35Callback` type, a `RtmpServer::set_scte35_callback`
+installer, and a `parse_oncuepoint_scte35` helper that decodes
+the AMF0 object's `name="scte35-bin64"` + `data=<base64>` shape;
+`lvqr-ingest/src/bridge.rs` `create_rtmp_server` wires the
+callback into `publish_scte35` onto the shared registry so the
+RTMP path uses the SAME parallel-track + cli-side bridge
+pipeline the SRT path already uses. End-to-end test at
+`crates/lvqr-ingest/tests/scte35_rtmp_oncuepoint_e2e.rs` drives
+real wire bytes through `MessagePayload::from_rtmp_message` ->
+`ChunkSerializer` -> `ServerSession::handle_input` and asserts
+the patched event variant fires with the expected AMF0 values.
 
 ### Test deltas
 

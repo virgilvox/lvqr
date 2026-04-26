@@ -335,13 +335,11 @@ format defines is honored at runtime. The remaining ranking:
 1. ~~**Hot config reload.**~~ v1 / v2 / v3 shipped across
    sessions 147 + 148 + 149.
 2. ~~**SCTE-35 passthrough.**~~ v1 shipped in session 152 (SRT
-   MPEG-TS PID 0x86 ingest, LL-HLS `#EXT-X-DATERANGE` and DASH
-   Period-level `<EventStream>` egress, splice_info_section
-   passthrough verbatim). RTMP onCuePoint deferred behind an
-   rml_rtmp v0.8 dependency gap (the library silently drops
-   AMF0 Data messages other than `@setDataFrame`-wrapped
-   onMetaData; lifting requires an upstream patch or a dep
-   swap).
+   MPEG-TS PID 0x86 ingest, RTMP onCuePoint scte35-bin64 ingest
+   via a vendored `rml_rtmp` patch at `vendor/rml_rtmp/` that
+   surfaces non-`@setDataFrame` AMF0 Data messages, LL-HLS
+   `#EXT-X-DATERANGE` and DASH Period-level `<EventStream>`
+   egress, splice_info_section passthrough verbatim).
 3. **Dedicated DVR scrub web UI.** Today DVR playback works via
    any HLS-aware player but seek-bar + thumbnail strip require
    integrator work. A drop-in `<lvqr-dvr-player>` web component

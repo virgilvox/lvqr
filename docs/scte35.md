@@ -31,7 +31,7 @@ the events it receives.
 | Path | Status | Convention |
 |------|--------|------------|
 | SRT MPEG-TS | shipped (session 152) | PMT stream_type 0x86 on a dedicated PID (typically 0x1FFB by broadcast convention); section reassembly across TS packet boundaries. |
-| RTMP onCuePoint | deferred | rml_rtmp v0.8 silently drops AMF0 Data messages other than `@setDataFrame`-wrapped onMetaData. Lifting requires either an upstream patch or replacing the rml_rtmp dep. Tracking: session 152 close block. |
+| RTMP onCuePoint | shipped (session 152 follow-up) | AMF0 Data message with method name `onCuePoint` and an object carrying `name="scte35-bin64"` + `data="<base64 splice_info_section>"`. The Adobe convention used by OBS, Wirecast, vMix, and ffmpeg's `-bsf:v scte35` pipeline. Wired via a vendored `rml_rtmp` v0.8 fork at `vendor/rml_rtmp/` that adds an `Amf0DataReceived` ServerSessionEvent so non-`@setDataFrame` AMF0 Data messages reach LVQR's RTMP path; without the patch the upstream library silently drops them. The fork is loaded via `[patch.crates-io]` in the workspace `Cargo.toml`. |
 | WHIP / WebRTC | deferred | No widely-adopted publisher convention for in-band SCTE-35 over WebRTC data channels. |
 | RTSP | deferred | No publisher convention; would require RDT or custom DESCRIBE handling. |
 

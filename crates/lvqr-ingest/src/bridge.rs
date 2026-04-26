@@ -19,7 +19,7 @@ use crate::remux::{
     AudioConfig, FlvAudioTag, FlvVideoTag, VideoConfig, audio_init_segment, audio_segment, extract_resolution,
     generate_catalog, parse_audio_tag, parse_video_tag, video_init_segment_with_size,
 };
-use crate::rtmp::{AuthCallback, MediaCallback, RtmpConfig, RtmpServer, StreamCallback};
+use crate::rtmp::{AuthCallback, MediaCallback, RtmpConfig, RtmpServer, Scte35Callback, StreamCallback};
 
 /// State for a single active RTMP stream being bridged to MoQ.
 ///
@@ -474,6 +474,51 @@ impl RtmpMoqBridge {
         let validate: AuthCallback =
             Arc::new(move |app: &str, key: &str| auth.check(&extract::extract_rtmp(app, key)).is_allow());
         server.set_validate_publish(validate);
+
+        // Session 152 RTMP unblock: wire the SCTE-35 onCuePoint
+        // scte35-bin64 carriage into the shared
+        // FragmentBroadcasterRegistry's reserved `"scte35"` track,
+        // mirroring the SRT MPEG-TS PID 0x86 path. The patched
+        // rml_rtmp `Amf0DataReceived` event surfaces these messages;
+        // rtmp.rs's `parse_oncuepoint_scte35` decodes the AMF0 object
+        // and base64; here we re-parse via lvqr-codec for CRC
+        // verification + timing extraction, then publish onto the
+        // registry. CRC failures and unparseable sections drop with
+        // a counter bump (parity with the SRT path).
+        let registry_scte35 = self.registry.clone();
+        let on_scte35: Scte35Callback = Arc::new(move |app: &str, key: &str, raw: Bytes| {
+            let stream_name = format!("{app}/{key}");
+            match lvqr_codec::parse_splice_info_section(&raw) {
+                Ok(info) => {
+                    let pts = info.absolute_pts().unwrap_or(0);
+                    let duration = info.duration.unwrap_or(0);
+                    let event_id = info.event_id.unwrap_or(0) as u64;
+                    crate::publish_scte35(&registry_scte35, &stream_name, event_id, pts, duration, raw);
+                    metrics::counter!(
+                        "lvqr_scte35_events_total",
+                        "ingest" => "rtmp",
+                        "command" => format!("{:#04x}", info.command_type),
+                    )
+                    .increment(1);
+                }
+                Err(e) => {
+                    let reason = match &e {
+                        lvqr_codec::CodecError::Scte35BadCrc { .. } => "crc",
+                        lvqr_codec::CodecError::Scte35Malformed(_) => "malformed",
+                        lvqr_codec::CodecError::EndOfStream { .. } => "truncated",
+                        _ => "other",
+                    };
+                    warn!(stream = %stream_name, error = %e, "RTMP scte35-bin64 parse failure");
+                    metrics::counter!(
+                        "lvqr_scte35_drops_total",
+                        "ingest" => "rtmp",
+                        "reason" => reason,
+                    )
+                    .increment(1);
+                }
+            }
+        });
+        server.set_scte35_callback(on_scte35);
         server
     }
 

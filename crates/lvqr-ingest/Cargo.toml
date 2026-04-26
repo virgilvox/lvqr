@@ -41,6 +41,15 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 thiserror = { workspace = true }
 
+# Base64 decode for SCTE-35 onCuePoint scte35-bin64 AMF0 payload
+# (RTMP path; session 152 + RTMP unblock).
+base64 = { workspace = true }
+
+# rml_amf0 is pulled in transitively by rml_rtmp; pinning a direct
+# edge so the Amf0Value match in the SCTE-35 onCuePoint dispatcher is
+# self-documenting at the manifest level.
+rml_amf0 = "0.3"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 rml_rtmp = { workspace = true }

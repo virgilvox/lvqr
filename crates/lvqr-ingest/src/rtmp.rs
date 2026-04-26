@@ -37,6 +37,17 @@ pub type StreamCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
 /// Authentication callback: (app, stream_key) -> bool. Returns true to accept.
 pub type AuthCallback = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
+/// SCTE-35 callback: (app, stream_key, raw splice_info_section bytes).
+/// Fires for every `onCuePoint` AMF0 Data message whose `name` property
+/// is `"scte35-bin64"` and whose `data` property base64-decodes to a
+/// non-empty byte vector. The callee is responsible for further
+/// parse / dispatch (typically [`crate::publish_scte35`] onto the
+/// shared FragmentBroadcasterRegistry's `"scte35"` track).
+///
+/// Wired through the patched rml_rtmp `Amf0DataReceived` event variant
+/// (see `vendor/rml_rtmp` and the session 152 close block).
+pub type Scte35Callback = Arc<dyn Fn(&str, &str, Bytes) + Send + Sync>;
+
 /// RTMP ingest server that translates RTMP streams to MoQ tracks.
 pub struct RtmpServer {
     config: RtmpConfig,
@@ -47,6 +58,10 @@ pub struct RtmpServer {
     /// Optional authentication: returns true to accept the publish stream key.
     /// `None` means open access.
     validate_publish: Option<AuthCallback>,
+    /// Optional SCTE-35 onCuePoint scte35-bin64 callback. `None` means
+    /// SCTE-35 ad markers are silently dropped (back-compat with
+    /// session 151 and earlier callers).
+    on_scte35: Option<Scte35Callback>,
 }
 
 impl RtmpServer {
@@ -70,6 +85,7 @@ impl RtmpServer {
             on_publish: Arc::new(on_publish),
             on_unpublish: Arc::new(on_unpublish),
             validate_publish: None,
+            on_scte35: None,
         }
     }
 
@@ -88,6 +104,7 @@ impl RtmpServer {
             on_publish,
             on_unpublish,
             validate_publish: None,
+            on_scte35: None,
         }
     }
 
@@ -96,6 +113,16 @@ impl RtmpServer {
     /// connection is closed.
     pub fn set_validate_publish(&mut self, validate: AuthCallback) {
         self.validate_publish = Some(validate);
+    }
+
+    /// Install an optional callback for SCTE-35 onCuePoint scte35-bin64
+    /// AMF0 Data messages. Each invocation receives the
+    /// (app, stream_key, raw splice_info_section bytes) triple; the
+    /// callee typically parses via [`lvqr_codec::parse_splice_info_section`]
+    /// and emits onto the shared FragmentBroadcasterRegistry's
+    /// `"scte35"` track via [`crate::publish_scte35`].
+    pub fn set_scte35_callback(&mut self, cb: Scte35Callback) {
+        self.on_scte35 = Some(cb);
     }
 
     pub fn config(&self) -> &RtmpConfig {
@@ -130,6 +157,7 @@ impl RtmpServer {
                     let on_publish = self.on_publish.clone();
                     let on_unpublish = self.on_unpublish.clone();
                     let validate_publish = self.validate_publish.clone();
+                    let on_scte35 = self.on_scte35.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_rtmp_connection(
@@ -139,6 +167,7 @@ impl RtmpServer {
                             on_publish,
                             on_unpublish,
                             validate_publish,
+                            on_scte35,
                         )
                         .await
                         {
@@ -158,6 +187,7 @@ impl RtmpServer {
 }
 
 /// Handle a single RTMP connection.
+#[allow(clippy::too_many_arguments)]
 async fn handle_rtmp_connection(
     mut stream: TcpStream,
     on_video: MediaCallback,
@@ -165,6 +195,7 @@ async fn handle_rtmp_connection(
     on_publish: StreamCallback,
     on_unpublish: StreamCallback,
     validate_publish: Option<AuthCallback>,
+    on_scte35: Option<Scte35Callback>,
 ) -> Result<(), IngestError> {
     // Phase 1: RTMP Handshake
     let mut handshake = Handshake::new(PeerType::Server);
@@ -210,6 +241,7 @@ async fn handle_rtmp_connection(
                     on_publish,
                     on_unpublish,
                     validate_publish,
+                    on_scte35,
                 )
                 .await;
             }
@@ -218,6 +250,7 @@ async fn handle_rtmp_connection(
 }
 
 /// Handle the post-handshake RTMP session.
+#[allow(clippy::too_many_arguments)]
 async fn handle_rtmp_session(
     mut stream: TcpStream,
     remaining_bytes: Vec<u8>,
@@ -226,6 +259,7 @@ async fn handle_rtmp_session(
     on_publish: StreamCallback,
     on_unpublish: StreamCallback,
     validate_publish: Option<AuthCallback>,
+    on_scte35: Option<Scte35Callback>,
 ) -> Result<(), IngestError> {
     let config = ServerSessionConfig::new();
     let (mut session, initial_results) =
@@ -357,6 +391,36 @@ async fn handle_rtmp_session(
                             "stream metadata received"
                         );
                     }
+                    ServerSessionEvent::Amf0DataReceived {
+                        app_name,
+                        stream_key,
+                        data,
+                    } => {
+                        if let Some(section) = parse_oncuepoint_scte35(data) {
+                            metrics::counter!(
+                                "lvqr_scte35_events_total",
+                                "ingest" => "rtmp",
+                                "command" => "oncuepoint",
+                            )
+                            .increment(1);
+                            if let Some(ref cb) = on_scte35 {
+                                (cb)(app_name, stream_key, section);
+                            } else {
+                                debug!(
+                                    app = %app_name,
+                                    key = %stream_key,
+                                    "RTMP scte35-bin64 onCuePoint received but no callback installed; dropping"
+                                );
+                            }
+                        } else {
+                            debug!(
+                                app = %app_name,
+                                key = %stream_key,
+                                first = ?data.first(),
+                                "RTMP AMF0 data not an scte35-bin64 onCuePoint; ignoring"
+                            );
+                        }
+                    }
                     _ => {
                         debug!(event = ?event, "unhandled RTMP event");
                     }
@@ -385,6 +449,58 @@ async fn process_session_results(
         }
     }
     Ok(())
+}
+
+/// Parse an `onCuePoint` AMF0 Data payload looking for a SCTE-35
+/// `scte35-bin64` carriage. The Adobe convention for in-band SCTE-35
+/// over RTMP is:
+///
+/// ```text
+/// amf0_string("onCuePoint")
+/// amf0_object {
+///     "name" => "scte35-bin64",
+///     "data" => "<base64-encoded splice_info_section>",
+///     ... (optional "type", "time", "duration" keys)
+/// }
+/// ```
+///
+/// Returns the base64-decoded splice_info_section as `Bytes` when the
+/// shape matches, or `None` for any other AMF0 Data carriage (which
+/// the caller logs at debug and drops).
+fn parse_oncuepoint_scte35(values: &[rml_amf0::Amf0Value]) -> Option<Bytes> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use rml_amf0::Amf0Value;
+
+    if values.len() < 2 {
+        return None;
+    }
+    let method = match &values[0] {
+        Amf0Value::Utf8String(s) => s,
+        _ => return None,
+    };
+    if method != "onCuePoint" {
+        return None;
+    }
+    let obj = match &values[1] {
+        Amf0Value::Object(props) => props,
+        _ => return None,
+    };
+    let name = obj.get("name").and_then(|v| match v {
+        Amf0Value::Utf8String(s) => Some(s.as_str()),
+        _ => None,
+    });
+    if name != Some("scte35-bin64") {
+        return None;
+    }
+    let b64 = obj.get("data").and_then(|v| match v {
+        Amf0Value::Utf8String(s) => Some(s.as_str()),
+        _ => None,
+    })?;
+    let decoded = STANDARD.decode(b64).ok()?;
+    if decoded.is_empty() {
+        return None;
+    }
+    Some(Bytes::from(decoded))
 }
 
 /// Check if an FLV video tag represents a keyframe.
@@ -418,5 +534,55 @@ mod tests {
     fn default_config() {
         let config = RtmpConfig::default();
         assert_eq!(config.bind_addr.port(), 1935);
+    }
+
+    fn mk_scte35_oncuepoint(b64: &str) -> Vec<rml_amf0::Amf0Value> {
+        use rml_amf0::Amf0Value;
+        use std::collections::HashMap;
+        let mut obj = HashMap::new();
+        obj.insert("name".into(), Amf0Value::Utf8String("scte35-bin64".into()));
+        obj.insert("data".into(), Amf0Value::Utf8String(b64.into()));
+        obj.insert("type".into(), Amf0Value::Utf8String("scte-35".into()));
+        vec![Amf0Value::Utf8String("onCuePoint".into()), Amf0Value::Object(obj)]
+    }
+
+    #[test]
+    fn parses_well_formed_oncuepoint_scte35_bin64() {
+        // base64 of "FCsection..." -- shape only, parser does not validate
+        // splice_info_section here (lvqr-codec does that).
+        let b64 = "/DARAA=="; // [0xFC, 0x30, 0x11, 0x00] base64
+        let values = mk_scte35_oncuepoint(b64);
+        let raw = parse_oncuepoint_scte35(&values).expect("parses");
+        assert_eq!(&raw[..], &[0xFC, 0x30, 0x11, 0x00]);
+    }
+
+    #[test]
+    fn rejects_oncuepoint_without_scte35_name() {
+        use rml_amf0::Amf0Value;
+        use std::collections::HashMap;
+        let mut obj = HashMap::new();
+        obj.insert("name".into(), Amf0Value::Utf8String("other-cue".into()));
+        obj.insert("data".into(), Amf0Value::Utf8String("/DARAA==".into()));
+        let values = vec![Amf0Value::Utf8String("onCuePoint".into()), Amf0Value::Object(obj)];
+        assert!(parse_oncuepoint_scte35(&values).is_none());
+    }
+
+    #[test]
+    fn rejects_non_oncuepoint_method() {
+        use rml_amf0::Amf0Value;
+        let values = vec![Amf0Value::Utf8String("onMetaData".into()), Amf0Value::Null];
+        assert!(parse_oncuepoint_scte35(&values).is_none());
+    }
+
+    #[test]
+    fn rejects_empty_base64_payload() {
+        let values = mk_scte35_oncuepoint("");
+        assert!(parse_oncuepoint_scte35(&values).is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_base64() {
+        let values = mk_scte35_oncuepoint("!!!not-valid-base64!!!");
+        assert!(parse_oncuepoint_scte35(&values).is_none());
     }
 }

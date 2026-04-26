@@ -115,7 +115,14 @@ criterion = "0.5"
 # Cluster gossip (Tier 3)
 chitchat = "0.10"
 
-# RTMP
+# RTMP. Vendored fork (vendor/rml_rtmp) carries a session-152 patch
+# adding an `Amf0DataReceived` ServerSessionEvent so non-@setDataFrame
+# AMF0 Data messages (notably onCuePoint scte35-bin64 carriages used
+# for SCTE-35 ad-marker passthrough) reach LVQR's RTMP ingest path
+# instead of silently being dropped at the rml_rtmp v0.8.0 boundary.
+# Wired via [patch.crates-io] below; the publish-side dep edges still
+# reference rml_rtmp 0.8 so a future upstream that exposes the same
+# event surface lifts the override transparently.
 rml_rtmp = "0.8"
 
 # H.264 parsing
@@ -243,6 +250,14 @@ lvqr-wasm = { version = "0.4.1", path = "crates/lvqr-wasm" }
 lvqr-agent = { version = "0.4.1", path = "crates/lvqr-agent" }
 lvqr-agent-whisper = { version = "0.4.1", path = "crates/lvqr-agent-whisper" }
 lvqr-transcode = { version = "0.4.1", path = "crates/lvqr-transcode" }
+
+[patch.crates-io]
+# Session 152 SCTE-35 RTMP onCuePoint passthrough patch. See
+# vendor/rml_rtmp/src/sessions/server/{events.rs,mod.rs} for the
+# minimal diff (one new ServerSessionEvent variant + one match arm in
+# handle_amf0_data). MIT-licensed upstream; LVQR fork keeps the same
+# license.
+rml_rtmp = { path = "vendor/rml_rtmp" }
 
 [profile.release]
 lto = true
