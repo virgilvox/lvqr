@@ -10,6 +10,79 @@ releases. For session-by-session engineering notes, see
 
 ### Added
 
+* **SCTE-35 ad-marker passthrough v1** (session 152). Splice events
+  injected on the publisher side flow ingest -> parser -> parallel
+  `"scte35"` track on the existing `FragmentBroadcasterRegistry` ->
+  per-broadcast bridge drain -> LL-HLS `#EXT-X-DATERANGE` + DASH
+  Period-level `<EventStream>`. Splice_info_section bytes are
+  preserved verbatim through both egress wire shapes (hex on HLS,
+  base64 inside `<Signal><Binary>` on DASH). The relay never
+  interprets splice semantics beyond what the egress wire shapes
+  need; ad-decisioning is the operator's responsibility (typically
+  via a downstream SSAI proxy that consumes the egress playlists).
+
+  * **Ingest paths**:
+    * **SRT MPEG-TS** -- PMT stream_type 0x86 on a dedicated PID
+      (typically 0x1FFB by broadcast convention); private-section
+      reassembly across TS packet boundaries.
+    * **RTMP onCuePoint scte35-bin64** -- the Adobe AMF0 convention
+      used by AWS Elemental, Wirecast, vMix, and ffmpeg's
+      `-bsf:v scte35` pipeline. Required vendoring `rml_rtmp` v0.8.0
+      at `vendor/rml_rtmp/` (MIT-licensed, license preserved) with a
+      ~25-line patch that adds an `Amf0DataReceived` ServerSessionEvent
+      variant: upstream's `handle_amf0_data` silently drops every AMF0
+      Data message that is not `@setDataFrame`-wrapped onMetaData. The
+      fork loads via `[patch.crates-io]` in the workspace `Cargo.toml`
+      and passes 170 / 0 / 0 tests (168 upstream + 2 LVQR-side
+      defensive tests).
+
+  * **Egress wire shapes**:
+    * **HLS** (per draft-pantos-hls-rfc8216bis section 4.4.5.1):
+      `#EXT-X-DATERANGE` at the playlist head with
+      `CLASS="urn:scte:scte35:2014:bin"` (industry convention),
+      `START-DATE`, optional `DURATION`, and one of SCTE35-OUT /
+      SCTE35-IN / SCTE35-CMD (driven by splice_command_type +
+      out_of_network_indicator) carrying the raw splice_info_section
+      as `0x...` hex.
+    * **DASH** (per ISO/IEC 23009-1 G.7 + SCTE 214-1):
+      Period-level `<EventStream
+      schemeIdUri="urn:scte:scte35:2014:xml+bin" timescale="90000">`
+      with `<Event>` children carrying base64-encoded
+      splice_info_section inside a `<Signal><Binary>` body. Rendered
+      BEFORE AdaptationSet siblings per spec ordering.
+
+  * **Parser** (`lvqr-codec/src/scte35.rs`): minimum-viable
+    splice_info_section decoder. Verifies CRC_32 (MPEG-2 polynomial
+    0x04C11DB7); decodes splice_null / splice_insert / time_signal
+    command bodies for the timing fields the egress renderers need
+    (event_id, pts, break_duration, command_type, cancel,
+    out_of_network_indicator); preserves the entire raw section in
+    `SpliceInfo::raw` for downstream passthrough.
+
+  * **Wiring**: new `lvqr_fragment::SCTE35_TRACK` reserved track
+    name; new `publish_scte35` helper in `lvqr-ingest`; new
+    `BroadcasterScte35Bridge` in `lvqr-cli` (mirror of the captions
+    bridge); new `MultiHlsServer::push_date_range` and
+    `MultiDashServer::push_event` methods.
+
+  * **Counter metrics**:
+    * `lvqr_scte35_events_total{ingest, command}` -- sections
+      successfully parsed and emitted onto the scte35 track.
+    * `lvqr_scte35_drops_total{ingest, reason}` -- sections dropped
+      at the parser boundary (CRC mismatch, malformed, truncated).
+    * `lvqr_scte35_bridge_drops_total{broadcast, reason}` -- sections
+      that reached the cli-side bridge but failed parse on the
+      second pass.
+
+  * **Anti-scope**: no semantic interpretation, no SCTE-104, no
+    mid-segment splice handling, no transcoder-level mid-stream IDR
+    insertion. WHIP / RTSP ingest paths deferred (no widely-adopted
+    publisher convention).
+
+  See [`docs/scte35.md`](docs/scte35.md) for the full standards
+  reference, ingest table, publisher quickstart, wire shape
+  examples, internal architecture, and operator runbook.
+
 * **Hot config reload** (sessions 147 + 148 + 149). New
   `lvqr serve --config <path.toml>` flag points at a TOML file;
   SIGHUP (Unix) and `POST /api/v1/config-reload` (cross-platform)

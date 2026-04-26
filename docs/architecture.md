@@ -51,14 +51,36 @@ changes when a new ingest lands, and vice versa.
   RTMP (1935)  ─┐
   WHIP  (HTTPS) ├┐
   SRT   (UDP)   ├┼─► FragmentBroadcaster ─► FragmentObserver taps
-  RTSP  (TCP)   ├┘                         ├─► MoQ relay
-  WS fMP4       ┘                          ├─► LL-HLS playlist + segments
-                                           ├─► DASH MPD + segments
-                                           ├─► WHEP RTP packetizer
-                                           ├─► WebSocket fMP4 forwarder
-                                           ├─► lvqr-record (disk)
-                                           └─► lvqr-archive (redb index)
+  RTSP  (TCP)   ├┘   per (broadcast, track)  ├─► MoQ relay
+  WS fMP4       ┘                            ├─► LL-HLS playlist + segments
+                                             ├─► DASH MPD + segments
+                                             ├─► WHEP RTP packetizer
+                                             ├─► WebSocket fMP4 forwarder
+                                             ├─► lvqr-record (disk)
+                                             └─► lvqr-archive (redb index)
 ```
+
+The registry's `(broadcast, track)` keying generalises beyond the
+default `"0.mp4"` (video) and `"1.mp4"` (audio) tracks. Three
+sibling tracks ship today:
+
+* **`"captions"`** -- WebVTT cues from
+  `lvqr-agent-whisper::WhisperCaptionsAgent` (Tier 4 item 4.5);
+  feeds the LL-HLS subtitles rendition under
+  `/hls/{broadcast}/captions/playlist.m3u8`.
+* **`"scte35"`** -- SCTE-35 ad markers (session 152). Producers:
+  the SRT MPEG-TS demuxer (PMT stream_type 0x86 with private-
+  section reassembly) and the patched RTMP onCuePoint
+  scte35-bin64 path. Consumers: `BroadcasterScte35Bridge` in
+  `lvqr-cli` projects each parsed event into the per-broadcast
+  HLS DateRange window (`#EXT-X-DATERANGE` per HLS spec section
+  4.4.5.1) and the per-broadcast DASH Period EventStream
+  (`<EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin">`
+  per ISO/IEC 23009-1 G.7 + SCTE 214-1). Splice_info_section
+  bytes flow through verbatim with CRC verification but no
+  semantic interpretation. The reserved track name is exported
+  as `lvqr_fragment::SCTE35_TRACK`. See [`scte35.md`](scte35.md).
+* Per-broadcast / per-track dynamic surface for future agents.
 
 Every ingest goes through `lvqr-cmaf::TrackCoalescer` for AVC
 Annex-B ↔ AVCC conversion and sample boundary detection, then

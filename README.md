@@ -31,9 +31,16 @@ in-process AI agents, cross-cluster federation, peer mesh).
 ## Feature overview
 
 ### Ingest
-- **RTMP** over TCP (OBS, ffmpeg, Larix, vMix)
+- **RTMP** over TCP (OBS, ffmpeg, Larix, vMix). Includes
+  AMF0 onCuePoint scte35-bin64 passthrough for SCTE-35 ad
+  markers (session 152), via a vendored `rml_rtmp` fork at
+  `vendor/rml_rtmp/` that surfaces non-`@setDataFrame` AMF0
+  Data messages the upstream library silently drops.
 - **WHIP** over HTTPS (WebRTC; H.264, HEVC, Opus)
-- **SRT** over UDP (MPEG-TS from broadcast encoders)
+- **SRT** over UDP (MPEG-TS from broadcast encoders).
+  Includes SCTE-35 ad-marker passthrough on PMT stream_type
+  0x86 (typically PID 0x1FFB) with private-section
+  reassembly across TS packet boundaries (session 152).
 - **RTSP/1.0** over TCP (ANNOUNCE/RECORD, interleaved RTP)
 - **WebSocket fMP4** (browser publishers)
 
@@ -41,9 +48,18 @@ in-process AI agents, cross-cluster federation, peer mesh).
 - **LL-HLS** (RFC 8216bis): blocking playlist reload, delta
   playlists, `EXT-X-PART` + `PRELOAD-HINT`, per-segment
   `PROGRAM-DATE-TIME`, configurable DVR, audio renditions, master
-  playlist, ABR ladder variants, automatic `ENDLIST` on disconnect
+  playlist, ABR ladder variants, automatic `ENDLIST` on disconnect.
+  SCTE-35 ad markers render as `#EXT-X-DATERANGE` lines per HLS
+  spec section 4.4.5.1 with the `CLASS="urn:scte:scte35:2014:bin"`
+  attribute and SCTE35-OUT / SCTE35-IN / SCTE35-CMD hex blobs
+  (session 152).
 - **MPEG-DASH**: live-profile dynamic MPD with flip to
-  `type="static"` on disconnect
+  `type="static"` on disconnect. SCTE-35 ad markers render at
+  Period level as `<EventStream
+  schemeIdUri="urn:scte:scte35:2014:xml+bin">` with
+  base64-encoded splice_info_section inside a
+  `<Signal><Binary>` body per ISO/IEC 23009-1 G.7 + SCTE 214-1
+  (session 152).
 - **WHEP** WebRTC egress via `str0m` (H.264 + HEVC video, Opus
   audio). WHIP Opus publishers pass through; RTMP / SRT / RTSP
   AAC publishers reach WHEP subscribers via an in-process
@@ -328,18 +344,19 @@ named in Known v0.4.0 limitations.
 Stream-key CRUD admin API shipped in session 146; hot config
 reload v1 (auth-only) shipped in session 147; v2 (mesh ICE +
 HMAC secret) shipped in session 148; v3 (JWKS + webhook URL
-rotation, async reload pipeline) shipped in session 149. Hot
-config reload is now feature-complete -- every key the file
-format defines is honored at runtime. The remaining ranking:
+rotation, async reload pipeline) shipped in session 149.
+SCTE-35 ad-marker passthrough v1 shipped in session 152 (both
+SRT MPEG-TS PID 0x86 and RTMP onCuePoint scte35-bin64 ingest;
+HLS `#EXT-X-DATERANGE` + DASH Period-level `<EventStream>`
+egress). Two of the v1.1 ranked items are now closed; the
+remaining ranking:
 
 1. ~~**Hot config reload.**~~ v1 / v2 / v3 shipped across
    sessions 147 + 148 + 149.
-2. ~~**SCTE-35 passthrough.**~~ v1 shipped in session 152 (SRT
-   MPEG-TS PID 0x86 ingest, RTMP onCuePoint scte35-bin64 ingest
-   via a vendored `rml_rtmp` patch at `vendor/rml_rtmp/` that
-   surfaces non-`@setDataFrame` AMF0 Data messages, LL-HLS
-   `#EXT-X-DATERANGE` and DASH Period-level `<EventStream>`
-   egress, splice_info_section passthrough verbatim).
+2. ~~**SCTE-35 passthrough.**~~ v1 shipped in session 152
+   (both ingest paths + both egress wire shapes;
+   splice_info_section passthrough verbatim, no semantic
+   interpretation). See [`docs/scte35.md`](docs/scte35.md).
 3. **Dedicated DVR scrub web UI.** Today DVR playback works via
    any HLS-aware player but seek-bar + thumbnail strip require
    integrator work. A drop-in `<lvqr-dvr-player>` web component
@@ -358,35 +375,44 @@ format defines is honored at runtime. The remaining ranking:
 
 #### Recently shipped (compact reference)
 
-* **SCTE-35 ad-marker passthrough v1** (session 152) -- ingest-
-  side SRT MPEG-TS demuxer learns stream_type 0x86 + private-
-  section reassembly across TS packet boundaries; new
-  `lvqr-codec/src/scte35.rs` parses splice_info_section per ANSI/
-  SCTE 35-2024 section 8.1 with CRC_32 verification (MPEG-2
-  polynomial 0x04C11DB7) and surfaces the timing fields the
-  egress renderers need (event_id, pts, break_duration,
-  command_type) while preserving the raw section bytes verbatim.
-  Events flow through a reserved `"scte35"` parallel track on the
-  existing `FragmentBroadcasterRegistry` (mirroring the
-  whisper-captions pattern under `lvqr_fragment::SCTE35_TRACK`).
-  LL-HLS render adds `#EXT-X-DATERANGE` per HLS spec section
-  4.4.5.1 (SCTE35-OUT / SCTE35-IN / SCTE35-CMD attributes driven
-  by splice_command_type + out_of_network_indicator); DASH MPD
-  render adds Period-level `<EventStream
-  schemeIdUri="urn:scte:scte35:2014:xml+bin">` per ISO/IEC
-  23009-1 G.7 + SCTE 214-1 with base64 splice_info_section inside
-  a `<Signal><Binary>` body. Net additions: +1 lvqr-codec module
-  (~280 lines + 11 unit tests), +1 ts.rs StreamType variant + 1
-  PMT-routing test, +1 lvqr-fragment SCTE35_TRACK constant, +1
-  lvqr-ingest publish_scte35 helper + 1 dispatch test, +1 SRT
-  process_scte35 dispatcher arm, +DateRange render path on
-  PlaylistBuilder + 3 unit tests, +EventStream render path on
-  Mpd::Period + 3 unit tests, +1 cli-side BroadcasterScte35Bridge
-  module + 5 unit tests. RTMP onCuePoint scte35-bin64 ingest is
-  deferred behind an rml_rtmp v0.8 dependency surface gap (see
-  `docs/scte35.md` ingest table). New docs at `docs/scte35.md`
-  cover the full standards reference + operator runbook + metrics
-  surface.
+* **SCTE-35 ad-marker passthrough v1** (session 152) -- ingest
+  on both **SRT MPEG-TS** (PMT stream_type 0x86 with private-
+  section reassembly across TS packet boundaries; typically
+  PID 0x1FFB) AND **RTMP onCuePoint scte35-bin64** (Adobe AMF0
+  convention used by AWS Elemental, Wirecast, vMix, ffmpeg).
+  RTMP onCuePoint required vendoring `rml_rtmp` v0.8.0 at
+  `vendor/rml_rtmp/` with a ~25-line patch that adds an
+  `Amf0DataReceived` ServerSessionEvent variant; upstream
+  silently drops every AMF0 Data message that is not
+  `@setDataFrame`-wrapped onMetaData. The fork loads via
+  `[patch.crates-io]` in the workspace root and passes 170 / 0
+  / 0 tests (168 upstream + 2 LVQR-side defensive tests for
+  the new variant). New `lvqr-codec/src/scte35.rs` parses
+  splice_info_section per ANSI/SCTE 35-2024 section 8.1 with
+  CRC_32 verification (MPEG-2 polynomial 0x04C11DB7) and
+  surfaces the timing fields egress renderers need (event_id,
+  pts, break_duration, command_type, cancel,
+  out_of_network_indicator) while preserving the raw section
+  bytes verbatim. Events flow through a reserved `"scte35"`
+  parallel track on the existing `FragmentBroadcasterRegistry`
+  (mirroring the whisper-captions pattern under
+  `lvqr_fragment::SCTE35_TRACK`). LL-HLS render adds
+  `#EXT-X-DATERANGE` per HLS spec section 4.4.5.1 with a
+  `CLASS="urn:scte:scte35:2014:bin"` attribute (industry
+  convention so client-side ad pipelines can filter without
+  parsing the SCTE35-* hex blob) and SCTE35-OUT / SCTE35-IN /
+  SCTE35-CMD attributes driven by splice_command_type +
+  out_of_network_indicator; DASH MPD render adds Period-level
+  `<EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin">`
+  per ISO/IEC 23009-1 G.7 + SCTE 214-1 with base64
+  splice_info_section inside a `<Signal><Binary>` body.
+  Counter metrics `lvqr_scte35_events_total{ingest, command}`
+  and `lvqr_scte35_drops_total{ingest, reason}` cover both
+  ingest paths. New docs at [`docs/scte35.md`](docs/scte35.md)
+  cover the full standards reference, ingest paths, operator
+  publisher quickstart (ffmpeg, AWS Elemental, Wirecast,
+  vMix, OBS), wire shape examples, internal architecture,
+  anti-scope, and metrics surface.
 
 * **lvqr-agent test polling** (session 151) -- four
   `tokio::time::sleep(Duration::from_millis(100))` sites in
@@ -702,8 +728,19 @@ test.
     the file format defines is honored at runtime.
   See [`docs/config-reload.md`](docs/config-reload.md).
 - [ ] **Dedicated DVR scrub web UI.**
-- [ ] **SCTE-35 passthrough.** (WebVTT captions already ship via
-  the whisper-captions HLS rendition.)
+- [x] **SCTE-35 passthrough.** Shipped in session 152.
+  Splice events injected on the publisher side (SRT MPEG-TS
+  PID 0x86 OR RTMP onCuePoint scte35-bin64) flow ingest ->
+  parser (CRC-verified) -> parallel `"scte35"` track on the
+  shared `FragmentBroadcasterRegistry` -> per-broadcast bridge
+  drain -> LL-HLS `#EXT-X-DATERANGE` + DASH Period-level
+  `<EventStream>`. Splice_info_section bytes are preserved
+  verbatim through both egress wire shapes (hex on HLS, base64
+  inside `<Signal><Binary>` on DASH). RTMP onCuePoint
+  required vendoring `rml_rtmp` v0.8.0 at `vendor/rml_rtmp/`
+  with a 25-line patch that surfaces non-`@setDataFrame` AMF0
+  Data messages (the upstream library silently drops them).
+  See [`docs/scte35.md`](docs/scte35.md).
 
 **Source of truth for session-by-session progress:**
 [`tracking/HANDOFF.md`](tracking/HANDOFF.md).
@@ -1057,6 +1094,8 @@ list lives in [`tracking/ROADMAP.md`](tracking/ROADMAP.md).
 - [Architecture](docs/architecture.md) -- the 29-crate workspace + the ten load-bearing decisions
 - [Deployment](docs/deployment.md) -- systemd, TLS, Prometheus, OTLP
 - [Auth](docs/auth.md) -- one-token-all-protocols model
+- [Hot config reload](docs/config-reload.md) -- SIGHUP / admin POST atomic auth + mesh + HMAC + JWKS / webhook reload
+- [SCTE-35 ad-marker passthrough](docs/scte35.md) -- standards refs, ingest paths (SRT, RTMP), wire shape examples (HLS DATERANGE + DASH EventStream), publisher quickstart (ffmpeg, AWS Elemental, Wirecast, vMix), metrics, operator runbook
 - [Cluster plane](docs/cluster.md) -- chitchat membership, ownership, redirect-to-owner
 - [Observability](docs/observability.md) -- OTLP export, Prometheus fanout
 - [Latency SLO](docs/slo.md) -- operator runbook + alert tuning
