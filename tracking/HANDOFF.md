@@ -2,7 +2,132 @@
 
 ## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 151 (2026-04-25) hardens lvqr-agent runner-test polling** -- replaces 4 fixed-100 ms `tokio::time::sleep` sites with a `poll_until` helper (10 ms tick, 2 s timeout) so the spawned drain-task's panic-counter increment can settle on a loaded macos-latest CI runner. The flake surfaced on session 150's substantive CI run but is orthogonal to the wasmtime upgrade (lvqr-agent has zero wasmtime deps); the OTHER 7 session-150 workflows including Feature matrix and Supply-chain audit landed green on the original push. **Session 150 (2026-04-25) closed the dominant audit-ignore cluster** -- wasmtime v25 -> v43 upgrade removes 16 RustSec advisories from `audit.toml` (including 2x CVSS-9 sandbox-escape entries), down from 22 ignores to 6. `lvqr-wasm` only uses the core WASM API surface (Engine/Module/Store/Instance/TypedFunc) which is stable across the upgrade range; total source diff was 7 lines (two Module::new error-conversion callsites). **Session 149 (2026-04-25) shipped hot config reload v3 (JWKS + webhook URL rotation)** -- `ConfigReloadHandle::reload` flipped to `async`; the reload pipeline now calls `JwksAuthProvider::new` and `WebhookAuthProvider::new` asynchronously and swaps the resulting provider into the `HotReloadAuthProvider` chain. Drop-old-on-swap leverages each provider's existing `Drop` to abort their spawned refresh / fetcher task. `applied_keys` grows entries (`"jwks"` / `"webhook"`) on URL diff. Feature-disabled builds emit a warning when the file names a feature-gated URL. `jwks_url` and `webhook_auth_url` are mutually exclusive within the same `[auth]` section (the route returns an error). The admin route closure shape widened from sync `Fn -> Result<...>` to async-flavored `Fn -> BoxFuture<Result<...>>` (internal-API change; SDK wire shape unchanged). With session 149, hot config reload is feature-complete -- every key the file format defines is honored at runtime. **Session 148 (2026-04-25) shipped hot config reload v2 (mesh ICE + HMAC secret)** -- `mesh_ice_servers` and `hmac_playback_secret` join the hot-reloadable surface alongside auth, swapped atomically via `arc_swap::ArcSwap` handles threaded through the `/signal` callback and the live HLS / DASH / DVR `/playback/*` middlewares. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Default-gate tests after 148: Rust workspace **1107** / 0 / 0 (was 1099 post-147; +8 net: 8 new lvqr-cli unit covering ice + hmac + applied_keys diff paths + clear semantics + no-deferred-warnings regression, 2 new RTMP-shape integration cases in `config_reload_e2e.rs` mesh ICE + HMAC rotation; the workshop-148 step rewrote one prior unit test from warnings-shape to applied_keys-shape, net unit delta = 8). Python pytest **38** unchanged. Vitest unchanged at 13. Admin surface unchanged at **12 route trees**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API**; **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates.
 
-**Last Updated**: 2026-04-25 (session 152 close).
+**Last Updated**: 2026-04-26 (session 152 polish round close).
+
+## Session 152 polish round (2026-04-26)
+
+After the initial 1205163 SCTE-35 v1 commit landed, the same
+session continued with five polish commits that closed the rml_rtmp
+RTMP onCuePoint blocker, fixed a CI clippy failure on the original
+push, added defensive coverage and operator-facing documentation,
+and re-swept the README + CHANGELOG + architecture docs to reflect
+the now-shipped state. Final SHAs (chronological):
+
+* **`b1aee85`** -- vendored rml_rtmp v0.8.0 fork at
+  `vendor/rml_rtmp/` with a 25-line patch adding
+  `ServerSessionEvent::Amf0DataReceived` + raising it from
+  `handle_amf0_data` for non-`@setDataFrame` AMF0 Data messages.
+  Loaded via `[patch.crates-io]`. RTMP onCuePoint scte35-bin64
+  ingest now ships in v1; LVQR-side wiring at
+  `crates/lvqr-ingest/src/rtmp.rs` (Scte35Callback type +
+  Amf0DataReceived arm + `parse_oncuepoint_scte35` helper for the
+  Adobe AMF0 shape) and `crates/lvqr-ingest/src/bridge.rs`
+  (`create_rtmp_server` wires the callback into `publish_scte35`).
+  Patched rml_rtmp passes 168/0/0 upstream tests; new lib deps
+  base64 + rml_amf0 (direct edge for self-documenting manifest).
+  +5 unit tests for the AMF0 shape parser + 2 integration tests
+  driving real wire bytes through `MessagePayload::from_rtmp_message`
+  + ChunkSerializer + ServerSession::handle_input.
+
+* **`f2f34a8`** -- CI fix + DATERANGE polish + vendor patch
+  defense + operator publisher quickstart. The original 1205163 +
+  b1aee85 push failed Format-and-Lint Clippy with three
+  `vec_init_then_push` errors in lvqr-codec/src/scte35.rs test
+  helpers (local clippy did not catch because it ran without
+  `-D warnings`). Refactored to vec! macros. Added the HLS
+  DATERANGE `CLASS="urn:scte:scte35:2014:bin"` attribute per
+  industry convention (Wowza, Akamai, AWS Elemental, JW Player);
+  +1 omits-class regression test. Added two defensive tests
+  INSIDE `vendor/rml_rtmp/src/sessions/server/tests.rs`
+  (`lvqr_amf0_data_received_fires_for_oncuepoint` +
+  `lvqr_setdataframe_onmetadata_does_not_fire_amf0_data_received`)
+  so the patch is self-testing against future upstream merges;
+  vendor lib now passes 170/0/0. Added a Publisher quickstart
+  section to `docs/scte35.md` covering ffmpeg over SRT/RTMP, AWS
+  Elemental MediaLive/MediaConnect, Wirecast, vMix, OBS. cargo
+  audit -n exits 0 (vendored fork doesn't surface new advisories);
+  cargo build --release across touched crates clean (6m 12s).
+
+* **`5b0d165`** -- README + CHANGELOG + architecture sweep. README
+  Ingest section: RTMP + SRT entries mention SCTE-35 passthrough.
+  README Egress section: HLS + DASH entries mention DATERANGE +
+  EventStream wire shapes. README "Next up" lead paragraph notes
+  both v1.1 ranked items #1 (hot config reload) and #2 (SCTE-35)
+  are now closed. README "Recently shipped" SCTE-35 entry
+  consolidated to reflect both ingest paths, the vendored
+  rml_rtmp patch mechanism, the CLASS attribute, and the metrics
+  surface. README Phase A roadmap closeout: SCTE-35 row flips
+  `[ ] -> [x]`. README Documentation links: adds an entry for
+  `docs/scte35.md` and reorders to put it next to
+  `docs/config-reload.md`. CHANGELOG.md gains a top entry under
+  Unreleased (post-0.4.1) covering ingest paths (with rml_rtmp
+  vendor context), egress wire shapes, parser surface, wiring,
+  counter metrics, anti-scope. docs/architecture.md data plane
+  diagram body extended with a new sub-section documenting the
+  three sibling tracks the registry now carries beyond `0.mp4` /
+  `1.mp4`: `"captions"`, `"scte35"`, and per-broadcast / per-track
+  dynamic surface for future agents.
+
+* **`c998266`** -- end-to-end RTMP+HLS pipeline test. Adds
+  `crates/lvqr-cli/tests/scte35_hls_dash_e2e.rs` with two cases:
+  `scte35_section_renders_as_hls_daterange_in_variant_playlist`
+  drives TestServer + synthetic video + a real CRC-valid
+  splice_insert section published onto the registry's reserved
+  scte35 track + a raw-TCP HTTP/1.1 GET against the variant
+  playlist, asserting the rendered body carries
+  `#EXT-X-DATERANGE` + `ID="splice-3405691582"` (derived from
+  event_id 0xCAFEBABE) + `CLASS="urn:scte:scte35:2014:bin"` +
+  `SCTE35-OUT=` (driven by out_of_network=1) + `DURATION=30.000`
+  (break_duration 2_700_000 / 90_000). Sister
+  `variant_playlist_omits_daterange_when_no_scte35_track`
+  regression guard. Pins the FULL pipeline contract through real
+  HTTP/1.1 (registry -> bridge drain -> parser -> push_date_range
+  -> manifest render -> HTTP).
+
+* **`ca28373`** -- DASH EventStream variant of the e2e test for
+  symmetry. `scte35_section_renders_as_dash_event_in_period_event_stream`
+  spins up TestServer with `with_dash()` + same publish path +
+  GET against `/dash/live/cam1/manifest.mpd`, asserting the
+  rendered MPD carries `<EventStream
+  schemeIdUri="urn:scte:scte35:2014:xml+bin">` + `<Event id=...
+  presentationTime=... duration=...>` + `<Signal xmlns=".../35/2016">
+  <Binary>` body + EventStream-before-AdaptationSet ordering per
+  ISO/IEC 23009-1 section 5.3.2.1.
+
+CI status as of session close: f2f34a8 lands 8/8 GREEN including
+the previously-failing CI workflow AND the slow LL-HLS Conformance
++ MPEG-DASH Conformance workflows. Subsequent docs-only and
+test-only commits (5b0d165, c998266, ca28373) are low-risk
+additive changes.
+
+Final test totals (default features):
+* Workspace lib: **824 / 0 / 0** across 29 crates.
+* Vendor `rml_rtmp` lib: **170 / 0 / 0** (168 upstream + 2 LVQR
+  defense).
+* lvqr-cli scte35 e2e: **3 / 0 / 0** (HLS DATERANGE render +
+  regression guard + DASH EventStream render).
+* lvqr-ingest scte35_rtmp_oncuepoint e2e: **2 / 0 / 0** (AMF0 wire
+  round-trip + @setDataFrame regression guard).
+* lvqr-codec proptest scte35 (added later in the polish round):
+  **3 / 0 / 0** (1536 random inputs total).
+* lvqr-codec libfuzzer target `parse_scte35` (added later in the
+  polish round): runnable via `cargo +nightly fuzz run
+  parse_scte35`.
+
+Final docs surface:
+* `docs/scte35.md` (new) -- standards refs, ingest paths,
+  publisher quickstart, wire shapes, internal architecture,
+  client-side consumption examples (hls.js, dash.js, Shaka,
+  native HLS), anti-scope, metrics, operator runbook.
+* `README.md` -- Ingest + Egress feature sections updated;
+  Recently shipped consolidated; Phase A roadmap closed; doc
+  link added.
+* `CHANGELOG.md` -- top-of-Unreleased entry covering the full
+  surface.
+* `docs/architecture.md` -- data plane diagram extended with the
+  three sibling tracks.
+* `tracking/SESSION_152_BRIEFING.md` -- the design brief itself
+  is unchanged; locked decisions held end-to-end.
 
 ## Session 152 close (2026-04-25)
 

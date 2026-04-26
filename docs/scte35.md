@@ -276,6 +276,159 @@ curl -s https://relay/dash/<broadcast>/manifest.mpd \
 curl -s https://relay/metrics | grep scte35
 ```
 
+## Client-side consumption
+
+How the rendered events look from a player or ad-decisioning
+client. LVQR ships no client-side SCTE-35 SDK -- the wire shape is
+standards-compliant, so any HLS or DASH library that exposes
+DATERANGE / EventStream events to JavaScript works.
+
+### hls.js (HLS DATERANGE)
+
+hls.js exposes DATERANGE entries via the
+`Hls.Events.LEVEL_UPDATED` payload's `levels[].details.dateRanges`
+collection and individual fire events on
+`Hls.Events.DATE_RANGE_UPDATED`. SCTE-35 markers carry the
+`CLASS="urn:scte:scte35:2014:bin"` attribute so a single filter
+distinguishes them from other DATERANGE uses (program boundaries,
+chapter markers, etc.).
+
+```javascript
+import Hls from 'hls.js';
+
+const video = document.querySelector('video');
+const hls = new Hls();
+hls.loadSource('https://relay.example.com/hls/live/cam1/playlist.m3u8');
+hls.attachMedia(video);
+
+hls.on(Hls.Events.DATE_RANGE_UPDATED, (_event, data) => {
+  for (const dr of data.dateRanges) {
+    if (dr.attr['CLASS'] !== 'urn:scte:scte35:2014:bin') continue;
+    // SCTE35-OUT (going to ad), SCTE35-IN (returning), SCTE35-CMD (other).
+    const out = dr.attr['SCTE35-OUT'];
+    const in_ = dr.attr['SCTE35-IN'];
+    const cmd = dr.attr['SCTE35-CMD'];
+    const hex = out || in_ || cmd;
+    if (!hex) continue;
+    // hex is "0x..." -- decode for downstream ad decisioning.
+    const sliceInfoSection = hexToBytes(hex.slice(2));
+    onSpliceEvent({
+      id: dr.id,
+      startDate: new Date(dr.attr['START-DATE']),
+      durationSecs: parseFloat(dr.attr['DURATION'] || '0'),
+      kind: out ? 'out' : in_ ? 'in' : 'cmd',
+      raw: sliceInfoSection,
+    });
+  }
+});
+
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  }
+  return out;
+}
+```
+
+### dash.js (DASH EventStream)
+
+dash.js exposes Period-level EventStream events via the
+`MediaPlayer.events.EVENT_MODE_ON_RECEIVE` and
+`MediaPlayer.events.EVENT_MODE_ON_START` callbacks. The Signal /
+Binary body is exposed as the event message data. Subscribe to the
+SCTE-35 scheme by URI:
+
+```javascript
+import { MediaPlayer } from 'dashjs';
+
+const player = MediaPlayer().create();
+player.initialize(
+  document.querySelector('video'),
+  'https://relay.example.com/dash/live/cam1/manifest.mpd',
+  true,
+);
+
+const SCTE35_SCHEME = 'urn:scte:scte35:2014:xml+bin';
+player.on(
+  MediaPlayer.events.EVENT_MODE_ON_RECEIVE,
+  (event) => {
+    const e = event.event;
+    // e.id: splice_event_id (or 0 for non-splice_insert command types)
+    // e.presentationTime: 90 kHz absolute splice PTS
+    // e.duration: 90 kHz break_duration (0 when undefined)
+    // e.messageData: parsed Signal/Binary body
+    onSpliceEvent({
+      id: e.id,
+      ptsTicks: e.presentationTime,
+      durationTicks: e.duration,
+      raw: e.messageData,  // Uint8Array of base64-decoded splice_info_section
+    });
+  },
+  { schemeIdUri: SCTE35_SCHEME },
+);
+```
+
+### Shaka Player (DASH EventStream)
+
+Shaka exposes EventStream events via the
+`shaka.Player.EventManager` `'metadata'` listener:
+
+```javascript
+import shaka from 'shaka-player';
+
+const player = new shaka.Player();
+await player.attach(document.querySelector('video'));
+await player.load('https://relay.example.com/dash/live/cam1/manifest.mpd');
+
+player.addEventListener('metadata', (event) => {
+  if (event.payload?.schemeIdUri !== 'urn:scte:scte35:2014:xml+bin') return;
+  onSpliceEvent({
+    id: event.payload.id,
+    startTime: event.startTime,
+    endTime: event.endTime,
+    raw: event.payload.value,  // raw splice_info_section bytes
+  });
+});
+```
+
+### Native HLS players (Safari, AVPlayer)
+
+Native players expose DATERANGE entries via the
+`AVMetadataItem` API (iOS / macOS) and the standard
+`textTracks` collection (browsers without hls.js). The SCTE-35
+attributes flow through unchanged; the client decides whether to
+act on them.
+
+```javascript
+// Browsers: poll the metadata text track.
+video.textTracks.addEventListener('change', () => {
+  for (const track of video.textTracks) {
+    if (track.kind !== 'metadata') continue;
+    track.mode = 'hidden';
+    track.addEventListener('cuechange', () => {
+      for (const cue of track.activeCues) {
+        // cue.value carries the DATERANGE attributes for hls.js
+        // shim adapters; for raw native HLS the cue is an
+        // ID3-style payload that may need different parsing.
+      }
+    });
+  }
+});
+```
+
+### Decoding the splice_info_section client-side
+
+The egress wire shapes preserve the raw section bytes verbatim:
+* HLS SCTE35-* attributes are `0x` + hex.
+* DASH `<Binary>` elements are RFC 4648 base64.
+
+Both decode to a SCTE 35-2024 section 8.1 `splice_info_section`
+that downstream ad-decisioning libraries (Google IMA, AWS MediaTailor
+SDK, Bitmovin Ad Engine) consume directly. LVQR does not interpret
+the section beyond what the playlist render needs; semantic decoding
+is the client's responsibility.
+
 ## Operator runbook
 
 * Confirm the publisher's SCTE-35 PID. Most broadcast encoders

@@ -12,6 +12,8 @@ rust-version = "1.85"
 #   cargo +nightly fuzz run parse_hevc_sps
 #   cargo +nightly fuzz run parse_aac_asc
 #   cargo +nightly fuzz run read_ue_v
+#   cargo +nightly fuzz run ts_demux
+#   cargo +nightly fuzz run parse_scte35
 #
 # Seeds for each target live under fuzz/corpus/<target>/ and are populated
 # from real encoder captures plus regression samples from past crashes.
@@ -47,6 +49,13 @@ bench = false
 [[bin]]
 name = "ts_demux"
 path = "fuzz_targets/ts_demux.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_scte35"
+path = "fuzz_targets/parse_scte35.rs"
 test = false
 doc = false
 bench = false
