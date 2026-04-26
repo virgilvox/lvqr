@@ -283,6 +283,22 @@ impl HlsServer {
     /// closed-segment-bytes coalesce [`Self::push_chunk_bytes`]
     /// applies so a fetched `seg-<n>.m4s` is populated even for
     /// the end-of-stream segment the force-close flushes.
+    /// Push a SCTE-35 `#EXT-X-DATERANGE` entry into the underlying
+    /// playlist. Delegates to [`PlaylistBuilder::push_date_range`].
+    /// Subsequent renders include the entry until the playlist's
+    /// segment window slides past its `START-DATE`.
+    ///
+    /// Used by the cli-side `BroadcasterScte35Bridge` to push events
+    /// drained from the registry's `"scte35"` track. Notifies all
+    /// blocked playlist waiters so LL-HLS clients see the new
+    /// DATERANGE on the next manifest refresh.
+    pub async fn push_date_range(&self, dr: crate::manifest::DateRange) {
+        let mut builder = self.state.builder.write().await;
+        builder.push_date_range(dr);
+        drop(builder);
+        self.state.notify.notify_waiters();
+    }
+
     pub async fn close_pending_segment(&self) {
         let mut builder = self.state.builder.write().await;
         let prev_last_seq = builder.manifest().segments.last().map(|s| s.sequence);
@@ -799,6 +815,17 @@ impl MultiHlsServer {
     /// and the subtitles state on first call. Tier 4 item 4.5
     /// session C: the WhisperCaptionsAgent's captions feed the
     /// returned server's `push_cue` via `BroadcasterCaptionsBridge`.
+    /// Push a SCTE-35 `#EXT-X-DATERANGE` entry into the video
+    /// rendition of `broadcast`. Lazily creates the broadcast entry
+    /// (the video rendition gets a default config); the next manifest
+    /// render carries the new DATERANGE alongside any prior live
+    /// entries. No-op if the playlist's segment window has already
+    /// advanced past the entry's `START-DATE`.
+    pub async fn push_date_range(&self, broadcast: &str, dr: crate::manifest::DateRange) {
+        let video = self.ensure_video(broadcast);
+        video.push_date_range(dr).await;
+    }
+
     pub fn ensure_subtitles(&self, broadcast: &str) -> SubtitlesServer {
         let mut map = self
             .inner

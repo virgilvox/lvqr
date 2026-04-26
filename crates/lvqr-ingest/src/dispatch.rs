@@ -36,7 +36,7 @@
 
 use bytes::Bytes;
 use lvqr_core::now_unix_ms;
-use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentMeta};
+use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta, SCTE35_TRACK};
 
 /// Publish an init segment to the broadcaster-registry path.
 pub fn publish_init(
@@ -76,10 +76,50 @@ pub fn publish_fragment(
     bc.emit(frag);
 }
 
+/// Publish a SCTE-35 splice event onto the broadcast's reserved
+/// `"scte35"` track ([`SCTE35_TRACK`]).
+///
+/// The fragment carries the raw `splice_info_section` bytes
+/// (table_id 0xFC through CRC_32) as its payload; egress renderers
+/// (HLS DATERANGE, DASH EventStream) base64- or hex-encode the
+/// payload directly per their respective spec carriage. The
+/// fragment's `pts` is the absolute splice PTS in 90 kHz ticks
+/// (publisher's `splice_time.pts_time + pts_adjustment`, masked to
+/// 33 bits); `duration` is the splice `break_duration` in 90 kHz
+/// ticks, or zero when the splice command sets no duration.
+///
+/// `event_id` is stamped onto the fragment's `group_id` so renderers
+/// that pair SCTE35-OUT with SCTE35-IN can match by ID. Pass zero
+/// for command types without an event_id (splice_null, time_signal,
+/// bandwidth_reservation, private_command).
+pub fn publish_scte35(
+    registry: &FragmentBroadcasterRegistry,
+    broadcast: &str,
+    event_id: u64,
+    pts_90k: u64,
+    duration_90k: u64,
+    section: Bytes,
+) {
+    let bc = registry.get_or_create(broadcast, SCTE35_TRACK, FragmentMeta::new("scte35", 90_000));
+    let frag = Fragment::new(
+        SCTE35_TRACK,
+        event_id,
+        0,
+        0,
+        pts_90k,
+        pts_90k,
+        duration_90k,
+        FragmentFlags::KEYFRAME,
+        section,
+    )
+    .with_ingest_time_ms(now_unix_ms());
+    bc.emit(frag);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lvqr_fragment::{FragmentFlags, FragmentStream};
+    use lvqr_fragment::FragmentStream;
 
     fn mk_frag(seq: u64, is_key: bool, payload: &'static [u8]) -> Fragment {
         Fragment::new(
@@ -119,6 +159,24 @@ mod tests {
         let delivered = sub.next_fragment().await.expect("broadcaster saw fragment");
         assert_eq!(delivered.payload.as_ref(), b"kf");
         assert!(delivered.flags.keyframe);
+    }
+
+    #[tokio::test]
+    async fn publish_scte35_lands_on_reserved_track() {
+        let reg = FragmentBroadcasterRegistry::new();
+        let bc = reg.get_or_create("live", SCTE35_TRACK, FragmentMeta::new("scte35", 90_000));
+        let mut sub = bc.subscribe();
+
+        let section = Bytes::from_static(&[0xFC, 0x30, 0x11, 0x00, 0x00]);
+        publish_scte35(&reg, "live", 0xDEADBEEF, 8_100_000, 2_700_000, section.clone());
+
+        let frag = sub.next_fragment().await.expect("scte35 fragment delivered");
+        assert_eq!(frag.track_id, SCTE35_TRACK);
+        assert_eq!(frag.group_id, 0xDEADBEEF);
+        assert_eq!(frag.pts, 8_100_000);
+        assert_eq!(frag.duration, 2_700_000);
+        assert_eq!(frag.payload, section);
+        assert!(frag.flags.keyframe);
     }
 
     #[tokio::test]

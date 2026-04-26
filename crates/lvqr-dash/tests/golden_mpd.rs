@@ -26,6 +26,7 @@ fn video_only_live() -> Mpd {
         periods: vec![Period {
             id: "0".into(),
             start: "PT0S".into(),
+            event_streams: Vec::new(),
             adaptation_sets: vec![AdaptationSet {
                 id: 0,
                 mime_type: "video/mp4".into(),

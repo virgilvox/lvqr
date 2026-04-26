@@ -8,10 +8,13 @@
 //!
 //! Scope: PAT, single-program PMT, PES reassembly with PTS/DTS
 //! extraction for H.264 (0x1B), HEVC (0x24), and AAC (0x0F).
-//! Multi-program TS, SCTE-35, DVB descriptors, and PCR recovery
-//! are out of scope for this first cut; the SRT ingest path
-//! (Tier 2.8) only needs single-program demux from broadcast
-//! encoders.
+//! Session 152 added private-section reassembly for SCTE-35
+//! (stream_type 0x86), surfaced via
+//! [`TsDemuxer::take_scte35_sections`] alongside the existing
+//! `feed`-returns-PES interface. Multi-program TS, DVB
+//! descriptors, and PCR recovery are still out of scope; the
+//! SRT ingest path only needs single-program demux from
+//! broadcast encoders.
 
 use std::collections::HashMap;
 
@@ -25,6 +28,10 @@ pub enum StreamType {
     H264,
     H265,
     Aac,
+    /// SCTE-35 cue messages per ANSI/SCTE 35-2024 section 7
+    /// (stream_type 0x86 in the PMT). Not a media stream;
+    /// payload is private-section data, not PES.
+    Scte35,
     Unknown(u8),
 }
 
@@ -34,9 +41,25 @@ impl StreamType {
             0x1B => Self::H264,
             0x24 => Self::H265,
             0x0F | 0x11 => Self::Aac,
+            0x86 => Self::Scte35,
             other => Self::Unknown(other),
         }
     }
+}
+
+/// One reassembled SCTE-35 splice_info_section yielded by
+/// [`TsDemuxer::take_scte35_sections`]. The raw bytes are the
+/// full section from `table_id` (0xFC) through `CRC_32`,
+/// suitable for direct passthrough into
+/// [`crate::scte35::parse_splice_info_section`].
+#[derive(Debug, Clone)]
+pub struct Scte35Section {
+    /// PMT-discovered PID this section arrived on. Egress
+    /// renderers that multiplex multiple SCTE-35 PIDs into one
+    /// event stream may key on it; v1 LVQR ignores it.
+    pub pid: u16,
+    /// Raw splice_info_section bytes (table_id .. CRC_32).
+    pub raw: Vec<u8>,
 }
 
 /// One reassembled PES packet yielded by [`TsDemuxer::feed`].
@@ -63,6 +86,20 @@ struct PesBuffer {
     started: bool,
 }
 
+/// Per-PID SCTE-35 section reassembly buffer.
+///
+/// Sections are MPEG-2 private sections (table_id 0xFC) which
+/// can span multiple TS packets. PUSI=1 packets carry a
+/// `pointer_field` byte then start a new section; PUSI=0
+/// packets continue the in-progress section. Completion is
+/// detected when `section_length` (read from the first 3 bytes)
+/// + 3 prefix bytes are present.
+#[derive(Debug, Default)]
+struct SectionBuffer {
+    buf: Vec<u8>,
+    expected_len: Option<usize>,
+}
+
 /// MPEG-TS demuxer with sync recovery and PES reassembly.
 #[derive(Debug)]
 pub struct TsDemuxer {
@@ -75,6 +112,14 @@ pub struct TsDemuxer {
     streams: HashMap<u16, StreamType>,
     /// Per-PID PES reassembly buffers.
     pes_bufs: HashMap<u16, PesBuffer>,
+    /// Per-PID SCTE-35 private-section reassembly buffers,
+    /// populated when the PMT registers a stream as
+    /// [`StreamType::Scte35`]. Sections drain via
+    /// [`TsDemuxer::take_scte35_sections`].
+    section_bufs: HashMap<u16, SectionBuffer>,
+    /// Completed SCTE-35 sections awaiting drain. Bounded by
+    /// the caller draining promptly between feed calls.
+    pending_scte35: Vec<Scte35Section>,
 }
 
 impl Default for TsDemuxer {
@@ -90,7 +135,24 @@ impl TsDemuxer {
             pmt_pid: None,
             streams: HashMap::new(),
             pes_bufs: HashMap::new(),
+            section_bufs: HashMap::new(),
+            pending_scte35: Vec::new(),
         }
+    }
+
+    /// Drain any reassembled SCTE-35 sections accumulated since
+    /// the previous call. Sections appear in arrival order. The
+    /// returned vector is owned by the caller; the demuxer's
+    /// internal pending queue is cleared.
+    ///
+    /// Pair with [`TsDemuxer::feed`]: drain sections after each
+    /// feed so the per-PID section buffers stay bounded. Sections
+    /// are raw `splice_info_section` bytes (table_id 0xFC through
+    /// CRC_32); pass each one to
+    /// [`crate::scte35::parse_splice_info_section`] for the
+    /// SpliceInfo decode.
+    pub fn take_scte35_sections(&mut self) -> Vec<Scte35Section> {
+        std::mem::take(&mut self.pending_scte35)
     }
 
     /// Feed an arbitrary byte slice into the demuxer. Returns
@@ -186,8 +248,79 @@ impl TsDemuxer {
             self.parse_pat(payload, pusi);
         } else if Some(pid) == self.pmt_pid {
             self.parse_pmt(payload, pusi);
-        } else if self.streams.contains_key(&pid) {
-            self.push_pes(pid, payload, pusi, out);
+        } else if let Some(&st) = self.streams.get(&pid) {
+            if st == StreamType::Scte35 {
+                self.push_section(pid, payload, pusi);
+            } else {
+                self.push_pes(pid, payload, pusi, out);
+            }
+        }
+    }
+
+    /// Accumulate one TS packet's worth of payload into the SCTE-35
+    /// section buffer for `pid`, completing and queueing the section
+    /// when section_length-1 bytes have arrived after the
+    /// section_length field.
+    ///
+    /// Per ISO/IEC 13818-1 a private section starts on a PUSI=1
+    /// packet and the first byte of payload is `pointer_field`. Any
+    /// bytes before the pointer are stuffing; the section starts at
+    /// `payload[1 + pointer_field]`. Sections may span multiple TS
+    /// packets; PUSI=0 packets carry continuation bytes only.
+    fn push_section(&mut self, pid: u16, payload: &[u8], pusi: bool) {
+        let buf = self.section_bufs.entry(pid).or_default();
+        if pusi {
+            // Drop any in-progress section (incomplete prior frame
+            // is unrecoverable per spec; the new pointer_field marks
+            // a fresh section start).
+            buf.buf.clear();
+            buf.expected_len = None;
+            if payload.is_empty() {
+                return;
+            }
+            let pointer = payload[0] as usize;
+            let start = 1 + pointer;
+            if start >= payload.len() {
+                return;
+            }
+            buf.buf.extend_from_slice(&payload[start..]);
+        } else {
+            if buf.buf.is_empty() && buf.expected_len.is_none() {
+                // Continuation packet without a prior PUSI start;
+                // ignore (we missed the section header).
+                return;
+            }
+            buf.buf.extend_from_slice(payload);
+        }
+
+        // Determine expected length on first sufficient header read.
+        if buf.expected_len.is_none() && buf.buf.len() >= 3 {
+            let section_length = (((buf.buf[1] & 0x0F) as usize) << 8) | buf.buf[2] as usize;
+            buf.expected_len = Some(3 + section_length);
+        }
+
+        // Flush completed sections, accommodating the rare case where
+        // more than one section's bytes arrive in the same packet
+        // (only possible if the publisher concatenates sections
+        // back-to-back after the first pointer_field).
+        while let Some(expected) = buf.expected_len {
+            if buf.buf.len() < expected {
+                break;
+            }
+            let section_bytes = buf.buf.drain(..expected).collect::<Vec<_>>();
+            self.pending_scte35.push(Scte35Section {
+                pid,
+                raw: section_bytes,
+            });
+            buf.expected_len = None;
+            if buf.buf.len() >= 3 {
+                let section_length = (((buf.buf[1] & 0x0F) as usize) << 8) | buf.buf[2] as usize;
+                buf.expected_len = Some(3 + section_length);
+            } else if buf.buf.iter().all(|&b| b == 0xFF) {
+                // Trailing stuffing bytes: discard.
+                buf.buf.clear();
+                break;
+            }
         }
     }
 
@@ -502,6 +635,62 @@ mod tests {
         // Feed second half.
         demux.feed(&full[100..]);
         assert_eq!(demux.pmt_pid, Some(pmt_pid));
+    }
+
+    #[test]
+    fn pmt_with_scte35_pid_routes_to_section_drain() {
+        let mut demux = TsDemuxer::new();
+        let pmt_pid = 0x1000;
+        let scte35_pid = 0x1FFB;
+
+        // PAT.
+        let pat = make_ts_packet(PAT_PID, true, &minimal_pat(pmt_pid));
+        demux.feed(&pat);
+
+        // Custom PMT with one stream entry: stream_type=0x86 (SCTE-35).
+        let mut pmt_payload = vec![
+            0x00, // pointer
+            0x02, // table_id PMT
+            0xB0, 0x12, // section_syntax + length = 18
+            0x00, 0x01, 0xC1, 0x00, 0x00, 0xE1, 0x00, 0xF0, 0x00,
+        ];
+        pmt_payload.push(0x86); // stream_type = SCTE-35
+        pmt_payload.push(0xE0 | ((scte35_pid >> 8) as u8 & 0x1F));
+        pmt_payload.push(scte35_pid as u8);
+        pmt_payload.push(0xF0);
+        pmt_payload.push(0x00);
+        pmt_payload.extend_from_slice(&[0x00; 4]); // CRC placeholder
+        let pmt = make_ts_packet(pmt_pid, true, &pmt_payload);
+        demux.feed(&pmt);
+
+        assert_eq!(demux.streams.get(&scte35_pid), Some(&StreamType::Scte35));
+
+        // Build a fake SCTE-35 splice_info_section: table_id 0xFC + 2-byte
+        // section_length + 17 bytes of body + padding. We do not validate
+        // the CRC at the demux layer; the parser handles that.
+        let section_body_len: usize = 17; // arbitrary; parser would CRC-check
+        let mut section = vec![
+            0xFCu8,
+            0x30 | ((section_body_len >> 8) as u8 & 0x0F),
+            section_body_len as u8,
+        ];
+        section.extend_from_slice(&vec![0x00u8; section_body_len]);
+
+        // Wrap section in a TS packet: PUSI=1, payload starts with
+        // pointer_field=0 then the section bytes.
+        let mut payload = vec![0u8]; // pointer_field
+        payload.extend_from_slice(&section);
+        let pkt = make_ts_packet(scte35_pid, true, &payload);
+        let pes = demux.feed(&pkt);
+        assert!(pes.is_empty(), "SCTE-35 PIDs do not yield PES packets");
+
+        let drained = demux.take_scte35_sections();
+        assert_eq!(drained.len(), 1, "one section drained");
+        assert_eq!(drained[0].pid, scte35_pid);
+        assert_eq!(&drained[0].raw[..], &section[..]);
+
+        // Drain is one-shot: a second call returns empty.
+        assert!(demux.take_scte35_sections().is_empty());
     }
 
     #[test]

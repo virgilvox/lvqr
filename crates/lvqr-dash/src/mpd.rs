@@ -272,10 +272,104 @@ impl AdaptationSet {
     }
 }
 
+/// SCTE-35 ad-marker scheme identifier per ANSI/SCTE 35-2024
+/// section 12.2 / SCTE 214-1, the "XML+bin" variant used by
+/// `<EventStream>` carriages that wrap base64-encoded
+/// `splice_info_section` bytes inside a `<Signal><Binary>` body.
+pub const SCTE35_SCHEME_ID: &str = "urn:scte:scte35:2014:xml+bin";
+
+/// SCTE-35 Signal/Binary XML namespace per SCTE 35-2016.
+pub const SCTE35_SIGNAL_NS: &str = "http://www.scte.org/schemas/35/2016";
+
+/// One `<Event>` element inside an `<EventStream>` per ISO/IEC
+/// 23009-1 section 5.10.4. LVQR uses Events to surface SCTE-35
+/// splice events to DASH clients; the `body` field carries the
+/// base64-encoded splice_info_section bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DashEvent {
+    /// `id` attribute. Carries the SCTE-35 splice_event_id when
+    /// available, otherwise zero. Must be unique within the
+    /// containing EventStream.
+    pub id: u64,
+    /// `presentationTime` attribute in the EventStream's timescale
+    /// (90 kHz for SCTE-35). Absolute splice PTS from the
+    /// publisher's section.
+    pub presentation_time: u64,
+    /// `duration` attribute in the EventStream's timescale.
+    /// `None` (zero on the wire) when the publisher did not set
+    /// `break_duration`.
+    pub duration: Option<u64>,
+    /// Element body. For `urn:scte:scte35:2014:xml+bin` LVQR
+    /// renders `<Signal xmlns=".../35/2016"><Binary>BASE64</Binary>
+    /// </Signal>` with the splice_info_section base64-encoded.
+    pub binary_base64: String,
+}
+
+impl DashEvent {
+    fn write(&self, out: &mut String, indent: usize) {
+        let pad = "  ".repeat(indent);
+        let _ = write!(out, r#"{pad}<Event presentationTime="{}""#, self.presentation_time);
+        if let Some(d) = self.duration {
+            let _ = write!(out, r#" duration="{d}""#);
+        }
+        let _ = write!(out, r#" id="{}">"#, self.id);
+        out.push('\n');
+        let inner_pad = "  ".repeat(indent + 1);
+        let _ = writeln!(out, r#"{inner_pad}<Signal xmlns="{ns}">"#, ns = SCTE35_SIGNAL_NS);
+        let _ = writeln!(
+            out,
+            r#"{p}  <Binary>{b}</Binary>"#,
+            p = inner_pad,
+            b = esc(&self.binary_base64)
+        );
+        let _ = writeln!(out, r#"{inner_pad}</Signal>"#);
+        let _ = writeln!(out, r#"{pad}</Event>"#);
+    }
+}
+
+/// One `<EventStream>` element inside a Period per ISO/IEC
+/// 23009-1 section 5.10.2. LVQR uses one EventStream per
+/// SCTE-35 carriage; `scheme_id_uri` is `SCTE35_SCHEME_ID` for
+/// the standard "xml+bin" variant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventStream {
+    /// `schemeIdUri` attribute. `SCTE35_SCHEME_ID` for SCTE-35.
+    pub scheme_id_uri: String,
+    /// `value` attribute. Optional per spec; LVQR omits when None.
+    pub value: Option<String>,
+    /// `timescale` attribute. 90000 for SCTE-35 (matches the PTS
+    /// units in the wire payload).
+    pub timescale: u32,
+    /// Events to render inside this stream, in presentationTime
+    /// order.
+    pub events: Vec<DashEvent>,
+}
+
+impl EventStream {
+    fn write(&self, out: &mut String, indent: usize) {
+        let pad = "  ".repeat(indent);
+        let _ = write!(
+            out,
+            r#"{pad}<EventStream schemeIdUri="{s}" timescale="{ts}""#,
+            s = esc(&self.scheme_id_uri),
+            ts = self.timescale,
+        );
+        if let Some(v) = &self.value {
+            let _ = write!(out, r#" value="{}""#, esc(v));
+        }
+        out.push_str(">\n");
+        for event in &self.events {
+            event.write(out, indent + 1);
+        }
+        let _ = writeln!(out, "{pad}</EventStream>");
+    }
+}
+
 /// One Period inside the MPD. LVQR uses a single Period for the
 /// entire live stream; multi-Period support is a future-session
-/// addition when SCTE-35 insertion points or mid-stream codec
-/// changes land.
+/// addition when mid-stream codec changes land. Session 152 added
+/// the `event_streams` field for SCTE-35 ad-marker passthrough at
+/// Period level per ISO/IEC 23009-1 G.7.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Period {
     /// `id` attribute. Unique within the MPD.
@@ -283,6 +377,10 @@ pub struct Period {
     /// `start` attribute as an ISO 8601 duration (e.g. `"PT0S"`).
     /// Live streams almost always start at `PT0S`.
     pub start: String,
+    /// `<EventStream>` elements. Rendered BEFORE AdaptationSets
+    /// per ISO/IEC 23009-1 ordering. Empty for streams that carry
+    /// no ad markers.
+    pub event_streams: Vec<EventStream>,
     /// AdaptationSets inside this Period.
     pub adaptation_sets: Vec<AdaptationSet>,
 }
@@ -299,6 +397,11 @@ impl Period {
             id = esc(&self.id),
             start = esc(&self.start)
         );
+        // Per ISO/IEC 23009-1 section 5.3.2.1 EventStream elements
+        // come before AdaptationSet siblings inside a Period.
+        for es in &self.event_streams {
+            es.write(out, indent + 1);
+        }
         for set in &self.adaptation_sets {
             set.write(out, indent + 1)?;
         }
@@ -384,6 +487,7 @@ mod tests {
             periods: vec![Period {
                 id: "0".into(),
                 start: "PT0S".into(),
+                event_streams: Vec::new(),
                 adaptation_sets: vec![AdaptationSet {
                     id: 0,
                     mime_type: "video/mp4".into(),
@@ -491,6 +595,7 @@ mod tests {
             periods: vec![Period {
                 id: "0".into(),
                 start: "PT0S".into(),
+                event_streams: Vec::new(),
                 adaptation_sets: Vec::new(),
             }],
         };
@@ -548,6 +653,81 @@ mod tests {
             xml.contains(r#"codecs="&quot;/&gt;&lt;injection&quot;""#),
             "codecs attribute not escaped correctly:\n{xml}"
         );
+    }
+
+    #[test]
+    fn event_stream_renders_with_period_level_signal_xml_bin() {
+        let mut mpd = live_mpd_with_video();
+        mpd.periods[0].event_streams.push(EventStream {
+            scheme_id_uri: SCTE35_SCHEME_ID.into(),
+            value: None,
+            timescale: 90_000,
+            events: vec![DashEvent {
+                id: 1234567,
+                presentation_time: 8_100_000,
+                duration: Some(2_700_000),
+                binary_base64: "/DAvAAAAAAAAAA/wBQb+ABAA".into(),
+            }],
+        });
+        let xml = mpd.render().expect("render");
+        assert!(
+            xml.contains(r#"<EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin" timescale="90000">"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<Event presentationTime="8100000" duration="2700000" id="1234567">"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<Signal xmlns="http://www.scte.org/schemas/35/2016">"#),
+            "{xml}"
+        );
+        assert!(xml.contains("<Binary>/DAvAAAAAAAAAA/wBQb+ABAA</Binary>"), "{xml}");
+    }
+
+    #[test]
+    fn event_stream_renders_before_adaptation_set_per_iso_23009_1() {
+        // Per ISO/IEC 23009-1 section 5.3.2.1 EventStream must appear
+        // before AdaptationSet siblings inside a Period; Shaka and
+        // dash.js both rely on the documented order.
+        let mut mpd = live_mpd_with_video();
+        mpd.periods[0].event_streams.push(EventStream {
+            scheme_id_uri: SCTE35_SCHEME_ID.into(),
+            value: None,
+            timescale: 90_000,
+            events: vec![DashEvent {
+                id: 1,
+                presentation_time: 0,
+                duration: None,
+                binary_base64: "ABCD".into(),
+            }],
+        });
+        let xml = mpd.render().expect("render");
+        let es_pos = xml.find("<EventStream ").expect("EventStream present");
+        let as_pos = xml.find("<AdaptationSet ").expect("AdaptationSet present");
+        assert!(es_pos < as_pos, "EventStream must precede AdaptationSet:\n{xml}");
+    }
+
+    #[test]
+    fn event_stream_omits_duration_when_none() {
+        let mut mpd = live_mpd_with_video();
+        mpd.periods[0].event_streams.push(EventStream {
+            scheme_id_uri: SCTE35_SCHEME_ID.into(),
+            value: None,
+            timescale: 90_000,
+            events: vec![DashEvent {
+                id: 7,
+                presentation_time: 100,
+                duration: None,
+                binary_base64: "AA==".into(),
+            }],
+        });
+        let xml = mpd.render().expect("render");
+        assert!(
+            xml.contains(r#"<Event presentationTime="100" id="7">"#),
+            "duration must be omitted from the wire when None:\n{xml}"
+        );
+        assert!(!xml.contains("duration=\"\""), "no empty duration attribute");
     }
 
     #[test]

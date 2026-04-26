@@ -15,7 +15,7 @@ use lvqr_codec::hevc::{self as hevc_codec, HevcNalType};
 use lvqr_codec::ts::{PesPacket, StreamType, TsDemuxer};
 use lvqr_core::{EventBus, RelayEvent};
 use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags};
-use lvqr_ingest::{publish_fragment, publish_init};
+use lvqr_ingest::{publish_fragment, publish_init, publish_scte35};
 use srt_tokio::access::{RejectReason, ServerRejectReason};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -209,6 +209,9 @@ async fn handle_connection(
                         for pes in pes_packets {
                             process_pes(&mut state, broadcast, &pes, registry);
                         }
+                        for section in state.demux.take_scte35_sections() {
+                            process_scte35(broadcast, &section, registry);
+                        }
                     }
                     Some(Err(e)) => {
                         warn!(%broadcast, error = %e, "SRT recv error");
@@ -234,8 +237,63 @@ fn process_pes(state: &mut ConnectionState, broadcast: &str, pes: &PesPacket, re
         StreamType::H264 => process_h264(state, broadcast, pes, registry),
         StreamType::Aac => process_aac(state, broadcast, pes, registry),
         StreamType::H265 => process_hevc(state, broadcast, pes, registry),
+        StreamType::Scte35 => {
+            // SCTE-35 PIDs do not flow through the PES path; the
+            // demuxer routes them to its private-section reassembler
+            // and surfaces complete sections via
+            // TsDemuxer::take_scte35_sections, which the connection
+            // loop drains alongside this match. This arm exists only
+            // to keep the match exhaustive.
+        }
         StreamType::Unknown(st) => {
             debug!(%broadcast, stream_type = st, "SRT unknown stream type; dropping PES");
+        }
+    }
+}
+
+/// Decode one reassembled SCTE-35 section and emit it onto the
+/// broadcast's reserved `"scte35"` track.
+///
+/// Sections that fail CRC verification or splice_command parsing are
+/// counted (`lvqr_scte35_drops_total{reason=...}`) and dropped. The
+/// passthrough contract is best-effort: if the publisher emits a
+/// section we cannot parse, downstream HLS / DASH consumers do not
+/// see it, but the publisher's other valid sections still flow.
+fn process_scte35(broadcast: &str, section: &lvqr_codec::ts::Scte35Section, registry: &FragmentBroadcasterRegistry) {
+    match lvqr_codec::parse_splice_info_section(&section.raw) {
+        Ok(info) => {
+            let pts = info.absolute_pts().unwrap_or(0);
+            let duration = info.duration.unwrap_or(0);
+            let event_id = info.event_id.unwrap_or(0) as u64;
+            publish_scte35(
+                registry,
+                broadcast,
+                event_id,
+                pts,
+                duration,
+                Bytes::copy_from_slice(&section.raw),
+            );
+            metrics::counter!(
+                "lvqr_scte35_events_total",
+                "ingest" => "srt",
+                "command" => format!("{:#04x}", info.command_type),
+            )
+            .increment(1);
+        }
+        Err(e) => {
+            let reason = match &e {
+                lvqr_codec::CodecError::Scte35BadCrc { .. } => "crc",
+                lvqr_codec::CodecError::Scte35Malformed(_) => "malformed",
+                lvqr_codec::CodecError::EndOfStream { .. } => "truncated",
+                _ => "other",
+            };
+            warn!(%broadcast, pid = section.pid, error = %e, "SRT scte35 parse failure");
+            metrics::counter!(
+                "lvqr_scte35_drops_total",
+                "ingest" => "srt",
+                "reason" => reason,
+            )
+            .increment(1);
         }
     }
 }

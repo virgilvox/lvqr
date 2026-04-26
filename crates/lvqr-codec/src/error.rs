@@ -21,4 +21,10 @@ pub enum CodecError {
 
     #[error("malformed AudioSpecificConfig: {0}")]
     MalformedAsc(&'static str),
+
+    #[error("malformed SCTE-35 splice_info_section: {0}")]
+    Scte35Malformed(&'static str),
+
+    #[error("SCTE-35 CRC mismatch: computed {computed:#010x}, wire {wire:#010x}")]
+    Scte35BadCrc { computed: u32, wire: u32 },
 }

@@ -70,5 +70,8 @@ pub mod mpd;
 pub mod server;
 
 pub use bridge::BroadcasterDashBridge;
-pub use mpd::{AdaptationSet, DashError, Mpd, MpdType, Period, Representation, SegmentTemplate, render_mpd};
+pub use mpd::{
+    AdaptationSet, DashError, DashEvent, EventStream, Mpd, MpdType, Period, Representation, SCTE35_SCHEME_ID,
+    SCTE35_SIGNAL_NS, SegmentTemplate, render_mpd,
+};
 pub use server::{DashConfig, DashServer, MultiDashServer, OwnerResolver, RedirectFuture};

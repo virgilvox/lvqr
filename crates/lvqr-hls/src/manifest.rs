@@ -71,6 +71,64 @@ pub struct Part {
     pub independent: bool,
 }
 
+/// SCTE-35 ad-marker carriage attribute on a DATERANGE entry per
+/// HLS spec section 4.4.5.1 (draft-pantos-hls-rfc8216bis).
+///
+/// Each DATERANGE may carry exactly one of the three SCTE35-*
+/// attributes; the choice is driven by the splice_command_type and
+/// out_of_network_indicator on the underlying splice_info_section:
+///
+/// * `SpliceOut` -- splice_insert with out_of_network_indicator = 1
+///   (going to ad). Renders `SCTE35-OUT="0x..."`.
+/// * `SpliceIn` -- splice_insert with out_of_network_indicator = 0
+///   (returning from ad). Renders `SCTE35-IN="0x..."`.
+/// * `Cmd` -- everything else (splice_null, time_signal,
+///   bandwidth_reservation, private_command, splice_schedule).
+///   Renders `SCTE35-CMD="0x..."`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateRangeKind {
+    SpliceOut,
+    SpliceIn,
+    Cmd,
+}
+
+impl DateRangeKind {
+    fn attribute_name(self) -> &'static str {
+        match self {
+            Self::SpliceOut => "SCTE35-OUT",
+            Self::SpliceIn => "SCTE35-IN",
+            Self::Cmd => "SCTE35-CMD",
+        }
+    }
+}
+
+/// One `#EXT-X-DATERANGE` entry per HLS spec section 4.4.5
+/// (draft-pantos-hls-rfc8216bis). Used by LVQR to surface SCTE-35
+/// splice events as in-playlist ad markers; the egress-side drain
+/// task on the registry's `"scte35"` track converts each
+/// `lvqr_codec::SpliceInfo` to one of these.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DateRange {
+    /// `ID` attribute. Must be unique within the playlist + date
+    /// range pair. LVQR derives it from the SCTE-35 splice_event_id
+    /// when available, falling back to the splice PTS when not.
+    pub id: String,
+    /// `START-DATE` attribute as wall-clock milliseconds since the
+    /// UNIX epoch. Rendered as an RFC 3339 ISO 8601 string at
+    /// playlist render time.
+    pub start_date_millis: u64,
+    /// `DURATION` attribute in seconds. `None` when the underlying
+    /// splice_insert has no break_duration (and for time_signal /
+    /// splice_null / etc.).
+    pub duration_secs: Option<f64>,
+    /// Which SCTE35-* attribute to render.
+    pub kind: DateRangeKind,
+    /// Raw SCTE-35 splice_info_section bytes encoded as a hex
+    /// string with a leading `0x` per HLS spec 4.4.5.1. Set by the
+    /// drain task from `SpliceInfo::raw`.
+    pub scte35_hex: String,
+}
+
 /// `#EXT-X-SERVER-CONTROL` tag values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerControl {
@@ -143,6 +201,13 @@ pub struct Manifest {
     /// more segments will appear and the playlist is final. Set by
     /// [`PlaylistBuilder::finalize`] when the broadcast ends.
     pub ended: bool,
+    /// SCTE-35 ad-marker `#EXT-X-DATERANGE` entries scoped to the
+    /// playlist's current segment window. Rendered after
+    /// `#EXT-X-MAP` and before the first segment so a client
+    /// walking top-down sees the ad-marker block before any media.
+    /// Pruned in lock-step with segment eviction in
+    /// [`PlaylistBuilder::close_pending_segment`].
+    pub date_ranges: Vec<DateRange>,
 }
 
 impl Manifest {
@@ -208,6 +273,18 @@ impl Manifest {
         }
         if skip_count > 0 {
             let _ = writeln!(out, "#EXT-X-SKIP:SKIPPED-SEGMENTS={skip_count}");
+        }
+        for dr in &self.date_ranges {
+            let _ = write!(
+                out,
+                "#EXT-X-DATERANGE:ID=\"{}\",START-DATE=\"{}\"",
+                escape_attr(&dr.id),
+                format_program_date_time(dr.start_date_millis),
+            );
+            if let Some(d) = dr.duration_secs {
+                let _ = write!(out, ",DURATION={d:.3}");
+            }
+            let _ = writeln!(out, ",{}={}", dr.kind.attribute_name(), dr.scte35_hex);
         }
         for seg in &self.segments[skip_count..] {
             if let Some(millis) = seg.program_date_time_millis {
@@ -429,6 +506,7 @@ impl PlaylistBuilder {
             preliminary_parts: Vec::new(),
             preload_hint_uri: None,
             ended: false,
+            date_ranges: Vec::new(),
         };
         let next_sequence = config.starting_sequence;
         Self {
@@ -561,6 +639,36 @@ impl PlaylistBuilder {
                 self.evicted_uris.push(dropped.uri);
             }
         }
+        // Prune date ranges whose START-DATE precedes the playlist's
+        // earliest live PROGRAM-DATE-TIME. Only meaningful when the
+        // builder is wall-clock-aligned (`program_date_time_base`).
+        // Without that anchor every DATERANGE is held; the egress
+        // drain task is responsible for not pushing far-stale events.
+        if let Some(first_pdt) = self.manifest.segments.first().and_then(|s| s.program_date_time_millis) {
+            self.manifest.date_ranges.retain(|dr| dr.start_date_millis >= first_pdt);
+        }
+    }
+
+    /// Append a SCTE-35 `#EXT-X-DATERANGE` entry to the playlist.
+    /// Called by the egress drain task on the registry's `"scte35"`
+    /// track. Duplicates (same ID + same SCTE35-* attribute) are
+    /// dropped so a publisher that re-emits the same event_id does
+    /// not double-render.
+    ///
+    /// The pruning policy lives in [`Self::close_pending_segment`]:
+    /// any entry whose `start_date_millis` precedes the playlist's
+    /// earliest live `PROGRAM-DATE-TIME` ages out alongside the
+    /// segment that owned it.
+    pub fn push_date_range(&mut self, dr: DateRange) {
+        if self
+            .manifest
+            .date_ranges
+            .iter()
+            .any(|existing| existing.id == dr.id && existing.kind == dr.kind)
+        {
+            return;
+        }
+        self.manifest.date_ranges.push(dr);
     }
 
     /// Drain the URIs the sliding-window eviction has queued since
@@ -587,6 +695,24 @@ impl PlaylistBuilder {
         self.manifest.preload_hint_uri = None;
         self.manifest.ended = true;
     }
+}
+
+/// Escape a string for inclusion as a quoted-string HLS attribute
+/// value per RFC 8216 section 4.2: backslashes and double-quotes
+/// get backslash-escaped; control characters are stripped (LF / CR
+/// would terminate the tag line). The common case (alphanumeric
+/// plus `-_./:`) returns unchanged.
+fn escape_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' | '\r' => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Convert a tick count in the playlist's timescale to fractional
@@ -636,6 +762,78 @@ mod tests {
             duration,
             kind,
         }
+    }
+
+    fn mk_date_range(id: &str, start_ms: u64, kind: DateRangeKind) -> DateRange {
+        DateRange {
+            id: id.into(),
+            start_date_millis: start_ms,
+            duration_secs: Some(30.0),
+            kind,
+            scte35_hex: "0xFC301100".into(),
+        }
+    }
+
+    #[test]
+    fn date_range_renders_with_id_start_date_duration_and_scte35_attr() {
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        b.push(&mk_chunk(0, 30_000, CmafChunkKind::Segment)).unwrap();
+        b.push_date_range(mk_date_range("splice-1", 1_700_000_000_000, DateRangeKind::SpliceOut));
+        let rendered = b.manifest().render();
+        assert!(
+            rendered.contains("#EXT-X-DATERANGE:ID=\"splice-1\","),
+            "playlist:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("START-DATE=\"2023-11-14T22:13:20.000Z\""),
+            "playlist:\n{rendered}"
+        );
+        assert!(rendered.contains("DURATION=30.000"), "playlist:\n{rendered}");
+        assert!(rendered.contains("SCTE35-OUT=0xFC301100"), "playlist:\n{rendered}");
+    }
+
+    #[test]
+    fn date_range_dedupe_drops_duplicate_id_and_kind() {
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        b.push_date_range(mk_date_range("splice-1", 1, DateRangeKind::SpliceOut));
+        b.push_date_range(mk_date_range("splice-1", 1, DateRangeKind::SpliceOut));
+        assert_eq!(b.manifest().date_ranges.len(), 1);
+        // Same ID with a DIFFERENT kind (the matching SCTE35-IN) is
+        // a distinct render entry and is kept.
+        b.push_date_range(mk_date_range("splice-1", 30_000, DateRangeKind::SpliceIn));
+        assert_eq!(b.manifest().date_ranges.len(), 2);
+    }
+
+    #[test]
+    fn date_range_pruned_when_segment_window_evicts_below_start_date() {
+        let base = 1_700_000_000_000u64;
+        let cfg = PlaylistBuilderConfig {
+            max_segments: Some(3),
+            program_date_time_base: Some(base),
+            ..PlaylistBuilderConfig::default()
+        };
+        let mut b = PlaylistBuilder::new(cfg);
+        // Push three 1-s segments and explicit-close so the playlist
+        // currently holds segments 0, 1, 2 (max=3, no eviction yet).
+        // First segment PDT = base. Push two date ranges, then push a
+        // fourth segment + close so the eviction drops segment 0 and
+        // first-PDT advances to base + 1000. The range whose start is
+        // before that bound prunes; the later one survives.
+        b.push(&mk_chunk(0, 90_000, CmafChunkKind::Segment)).unwrap();
+        b.push(&mk_chunk(90_000, 90_000, CmafChunkKind::Segment)).unwrap();
+        b.push(&mk_chunk(180_000, 90_000, CmafChunkKind::Segment)).unwrap();
+        b.close_pending_segment();
+        b.push_date_range(mk_date_range("old", base, DateRangeKind::Cmd));
+        b.push_date_range(mk_date_range("new", base + 1_500, DateRangeKind::Cmd));
+        b.push(&mk_chunk(270_000, 90_000, CmafChunkKind::Segment)).unwrap();
+        b.close_pending_segment();
+        assert_eq!(
+            b.manifest().date_ranges.len(),
+            1,
+            "expected one survivor; got {:?}",
+            b.manifest().date_ranges
+        );
+        assert_eq!(b.manifest().date_ranges[0].id, "new");
     }
 
     #[test]
@@ -826,6 +1024,7 @@ mod tests {
             preliminary_parts: Vec::new(),
             preload_hint_uri: None,
             ended: false,
+            date_ranges: Vec::new(),
         };
         assert_eq!(m.delta_skip_count(), 0);
         // Rendered server-control line must omit CAN-SKIP-UNTIL in

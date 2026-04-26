@@ -21,6 +21,7 @@ mod config_file;
 mod config_reload;
 mod handle;
 mod hls;
+mod scte35_bridge;
 mod signed_url;
 mod ws;
 
@@ -490,6 +491,15 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         // is not `"captions"`, so it composes safely with
         // the LL-HLS bridge above.
         captions::BroadcasterCaptionsBridge::install(hls.clone(), &shared_registry);
+        // Session 152: SCTE-35 ad-marker bridge. The bridge no-ops
+        // on every track that is not `"scte35"` (per
+        // FragmentBroadcasterRegistry SCTE35_TRACK reservation), so
+        // it composes safely with the LL-HLS bridge and the
+        // captions bridge above. Drains scte35 fragments from the
+        // shared registry and projects them into the per-broadcast
+        // HLS DATERANGE window and DASH Period EventStream.
+        let dash_for_scte35 = dash_server.clone();
+        scte35_bridge::BroadcasterScte35Bridge::install(hls.clone(), dash_for_scte35, &shared_registry);
     }
 
     // Tier 4 item 4.5 session D: if the operator passed

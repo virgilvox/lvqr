@@ -62,6 +62,22 @@ use crate::stream::FragmentStream;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+/// Reserved track name for SCTE-35 ad-marker passthrough events.
+///
+/// Producers (RTMP onCuePoint scte35-bin64, SRT MPEG-TS PID 0x86)
+/// emit `Fragment` values onto this track via the registry. Egress
+/// drains (LL-HLS DATERANGE renderer, DASH EventStream renderer)
+/// subscribe to it. The Fragment payload is the raw
+/// `splice_info_section` bytes per SCTE 35-2024 section 8.1; the
+/// Fragment's `pts` carries the absolute splice PTS in 90 kHz ticks
+/// and `duration` carries `break_duration` (zero when undefined).
+///
+/// This is a soft reservation enforced by convention. Misconfigured
+/// ingest paths that emit non-SCTE-35 payloads onto this track will
+/// confuse the egress renderers; the convention is documented here
+/// and in `docs/scte35.md`.
+pub const SCTE35_TRACK: &str = "scte35";
+
 type RegistryKey = (String, String);
 type RegistryMap = HashMap<RegistryKey, Arc<FragmentBroadcaster>>;
 

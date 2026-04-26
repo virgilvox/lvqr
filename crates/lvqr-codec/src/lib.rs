@@ -37,7 +37,9 @@ pub mod aac;
 pub mod bit_reader;
 pub mod error;
 pub mod hevc;
+pub mod scte35;
 pub mod ts;
 
 pub use error::CodecError;
+pub use scte35::{SpliceInfo, parse_splice_info_section};
 pub use ts::{PesPacket, StreamType, TsDemuxer};

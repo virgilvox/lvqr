@@ -11,7 +11,7 @@ pub mod error;
 pub mod protocol;
 pub mod remux;
 
-pub use dispatch::{publish_fragment, publish_init};
+pub use dispatch::{publish_fragment, publish_init, publish_scte35};
 pub use error::IngestError;
 pub use observer::{MediaCodec, NoopRawSampleObserver, RawSampleObserver, SharedRawSampleObserver};
 pub use protocol::IngestProtocol;

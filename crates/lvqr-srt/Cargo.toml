@@ -20,6 +20,7 @@ lvqr-core = { workspace = true }
 lvqr-fragment = { workspace = true }
 lvqr-ingest = { workspace = true }
 lvqr-moq = { workspace = true }
+metrics = { workspace = true }
 srt-tokio = "0.4"
 tokio = { workspace = true, features = ["net", "rt", "sync"] }
 tokio-util = { workspace = true }

@@ -44,5 +44,5 @@ pub use broadcaster::{BroadcasterStream, DEFAULT_BROADCASTER_CAPACITY, FragmentB
 pub use fragment::{Fragment, FragmentFlags, FragmentMeta};
 pub use moq_sink::{MoqSinkError, MoqTrackSink};
 pub use moq_stream::{MoqGroupStream, MoqTrackStream};
-pub use registry::FragmentBroadcasterRegistry;
+pub use registry::{FragmentBroadcasterRegistry, SCTE35_TRACK};
 pub use stream::FragmentStream;

@@ -334,9 +334,14 @@ format defines is honored at runtime. The remaining ranking:
 
 1. ~~**Hot config reload.**~~ v1 / v2 / v3 shipped across
    sessions 147 + 148 + 149.
-2. **SCTE-35 passthrough.** WebVTT captions already ship via
-   the WASM agent path (session 96); SCTE-35 ad-marker events
-   would land on the same observer surface.
+2. ~~**SCTE-35 passthrough.**~~ v1 shipped in session 152 (SRT
+   MPEG-TS PID 0x86 ingest, LL-HLS `#EXT-X-DATERANGE` and DASH
+   Period-level `<EventStream>` egress, splice_info_section
+   passthrough verbatim). RTMP onCuePoint deferred behind an
+   rml_rtmp v0.8 dependency gap (the library silently drops
+   AMF0 Data messages other than `@setDataFrame`-wrapped
+   onMetaData; lifting requires an upstream patch or a dep
+   swap).
 3. **Dedicated DVR scrub web UI.** Today DVR playback works via
    any HLS-aware player but seek-bar + thumbnail strip require
    integrator work. A drop-in `<lvqr-dvr-player>` web component
@@ -354,6 +359,36 @@ format defines is honored at runtime. The remaining ranking:
    `POST /api/v1/slo/client-sample` endpoint.
 
 #### Recently shipped (compact reference)
+
+* **SCTE-35 ad-marker passthrough v1** (session 152) -- ingest-
+  side SRT MPEG-TS demuxer learns stream_type 0x86 + private-
+  section reassembly across TS packet boundaries; new
+  `lvqr-codec/src/scte35.rs` parses splice_info_section per ANSI/
+  SCTE 35-2024 section 8.1 with CRC_32 verification (MPEG-2
+  polynomial 0x04C11DB7) and surfaces the timing fields the
+  egress renderers need (event_id, pts, break_duration,
+  command_type) while preserving the raw section bytes verbatim.
+  Events flow through a reserved `"scte35"` parallel track on the
+  existing `FragmentBroadcasterRegistry` (mirroring the
+  whisper-captions pattern under `lvqr_fragment::SCTE35_TRACK`).
+  LL-HLS render adds `#EXT-X-DATERANGE` per HLS spec section
+  4.4.5.1 (SCTE35-OUT / SCTE35-IN / SCTE35-CMD attributes driven
+  by splice_command_type + out_of_network_indicator); DASH MPD
+  render adds Period-level `<EventStream
+  schemeIdUri="urn:scte:scte35:2014:xml+bin">` per ISO/IEC
+  23009-1 G.7 + SCTE 214-1 with base64 splice_info_section inside
+  a `<Signal><Binary>` body. Net additions: +1 lvqr-codec module
+  (~280 lines + 11 unit tests), +1 ts.rs StreamType variant + 1
+  PMT-routing test, +1 lvqr-fragment SCTE35_TRACK constant, +1
+  lvqr-ingest publish_scte35 helper + 1 dispatch test, +1 SRT
+  process_scte35 dispatcher arm, +DateRange render path on
+  PlaylistBuilder + 3 unit tests, +EventStream render path on
+  Mpd::Period + 3 unit tests, +1 cli-side BroadcasterScte35Bridge
+  module + 5 unit tests. RTMP onCuePoint scte35-bin64 ingest is
+  deferred behind an rml_rtmp v0.8 dependency surface gap (see
+  `docs/scte35.md` ingest table). New docs at `docs/scte35.md`
+  cover the full standards reference + operator runbook + metrics
+  surface.
 
 * **lvqr-agent test polling** (session 151) -- four
   `tokio::time::sleep(Duration::from_millis(100))` sites in

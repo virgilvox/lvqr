@@ -42,7 +42,9 @@ use axum::{
 use bytes::Bytes;
 use lvqr_cmaf::{detect_audio_codec_string, detect_video_codec_string};
 
-use crate::mpd::{AdaptationSet, Mpd, MpdType, Period, Representation, SegmentTemplate};
+use crate::mpd::{
+    AdaptationSet, DashEvent, EventStream, Mpd, MpdType, Period, Representation, SCTE35_SCHEME_ID, SegmentTemplate,
+};
 
 /// Default base path used when mounting a [`MultiDashServer`] router.
 const MULTI_DASH_PREFIX: &str = "/dash";
@@ -136,6 +138,12 @@ struct DashState {
     config: DashConfig,
     video: Mutex<TrackState>,
     audio: Mutex<TrackState>,
+    /// SCTE-35 ad-marker `<EventStream>` elements rendered into the
+    /// MPD's single Period. Pushed by [`DashServer::push_event`] from
+    /// the cli-side `BroadcasterScte35Bridge` drain task. The vector
+    /// holds one EventStream per scheme; SCTE-35 passthrough uses
+    /// exactly one.
+    event_streams: Mutex<Vec<EventStream>>,
     /// Set by [`DashServer::finalize`] when the broadcast ends.
     /// The renderer reads this to switch `MpdType::Dynamic` to
     /// `MpdType::Static` and omit `minimumUpdatePeriod` so DASH
@@ -164,8 +172,39 @@ impl DashServer {
                 config,
                 video: Mutex::new(TrackState::new()),
                 audio: Mutex::new(TrackState::new()),
+                event_streams: Mutex::new(Vec::new()),
                 finalized: std::sync::atomic::AtomicBool::new(false),
             }),
+        }
+    }
+
+    /// Push a SCTE-35 ad-marker event into the broadcast's Period-
+    /// level `<EventStream>`. Lazily creates the EventStream on
+    /// first call (scheme `urn:scte:scte35:2014:xml+bin`, timescale
+    /// 90 000). Duplicate events (same `id`) are coalesced; the
+    /// most recent payload wins.
+    ///
+    /// Used by the cli-side `BroadcasterScte35Bridge` to forward
+    /// events drained from the registry's `"scte35"` track.
+    pub fn push_event(&self, event: DashEvent) {
+        let mut streams = self
+            .state
+            .event_streams
+            .lock()
+            .expect("dash event_streams lock poisoned");
+        if streams.is_empty() {
+            streams.push(EventStream {
+                scheme_id_uri: SCTE35_SCHEME_ID.to_string(),
+                value: None,
+                timescale: 90_000,
+                events: Vec::new(),
+            });
+        }
+        let es = &mut streams[0];
+        if let Some(slot) = es.events.iter_mut().find(|e| e.id == event.id) {
+            *slot = event;
+        } else {
+            es.events.push(event);
         }
     }
 
@@ -326,6 +365,12 @@ impl DashServer {
             periods: vec![Period {
                 id: "0".into(),
                 start: "PT0S".into(),
+                event_streams: self
+                    .state
+                    .event_streams
+                    .lock()
+                    .expect("dash event_streams lock poisoned")
+                    .clone(),
                 adaptation_sets,
             }],
         };
@@ -499,6 +544,16 @@ impl MultiDashServer {
     /// Producer-side entry point. Returns a cheap clone of the
     /// per-broadcast [`DashServer`], constructing a fresh entry if
     /// the broadcast has not been seen yet.
+    /// Push a SCTE-35 ad-marker event into `broadcast`. Lazily
+    /// creates the per-broadcast `DashServer` so events that arrive
+    /// before any media still register; they will be visible on the
+    /// MPD as soon as the first video segment lands and the renderer
+    /// has enough state to emit the manifest.
+    pub fn push_event(&self, broadcast: &str, event: DashEvent) {
+        let server = self.ensure(broadcast);
+        server.push_event(event);
+    }
+
     pub fn ensure(&self, broadcast: &str) -> DashServer {
         let mut map = self.inner.broadcasts.lock().expect("dash broadcasts lock poisoned");
         if let Some(existing) = map.get(broadcast) {

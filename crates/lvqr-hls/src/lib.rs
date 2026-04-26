@@ -69,7 +69,8 @@ pub mod server;
 pub mod subtitles;
 
 pub use manifest::{
-    HlsError, Manifest, Part, PlaylistBuilder, PlaylistBuilderConfig, Segment, ServerControl, render_manifest,
+    DateRange, DateRangeKind, HlsError, Manifest, Part, PlaylistBuilder, PlaylistBuilderConfig, Segment, ServerControl,
+    render_manifest,
 };
 pub use master::{MasterPlaylist, MediaRendition, MediaRenditionType, RenditionMeta, VariantStream};
 pub use server::{HlsServer, MultiHlsServer, OwnerResolver, RedirectFuture};

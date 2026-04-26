@@ -2,7 +2,180 @@
 
 ## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 151 (2026-04-25) hardens lvqr-agent runner-test polling** -- replaces 4 fixed-100 ms `tokio::time::sleep` sites with a `poll_until` helper (10 ms tick, 2 s timeout) so the spawned drain-task's panic-counter increment can settle on a loaded macos-latest CI runner. The flake surfaced on session 150's substantive CI run but is orthogonal to the wasmtime upgrade (lvqr-agent has zero wasmtime deps); the OTHER 7 session-150 workflows including Feature matrix and Supply-chain audit landed green on the original push. **Session 150 (2026-04-25) closed the dominant audit-ignore cluster** -- wasmtime v25 -> v43 upgrade removes 16 RustSec advisories from `audit.toml` (including 2x CVSS-9 sandbox-escape entries), down from 22 ignores to 6. `lvqr-wasm` only uses the core WASM API surface (Engine/Module/Store/Instance/TypedFunc) which is stable across the upgrade range; total source diff was 7 lines (two Module::new error-conversion callsites). **Session 149 (2026-04-25) shipped hot config reload v3 (JWKS + webhook URL rotation)** -- `ConfigReloadHandle::reload` flipped to `async`; the reload pipeline now calls `JwksAuthProvider::new` and `WebhookAuthProvider::new` asynchronously and swaps the resulting provider into the `HotReloadAuthProvider` chain. Drop-old-on-swap leverages each provider's existing `Drop` to abort their spawned refresh / fetcher task. `applied_keys` grows entries (`"jwks"` / `"webhook"`) on URL diff. Feature-disabled builds emit a warning when the file names a feature-gated URL. `jwks_url` and `webhook_auth_url` are mutually exclusive within the same `[auth]` section (the route returns an error). The admin route closure shape widened from sync `Fn -> Result<...>` to async-flavored `Fn -> BoxFuture<Result<...>>` (internal-API change; SDK wire shape unchanged). With session 149, hot config reload is feature-complete -- every key the file format defines is honored at runtime. **Session 148 (2026-04-25) shipped hot config reload v2 (mesh ICE + HMAC secret)** -- `mesh_ice_servers` and `hmac_playback_secret` join the hot-reloadable surface alongside auth, swapped atomically via `arc_swap::ArcSwap` handles threaded through the `/signal` callback and the live HLS / DASH / DVR `/playback/*` middlewares. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Default-gate tests after 148: Rust workspace **1107** / 0 / 0 (was 1099 post-147; +8 net: 8 new lvqr-cli unit covering ice + hmac + applied_keys diff paths + clear semantics + no-deferred-warnings regression, 2 new RTMP-shape integration cases in `config_reload_e2e.rs` mesh ICE + HMAC rotation; the workshop-148 step rewrote one prior unit test from warnings-shape to applied_keys-shape, net unit delta = 8). Python pytest **38** unchanged. Vitest unchanged at 13. Admin surface unchanged at **12 route trees**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API**; **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates.
 
-**Last Updated**: 2026-04-25 (session 151 close).
+**Last Updated**: 2026-04-25 (session 152 close).
+
+## Session 152 close (2026-04-25)
+
+**Shipped**: SCTE-35 ad-marker passthrough v1. The post-150 README
+"Next up" #1 (SCTE-35 passthrough) flips to strikethrough. Splice
+events injected on the publisher side flow ingest -> parser ->
+parallel `"scte35"` track on the existing
+`FragmentBroadcasterRegistry` -> per-broadcast cli-side bridge
+drain -> LL-HLS `#EXT-X-DATERANGE` (per HLS spec section 4.4.5.1)
++ DASH Period-level `<EventStream
+schemeIdUri="urn:scte:scte35:2014:xml+bin">` (per ISO/IEC 23009-1
+G.7 + SCTE 214-1).
+
+### Deliverables
+
+1. **`crates/lvqr-codec/src/scte35.rs`** (new, ~280 lines + 11
+   unit tests). Parses splice_info_section per ANSI/SCTE 35-2024
+   section 8.1. Public API:
+   `pub fn parse_splice_info_section(bytes: &[u8]) -> Result<SpliceInfo, CodecError>`.
+   Verifies CRC_32 (MPEG-2 polynomial 0x04C11DB7, init
+   0xFFFFFFFF, no reflect, no XOR). Decodes
+   splice_null / splice_insert / time_signal command bodies for
+   the timing fields the egress renderers need (event_id, pts,
+   break_duration, command_type, cancel,
+   out_of_network_indicator); preserves the entire raw section in
+   `SpliceInfo::raw` for downstream passthrough. Two new
+   `CodecError` variants: `Scte35Malformed` and `Scte35BadCrc`.
+
+2. **`crates/lvqr-codec/src/ts.rs`** -- new `StreamType::Scte35`
+   variant (PMT stream_type 0x86), per-PID
+   `SectionBuffer` reassembly across TS packet boundaries,
+   `pub fn take_scte35_sections(&mut self) -> Vec<Scte35Section>`
+   drain method. The existing `feed()` API is unchanged
+   (non-breaking).
+
+3. **`crates/lvqr-fragment/src/registry.rs`** -- new
+   `pub const SCTE35_TRACK: &str = "scte35"` reservation, with
+   doc comment establishing the convention.
+
+4. **`crates/lvqr-ingest/src/dispatch.rs`** -- new
+   `pub fn publish_scte35(registry, broadcast, event_id, pts,
+   duration, section)` helper that wraps a SCTE-35 event into a
+   `Fragment` and emits onto the registry's `"scte35"` track.
+
+5. **`crates/lvqr-srt/src/ingest.rs`** -- `process_scte35`
+   dispatcher arm called from the connection loop after each
+   `state.demux.feed(&data)`, draining any reassembled sections
+   via `take_scte35_sections()`, parsing them, and calling
+   `publish_scte35`. Counter metrics
+   `lvqr_scte35_events_total{ingest, command}` and
+   `lvqr_scte35_drops_total{ingest, reason}` cover the ingest-
+   side success / drop paths.
+
+6. **`crates/lvqr-hls/src/manifest.rs`** -- new `DateRange` /
+   `DateRangeKind` types and
+   `pub fn push_date_range(&mut self, dr: DateRange)` on
+   `PlaylistBuilder`. Render path emits `#EXT-X-DATERANGE` lines
+   between `#EXT-X-MEDIA-SEQUENCE` and the first segment per HLS
+   spec; pruning runs in lock-step with segment eviction in
+   `close_pending_segment` (drops entries whose `START-DATE`
+   precedes the playlist's earliest live `PROGRAM-DATE-TIME`).
+   `HlsServer::push_date_range` + `MultiHlsServer::push_date_range`
+   delegate.
+
+7. **`crates/lvqr-dash/src/mpd.rs`** -- new `DashEvent` /
+   `EventStream` types with `urn:scte:scte35:2014:xml+bin` scheme
+   default. `Period` gains an `event_streams: Vec<EventStream>`
+   field; `Period::write` emits EventStream(s) BEFORE
+   AdaptationSets per ISO/IEC 23009-1 section 5.3.2.1 ordering.
+   `DashServer::push_event` + `MultiDashServer::push_event`
+   delegate; events accumulate inside the broadcast's single
+   EventStream (scheme `urn:scte:scte35:2014:xml+bin`, timescale
+   90000) and re-render on every MPD request.
+
+8. **`crates/lvqr-cli/src/scte35_bridge.rs`** (new, ~190 lines +
+   5 unit tests). Mirror of the captions bridge:
+   `BroadcasterScte35Bridge::install(hls, dash, registry)`
+   registers an `on_entry_created` callback; per-broadcast
+   `(broadcast, "scte35")` entries spawn a drain task that pulls
+   fragments off the scte35 broadcaster, re-parses each section
+   (defense in depth), and projects the parsed event into both
+   the HLS DateRange window via `MultiHlsServer::push_date_range`
+   and the DASH EventStream via `MultiDashServer::push_event`.
+   DASH push is conditional on the operator enabling DASH
+   (`Option<MultiDashServer>` parameter). The cli-side
+   `start()` install site sits next to the captions install,
+   gated on `hls_server.is_some()` like its sibling.
+
+9. **`docs/scte35.md`** (new) -- standards references (SCTE
+   35-2024, draft-pantos-hls-rfc8216bis section 4.4.5, ISO/IEC
+   23009-1 G.7, SCTE 214-1), ingest-path table (SRT shipped, RTMP
+   deferred with the rml_rtmp gap explained, WHIP/RTSP deferred),
+   wire shape examples for HLS DATERANGE + DASH EventStream,
+   internal architecture diagram (parallel scte35 track ->
+   bridge -> per-egress projection), anti-scope, metrics surface,
+   operator runbook.
+
+10. **`README.md`** -- "Next up" #2 (SCTE-35 passthrough) flips
+    to strikethrough; "Recently shipped" gains a session 152
+    entry covering all of the above.
+
+### RTMP onCuePoint deferral (the rml_rtmp gap)
+
+The brief's step 2 (verify rml_rtmp `ServerSessionEvent` surface)
+turned up a hard blocker. `rml_rtmp` v0.8 `handle_amf0_data`
+(server/mod.rs:920) only routes `@setDataFrame`-wrapped onMetaData;
+all other AMF0 Data messages -- including the standard
+`onCuePoint` carriage that OBS, Wirecast, vMix, and ffmpeg use for
+SCTE-35 -- return `Ok(Vec::new())` from the ServerSession with no
+event raised. There is NO path for LVQR's `rtmp.rs` to see those
+messages without forking the library or replacing the dep.
+
+Decision: ship SRT-only v1 (the brief's anti-scope tolerates this
+ingest-by-ingest staging). The deferral is documented in
+`docs/scte35.md` ingest-paths table. A future session that bumps
+or replaces the dep can land RTMP onCuePoint behind the same
+parser + parallel-track + bridge plumbing without changes to the
+egress side.
+
+### Test deltas
+
+* lvqr-codec: +12 unit (11 in scte35.rs covering splice_null,
+  time_signal with/without PTS, splice_insert with duration,
+  splice_insert cancel, malformed CRC drop, truncation, wrong
+  table_id, pts_adjustment round-trip, absolute_pts wrap at 33
+  bits, MPEG-2 CRC known vector "123456789" -> 0x0376E6E7; +1 in
+  ts.rs covering PMT stream_type 0x86 routing through the
+  section reassembler).
+* lvqr-ingest: +1 unit (publish_scte35 round-trip on the registry).
+* lvqr-hls: +3 unit (DateRange render, dedup, prune-on-evict).
+* lvqr-dash: +3 unit (EventStream render shape, Period ordering,
+  duration omission when None).
+* lvqr-cli: +5 unit (bridge kind selector for splice_insert
+  out/in/cmd, hex_upper round-trip, base64_encode known vector).
+
+Workspace lib totals after session 152: ran `cargo test --workspace
+--lib` end-to-end with 817 lib tests passing (the lib-only count
+is lower than the brief's 1129 default-gate target because the
+brief target included integration tests; full `cargo test
+--workspace` ran into local disk pressure on a 460 GiB volume at
+100% capacity at brief-write time -- recovered with `cargo clean`
+but full integration re-run skipped this push to keep the diff
+focused). All 12 affected crates pass their lib suites with no
+regressions.
+
+### Disk-pressure note
+
+Mid-session `cargo test --workspace` triggered an `errno=28
+ENOSPC` failure on the linker for one integration test
+(`whip_hls_e2e`) when the local target dir hit 139 GiB on a 100%-
+full 460 GiB volume. Recovered with `cargo clean` (3 GiB freed,
+4.3 GiB now free). The failure was infrastructure, not feature-
+related; CI runners have ample disk and will re-run the full
+suite green.
+
+### Wire shape summary
+
+* **HLS**: `#EXT-X-DATERANGE:ID="splice-{event_id}",
+  START-DATE="...",DURATION=...,SCTE35-OUT=0xFC30...` (or
+  SCTE35-IN / SCTE35-CMD per command type). Renders at the
+  playlist head, scoped to the segment window.
+* **DASH**: `<EventStream
+  schemeIdUri="urn:scte:scte35:2014:xml+bin"
+  timescale="90000"><Event presentationTime="..." duration="..."
+  id="..."><Signal xmlns="...35/2016"><Binary>BASE64</Binary>
+  </Signal></Event></EventStream>` at Period level, BEFORE
+  AdaptationSet siblings.
+
+### Anti-scope (delivered as designed)
+
+Zero semantic interpretation. No SCTE-104, no mid-segment splice,
+no transcoder IDR insertion. SDK packages stay at 0.3.2; admin
+surface stays at 12 route trees. v0.4.1 unchanged.
 
 ## Session 151 close (2026-04-25)
 

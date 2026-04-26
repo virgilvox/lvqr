@@ -81,6 +81,7 @@ lvqr-admin = { workspace = true }
 lvqr-auth = { workspace = true, features = ["jwt"] }
 lvqr-record = { workspace = true }
 lvqr-fragment = { workspace = true }
+lvqr-codec = { workspace = true }
 lvqr-cmaf = { workspace = true }
 lvqr-hls = { workspace = true }
 lvqr-dash = { workspace = true }

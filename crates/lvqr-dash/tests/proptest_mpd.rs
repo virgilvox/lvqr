@@ -84,6 +84,7 @@ fn arb_period() -> impl Strategy<Value = Period> {
     prop::collection::vec(arb_adaptation_set(), 1..4).prop_map(|sets| Period {
         id: "0".into(),
         start: "PT0S".into(),
+        event_streams: Vec::new(),
         adaptation_sets: sets,
     })
 }
