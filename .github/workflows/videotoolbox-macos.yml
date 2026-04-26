@@ -1,0 +1,126 @@
+name: VideoToolbox HW encode (macos)
+
+# Session 156 follow-up: exercise the new `vtenc_h264_hw` integration
+# test on every PR touching the transcode crate. Without this lane the
+# `crates/lvqr-transcode/tests/videotoolbox_ladder.rs` test gates on
+# `cfg(target_os = "macos")` + `feature = "hw-videotoolbox"` and skips
+# silently on every ubuntu-latest run, leaving the HW path
+# functionally untested in CI.
+#
+# Cost note: macos-latest minutes are 10x ubuntu-latest. Path filters
+# scope re-runs to the transcode + cli crates that actually exercise
+# the encoder; unrelated workspace edits do not retrigger.
+#
+# Posture: `continue-on-error: true` for the first weeks while we
+# learn what variance looks like on the GitHub-hosted Apple Silicon
+# runner. Promote to a required check after a green-run streak.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/lvqr-transcode/**"
+      - "crates/lvqr-cli/Cargo.toml"
+      - "crates/lvqr-cli/src/config.rs"
+      - "crates/lvqr-cli/src/lib.rs"
+      - "crates/lvqr-cli/src/main.rs"
+      - "crates/lvqr-conformance/fixtures/fmp4/**"
+      - ".github/workflows/videotoolbox-macos.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/lvqr-transcode/**"
+      - "crates/lvqr-cli/Cargo.toml"
+      - "crates/lvqr-cli/src/config.rs"
+      - "crates/lvqr-cli/src/lib.rs"
+      - "crates/lvqr-cli/src/main.rs"
+      - "crates/lvqr-conformance/fixtures/fmp4/**"
+      - ".github/workflows/videotoolbox-macos.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  videotoolbox-ladder:
+    name: cargo test (macos, hw-videotoolbox)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: videotoolbox-macos-v1
+
+      # Homebrew on macos-latest already ships pre-built bottles for
+      # the GStreamer plugin set; cold install is ~5 min, warm is
+      # ~30 s. The `applemedia` plugin (which ships `vtenc_h264_hw`)
+      # lives in `gst-plugins-bad`. The dev headers + .pc files come
+      # with the base `gstreamer` formula; gstreamer-rs picks them up
+      # via Homebrew's default pkg-config search path.
+      - name: Install GStreamer + plugins via Homebrew
+        run: |
+          brew update --quiet
+          brew install --quiet gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav
+
+      # Verify the HW encoder element is actually available before
+      # spending compile time. A surprise plugin packaging change on
+      # Homebrew's side surfaces here as a fast-fail rather than as a
+      # confusing "factory opted out" log buried in the test output.
+      - name: Probe vtenc_h264_hw availability
+        run: |
+          gst-inspect-1.0 --version
+          gst-inspect-1.0 vtenc_h264_hw | head -8
+          echo "---"
+          # Round-trip smoke: encode 30 frames of testsrc through
+          # vtenc_h264_hw to confirm HW initialisation works on this
+          # runner before cargo touches anything.
+          gst-launch-1.0 -e \
+            videotestsrc num-buffers=30 \
+            ! 'video/x-raw,width=320,height=180,framerate=30/1' \
+            ! videoconvert \
+            ! vtenc_h264_hw bitrate=500 realtime=true \
+            ! h264parse \
+            ! mp4mux \
+            ! filesink location=/tmp/vt_smoke.mp4
+          ls -la /tmp/vt_smoke.mp4
+
+      # Build the feature-on slice of the workspace. Restricted to
+      # the two crates the integration test transitively pulls so the
+      # macos-runner doesn't pay the full workspace compile.
+      - name: Build lvqr-transcode + tests (hw-videotoolbox)
+        run: |
+          cargo build -p lvqr-transcode --features hw-videotoolbox --tests
+
+      # The actual session 156 contract: drive the CMAF H.264 baseline
+      # 360p conformance fixture through the HW pipeline + assert
+      # three rendition outputs land non-empty + 720p > 240p bytes.
+      - name: Run videotoolbox_ladder integration test
+        run: |
+          cargo test -p lvqr-transcode \
+            --test videotoolbox_ladder \
+            --features hw-videotoolbox \
+            -- --nocapture
+
+      # Parity coverage on the lib slice: the 6 new VideoToolbox unit
+      # tests (factory-build / opt-out / naming / metric label /
+      # suffix-skip / pipeline string) ride here too.
+      - name: Run videotoolbox unit tests
+        run: |
+          cargo test -p lvqr-transcode --lib \
+            --features hw-videotoolbox \
+            videotoolbox::
+
+      - name: Upload cargo test artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: videotoolbox-macos-cargo-test-${{ github.run_id }}
+          path: |
+            target/debug/deps/videotoolbox_ladder-*
+            /tmp/vt_smoke.mp4
+          if-no-files-found: ignore
+          retention-days: 7

@@ -183,11 +183,19 @@ for runtime backend selection).
   extract a shared `pipeline.rs` scaffolding module from
   `software.rs` + `videotoolbox.rs` so future backends are
   trivial.
-* **macos-runner CI lane.** `videotoolbox_ladder.rs` skips
+* **macos-runner CI lane.** ~~`videotoolbox_ladder.rs` skips
   cleanly on ubuntu-latest, so the default CI matrix is
   unaffected. A future GitHub Actions workflow change can add a
   macos-latest runner that exercises the integration test on
-  every PR.
+  every PR.~~ Closed in the session 156 follow-up commit:
+  `.github/workflows/videotoolbox-macos.yml` runs the
+  integration test on `macos-latest` with Homebrew-installed
+  GStreamer + plugins, gated on path filters covering the
+  transcode crate + lvqr-cli's transcode wiring + the
+  conformance fixture. `continue-on-error: true` for the first
+  weeks while CI variance on the GitHub-hosted Apple Silicon
+  runner stabilises; promote to a required check after a
+  green-run streak.
 * **Per-rendition encoder selection.** A future
   `--transcode-rendition 720p:vt,480p:sw` syntax would let an
   operator mix HW + software per ladder rung. Not asked for
