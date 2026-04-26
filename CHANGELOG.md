@@ -10,6 +10,32 @@ releases. For session-by-session engineering notes, see
 
 ### Added
 
+* **SCTE-35 ad-break markers in `@lvqr/dvr-player` v0.3.3**
+  (session 154). The DVR scrub component now paints session 152's
+  `#EXT-X-DATERANGE` entries on its seek bar: vertical ticks for
+  CMD / time-signal singletons, coloured break-range spans for
+  paired SCTE35-OUT + SCTE35-IN entries (joined by their shared
+  DATERANGE `ID`), and a faint in-flight overlay for an OUT whose
+  IN has not yet landed. Hover tooltip shows kind, ID, time
+  inside the seekable range, and duration when set. New
+  `markers="visible"` (default) | `"hidden"` attribute toggles
+  the visual layer without suppressing events. New events
+  `lvqr-dvr-markers-changed` (fires on the diff vs the prior
+  LEVEL_LOADED pass) and `lvqr-dvr-marker-crossed` (fires per
+  ID when `currentTime` crosses a marker, debounced 100 ms per
+  ID). New `getMarkers()` programmatic method returns the sorted
+  store + pair groups. Reads markers from hls.js's
+  `LevelDetails.dateRanges` (v1.5+) on `LEVEL_LOADED`; trusts
+  `DateRange.startTime` for the PDT-anchored time mapping. **No
+  Rust crate touched, no new server route, no new HLS tag.**
+  CSS hooks: `--lvqr-marker-color`, `--lvqr-marker-tick-color`,
+  `--lvqr-marker-in-flight`, `--lvqr-marker-tooltip-bg`. New
+  shadow parts: `markers`, `marker-tooltip`. New helper
+  `bindings/js/tests/helpers/rtmp-push.ts` (Node ffmpeg wrapper)
+  closes session 153's deferred "live-stream-driven Playwright
+  assertions" item via a real-publish LIVE-pill activation test.
+  `@lvqr/player` and `@lvqr/core` stay at 0.3.2; workspace stays
+  at 0.4.1.
 * **`@lvqr/dvr-player` web component v0.3.2** (session 153). New
   npm package at `bindings/js/packages/dvr-player/`, sister to
   `@lvqr/player`, drops in as `<lvqr-dvr-player>` for HLS DVR

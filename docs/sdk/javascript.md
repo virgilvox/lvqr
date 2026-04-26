@@ -8,16 +8,17 @@ Three npm packages for browser integration:
   MoQ-Lite over WebTransport / WebSocket live path
 - `@lvqr/dvr-player` -- Drop-in `<lvqr-dvr-player>` Web Component
   for HLS DVR scrub (custom seek bar, LIVE pill, Go Live button,
-  client-side hover thumbnails). Wraps hls.js against the relay's
-  live HLS endpoint with the `--hls-dvr-window` sliding-window
-  DVR depth. See [`../dvr-scrub.md`](../dvr-scrub.md) for the
-  operator embedding recipe.
+  client-side hover thumbnails, SCTE-35 ad-break markers). Wraps
+  hls.js against the relay's live HLS endpoint with the
+  `--hls-dvr-window` sliding-window DVR depth. See
+  [`../dvr-scrub.md`](../dvr-scrub.md) for the operator embedding
+  recipe.
 
-All three ship at `0.3.2` on npm. The `@lvqr/dvr-player` package
-landed in session 153 (2026-04-25) and ships alongside the other
-two on the next release cycle. Features added on `main` after the
-last publish (listed below under **Timeouts + reconnect** and
-**Admin API**) land for consumers at the next release cycle.
+`@lvqr/core` and `@lvqr/player` ship at `0.3.2`; `@lvqr/dvr-player`
+ships at `0.3.3` (session 154 added the SCTE-35 marker layer; the
+two other packages stayed at 0.3.2). Features added on `main`
+after the last publish (listed below under **Timeouts + reconnect**
+and **Admin API**) land for consumers at the next release cycle.
 
 ## Install
 
@@ -89,6 +90,7 @@ sliding window of the broadcast, jump to live -- use
 | `live-edge-threshold-secs` | Live-edge detection threshold (default `max(6, 3 * #EXT-X-TARGETDURATION)`) |
 | `thumbnails` | `enabled` (default) or `disabled` |
 | `controls` | `custom` (default) or `native` |
+| `markers` | `visible` (default) or `hidden` -- SCTE-35 ad-break markers on the seek bar (v0.3.3+) |
 
 ### Custom events
 
@@ -102,12 +104,21 @@ player.addEventListener('lvqr-dvr-live-edge-changed', (e) => {
 player.addEventListener('lvqr-dvr-error', (e) => {
   const { code, message, fatal, source } = e.detail;
 });
+
+// SCTE-35 ad-break markers (v0.3.3+).
+player.addEventListener('lvqr-dvr-markers-changed', (e) => {
+  const { markers, pairs } = e.detail;
+});
+player.addEventListener('lvqr-dvr-marker-crossed', (e) => {
+  const { marker, direction, currentTime } = e.detail;
+});
 ```
 
 See [`../dvr-scrub.md`](../dvr-scrub.md) for the full surface
 including the programmatic API
-(`play / pause / seek / goLive / getHlsInstance`), CSS theming,
-and the importmap-based CDN drop-in recipe.
+(`play / pause / seek / goLive / getHlsInstance / getMarkers`),
+CSS theming, the SCTE-35 marker recipe, and the importmap-based
+CDN drop-in.
 
 ## Core client (low-level)
 

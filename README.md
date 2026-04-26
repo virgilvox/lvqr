@@ -376,6 +376,42 @@ remaining ranking:
 
 #### Recently shipped (compact reference)
 
+* **SCTE-35 ad-break markers on `@lvqr/dvr-player` v0.3.3**
+  (session 154) -- the dvr-player's seek bar paints session 152's
+  `#EXT-X-DATERANGE` ad markers inline. Vertical ticks for
+  CMD / time-signal singletons, coloured break-range spans for
+  paired SCTE35-OUT + SCTE35-IN entries (joined by their shared
+  DATERANGE `ID`), faint in-flight overlays for an OUT whose IN
+  has not yet landed; hover tooltip with kind / id / time /
+  duration. New `markers="visible|hidden"` attribute, two new
+  events `lvqr-dvr-markers-changed` (diff vs prior LEVEL_LOADED)
+  and `lvqr-dvr-marker-crossed` (per-id with 100 ms debounce),
+  new programmatic `getMarkers()` returning sorted store + pairs.
+  Reads markers from hls.js's `LevelDetails.dateRanges` (v1.5+)
+  and trusts `DateRange.startTime` for the PDT-anchored
+  currentTime mapping. **No relay-side wire change** -- pure
+  consumer of session 152's existing `#EXT-X-DATERANGE` surface.
+  CSS hooks: `--lvqr-marker-color`, `--lvqr-marker-tick-color`,
+  `--lvqr-marker-in-flight`, `--lvqr-marker-tooltip-bg`. Pure
+  helpers in `src/markers.ts` (classifyMarker /
+  dvrMarkersFromHlsDateRanges / markerToFraction /
+  groupOutInPairs / formatDuration) covered by 28 Vitest tests
+  in `bindings/js/tests/sdk/dvr-player-markers.spec.ts`.
+  Playwright project gains two routed-stub-playlist marker tests
+  (LEVEL_LOADED -> store + emit -> rendered ticks at OUT/IN
+  fractions; `markers="hidden"` empties layer + getMarkers
+  still exposes store) plus one opt-in live-RTMP test using the
+  new `bindings/js/tests/helpers/rtmp-push.ts` ffmpeg wrapper
+  (gated behind `LVQR_LIVE_RTMP_TESTS=1` because the back-to-back
+  ffmpeg-to-loopback-RTMP flow is flake-prone on macOS dev
+  boxes; closes session 153's deferred "live-stream-driven
+  Playwright assertions" item by exercising the helper end-to-
+  end against the dvr-player webServer profile). Three e2e
+  tests; the live one skips by default + when ffmpeg is missing.
+  **Workspace test count delta:** +28 Vitest dvr-player-markers,
+  +3 Playwright dvr-player markers (2 default + 1 opt-in).
+  `@lvqr/player` and `@lvqr/core` stay at 0.3.2; workspace stays
+  at 0.4.1.
 * **Dedicated DVR scrub web UI v1** (session 153) -- new
   `@lvqr/dvr-player` package at `bindings/js/packages/dvr-player/`
   ships as a sister to `@lvqr/player`. Vanilla `class extends

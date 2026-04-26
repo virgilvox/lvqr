@@ -283,6 +283,40 @@ client. LVQR ships no client-side SCTE-35 SDK -- the wire shape is
 standards-compliant, so any HLS or DASH library that exposes
 DATERANGE / EventStream events to JavaScript works.
 
+### `@lvqr/dvr-player` web component (turn-key)
+
+For operators who want a drop-in HLS DVR player that renders
+markers on its seek bar without writing any JavaScript, the
+[`@lvqr/dvr-player`](../bindings/js/packages/dvr-player) web
+component (since v0.3.3) parses the playlist's DATERANGE
+entries, paints OUT/IN pair spans + CMD ticks on its custom
+seek bar, and emits `lvqr-dvr-markers-changed` /
+`lvqr-dvr-marker-crossed` events for downstream pipelines.
+
+```html
+<script type="module">
+  import '@lvqr/dvr-player';
+</script>
+<lvqr-dvr-player
+  src="https://relay.example.com:8080/hls/live/cam1/master.m3u8"
+  autoplay
+  muted
+></lvqr-dvr-player>
+<script type="module">
+  document.querySelector('lvqr-dvr-player').addEventListener(
+    'lvqr-dvr-marker-crossed',
+    (e) => console.log('crossed', e.detail.marker.kind, e.detail.marker.id),
+  );
+</script>
+```
+
+See [`docs/dvr-scrub.md`](dvr-scrub.md#scte-35-ad-break-markers)
+for the full marker recipe (attribute toggles, theming hooks,
+edge cases, programmatic API). The DIY hls.js recipe below
+remains the right path for integrators who already ship their
+own player chrome and just want raw access to the SCTE-35
+events.
+
 ### hls.js (HLS DATERANGE)
 
 hls.js exposes DATERANGE entries via the

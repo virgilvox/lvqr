@@ -28,6 +28,15 @@ import Hls, { type Events as HlsEvents, type ErrorData, type LevelLoadedData } f
 import { getBooleanAttr, getNumericAttr, getStringAttr, setBooleanAttr } from './internals/attrs.js';
 import { dispatchTyped } from './internals/dispatch.js';
 import { fractionToTime, timeToFraction, formatTime, generatePercentileLabels, isAtLiveEdge } from './seekbar.js';
+import {
+  type DvrMarker,
+  type DvrMarkerPair,
+  type HlsDateRangeLike,
+  dvrMarkersFromHlsDateRanges,
+  formatDuration,
+  groupOutInPairs,
+  markerToFraction,
+} from './markers.js';
 
 const ATTR_SRC = 'src';
 const ATTR_AUTOPLAY = 'autoplay';
@@ -36,11 +45,14 @@ const ATTR_TOKEN = 'token';
 const ATTR_THUMBNAILS = 'thumbnails';
 const ATTR_LIVE_THRESHOLD = 'live-edge-threshold-secs';
 const ATTR_CONTROLS = 'controls';
+const ATTR_MARKERS = 'markers';
 
 const DEFAULT_LIVE_THRESHOLD_SECS = 6;
 const THUMBNAIL_CACHE_CAP = 60;
 const LIVE_EDGE_POLL_HZ = 4;
 const LIVE_BADGE_DEBOUNCE_MS = 250;
+const MARKER_CROSSING_DEBOUNCE_MS = 100;
+const MARKER_TOOLTIP_ID_TRUNCATE = 24;
 
 function getTemplateHTML(): string {
   return /*html*/ `
@@ -56,6 +68,10 @@ function getTemplateHTML(): string {
         --lvqr-thumb-color: #fff;
         --lvqr-buffered-color: rgba(255, 255, 255, 0.35);
         --lvqr-played-color: var(--lvqr-accent);
+        --lvqr-marker-color: rgba(255, 200, 80, 0.45);
+        --lvqr-marker-tick-color: #ffc850;
+        --lvqr-marker-in-flight: rgba(255, 200, 80, 0.18);
+        --lvqr-marker-tooltip-bg: rgba(0, 0, 0, 0.85);
       }
       :host([hidden]) { display: none; }
       .stage { position: relative; width: 100%; height: 100%; }
@@ -194,10 +210,73 @@ function getTemplateHTML(): string {
         border-radius: 50%;
         opacity: 0;
         transition: opacity 0.1s;
+        z-index: 3;
       }
       .seekbar:hover .thumb, .seekbar.is-dragging .thumb {
         opacity: 1;
       }
+      .marker-layer {
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 6px;
+        bottom: 6px;
+        pointer-events: none;
+        z-index: 1;
+      }
+      .marker-layer[hidden] { display: none; }
+      .marker-span {
+        position: absolute;
+        top: 6px;
+        bottom: 6px;
+        background: var(--lvqr-marker-color);
+        pointer-events: none;
+      }
+      .marker-span.is-open {
+        background: var(--lvqr-marker-in-flight);
+      }
+      .marker {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 10px;
+        margin-left: -5px;
+        pointer-events: auto;
+        cursor: help;
+      }
+      .marker::before {
+        content: '';
+        position: absolute;
+        left: 4px;
+        top: 0;
+        bottom: 0;
+        width: 2px;
+        background: var(--lvqr-marker-tick-color);
+      }
+      .marker[data-kind="out"]::before {
+        top: -2px;
+        bottom: -2px;
+      }
+      .marker[data-kind="unknown"]::before {
+        background: rgba(255, 255, 255, 0.5);
+      }
+      .marker-tooltip {
+        position: absolute;
+        bottom: 36px;
+        background: var(--lvqr-marker-tooltip-bg);
+        color: #fff;
+        font-size: 11px;
+        line-height: 1.35;
+        padding: 6px 8px;
+        border-radius: 3px;
+        pointer-events: none;
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+        z-index: 4;
+        display: none;
+      }
+      .marker-tooltip.is-visible { display: block; }
+      .marker-tooltip strong { font-weight: 600; }
       .labels {
         position: absolute;
         left: 0;
@@ -275,8 +354,10 @@ function getTemplateHTML(): string {
           <div class="seekbar" part="seekbar" role="slider" tabindex="0" aria-label="Seek">
             <div class="buffered"></div>
             <div class="played"></div>
+            <div class="marker-layer" part="markers"></div>
             <div class="thumb"></div>
           </div>
+          <div class="marker-tooltip" part="marker-tooltip"></div>
           <div class="preview" part="preview">
             <canvas width="160" height="90"></canvas>
             <div class="preview-time">--:--</div>
@@ -298,7 +379,16 @@ function getTemplate(): HTMLTemplateElement {
 
 export class LvqrDvrPlayerElement extends HTMLElement {
   static get observedAttributes(): string[] {
-    return [ATTR_SRC, ATTR_AUTOPLAY, ATTR_MUTED, ATTR_TOKEN, ATTR_THUMBNAILS, ATTR_LIVE_THRESHOLD, ATTR_CONTROLS];
+    return [
+      ATTR_SRC,
+      ATTR_AUTOPLAY,
+      ATTR_MUTED,
+      ATTR_TOKEN,
+      ATTR_THUMBNAILS,
+      ATTR_LIVE_THRESHOLD,
+      ATTR_CONTROLS,
+      ATTR_MARKERS,
+    ];
   }
 
   private shadow: ShadowRoot;
@@ -318,6 +408,8 @@ export class LvqrDvrPlayerElement extends HTMLElement {
   private previewEl: HTMLDivElement;
   private previewCanvasEl: HTMLCanvasElement;
   private previewTimeEl: HTMLDivElement;
+  private markerLayerEl: HTMLDivElement;
+  private markerTooltipEl: HTMLDivElement;
 
   private hls: Hls | null = null;
   private thumbHls: Hls | null = null;
@@ -329,6 +421,11 @@ export class LvqrDvrPlayerElement extends HTMLElement {
   private liveBadgeDebounceTimer: number | null = null;
   private thumbCache = new Map<number, ImageBitmap>();
   private thumbSeekToken = 0;
+  private markerStore = new Map<string, DvrMarker>();
+  private markerSignature = '';
+  private markerCrossingLastEmit = new Map<string, number>();
+  private lastCrossingTime: number | null = null;
+  private isMarkerHovered = false;
 
   constructor() {
     super();
@@ -351,6 +448,8 @@ export class LvqrDvrPlayerElement extends HTMLElement {
     this.previewEl = this.shadow.querySelector('.preview') as HTMLDivElement;
     this.previewCanvasEl = this.shadow.querySelector('.preview canvas') as HTMLCanvasElement;
     this.previewTimeEl = this.shadow.querySelector('.preview-time') as HTMLDivElement;
+    this.markerLayerEl = this.shadow.querySelector('.marker-layer') as HTMLDivElement;
+    this.markerTooltipEl = this.shadow.querySelector('.marker-tooltip') as HTMLDivElement;
 
     this.bindHandlers();
   }
@@ -358,6 +457,7 @@ export class LvqrDvrPlayerElement extends HTMLElement {
   connectedCallback(): void {
     if (getBooleanAttr(this, ATTR_MUTED)) this.videoEl.muted = true;
     this.applyControlsMode();
+    this.applyMarkersVisibility();
     if (this.getAttribute(ATTR_SRC)) {
       void this.startPlayback();
     }
@@ -382,6 +482,10 @@ export class LvqrDvrPlayerElement extends HTMLElement {
         break;
       case ATTR_THUMBNAILS:
         if (value === 'disabled') this.teardownThumbnails();
+        break;
+      case ATTR_MARKERS:
+        this.applyMarkersVisibility();
+        this.renderMarkers();
         break;
     }
   }
@@ -428,6 +532,14 @@ export class LvqrDvrPlayerElement extends HTMLElement {
     return this.hls;
   }
 
+  getMarkers(): { markers: DvrMarker[]; pairs: DvrMarkerPair[] } {
+    const markers = [...this.markerStore.values()].sort(
+      (a, b) => a.startTime - b.startTime || (a.id < b.id ? -1 : 1),
+    );
+    const pairs = groupOutInPairs(markers);
+    return { markers, pairs };
+  }
+
   // Internals.
 
   private bindHandlers(): void {
@@ -446,8 +558,14 @@ export class LvqrDvrPlayerElement extends HTMLElement {
     this.seekBarEl.addEventListener('pointermove', (e) => this.onSeekMove(e));
     this.seekBarEl.addEventListener('pointerup', (e) => this.onSeekUp(e));
     this.seekBarEl.addEventListener('pointercancel', (e) => this.onSeekUp(e));
-    this.seekBarEl.addEventListener('pointerleave', () => this.hidePreview());
+    this.seekBarEl.addEventListener('pointerleave', () => {
+      this.hidePreview();
+      this.hideMarkerTooltip();
+    });
     this.seekBarEl.addEventListener('keydown', (e) => this.onSeekKey(e));
+
+    this.markerLayerEl.addEventListener('pointerover', (e) => this.onMarkerPointerOver(e));
+    this.markerLayerEl.addEventListener('pointerout', (e) => this.onMarkerPointerOut(e));
   }
 
   private applyControlsMode(): void {
@@ -469,6 +587,7 @@ export class LvqrDvrPlayerElement extends HTMLElement {
 
   private async startPlayback(): Promise<void> {
     this.stop();
+    this.clearMarkerStore();
     const src = this.getAttribute(ATTR_SRC);
     if (!src) return;
 
@@ -553,6 +672,209 @@ export class LvqrDvrPlayerElement extends HTMLElement {
   private onLevelLoaded(data: LevelLoadedData): void {
     const td = data?.details?.targetduration;
     if (typeof td === 'number' && td > 0) this.targetDurationSecs = td;
+    this.refreshMarkerStore(data);
+  }
+
+  private refreshMarkerStore(data: LevelLoadedData): void {
+    const raw = (data?.details as { dateRanges?: Record<string, HlsDateRangeLike | undefined> } | undefined)?.dateRanges
+      ?? {};
+    const next = dvrMarkersFromHlsDateRanges(raw);
+    const sig = this.markerSignatureFor(next);
+    if (sig === this.markerSignature) {
+      // No change vs the previous LEVEL_LOADED pass; still
+      // re-render in case the seekable range moved (the played
+      // fill drifts; marker fractions follow).
+      this.renderMarkers();
+      return;
+    }
+    this.markerSignature = sig;
+    this.markerStore.clear();
+    for (const m of next) this.markerStore.set(markerKey(m), m);
+    // Drop crossing-throttle entries for evicted markers so a
+    // re-emitted ID is not silently suppressed.
+    for (const k of [...this.markerCrossingLastEmit.keys()]) {
+      if (!this.markerStore.has(k)) this.markerCrossingLastEmit.delete(k);
+    }
+    this.renderMarkers();
+    const pairs = groupOutInPairs(next);
+    dispatchTyped(this, 'lvqr-dvr-markers-changed', { markers: next, pairs });
+  }
+
+  private markerSignatureFor(markers: ReadonlyArray<DvrMarker>): string {
+    return markers
+      .map((m) => `${m.id}|${m.kind}|${m.startTime}|${m.durationSecs ?? ''}|${m.scte35Hex ?? ''}`)
+      .join('\n');
+  }
+
+  private clearMarkerStore(): void {
+    if (this.markerStore.size === 0 && this.markerSignature === '') return;
+    this.markerStore.clear();
+    this.markerSignature = '';
+    this.markerCrossingLastEmit.clear();
+    this.lastCrossingTime = null;
+    this.renderMarkers();
+    dispatchTyped(this, 'lvqr-dvr-markers-changed', { markers: [], pairs: [] });
+  }
+
+  private applyMarkersVisibility(): void {
+    const mode = getStringAttr(this, ATTR_MARKERS, 'visible');
+    this.markerLayerEl.hidden = mode === 'hidden';
+    if (mode === 'hidden') {
+      this.markerTooltipEl.classList.remove('is-visible');
+    }
+  }
+
+  private renderMarkers(): void {
+    const range = this.seekable();
+    if (!range || this.markerLayerEl.hidden) {
+      this.markerLayerEl.replaceChildren();
+      return;
+    }
+    const markers = [...this.markerStore.values()].sort(
+      (a, b) => a.startTime - b.startTime || (a.id < b.id ? -1 : 1),
+    );
+    const pairs = groupOutInPairs(markers);
+    const span = range.end - range.start;
+    const frags = document.createDocumentFragment();
+    for (const g of pairs) {
+      if (g.kind === 'pair' && g.out && g.in) {
+        const f1 = markerToFraction(g.out, range);
+        const f2 = markerToFraction(g.in, range);
+        if (f1 !== null && f2 !== null) {
+          frags.appendChild(this.buildSpan(f1, f2, false));
+        }
+        if (f1 !== null) frags.appendChild(this.buildTick(g.out, f1));
+        if (f2 !== null) frags.appendChild(this.buildTick(g.in, f2));
+      } else if (g.kind === 'open' && g.out) {
+        const f1 = markerToFraction(g.out, range);
+        if (f1 !== null) {
+          frags.appendChild(this.buildSpan(f1, 1, true));
+          frags.appendChild(this.buildTick(g.out, f1));
+        }
+      } else if (g.kind === 'in-only' && g.in) {
+        const f = markerToFraction(g.in, range);
+        if (f !== null) frags.appendChild(this.buildTick(g.in, f));
+      } else if (g.kind === 'singleton' && g.out) {
+        const f = markerToFraction(g.out, range);
+        if (f !== null) frags.appendChild(this.buildTick(g.out, f));
+      }
+    }
+    this.markerLayerEl.replaceChildren(frags);
+    // Keep a hidden span helper for tests/ poll; tooltip refresh
+    // is interaction-driven via pointermove.
+    void span;
+  }
+
+  private buildTick(marker: DvrMarker, fraction: number): HTMLDivElement {
+    const el = document.createElement('div');
+    el.className = 'marker';
+    el.dataset.id = marker.id;
+    el.dataset.kind = marker.kind;
+    el.dataset.key = markerKey(marker);
+    el.style.left = `${(fraction * 100).toFixed(3)}%`;
+    el.setAttribute('role', 'note');
+    el.setAttribute(
+      'aria-label',
+      `SCTE-35 ${marker.kind} marker ${marker.id}`,
+    );
+    return el;
+  }
+
+  private buildSpan(f1: number, f2: number, open: boolean): HTMLDivElement {
+    const el = document.createElement('div');
+    el.className = open ? 'marker-span is-open' : 'marker-span';
+    const lo = Math.min(f1, f2);
+    const hi = Math.max(f1, f2);
+    el.style.left = `${(lo * 100).toFixed(3)}%`;
+    el.style.width = `${((hi - lo) * 100).toFixed(3)}%`;
+    return el;
+  }
+
+  private showMarkerTooltip(marker: DvrMarker, anchorFraction: number): void {
+    const range = this.seekable();
+    if (!range) return;
+    const span = range.end - range.start;
+    const truncatedId =
+      marker.id.length > MARKER_TOOLTIP_ID_TRUNCATE
+        ? `${marker.id.slice(0, MARKER_TOOLTIP_ID_TRUNCATE)}...`
+        : marker.id;
+    const kindLabel: Record<string, string> = {
+      out: 'Out',
+      in: 'In',
+      cmd: 'Cue',
+      unknown: 'Marker',
+    };
+    const lines = [
+      `<strong>${escapeHtml(kindLabel[marker.kind] ?? 'Marker')}</strong>`,
+      `id: ${escapeHtml(truncatedId)}`,
+      `t: ${escapeHtml(formatTime(marker.startTime - range.start, span))}`,
+    ];
+    if (marker.durationSecs !== null) lines.push(`dur: ${formatDuration(marker.durationSecs)}`);
+    if (marker.class && marker.class !== 'urn:scte:scte35:2014:bin') {
+      lines.push(`class: ${escapeHtml(marker.class)}`);
+    }
+    this.markerTooltipEl.innerHTML = lines.join('<br>');
+    this.markerTooltipEl.style.left = `${(anchorFraction * 100).toFixed(3)}%`;
+    this.markerTooltipEl.style.transform = 'translateX(-50%)';
+    this.markerTooltipEl.classList.add('is-visible');
+    // Suppress thumbnail preview while a marker tooltip is up.
+    this.previewEl.classList.remove('is-visible');
+  }
+
+  private hideMarkerTooltip(): void {
+    this.markerTooltipEl.classList.remove('is-visible');
+  }
+
+  private onMarkerPointerOver(e: PointerEvent): void {
+    const target = e.target as HTMLElement | null;
+    if (!target || !target.classList.contains('marker')) return;
+    const key = target.dataset.key;
+    if (!key) return;
+    const marker = this.markerStore.get(key);
+    if (!marker) return;
+    const range = this.seekable();
+    if (!range) return;
+    const f = markerToFraction(marker, range);
+    if (f === null) return;
+    this.isMarkerHovered = true;
+    this.showMarkerTooltip(marker, f);
+  }
+
+  private onMarkerPointerOut(e: PointerEvent): void {
+    const related = e.relatedTarget as HTMLElement | null;
+    if (related && related.classList.contains('marker')) return;
+    this.isMarkerHovered = false;
+    this.hideMarkerTooltip();
+  }
+
+  private maybeEmitCrossings(): void {
+    if (this.markerStore.size === 0) {
+      this.lastCrossingTime = this.videoEl.currentTime;
+      return;
+    }
+    const t = this.videoEl.currentTime;
+    const prev = this.lastCrossingTime;
+    this.lastCrossingTime = t;
+    if (prev === null || prev === t) return;
+    const direction: 'forward' | 'backward' = t > prev ? 'forward' : 'backward';
+    const lo = Math.min(prev, t);
+    const hi = Math.max(prev, t);
+    const now = Date.now();
+    for (const [key, marker] of this.markerStore) {
+      const st = marker.startTime;
+      if (!Number.isFinite(st)) continue;
+      // strict-low / inclusive-high so a single tick is emitted
+      // per crossing (no double-fire when t lands exactly on st).
+      if (st <= lo || st > hi) continue;
+      const last = this.markerCrossingLastEmit.get(key) ?? 0;
+      if (now - last < MARKER_CROSSING_DEBOUNCE_MS) continue;
+      this.markerCrossingLastEmit.set(key, now);
+      dispatchTyped(this, 'lvqr-dvr-marker-crossed', {
+        marker,
+        direction,
+        currentTime: t,
+      });
+    }
   }
 
   private onHlsError(data: ErrorData): void {
@@ -571,6 +893,7 @@ export class LvqrDvrPlayerElement extends HTMLElement {
     this.updateLabels();
     this.updateTimeDisplay();
     this.maybeUpdateLiveBadge();
+    this.maybeEmitCrossings();
   }
 
   private updatePlayedFill(): void {
@@ -723,6 +1046,7 @@ export class LvqrDvrPlayerElement extends HTMLElement {
   private maybeShowPreview(e: PointerEvent): void {
     const mode = getStringAttr(this, ATTR_THUMBNAILS, 'enabled');
     if (mode === 'disabled') return;
+    if (this.isMarkerHovered) return;
     const range = this.seekable();
     if (!range) return;
     const rect = this.seekBarEl.getBoundingClientRect();
@@ -830,6 +1154,10 @@ function waitForSeek(v: HTMLVideoElement): Promise<void> {
       resolve();
     }, 1500);
   });
+}
+
+function markerKey(m: { id: string; kind: string }): string {
+  return `${m.id}|${m.kind}`;
 }
 
 function escapeHtml(s: string): string {

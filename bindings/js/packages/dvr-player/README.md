@@ -5,8 +5,10 @@ hls.js against the relay's live HLS endpoint (with a sliding-window
 DVR depth driven by `--hls-dvr-window-secs`), replaces the native
 controls with a custom seek bar carrying time-axis labels, surfaces
 a LIVE indicator that tracks the live-edge delta, exposes a Go Live
-button for the paused-vs-live transition, and renders client-side
-hover thumbnails via canvas `drawImage`.
+button for the paused-vs-live transition, renders client-side hover
+thumbnails via canvas `drawImage`, and (since v0.3.3) paints SCTE-35
+ad-break markers on the seek bar from session 152's
+`#EXT-X-DATERANGE` passthrough.
 
 Sister package to [`@lvqr/player`](../player), which targets the
 MoQ-Lite over WebTransport / WebSocket live path. Use `@lvqr/player`
@@ -51,6 +53,7 @@ seekable range from the loaded playlist.
 | `live-edge-threshold-secs` | `max(6, 3 * #EXT-X-TARGETDURATION)` | Delta in seconds below which `currentTime` registers as "at live edge". |
 | `thumbnails` | `enabled` | `enabled` renders client-side canvas thumbnails on hover (lazy-init second hls.js instance on first hover); `disabled` skips the off-screen video and saves the double-decode CPU cost. |
 | `controls` | `custom` | `custom` renders the LVQR custom seek bar + LIVE pill. `native` hides the custom UI and falls back to the browser's `<video controls>`. |
+| `markers` | `visible` | `visible` paints SCTE-35 ad-break markers on the seek bar (ticks for time-signal singletons, coloured spans for paired OUT/IN ranges, in-flight overlays for an OUT whose IN has not yet landed). `hidden` empties the layer; events still fire. |
 
 ## Custom events
 
@@ -59,6 +62,8 @@ All events bubble (composed: false). Detail shapes:
 * `lvqr-dvr-seek` -- `{ fromTime: number, toTime: number, isLiveEdge: boolean, source: 'user' | 'programmatic' }`
 * `lvqr-dvr-live-edge-changed` -- `{ isAtLiveEdge: boolean, deltaSecs: number, thresholdSecs: number }`
 * `lvqr-dvr-error` -- `{ code: string, message: string, fatal: boolean, source: 'hls.js' | 'component' }`
+* `lvqr-dvr-markers-changed` -- `{ markers: DvrMarker[], pairs: DvrMarkerPair[] }` (v0.3.3+). Fires on `LEVEL_LOADED` whenever the parsed `#EXT-X-DATERANGE` set diffs against the prior pass (added, removed, or attribute changed). Empty arrays on `src` change.
+* `lvqr-dvr-marker-crossed` -- `{ marker: DvrMarker, direction: 'forward' | 'backward', currentTime: number }` (v0.3.3+). Fires when `currentTime` crosses a marker's `startTime` (debounced 100 ms per marker so a scrub does not double-fire).
 
 The `lvqr-dvr-live-edge-changed` event fires only on threshold
 crossings (debounced 250 ms) -- not every `timeupdate` tick.
@@ -74,14 +79,59 @@ class LvqrDvrPlayerElement extends HTMLElement {
   seek(time: number): void;        // emits lvqr-dvr-seek with source: 'programmatic'
   goLive(): void;                  // jumps to seekable.end + resumes
   getHlsInstance(): Hls | null;    // escape hatch for advanced consumers
+  getMarkers(): { markers: DvrMarker[], pairs: DvrMarkerPair[] }; // v0.3.3+
 }
 ```
 
 `getHlsInstance()` exposes the underlying hls.js instance so callers
 can subscribe to events the component does not re-emit (e.g.
-`Hls.Events.AUDIO_TRACK_LOADED`, `Hls.Events.LEVEL_SWITCHED`,
-`#EXT-X-DATERANGE` ad-marker events from session 152's SCTE-35
-passthrough).
+`Hls.Events.AUDIO_TRACK_LOADED`, `Hls.Events.LEVEL_SWITCHED`).
+
+`getMarkers()` returns the current SCTE-35 marker store keyed by the
+playlist's DATERANGE `ID`, sorted by ascending `startTime` then
+`id`. Useful for operators who want to render their own overlay
+(e.g. a chapter list, an out-of-band ad-pipeline integration) or
+who want to feed the parsed list downstream.
+
+## SCTE-35 ad-break markers
+
+When the served HLS playlist carries `#EXT-X-DATERANGE` lines (per
+HLS spec section 4.4.5.1), the seek bar paints them as visual
+markers:
+
+* **Time-signal / CMD singletons** -- vertical tick at the
+  marker's `startTime`.
+* **Paired OUT + IN** (joined by their shared DATERANGE `ID`) --
+  coloured break-range span between the two start times, plus
+  ticks at each endpoint. Default fill is warm amber via
+  `--lvqr-marker-color`.
+* **OUT-only in-flight breaks** (an OUT whose matching IN has not
+  yet arrived) -- faint translucent overlay running from the
+  OUT's start time to the live edge, plus a tick at the OUT.
+* **Hover tooltip** -- shows the marker kind, ID, time inside
+  the seekable range, duration when set, and CLASS attribute
+  when present and not the default `urn:scte:scte35:2014:bin`.
+
+Marker rendering relies on the playlist carrying
+`#EXT-X-PROGRAM-DATE-TIME`; LVQR's relay always emits PDT, so
+this works out of the box. Toggle off via `markers="hidden"` if
+you prefer to render your own overlay against the
+`lvqr-dvr-markers-changed` event detail.
+
+CSS hooks for theming the marker layer:
+
+```css
+lvqr-dvr-player {
+  --lvqr-marker-color: rgba(255, 200, 80, 0.45);   /* paired OUT/IN span fill */
+  --lvqr-marker-tick-color: #ffc850;               /* tick colour */
+  --lvqr-marker-in-flight: rgba(255, 200, 80, 0.18); /* OUT-only overlay */
+  --lvqr-marker-tooltip-bg: rgba(0, 0, 0, 0.85);   /* tooltip background */
+}
+```
+
+See [`docs/dvr-scrub.md`](../../../docs/dvr-scrub.md#scte-35-ad-break-markers)
+for an end-to-end recipe (publisher onCuePoint -> relay
+DATERANGE -> dvr-player marker render).
 
 ## Bundle size
 
@@ -138,7 +188,8 @@ lvqr-dvr-player {
 The shadow-DOM tree exposes `part="..."` attributes on the major
 sub-elements (`video`, `seekbar`, `live-badge`, `go-live-button`,
 `play-button`, `mute-button`, `time-display`, `labels`, `preview`,
-`controls`, `live-overlay`, `status`) for `::part(...)` styling.
+`markers`, `marker-tooltip`, `controls`, `live-overlay`, `status`)
+for `::part(...)` styling.
 
 ## Anti-scope
 
@@ -148,11 +199,9 @@ sub-elements (`video`, `seekbar`, `live-badge`, `go-live-button`,
 * **No server-side thumbnail spritesheet.** Thumbnails are
   client-side via canvas; integrators wanting WEBVTT
   `#EXT-X-IMAGE-STREAM-INF` sprites should track v1.2.
-* **No SCTE-35 marker visualization on the seek bar.** Session 152
-  shipped SCTE-35 passthrough; rendering the markers as ticks is
-  candidate v1.1 work. Advanced consumers can subscribe to
-  `Hls.Events.LEVEL_LOADED` via `getHlsInstance()` and inspect the
-  `#EXT-X-DATERANGE` payloads for now.
+* **SCTE-35 marker visualization shipped in v0.3.3.** See the
+  "SCTE-35 ad-break markers" section above and
+  [`docs/dvr-scrub.md`](../../../docs/dvr-scrub.md#scte-35-ad-break-markers).
 * **No analytics callbacks.** Attach your own listeners to the
   documented custom events.
 

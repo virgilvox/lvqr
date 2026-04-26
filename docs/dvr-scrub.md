@@ -171,11 +171,8 @@ framework-free.
 * **No DASH.** The component is HLS-only; the relay's DASH egress
   serves dash.js / Shaka clients directly without LVQR-side UI.
 
-* **No SCTE-35 marker rendering.** Session 152 shipped SCTE-35
-  passthrough; rendering ad-break markers as ticks on the seek bar
-  is a v1.1 candidate. Advanced consumers can subscribe via
-  `getHlsInstance().on(Hls.Events.LEVEL_LOADED, ...)` to the
-  underlying `#EXT-X-DATERANGE` events.
+* **SCTE-35 marker rendering shipped in v0.3.3.** See the
+  "SCTE-35 ad-break markers" section below.
 
 * **No server-side thumbnail spritesheets.** Hover thumbnails are
   client-side via canvas. Server-side WEBVTT image-stream sprites
@@ -185,3 +182,115 @@ framework-free.
 * **No analytics, PWA, or service-worker layer.** Operator
   integrators attach their own listeners to the documented custom
   events.
+
+## SCTE-35 ad-break markers
+
+**Status:** shipped in `@lvqr/dvr-player` v0.3.3 (session 154).
+
+When the served HLS playlist carries `#EXT-X-DATERANGE` lines from
+session 152's SCTE-35 passthrough, the dvr-player's seek bar
+paints them inline:
+
+* **Time-signal / CMD singletons** -- vertical tick at the
+  marker's `startTime` (the splice PTS, anchored against the
+  playlist's `#EXT-X-PROGRAM-DATE-TIME`).
+* **OUT + IN pairs** (joined by their shared DATERANGE `ID`) --
+  coloured break-range span between the two start times, plus
+  ticks at each endpoint.
+* **OUT-only in-flight breaks** (the IN has not yet landed on
+  the playlist) -- faint translucent overlay running from the
+  OUT's start time to the live edge, plus a tick at the OUT.
+* **Hover tooltip** -- shows the marker kind, ID, time inside
+  the seekable range, and duration when set.
+
+The component reads markers from hls.js's
+`LevelDetails.dateRanges` on the `LEVEL_LOADED` event; hls.js
+v1.5+ does the PDT-anchored time mapping for us, so the
+component just maps `startTime` to a fraction along the seek
+bar via the existing `timeToFraction` helper.
+
+### Wire shape (consumed by the component)
+
+The relay emits one `#EXT-X-DATERANGE` line per splice event,
+scoped to the playlist's current sliding window. Two example
+entries an operator might see in the served playlist:
+
+```
+#EXT-X-DATERANGE:ID="splice-12345",CLASS="urn:scte:scte35:2014:bin",START-DATE="2026-04-25T18:30:00.000Z",DURATION=30.000,SCTE35-OUT=0xFC301100...
+#EXT-X-DATERANGE:ID="splice-12345",CLASS="urn:scte:scte35:2014:bin",START-DATE="2026-04-25T18:30:30.000Z",SCTE35-IN=0xFC301100...
+```
+
+The shared `ID` (here `splice-12345`, the SCTE-35
+`splice_event_id` per session 152's renderer) is what pairs the
+OUT and IN; the component groups them automatically.
+
+### Programmatic access
+
+```js
+import '@lvqr/dvr-player';
+
+const player = document.querySelector('lvqr-dvr-player');
+
+// Read the current marker store. Each entry carries id, kind,
+// startTime, startDate, durationSecs, class, and scte35Hex.
+console.log(player.getMarkers());
+
+// Subscribe to the diff event (fires when the playlist's
+// daterange set changes between LEVEL_LOADED refreshes).
+player.addEventListener('lvqr-dvr-markers-changed', (e) => {
+  console.log('markers changed', e.detail.markers, e.detail.pairs);
+});
+
+// Subscribe to the crossing event (fires when currentTime
+// crosses a marker's startTime).
+player.addEventListener('lvqr-dvr-marker-crossed', (e) => {
+  if (e.detail.marker.kind === 'out') console.log('entered ad break', e.detail.marker.id);
+  if (e.detail.marker.kind === 'in') console.log('left ad break', e.detail.marker.id);
+});
+```
+
+### Toggling visibility
+
+Set `markers="hidden"` to suppress the visual layer while still
+receiving the events:
+
+```html
+<lvqr-dvr-player src="..." markers="hidden"></lvqr-dvr-player>
+```
+
+This is useful when an operator wants to render their own
+overlay (e.g. on top of an existing player chrome) but does not
+want both the LVQR layer and the custom layer competing.
+
+### Theming
+
+The marker layer reads four CSS custom properties:
+
+```css
+lvqr-dvr-player {
+  --lvqr-marker-color: rgba(255, 200, 80, 0.45);   /* paired OUT/IN span fill */
+  --lvqr-marker-tick-color: #ffc850;               /* tick colour */
+  --lvqr-marker-in-flight: rgba(255, 200, 80, 0.18); /* OUT-only in-flight overlay */
+  --lvqr-marker-tooltip-bg: rgba(0, 0, 0, 0.85);   /* tooltip background */
+}
+```
+
+`::part(markers)` and `::part(marker-tooltip)` are also exposed
+for fine-grained restyling.
+
+### Limits + edge cases
+
+* **Missing `#EXT-X-PROGRAM-DATE-TIME`.** hls.js's
+  `DateRange.startTime` returns NaN when the playlist has no PDT
+  anchor. The component drops such entries from the rendered
+  layer; `getMarkers()` filters them out as well. LVQR's relay
+  always emits PDT, so this only affects hand-crafted playlists.
+* **Markers outside the seekable range.** A daterange whose
+  `startTime` falls before the sliding-window start or after the
+  live edge is filtered from the render. The store retains it;
+  if the seekable range later includes the marker, it shows up
+  on the next render pass.
+* **DASH consumers.** The dvr-player is HLS-only. DASH's
+  `<EventStream>` carriage of the same SCTE-35 events is
+  available to dash.js / Shaka clients but is not rendered by
+  this component.

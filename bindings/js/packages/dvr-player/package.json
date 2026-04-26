@@ -1,7 +1,7 @@
 {
   "name": "@lvqr/dvr-player",
-  "version": "0.3.2",
-  "description": "LVQR DVR scrub Web Component - drop-in HLS DVR player with custom seek bar, LIVE indicator, and client-side hover thumbnails",
+  "version": "0.3.3",
+  "description": "LVQR DVR scrub Web Component - drop-in HLS DVR player with custom seek bar, LIVE indicator, client-side hover thumbnails, and SCTE-35 ad-break markers",
   "license": "MIT OR Apache-2.0",
   "author": "Moheeb Zara <hackbuildvideo@gmail.com>",
   "repository": {
