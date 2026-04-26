@@ -169,10 +169,13 @@ opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace", "metric
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "trace", "metrics"] }
 tracing-opentelemetry = "0.28"
 
-# WASM host (Tier 4 item 4.2). Component model + WASI 0.2 stable as of 25.0.
-# Any upgrade gets its own session per TIER_4_PLAN.md dependency-pin table.
+# WASM host (Tier 4 item 4.2). Pinned to the >=43.0.1 line at session
+# 150 to close the wasmtime advisory cluster in audit.toml (16 entries
+# including 2x CVSS-9 sandbox-escape advisories on the v25 line).
+# `lvqr-wasm` only uses the core `Engine`/`Module`/`Store`/`Instance`
+# /`TypedFunc` API surface, which is stable across the v25..v43 range.
 # `notify` is pulled in at session A for session-87's hot-reload path.
-wasmtime = { version = "25", default-features = false, features = ["runtime", "cranelift"] }
+wasmtime = { version = "43", default-features = false, features = ["runtime", "cranelift"] }
 notify = "6"
 
 # io_uring runtime for the lvqr-archive `io-uring` feature (Tier 4 item 4.1,

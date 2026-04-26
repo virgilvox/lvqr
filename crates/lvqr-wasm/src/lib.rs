@@ -141,8 +141,8 @@ impl WasmFilter {
         let path = path.as_ref().to_path_buf();
         let bytes = fs::read(&path).with_context(|| format!("reading WASM module {}", path.display()))?;
         let engine = Engine::default();
-        let module =
-            Module::new(&engine, &bytes).with_context(|| format!("compiling WASM module {}", path.display()))?;
+        let module = Module::new(&engine, &bytes)
+            .map_err(|e| anyhow::anyhow!("compiling WASM module {}: {e}", path.display()))?;
         Ok(Self {
             engine,
             module,
@@ -156,7 +156,8 @@ impl WasmFilter {
     /// production paths should prefer [`Self::load`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let engine = Engine::default();
-        let module = Module::new(&engine, bytes).context("compiling WASM module from bytes")?;
+        let module =
+            Module::new(&engine, bytes).map_err(|e| anyhow::anyhow!("compiling WASM module from bytes: {e}"))?;
         Ok(Self {
             engine,
             module,

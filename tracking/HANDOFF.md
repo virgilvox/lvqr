@@ -1,8 +1,99 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 149 (2026-04-25) shipped hot config reload v3 (JWKS + webhook URL rotation)** -- `ConfigReloadHandle::reload` flipped to `async`; the reload pipeline now calls `JwksAuthProvider::new` and `WebhookAuthProvider::new` asynchronously and swaps the resulting provider into the `HotReloadAuthProvider` chain. Drop-old-on-swap leverages each provider's existing `Drop` to abort their spawned refresh / fetcher task. `applied_keys` grows entries (`"jwks"` / `"webhook"`) on URL diff. Feature-disabled builds emit a warning when the file names a feature-gated URL. `jwks_url` and `webhook_auth_url` are mutually exclusive within the same `[auth]` section (the route returns an error). The admin route closure shape widened from sync `Fn -> Result<...>` to async-flavored `Fn -> BoxFuture<Result<...>>` (internal-API change; SDK wire shape unchanged). With session 149, hot config reload is feature-complete -- every key the file format defines is honored at runtime. **Session 148 (2026-04-25) shipped hot config reload v2 (mesh ICE + HMAC secret)** -- `mesh_ice_servers` and `hmac_playback_secret` join the hot-reloadable surface alongside auth, swapped atomically via `arc_swap::ArcSwap` handles threaded through the `/signal` callback and the live HLS / DASH / DVR `/playback/*` middlewares. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Default-gate tests after 148: Rust workspace **1107** / 0 / 0 (was 1099 post-147; +8 net: 8 new lvqr-cli unit covering ice + hmac + applied_keys diff paths + clear semantics + no-deferred-warnings regression, 2 new RTMP-shape integration cases in `config_reload_e2e.rs` mesh ICE + HMAC rotation; the workshop-148 step rewrote one prior unit test from warnings-shape to applied_keys-shape, net unit delta = 8). Python pytest **38** unchanged. Vitest unchanged at 13. Admin surface unchanged at **12 route trees**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API**; **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates.
+## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 150 (2026-04-25) closed the dominant audit-ignore cluster** -- wasmtime v25 -> v43 upgrade removes 16 RustSec advisories from `audit.toml` (including 2x CVSS-9 sandbox-escape entries), down from 22 ignores to 6. `lvqr-wasm` only uses the core WASM API surface (Engine/Module/Store/Instance/TypedFunc) which is stable across the upgrade range; total source diff was 7 lines (two Module::new error-conversion callsites). **Session 149 (2026-04-25) shipped hot config reload v3 (JWKS + webhook URL rotation)** -- `ConfigReloadHandle::reload` flipped to `async`; the reload pipeline now calls `JwksAuthProvider::new` and `WebhookAuthProvider::new` asynchronously and swaps the resulting provider into the `HotReloadAuthProvider` chain. Drop-old-on-swap leverages each provider's existing `Drop` to abort their spawned refresh / fetcher task. `applied_keys` grows entries (`"jwks"` / `"webhook"`) on URL diff. Feature-disabled builds emit a warning when the file names a feature-gated URL. `jwks_url` and `webhook_auth_url` are mutually exclusive within the same `[auth]` section (the route returns an error). The admin route closure shape widened from sync `Fn -> Result<...>` to async-flavored `Fn -> BoxFuture<Result<...>>` (internal-API change; SDK wire shape unchanged). With session 149, hot config reload is feature-complete -- every key the file format defines is honored at runtime. **Session 148 (2026-04-25) shipped hot config reload v2 (mesh ICE + HMAC secret)** -- `mesh_ice_servers` and `hmac_playback_secret` join the hot-reloadable surface alongside auth, swapped atomically via `arc_swap::ArcSwap` handles threaded through the `/signal` callback and the live HLS / DASH / DVR `/playback/*` middlewares. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Default-gate tests after 148: Rust workspace **1107** / 0 / 0 (was 1099 post-147; +8 net: 8 new lvqr-cli unit covering ice + hmac + applied_keys diff paths + clear semantics + no-deferred-warnings regression, 2 new RTMP-shape integration cases in `config_reload_e2e.rs` mesh ICE + HMAC rotation; the workshop-148 step rewrote one prior unit test from warnings-shape to applied_keys-shape, net unit delta = 8). Python pytest **38** unchanged. Vitest unchanged at 13. Admin surface unchanged at **12 route trees**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API**; **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates.
 
-**Last Updated**: 2026-04-25 (session 149 close).
+**Last Updated**: 2026-04-25 (session 150 close).
+
+## Session 150 close (2026-04-25)
+
+**Shipped**: wasmtime v25 -> v43 upgrade. Closes the dominant
+audit-ignore cluster on the workspace (16 wasmtime advisories
+including 2x CVSS-9 sandbox-escape entries, `RUSTSEC-2026-0095`
+and `RUSTSEC-2026-0096`). Pre-150 `audit.toml` carried 22
+ignores; post-150 it carries 6 (rsa Marvin attack with no
+upstream fix, 4 unmaintained transitives, 2 transitive
+soundness advisories not reachable from LVQR call sites).
+
+### Why this was not the multi-major API headache the audit
+### policy described
+
+The pre-150 `audit.toml` comment described the wasmtime upgrade
+as "a multi-major bump that touches the lvqr-wasm host-binding
+generator" -- accurate for projects using component-model
+bindings, NOT accurate for `lvqr-wasm`. The crate uses ONLY the
+core WASM API surface (`Engine`, `Module`, `Store`, `Instance`,
+`TypedFunc`), which is stable across wasmtime v25..v43. No
+component-model bindings, no Linker host functions, no WASIp1
+or WASIp2 surfaces, no wit-bindgen integration. The actual
+upgrade required:
+
+1. `Cargo.toml` workspace pin: `wasmtime = "25"` -> `"43"`.
+2. Two `Module::new(...)` callsites in
+   `crates/lvqr-wasm/src/lib.rs` (`load` + `from_bytes`) needed
+   `wasmtime::Error` -> `anyhow::Error` conversion via
+   `anyhow::anyhow!("{e}")`. Reason: wasmtime v43 dropped
+   `std::error::Error` from its top-level error type, which
+   broke `anyhow::Context`'s blanket impl chain. Workaround:
+   stringify the wasmtime error directly. No semantic loss; the
+   error message still surfaces `e`'s Display.
+3. `cargo audit --deny warnings` re-runs clean against the new
+   ignore list.
+
+Total source diff: 7 lines in `lvqr-wasm/src/lib.rs`. The audit-
+ignore comment overstated the scope.
+
+### Deliverables
+
+1. **`Cargo.toml`** workspace pin bump + comment update naming
+   session 150 as the closer of the wasmtime advisory cluster.
+2. **`crates/lvqr-wasm/src/lib.rs`** -- two `Module::new`
+   callsites flipped from `.with_context(..)` /  `.context(..)`
+   to `.map_err(|e| anyhow::anyhow!("...: {e}"))`. Anyhow's
+   `Context` blanket impl no longer applies because v43's
+   `wasmtime::Error` doesn't implement `std::error::Error`;
+   the explicit map preserves the error chain via Display.
+3. **`audit.toml`** -- 16 wasmtime ignores removed; replaced
+   with a NOTE block documenting the closure. Remaining 6
+   ignores (1 rsa, 4 unmaintained transitives, 1 lru
+   soundness) carry forward.
+4. **`Cargo.lock`** -- wasmtime + transitive deps reset to
+   v43.0.1 line. `wasmtime-internal-*` family of crates
+   replaces the v25 `wasmtime-{jit-icache-coherence,slab,types,
+   versioned-export-macros,wit-bindgen}` set.
+5. **README** "Recently shipped" gains a session 150 entry.
+
+### Ground truth (session 150 close)
+
+* **Source change scope**: 4 files. `crates/lvqr-wasm/src/lib.rs`
+  is the only Rust source change (7 lines).
+* **Tests** verified:
+  - `cargo test -p lvqr-wasm --lib`: 28 / 0 / 0 (unchanged).
+  - `cargo test --workspace --lib --bins --tests`: 1111 / 0 / 0
+    (unchanged from session 149 close).
+* **CI gates**: `cargo fmt --all -- --check` clean; `cargo
+  clippy --workspace --all-targets -- -D warnings` clean;
+  `cargo audit --deny warnings` (with the new `audit.toml`
+  staged at `~/.cargo/audit.toml` per the `audit.yml` workflow)
+  exits 0.
+* **Workspace version**: `0.4.1` unchanged. No publish.
+* **Admin surface**: unchanged at 12 route trees.
+* **SDK packages**: unchanged at 0.3.2 (no SDK shape change;
+  the wasmtime upgrade is internal to the lvqr-wasm host crate).
+
+### Known limitations after 150
+
+* **6 audit ignores remain.** `rsa` (RUSTSEC-2023-0071, no fixed
+  upgrade upstream), 3 unmaintained transitives
+  (`paste`, `proc-macro-error`, `rustls-pemfile`), and 2
+  unreachable soundness advisories (`lru` IterMut Stacked
+  Borrows, `rand` custom-logger). Each carries a documented
+  rationale in `audit.toml`; closure tracked alongside the
+  next routine dep-bump session.
+* **Component model not used.** `lvqr-wasm` ships core WASM
+  only. If a future session adopts the component model for
+  fragment filters (e.g. bindgen-generated host bindings),
+  the wasmtime API surface broadens substantially and the
+  upgrade story becomes more involved.
 
 ## Session 149 close (2026-04-25)
 

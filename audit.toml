@@ -20,29 +20,19 @@ ignore = [
     # we do not exercise. Revisit if upstream rsa ships a fix.
     "RUSTSEC-2023-0071",
 
-    # wasmtime advisories -- the workspace pins wasmtime = "25" per
-    # `tracking/TIER_4_PLAN.md`'s "Dependencies to pin" table, and
-    # `Cargo.toml` workspace.dependencies (lines 168-172) records
-    # "any upgrade gets its own session". Closing every wasmtime
-    # row below means jumping to wasmtime >= 36 (or 42/43 for the
-    # post-2026-04 batch), which is a multi-major bump that touches
-    # the lvqr-wasm host-binding generator. Tracked as a planned
-    # Tier 4 maintenance session.
-    "RUSTSEC-2025-0046", # Host panic with `fd_renumber` WASIp1 function
-    "RUSTSEC-2025-0118", # Unsound API access to a WebAssembly shared linear memory
-    "RUSTSEC-2026-0020", # Guest-controlled resource exhaustion in WASI implementations
-    "RUSTSEC-2026-0021", # Panic adding excessive fields to a `wasi:http/types.fields` instance
-    "RUSTSEC-2026-0085", # Panic when lifting `flags` component value
-    "RUSTSEC-2026-0086", # Host data leakage with 64-bit tables and Winch
-    "RUSTSEC-2026-0087", # Wasmtime segfault with `f64x2.splat` operator on Cranelift x86-64
-    "RUSTSEC-2026-0088", # Data leakage between pooling allocator instances
-    "RUSTSEC-2026-0089", # Host panic when Winch compiler executes `table.fill`
-    "RUSTSEC-2026-0091", # Out-of-bounds write or crash when transcoding component model strings
-    "RUSTSEC-2026-0092", # Panic when transcoding misaligned component model UTF-16 strings
-    "RUSTSEC-2026-0093", # Heap OOB read in component model UTF-16 to latin1+utf16 string transcoding
-    "RUSTSEC-2026-0094", # Improperly masked return value from `table.grow` with Winch compiler backend
-    "RUSTSEC-2026-0095", # Wasmtime with Winch compiler backend may allow a sandbox-escaping memory access
-    "RUSTSEC-2026-0096", # Miscompiled guest heap access enables sandbox escape on aarch64 Cranelift
+    # NOTE: 16 wasmtime advisories (RUSTSEC-2025-0046, 2025-0118,
+    # 2026-{0020,0021,0085..0089,0091..0096} including 2x CVSS-9
+    # sandbox-escape entries) were closed in session 150 by upgrading
+    # wasmtime from v25 to v43 in `Cargo.toml`. The lvqr-wasm crate
+    # uses only the core `Engine`/`Module`/`Store`/`Instance`/
+    # `TypedFunc` API surface, which is stable across the v25..v43
+    # range; the upgrade required only two `Module::new` callsites
+    # converting `wasmtime::Error` to `anyhow::Error` via
+    # `anyhow::anyhow!` (wasmtime v43 dropped `std::error::Error`
+    # from its top-level error type, breaking anyhow's blanket
+    # `From` impl). The 16 ignores that previously lived here are
+    # gone; future wasmtime advisories should drive a fresh upgrade
+    # rather than be ignored.
 
     # Unmaintained transitive dependencies. Each is brought in by a
     # crate the project does not control directly; replacing them

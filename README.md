@@ -355,6 +355,19 @@ format defines is honored at runtime. The remaining ranking:
 
 #### Recently shipped (compact reference)
 
+* **wasmtime v25 -> v43 upgrade** (session 150) -- closes 16
+  RustSec advisories on the workspace's WASM filter host crate,
+  including 2x CVSS-9 sandbox-escape entries
+  (`RUSTSEC-2026-0095`, `RUSTSEC-2026-0096`). The upgrade
+  required only two `Module::new` callsite tweaks in
+  `lvqr-wasm` (wasmtime v43 dropped `std::error::Error` from its
+  top-level error type; converted via `anyhow::anyhow!`).
+  Workspace tests stay at 1111/0/0; `cargo audit --deny
+  warnings` cleanly passes against the new ignore list (down to
+  6 documented advisories: rsa Marvin attack with no upstream
+  fix, 4 unmaintained transitives, and 2 soundness items not
+  reachable from LVQR call sites). Audit-debt removed: the 16
+  wasmtime ignores in `audit.toml` are gone.
 * **Hot config reload v3: JWKS + webhook URL rotation** (session 149)
   -- `ConfigReloadHandle::reload` flips to `async` so it can call
   `JwksAuthProvider::new` / `WebhookAuthProvider::new`
