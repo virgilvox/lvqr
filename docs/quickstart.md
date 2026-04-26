@@ -214,35 +214,91 @@ parameter are honoured on every auth surface. Every auth
 failure increments `lvqr_auth_failures_total{entry="..."}` for
 alerting.
 
-## Config file (optional)
+### Runtime stream-key CRUD
 
-```toml
-# lvqr.toml -- fields map to the CLI flags
-[server]
-rtmp_port = 1935
-admin_port = 8080
-hls_port = 8888
-dash_port = 8889
+Mint, revoke, and rotate ingest stream keys at runtime without
+bouncing the relay. Tokens are
+`lvqr_sk_<43-char base64url-no-pad>`. Default-on; opt out with
+`--no-streamkeys`.
 
-[hls]
-dvr_window_secs = 120
-target_duration_secs = 2
-part_target_ms = 200
+```bash
+# Mint a per-broadcast key (admin token required when --admin-token is set)
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  http://localhost:8080/api/v1/streamkeys
 
-[cluster]
-listen = "10.0.0.1:10007"
-seeds = ["10.0.0.2:10007", "10.0.0.3:10007"]
-advertise_hls = "http://a.internal:8888"
+# List active keys
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  http://localhost:8080/api/v1/streamkeys
 
-[auth]
-jwt_secret = "env:LVQR_JWT_SECRET"
-jwt_issuer = "https://auth.example.com"
+# Revoke
+curl -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
+  http://localhost:8080/api/v1/streamkeys/$KEY_ID
+
+# Rotate (mints a new token under the same key id; old token denied)
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  http://localhost:8080/api/v1/streamkeys/$KEY_ID/rotate
 ```
 
-Note: CLI flags and env vars always override config file
-values. Where a config-driven deploy is essential, systemd with
-`EnvironmentFile` is usually simpler. See
-[deployment](deployment.md).
+The store is in-memory (restart loses keys; use
+`LVQR_PUBLISH_KEY` for the durable single-key path). Full
+recipe: [`auth.md#stream-key-crud-admin-api`](auth.md).
+
+## Hot config reload
+
+`lvqr serve --config <path.toml>` plus SIGHUP / `POST
+/api/v1/config-reload` rotate auth providers, mesh ICE servers,
+the HMAC playback secret, JWKS endpoint URLs, and webhook auth
+URLs without bouncing the relay. The chain wraps in
+`HotReloadAuthProvider` (always-on `arc_swap::ArcSwap` swap;
+single-digit-ns reads).
+
+```toml
+# /etc/lvqr.toml -- every field optional
+hmac_playback_secret = "rotate-me-monthly"
+
+[auth]
+publish_key = "operator-secret-v1"
+admin_token = "ops-team"
+# OR (asymmetric JWT, --features jwks)
+# jwks_url = "https://idp.example.com/.well-known/jwks.json"
+# OR (decision webhook, --features webhook)
+# webhook_auth_url = "https://decisioner.example.com/check"
+
+[[mesh_ice_servers]]
+urls = ["turn:turn.example:3478"]
+username = "u"
+credential = "p"
+```
+
+```bash
+# Boot against the file
+lvqr serve --config /etc/lvqr.toml --admin-token "$ADMIN_TOKEN"
+
+# Rotate the publish key
+sed -i 's/operator-secret-v1/operator-secret-v2/' /etc/lvqr.toml
+kill -HUP $(pgrep lvqr)
+# OR
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  http://localhost:8080/api/v1/config-reload
+```
+
+The response shows which categories the reload effectively
+touched:
+
+```json
+{
+  "config_path": "/etc/lvqr.toml",
+  "last_reload_at_ms": 1735170000000,
+  "last_reload_kind": "admin_post",
+  "applied_keys": ["auth", "mesh_ice"],
+  "warnings": []
+}
+```
+
+Failed reloads (malformed TOML, JWT init reject, JWKS initial
+fetch failure) leave the prior chain live and return 500 with
+the parse error in the body. Full recipe + hot-reloadable key
+matrix: [`config-reload.md`](config-reload.md).
 
 ## Next steps
 

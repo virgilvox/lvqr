@@ -10,6 +10,41 @@ releases. For session-by-session engineering notes, see
 
 ### Added
 
+* **Hot config reload** (sessions 147 + 148 + 149). New
+  `lvqr serve --config <path.toml>` flag points at a TOML file;
+  SIGHUP (Unix) and `POST /api/v1/config-reload` (cross-platform)
+  re-apply the file atomically without bouncing the relay. The
+  five hot-reloadable categories are honored end-to-end:
+  - `[auth]` section -- Static + HS256 JWT (147).
+  - `mesh_ice_servers` -- the operator's STUN / TURN list pushed
+    via `/signal` `AssignParent` (148).
+  - `hmac_playback_secret` -- the HMAC-SHA256 key used by live
+    HLS / DASH and DVR `/playback/*` `?sig=...&exp=...` (148).
+  - `jwks_url` -- JWKS discovery endpoint URL (149, requires
+    `--features jwks`).
+  - `webhook_auth_url` -- decision-webhook URL (149, requires
+    `--features webhook`).
+
+  Implemented via a new `lvqr_auth::HotReloadAuthProvider`
+  (always-on `arc_swap::ArcSwap` wrap; single-digit-ns reads on
+  the auth-check fast path) plus per-category `ArcSwap` handles
+  threaded through the signal callback and live-playback
+  middleware. The reload pipeline is `async` so it can call
+  `JwksAuthProvider::new` / `WebhookAuthProvider::new`
+  mid-process and atomically swap the resulting provider into
+  the chain; old provider's `Drop` aborts its spawned refresh /
+  fetcher task. Build failure (malformed TOML, JWT init reject,
+  JWKS initial fetch failure) leaves all prior state intact (no
+  partial swap). Stream-key store handle (146) preserved across
+  reloads. The route's wire shape (`ConfigReloadStatus`) carries
+  `applied_keys` (categories that effectively changed against
+  prior snapshot) and `warnings` (e.g. file naming a feature-
+  gated URL with that feature disabled at build). SDK clients
+  gain `LvqrAdminClient.configReload()` / `triggerConfigReload()`
+  in TS and `config_reload_status()` / `trigger_config_reload()`
+  in Python. See
+  [`docs/config-reload.md`](docs/config-reload.md).
+
 * **Runtime stream-key CRUD admin API** (session 146). New routes
   `GET /api/v1/streamkeys`, `POST /api/v1/streamkeys`,
   `DELETE /api/v1/streamkeys/{id}`, and
