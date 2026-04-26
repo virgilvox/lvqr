@@ -31,6 +31,12 @@ transcode = ["lvqr-cli/transcode", "dep:lvqr-transcode"]
 [dependencies]
 lvqr-core = { workspace = true }
 lvqr-cli = { workspace = true }
+# Session 155: the extracted `splice_insert_section_bytes` helper at
+# `crates/lvqr-test-utils/src/scte35.rs` (moved from
+# `crates/lvqr-cli/tests/scte35_hls_dash_e2e.rs`) names
+# `lvqr_codec::scte35::{CMD_SPLICE_INSERT, TABLE_ID}` directly so the
+# constants stay in sync with the relay's parser.
+lvqr-codec = { workspace = true }
 lvqr-archive = { workspace = true }
 lvqr-auth = { workspace = true }
 lvqr-fragment = { workspace = true }
@@ -63,11 +69,16 @@ lvqr-agent = { workspace = true, optional = true }
 # accessor returns an `&lvqr_transcode::TranscodeRunnerHandle`, and the
 # `with_transcode_ladder` builder names `RenditionSpec` directly.
 lvqr-transcode = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["rt", "macros", "net", "io-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process"] }
 # Session 133 (PLAN row 122-E): shared RTMP handshake helper in
 # `lvqr_test_utils::rtmp`. rml_rtmp's `Handshake` state machine is
 # the same one the 12 RTMP-class integration tests reimplemented.
 rml_rtmp = { workspace = true }
+# Session 155: the `scte35-rtmp-push` bin builds AMF0 onCuePoint
+# carriages directly. Pinned to the same minor that lvqr-ingest's
+# parse_oncuepoint_scte35 consumer uses so the wire shape stays
+# consistent on both sides.
+rml_amf0 = "0.3"
 tokio-util = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
@@ -75,4 +86,18 @@ tracing-subscriber = { workspace = true }
 rcgen = { workspace = true }
 rand = { workspace = true }
 anyhow = { workspace = true }
+# Session 155: the `scte35-rtmp-push` bin needs a clap CLI + base64
+# encoding for the AMF0 onCuePoint scte35-bin64 `data` property.
+clap = { workspace = true }
+base64 = { workspace = true }
 tempfile = "3"
+
+# Session 155: drives a real RTMP publisher session against the
+# relay's RTMP listener; sends synthetic H.264 + an `onCuePoint
+# scte35-bin64` AMF0 Data message; used by the new
+# `bindings/js/tests/e2e/dvr-player/markers.spec.ts` Playwright e2e
+# (gated on LVQR_LIVE_RTMP_TESTS=1) and by the
+# `tests/scte35_rtmp_push_smoke.rs` Rust integration test.
+[[bin]]
+name = "scte35-rtmp-push"
+path = "src/bin/scte35_rtmp_push.rs"

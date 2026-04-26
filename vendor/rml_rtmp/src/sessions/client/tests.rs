@@ -1441,6 +1441,104 @@ fn publisher_can_send_metadata() {
 }
 
 #[test]
+fn publisher_can_send_publish_amf0_data() {
+    // LVQR session 155: validates the new `publish_amf0_data` method
+    // produces an `RtmpMessage::Amf0Data` carrying the supplied values
+    // verbatim (no `@setDataFrame` / `onMetaData` wrapping). Mirrors
+    // `publisher_can_send_video_data` in shape.
+    let config = ClientSessionConfig::new();
+    let mut deserializer = ChunkDeserializer::new();
+    let mut serializer = ChunkSerializer::new();
+    let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
+    consume_results(&mut deserializer, initial_results);
+
+    perform_successful_connect(
+        "test".to_string(),
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+    let stream_id =
+        perform_successful_publish_request(&mut session, &mut serializer, &mut deserializer);
+
+    // Stub `onCuePoint` AMF0 shape: a Utf8String method name plus an
+    // Object carrying a `name` and a `data` property. Mirrors the wire
+    // shape the relay's RTMP `parse_oncuepoint_scte35` consumer at
+    // `crates/lvqr-ingest/src/rtmp.rs:470` expects.
+    let mut object_props = HashMap::new();
+    object_props.insert(
+        "name".to_string(),
+        Amf0Value::Utf8String("scte35-bin64".to_string()),
+    );
+    object_props.insert(
+        "data".to_string(),
+        Amf0Value::Utf8String("ZHVtbXk=".to_string()),
+    );
+
+    let values_in = vec![
+        Amf0Value::Utf8String("onCuePoint".to_string()),
+        Amf0Value::Object(object_props.clone()),
+    ];
+    let result = session.publish_amf0_data(values_in.clone()).unwrap();
+    let (mut responses, _) = split_results(&mut deserializer, vec![result]);
+
+    assert_eq!(responses.len(), 1, "Unexpected number of responses");
+    match responses.remove(0) {
+        (payload, RtmpMessage::Amf0Data { values }) => {
+            assert_eq!(
+                payload.message_stream_id, stream_id,
+                "AMF0 data must ride the active publish stream id"
+            );
+            assert_eq!(
+                values.len(),
+                2,
+                "Wire payload must preserve the input value count verbatim"
+            );
+            match &values[0] {
+                Amf0Value::Utf8String(s) => {
+                    assert_eq!(s, "onCuePoint", "Expected onCuePoint method name")
+                }
+                x => panic!("Expected Amf0 string, instead got {:?}", x),
+            }
+            match &values[1] {
+                Amf0Value::Object(props) => {
+                    assert_eq!(
+                        props.get("name"),
+                        Some(&Amf0Value::Utf8String("scte35-bin64".to_string())),
+                        "Expected scte35-bin64 name property",
+                    );
+                    assert_eq!(
+                        props.get("data"),
+                        Some(&Amf0Value::Utf8String("ZHVtbXk=".to_string())),
+                        "Expected base64 data property to round-trip verbatim",
+                    );
+                }
+                x => panic!("Expected Amf0 object, instead got {:?}", x),
+            }
+        }
+        x => panic!("Expected amf0 data, instead received {:?}", x),
+    }
+}
+
+#[test]
+fn publish_amf0_data_errors_outside_publishing_state() {
+    // LVQR session 155: contract guard. publish_amf0_data must reject
+    // calls before the publish handshake completes; mirrors the
+    // SessionInInvalidState behaviour of publish_metadata /
+    // publish_video_data when called pre-publish.
+    let config = ClientSessionConfig::new();
+    let (mut session, _) = ClientSession::new(config).unwrap();
+
+    let err = session
+        .publish_amf0_data(vec![Amf0Value::Utf8String("onCuePoint".to_string())])
+        .expect_err("publish_amf0_data must error when not Publishing");
+    match err {
+        ClientSessionError::SessionInInvalidState { .. } => (),
+        x => panic!("Expected SessionInInvalidState, got {:?}", x),
+    }
+}
+
+#[test]
 fn publisher_can_send_video_data() {
     let config = ClientSessionConfig::new();
     let mut deserializer = ChunkDeserializer::new();

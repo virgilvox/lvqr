@@ -14,6 +14,13 @@ name: Mesh E2E
 #     registration, shadow DOM, attribute reflection, programmatic
 #     API + event flow, keyboard scrub, pointer drag, and hover
 #     preview overlay. Boots a second `lvqr serve` on port 18089.
+#     Session 154 added the SCTE-35 ad-marker render path; session
+#     155 closes its three test-coverage follow-ups by exercising
+#     a live ffmpeg publish + LIVE-pill assertion + a synthetic
+#     `scte35-rtmp-push` bin -> onCuePoint -> DATERANGE -> marker
+#     render flow. Both live-RTMP tests are gated on
+#     `LVQR_LIVE_RTMP_TESTS=1`; this workflow installs ffmpeg + sets
+#     the env var so they run on every CI push.
 #
 # Triggers: changes to either suite's spec or source under test, the
 # shared playwright config / package metadata, the underlying CLI /
@@ -34,6 +41,7 @@ on:
     paths:
       - "bindings/js/packages/**"
       - "bindings/js/tests/e2e/**"
+      - "bindings/js/tests/helpers/**"
       - "bindings/js/playwright.config.ts"
       - "bindings/js/package.json"
       - "bindings/js/package-lock.json"
@@ -43,12 +51,15 @@ on:
       - "crates/lvqr-hls/**"
       - "crates/lvqr-cli/src/main.rs"
       - "crates/lvqr-cli/src/lib.rs"
+      - "crates/lvqr-test-utils/**"
+      - "vendor/rml_rtmp/**"
       - ".github/workflows/mesh-e2e.yml"
   push:
     branches: [main]
     paths:
       - "bindings/js/packages/**"
       - "bindings/js/tests/e2e/**"
+      - "bindings/js/tests/helpers/**"
       - "bindings/js/playwright.config.ts"
       - "bindings/js/package.json"
       - "bindings/js/package-lock.json"
@@ -58,6 +69,8 @@ on:
       - "crates/lvqr-hls/**"
       - "crates/lvqr-cli/src/main.rs"
       - "crates/lvqr-cli/src/lib.rs"
+      - "crates/lvqr-test-utils/**"
+      - "vendor/rml_rtmp/**"
       - ".github/workflows/mesh-e2e.yml"
   workflow_dispatch:
 
@@ -69,15 +82,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Session 155: install ffmpeg for the live-RTMP Playwright
+      # tests in `bindings/js/tests/e2e/dvr-player/markers.spec.ts`.
+      # The first live test drives an ffmpeg-publisher via the
+      # `helpers/rtmp-push.ts` wrapper; the second drives the new
+      # `scte35-rtmp-push` Rust bin (which does not need ffmpeg but
+      # the broader test depends on the live-RTMP env gate). Cached
+      # apt step costs ~30 s on a cold runner.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       # Rust side: build the lvqr binary that Playwright's webServer
-      # will spawn. The binary path is resolved relative to
-      # bindings/js/playwright.config.ts as ../../target/debug/lvqr.
+      # will spawn, plus the lvqr-test-utils bins (session 155 adds
+      # `scte35-rtmp-push` for the gated marker e2e). The binary
+      # paths are resolved relative to bindings/js/playwright.config.ts
+      # as ../../target/debug/<bin>.
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: mesh-e2e-v1
-      - name: Build lvqr-cli (debug)
-        run: cargo build -p lvqr-cli
+      - name: Build lvqr-cli + lvqr-test-utils bins (debug)
+        run: cargo build -p lvqr-cli -p lvqr-test-utils --bins
 
       # Rebuild every workspace dist/ so the suites pull the latest
       # source: the mesh suite's `addInitScript` injects
@@ -105,6 +130,15 @@ jobs:
 
       - name: Run mesh Playwright tests
         working-directory: bindings/js
+        env:
+          # Session 155: opt the live-RTMP marker tests in
+          # `tests/e2e/dvr-player/markers.spec.ts` into the run.
+          # The two gated tests skip when this env var is unset
+          # (so local `npx playwright test` stays deterministic);
+          # CI installs ffmpeg + the scte35-rtmp-push bin above so
+          # both live tests exercise the full publish + render
+          # pipeline on every push.
+          LVQR_LIVE_RTMP_TESTS: "1"
         run: npx playwright test
 
       - name: Upload Playwright report

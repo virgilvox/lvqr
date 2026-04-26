@@ -1,8 +1,228 @@
 # LVQR Handoff Document
 
-## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 154 (2026-04-25) shipped SCTE-35 ad-break markers on `@lvqr/dvr-player` v0.3.3** -- the DVR scrub component now paints session 152's `#EXT-X-DATERANGE` ad markers on its custom seek bar (vertical ticks for CMD / time-signal singletons, coloured break-range spans for paired SCTE35-OUT + SCTE35-IN entries joined by their shared DATERANGE `ID`, faint in-flight overlays for an OUT whose IN has not yet landed). Hover tooltip shows kind / id / time / duration. New `markers="visible|hidden"` attribute toggles the visual layer; events still fire when hidden. Two new public events: `lvqr-dvr-markers-changed` (fires on diff vs prior LEVEL_LOADED, detail `{ markers, pairs }`) and `lvqr-dvr-marker-crossed` (fires per-id when `currentTime` crosses a marker's `startTime`, debounced 100 ms per id, detail `{ marker, direction, currentTime }`). New programmatic `getMarkers()` returns `{ markers, pairs }` with the store sorted by ascending `startTime` then `id`. Reads daterange entries from hls.js's `LevelDetails.dateRanges` (v1.5+) on `Hls.Events.LEVEL_LOADED`; trusts `DateRange.startTime` for the PDT-anchored currentTime mapping (so the component does NOT re-implement program-date-time anchoring). Pure helpers in `bindings/js/packages/dvr-player/src/markers.ts` (`classifyMarker`, `dvrMarkersFromHlsDateRanges`, `markerToFraction`, `groupOutInPairs`, `formatDuration`) covered by **25 Vitest tests** in `bindings/js/tests/sdk/dvr-player-markers.spec.ts`. Playwright project gains `markers.spec.ts` with three new tests: two routed-stub-playlist tests (LEVEL_LOADED populates store + emits markers-changed; `markers="hidden"` empties layer + getMarkers still returns store) plus one live-RTMP test that pushes synthetic ffmpeg video into the dvr-player webServer profile and asserts the LIVE pill activates -- **the live-RTMP test also closes session 153's deferred "live-stream-driven Playwright assertions" item via the new `bindings/js/tests/helpers/rtmp-push.ts` Node ffmpeg wrapper** (ffmpeg-gated `test.skip` when the binary is missing on the runner, so the spec is opt-in across CI environments). **No Rust crate touched, no relay-side wire change, no new HLS tag** -- the component is a pure consumer of session 152's existing `#EXT-X-DATERANGE` surface. The brief's design question 6 originally proposed a second helper (a Rust `[[bin]] scte35-rtmp-push` that would inject `onCuePoint scte35-bin64` AMF0 Data messages over a real RTMP publisher session) but that path was descoped during execution: the vendored `rml_rtmp` v0.8 client lacks a generic AMF0-data sender and patching it would have violated the brief's own "no Rust crate touched" anti-scope. The end-to-end "real RTMP onCuePoint -> relay DATERANGE" wire is already covered by `crates/lvqr-cli/tests/scte35_hls_dash_e2e.rs` (Rust-side, session 152); the component-side "DATERANGE -> render" path is fully covered by the routed-stub-playlist Playwright tests because hls.js fires LEVEL_LOADED with `dateRanges` populated after parsing the playlist text, before any segment fetch succeeds. CSS hooks: `--lvqr-marker-color` (paired-span fill), `--lvqr-marker-tick-color` (tick colour), `--lvqr-marker-in-flight` (OUT-only overlay), `--lvqr-marker-tooltip-bg`. New shadow parts: `markers`, `marker-tooltip`. Workspace 0.4.1 unchanged; `@lvqr/player` and `@lvqr/core` stay at 0.3.2; `@lvqr/dvr-player` bumps to 0.3.3. **Session 153 (2026-04-25) shipped Dedicated DVR scrub web UI v1** -- new `@lvqr/dvr-player` package at `bindings/js/packages/dvr-player/` ships as a sister to `@lvqr/player`, version 0.3.2 lockstep with the rest of the SDK. Vanilla `class extends HTMLElement` (no Lit, no Stencil; "structured-vanilla" pattern with template-literal HTML strings + small attribute helpers in `src/internals/attrs.ts` + typed `CustomEvent` dispatcher in `src/internals/dispatch.ts` + shadow DOM + `attributeChangedCallback`-driven reactivity). Pure-arithmetic helpers (time-to-x mapping, percentile labels, threshold checks, formatting) extracted into `src/seekbar.ts` and unit-tested via Vitest. **32 unit tests** across three SDK specs in `bindings/js/tests/sdk/` -- 14 over the seek-bar arithmetic (`dvr-player-seekbar.spec.ts`), 14 over the attribute helpers (`dvr-player-attrs.spec.ts` -- boolean / numeric / string getters with fallback semantics including NaN / Infinity / empty-string / "0"-not-fallback edge cases), 4 over the typed event dispatcher (`dvr-player-dispatch.spec.ts` -- detail-shape preservation + bubbles flag for all three event names). Playwright project under `bindings/js/tests/e2e/dvr-player/` runs **15 tests** across `mount.spec.ts` (4 -- registration + 13 part landmarks + muted + controls=native + programmatic seek) and `interactions.spec.ts` (11 -- goLive() event + source classification, seek() clamping at both endpoints, multi-seek fromTime chaining, keyboard ArrowLeft / ArrowRight scrub, keyboard Home / End jumps, live-edge-threshold-secs custom-value classification, controls toggle round-trip native -> custom -> default, pointer-drag interaction with user-source event firing, hover preview show / hide, getHlsInstance pre-playback null, host->document event bubbling). Wraps hls.js (^1.5.0 direct dep) against the relay's existing live HLS endpoint (`/hls/{broadcast}/master.m3u8`) with the sliding-window DVR depth driven by `--hls-dvr-window-secs`; **no new server route** -- the kickoff prompt's `/playback/{broadcast}/master.m3u8` URL was a misread (the actual `/playback/*` surface returns JSON, not HLS), corrected at brief read-back. Custom seek bar with HH:MM:SS percentile labels (or MM:SS for sub-hour spans) at 0/25/50/75/100% of the seekable range, LIVE pill that toggles based on `seekable.end - currentTime` crossing `max(6, 3 * #EXT-X-TARGETDURATION)` (configurable via `live-edge-threshold-secs`), explicit "Go Live" button that only renders when behind the live edge (no implicit live-snap on resume; explicitly rejected because operators report it surprises viewers who paused with intent). Client-side hover thumbnails via canvas `drawImage` against a lazy second hls.js instance (LRU-capped at 60 entries; opt-out via `thumbnails="disabled"`; image bitmaps cached for instant re-hover). Bearer-token auth via hls.js `xhrSetup` (`Authorization: Bearer` header) plus query-string fallback for native HLS in Safari MSE-less mode. Public events `lvqr-dvr-seek` / `lvqr-dvr-live-edge-changed` / `lvqr-dvr-error` (typed via the `LvqrDvrPlayerEvents` map; debounced 250 ms on the live-edge crossing); programmatic API `play()` / `pause()` / `seek(time)` / `goLive()` / `getHlsInstance()`. Component-level web research (April 2026): Mux Player + Media Chrome (the canonical streaming-infra public web component, ~9 billion requests served) ships **vanilla**, not Lit; Vidstack's `lit-html + Maverick signals` stack is being publicly retired in 2026 by its own author (cf. mux.com "6 Years Building Video Players" retrospective). LVQR adopts the structured-vanilla pattern without the Mux dependency on strategic-peer grounds. Playwright project at `bindings/js/tests/e2e/dvr-player/` adds a second `webServer` profile in `playwright.config.ts` on non-overlapping ports (admin 18089, hls 18190, rtmp 11936, lvqr 14444) with `--archive-dir` + `--hls-dvr-window-secs=300` + `--no-auth-live-playback`; spec mounts the dist via importmap-routed `page.route` handlers and asserts custom-element registration, shadow-DOM structure (13 part landmarks), `muted` + `controls=native` attribute reflection, and programmatic `seek()` event flow. New docs at `docs/dvr-scrub.md` cover the operator embedding recipe, signed-URL / bearer-token auth precedence, theming via CSS custom properties (`--lvqr-accent`, `--lvqr-control-bg`, etc.) + `::part()` access (`video`, `seekbar`, `live-badge`, `go-live-button`, `play-button`, `mute-button`, `time-display`, `labels`, `preview`, `controls`, `live-overlay`, `status`), and the relationship between `--hls-dvr-window-secs` and the seekable range the component renders. README "Next up" #3 (Dedicated DVR scrub web UI) flips to strikethrough with a forward link to `docs/dvr-scrub.md`; Phase A v1.1 roadmap row flips `[ ] -> [x]`. Workspace 0.4.1 unchanged; `@lvqr/player` and `@lvqr/core` stay at 0.3.2; no Rust-side changes touched in this session. **Session 152 (2026-04-25 / 26) shipped SCTE-35 ad-marker passthrough v1** -- both ingest paths land in the same session: SRT MPEG-TS (PMT stream_type 0x86 with private-section reassembly across TS packet boundaries) and RTMP onCuePoint scte35-bin64 (Adobe AMF0 convention used by AWS Elemental, Wirecast, vMix, ffmpeg). RTMP required vendoring `rml_rtmp` v0.8.0 at `vendor/rml_rtmp/` with a 25-line patch adding `ServerSessionEvent::Amf0DataReceived` (upstream silently drops every AMF0 Data message that is not `@setDataFrame`-wrapped onMetaData); fork loads via `[patch.crates-io]` and passes 170/0/0 tests (168 upstream + 2 LVQR defense). Splice events flow through a reserved `"scte35"` parallel track on `FragmentBroadcasterRegistry` (mirroring the whisper-captions pattern under `lvqr_fragment::SCTE35_TRACK`); LL-HLS render adds `#EXT-X-DATERANGE` per HLS spec section 4.4.5.1 with `CLASS="urn:scte:scte35:2014:bin"` (industry convention) + SCTE35-OUT/IN/CMD attributes; DASH MPD render adds Period-level `<EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin">` per ISO/IEC 23009-1 G.7 + SCTE 214-1. New `lvqr-codec/src/scte35.rs` parses splice_info_section per ANSI/SCTE 35-2024 section 8.1 with CRC_32 verification; proptest harness (1536 random inputs) + libfuzzer target prove panic-free on adversarial input. Counter metrics `lvqr_scte35_events_total{ingest,command}` + `lvqr_scte35_drops_total{ingest,reason}`. All 8 CI workflows GREEN end-to-end (LL-HLS Conformance + MPEG-DASH Conformance + Feature matrix + Supply-chain audit + Tier 4 demos + SDK tests + Test Contract + CI). Workspace lib **824 / 0 / 0** + 8 SCTE-35 e2e tests through TestServer + real HTTP/1.1. Splice_info_section bytes preserved verbatim through both egress wire shapes; no semantic interpretation. New docs at `docs/scte35.md` (~430 lines) cover standards refs, ingest table, publisher quickstart (ffmpeg/AWS Elemental/Wirecast/vMix/OBS), wire shape examples, internal architecture diagram, client-side consumption snippets (hls.js/dash.js/Shaka/native HLS), anti-scope, metrics, operator runbook. README "Next up" #2 (SCTE-35 passthrough) flips to strikethrough; Phase A v1.1 roadmap row flips `[ ] -> [x]`. **Session 151 (2026-04-25) hardens lvqr-agent runner-test polling** -- replaces 4 fixed-100 ms `tokio::time::sleep` sites with a `poll_until` helper (10 ms tick, 2 s timeout) so the spawned drain-task's panic-counter increment can settle on a loaded macos-latest CI runner. The flake surfaced on session 150's substantive CI run but is orthogonal to the wasmtime upgrade (lvqr-agent has zero wasmtime deps); the OTHER 7 session-150 workflows including Feature matrix and Supply-chain audit landed green on the original push. **Session 150 (2026-04-25) closed the dominant audit-ignore cluster** -- wasmtime v25 -> v43 upgrade removes 16 RustSec advisories from `audit.toml` (including 2x CVSS-9 sandbox-escape entries), down from 22 ignores to 6. `lvqr-wasm` only uses the core WASM API surface (Engine/Module/Store/Instance/TypedFunc) which is stable across the upgrade range; total source diff was 7 lines (two Module::new error-conversion callsites). **Session 149 (2026-04-25) shipped hot config reload v3 (JWKS + webhook URL rotation)** -- `ConfigReloadHandle::reload` flipped to `async`; the reload pipeline now calls `JwksAuthProvider::new` and `WebhookAuthProvider::new` asynchronously and swaps the resulting provider into the `HotReloadAuthProvider` chain. Drop-old-on-swap leverages each provider's existing `Drop` to abort their spawned refresh / fetcher task. `applied_keys` grows entries (`"jwks"` / `"webhook"`) on URL diff. Feature-disabled builds emit a warning when the file names a feature-gated URL. `jwks_url` and `webhook_auth_url` are mutually exclusive within the same `[auth]` section (the route returns an error). The admin route closure shape widened from sync `Fn -> Result<...>` to async-flavored `Fn -> BoxFuture<Result<...>>` (internal-API change; SDK wire shape unchanged). With session 149, hot config reload is feature-complete -- every key the file format defines is honored at runtime. **Session 148 (2026-04-25) shipped hot config reload v2 (mesh ICE + HMAC secret)** -- `mesh_ice_servers` and `hmac_playback_secret` join the hot-reloadable surface alongside auth, swapped atomically via `arc_swap::ArcSwap` handles threaded through the `/signal` callback and the live HLS / DASH / DVR `/playback/*` middlewares. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Default-gate tests after 148: Rust workspace **1107** / 0 / 0 (was 1099 post-147; +8 net: 8 new lvqr-cli unit covering ice + hmac + applied_keys diff paths + clear semantics + no-deferred-warnings regression, 2 new RTMP-shape integration cases in `config_reload_e2e.rs` mesh ICE + HMAC rotation; the workshop-148 step rewrote one prior unit test from warnings-shape to applied_keys-shape, net unit delta = 8). Python pytest **38** unchanged. Vitest unchanged at 13. Admin surface unchanged at **12 route trees**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API**; **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates.
+## Project Status: v0.4.1 PUBLISHED on crates.io -- **Tier 3 COMPLETE; Tier 4 COMPLETE** + `examples/tier4-demos/` exit criterion CLOSED. **Phase A + B v1.1 CLOSED**. **Phase C fully CLOSED**. **Phase D mesh-data-plane checklist FULLY CLOSED**. **Session 155 (2026-04-26) closed session 154's three test-coverage follow-ups in one push** -- (1) `mesh-e2e.yml` workflow `apt-get install`s ffmpeg + sets `LVQR_LIVE_RTMP_TESTS=1`, so the live-RTMP marker tests run on every CI push; (2) the existing live-RTMP test now asserts the dvr-player LIVE pill flips to `is-live` against a real ffmpeg publish via a new `bindings/js/tests/helpers/hls-poll.ts::waitForLiveVariantPlaylist` variant-non-empty pre-check helper that closes the manifestLoadError race; (3) new `[[bin]] scte35-rtmp-push` on `lvqr-test-utils` opens a real RTMP publisher session and sends a single `onCuePoint scte35-bin64` AMF0 Data message at a chosen offset, plus a new `LVQR_LIVE_RTMP_TESTS=1`-gated Playwright e2e drives the bin into the dvr-player webServer profile and asserts the SCTE-35 marker tick renders at the expected fraction with the expected DATERANGE id (`splice-3405691582` from default event_id `0xCAFEBABE`). The bin depends on a new ~25-line `publish_amf0_data` patch on the vendored `rml_rtmp` v0.8 client at `vendor/rml_rtmp/src/sessions/client/mod.rs` (mirrors session 152's server-side `Amf0DataReceived` patch -- the upstream client API only exposes `publish_metadata` which hard-codes `@setDataFrame` + `onMetaData`; the new method emits an arbitrary `Vec<Amf0Value>` verbatim). Synthetic H.264 NAL helpers in new `crates/lvqr-test-utils/src/h264.rs` use parseable Baseline-profile SPS + PPS lifted from the `h264-reader` test fixtures already pinned in `crates/lvqr-ingest/src/remux/flv.rs`. `splice_insert_section_bytes` extracted from `crates/lvqr-cli/tests/scte35_hls_dash_e2e.rs` into `crates/lvqr-test-utils/src/scte35.rs` (with a hex-pin regression test + a codec-parser round-trip test) so the new bin and the existing e2e share a single source of truth. Five new tests across four tiers: 2 rml_rtmp client unit (172 / 0 / 0 fork total, was 170), 2 lvqr-test-utils unit (hex-pin + round-trip on the extracted helper, plus 3 h264 builder tests), 1 Rust integration smoke (`crates/lvqr-test-utils/tests/scte35_rtmp_push_smoke.rs` -- default-gate, drives the bin against a `TestServer` and asserts DATERANGE), 1 strengthened + 1 new gated Playwright test in `bindings/js/tests/e2e/dvr-player/markers.spec.ts`. Bonus: fixed a long-standing bug in `lvqr_test_utils::rtmp::read_until` that was silently dropping the post-connect `SetChunkSize` packet (it followed `ConnectionRequestAccepted` in the result vector and the helper short-circuited on the matching event before writing later responses); the bug was latent until the bin's >128-byte AMF0 onCuePoint send -- with the server's deserializer stuck at default chunk_size=128, mid-payload bytes got parsed as chunk headers (`NoPreviousChunkOnStream { csid: 52 }`). **No relay-side wire change, no SDK package version bump, no production code path in `@lvqr/dvr-player` touched**; `@lvqr/dvr-player` stays at v0.3.3 with test + tooling deltas only. Workspace `0.4.1` unchanged. **Session 154 (2026-04-25) shipped SCTE-35 ad-break markers on `@lvqr/dvr-player` v0.3.3** -- the DVR scrub component now paints session 152's `#EXT-X-DATERANGE` ad markers on its custom seek bar (vertical ticks for CMD / time-signal singletons, coloured break-range spans for paired SCTE35-OUT + SCTE35-IN entries joined by their shared DATERANGE `ID`, faint in-flight overlays for an OUT whose IN has not yet landed). Hover tooltip shows kind / id / time / duration. New `markers="visible|hidden"` attribute toggles the visual layer; events still fire when hidden. Two new public events: `lvqr-dvr-markers-changed` (fires on diff vs prior LEVEL_LOADED, detail `{ markers, pairs }`) and `lvqr-dvr-marker-crossed` (fires per-id when `currentTime` crosses a marker's `startTime`, debounced 100 ms per id, detail `{ marker, direction, currentTime }`). New programmatic `getMarkers()` returns `{ markers, pairs }` with the store sorted by ascending `startTime` then `id`. Reads daterange entries from hls.js's `LevelDetails.dateRanges` (v1.5+) on `Hls.Events.LEVEL_LOADED`; trusts `DateRange.startTime` for the PDT-anchored currentTime mapping (so the component does NOT re-implement program-date-time anchoring). Pure helpers in `bindings/js/packages/dvr-player/src/markers.ts` (`classifyMarker`, `dvrMarkersFromHlsDateRanges`, `markerToFraction`, `groupOutInPairs`, `formatDuration`) covered by **25 Vitest tests** in `bindings/js/tests/sdk/dvr-player-markers.spec.ts`. Playwright project gains `markers.spec.ts` with three new tests: two routed-stub-playlist tests (LEVEL_LOADED populates store + emits markers-changed; `markers="hidden"` empties layer + getMarkers still returns store) plus one live-RTMP test that pushes synthetic ffmpeg video into the dvr-player webServer profile and asserts the LIVE pill activates -- **the live-RTMP test also closes session 153's deferred "live-stream-driven Playwright assertions" item via the new `bindings/js/tests/helpers/rtmp-push.ts` Node ffmpeg wrapper** (ffmpeg-gated `test.skip` when the binary is missing on the runner, so the spec is opt-in across CI environments). **No Rust crate touched, no relay-side wire change, no new HLS tag** -- the component is a pure consumer of session 152's existing `#EXT-X-DATERANGE` surface. The brief's design question 6 originally proposed a second helper (a Rust `[[bin]] scte35-rtmp-push` that would inject `onCuePoint scte35-bin64` AMF0 Data messages over a real RTMP publisher session) but that path was descoped during execution: the vendored `rml_rtmp` v0.8 client lacks a generic AMF0-data sender and patching it would have violated the brief's own "no Rust crate touched" anti-scope. The end-to-end "real RTMP onCuePoint -> relay DATERANGE" wire is already covered by `crates/lvqr-cli/tests/scte35_hls_dash_e2e.rs` (Rust-side, session 152); the component-side "DATERANGE -> render" path is fully covered by the routed-stub-playlist Playwright tests because hls.js fires LEVEL_LOADED with `dateRanges` populated after parsing the playlist text, before any segment fetch succeeds. CSS hooks: `--lvqr-marker-color` (paired-span fill), `--lvqr-marker-tick-color` (tick colour), `--lvqr-marker-in-flight` (OUT-only overlay), `--lvqr-marker-tooltip-bg`. New shadow parts: `markers`, `marker-tooltip`. Workspace 0.4.1 unchanged; `@lvqr/player` and `@lvqr/core` stay at 0.3.2; `@lvqr/dvr-player` bumps to 0.3.3. **Session 153 (2026-04-25) shipped Dedicated DVR scrub web UI v1** -- new `@lvqr/dvr-player` package at `bindings/js/packages/dvr-player/` ships as a sister to `@lvqr/player`, version 0.3.2 lockstep with the rest of the SDK. Vanilla `class extends HTMLElement` (no Lit, no Stencil; "structured-vanilla" pattern with template-literal HTML strings + small attribute helpers in `src/internals/attrs.ts` + typed `CustomEvent` dispatcher in `src/internals/dispatch.ts` + shadow DOM + `attributeChangedCallback`-driven reactivity). Pure-arithmetic helpers (time-to-x mapping, percentile labels, threshold checks, formatting) extracted into `src/seekbar.ts` and unit-tested via Vitest. **32 unit tests** across three SDK specs in `bindings/js/tests/sdk/` -- 14 over the seek-bar arithmetic (`dvr-player-seekbar.spec.ts`), 14 over the attribute helpers (`dvr-player-attrs.spec.ts` -- boolean / numeric / string getters with fallback semantics including NaN / Infinity / empty-string / "0"-not-fallback edge cases), 4 over the typed event dispatcher (`dvr-player-dispatch.spec.ts` -- detail-shape preservation + bubbles flag for all three event names). Playwright project under `bindings/js/tests/e2e/dvr-player/` runs **15 tests** across `mount.spec.ts` (4 -- registration + 13 part landmarks + muted + controls=native + programmatic seek) and `interactions.spec.ts` (11 -- goLive() event + source classification, seek() clamping at both endpoints, multi-seek fromTime chaining, keyboard ArrowLeft / ArrowRight scrub, keyboard Home / End jumps, live-edge-threshold-secs custom-value classification, controls toggle round-trip native -> custom -> default, pointer-drag interaction with user-source event firing, hover preview show / hide, getHlsInstance pre-playback null, host->document event bubbling). Wraps hls.js (^1.5.0 direct dep) against the relay's existing live HLS endpoint (`/hls/{broadcast}/master.m3u8`) with the sliding-window DVR depth driven by `--hls-dvr-window-secs`; **no new server route** -- the kickoff prompt's `/playback/{broadcast}/master.m3u8` URL was a misread (the actual `/playback/*` surface returns JSON, not HLS), corrected at brief read-back. Custom seek bar with HH:MM:SS percentile labels (or MM:SS for sub-hour spans) at 0/25/50/75/100% of the seekable range, LIVE pill that toggles based on `seekable.end - currentTime` crossing `max(6, 3 * #EXT-X-TARGETDURATION)` (configurable via `live-edge-threshold-secs`), explicit "Go Live" button that only renders when behind the live edge (no implicit live-snap on resume; explicitly rejected because operators report it surprises viewers who paused with intent). Client-side hover thumbnails via canvas `drawImage` against a lazy second hls.js instance (LRU-capped at 60 entries; opt-out via `thumbnails="disabled"`; image bitmaps cached for instant re-hover). Bearer-token auth via hls.js `xhrSetup` (`Authorization: Bearer` header) plus query-string fallback for native HLS in Safari MSE-less mode. Public events `lvqr-dvr-seek` / `lvqr-dvr-live-edge-changed` / `lvqr-dvr-error` (typed via the `LvqrDvrPlayerEvents` map; debounced 250 ms on the live-edge crossing); programmatic API `play()` / `pause()` / `seek(time)` / `goLive()` / `getHlsInstance()`. Component-level web research (April 2026): Mux Player + Media Chrome (the canonical streaming-infra public web component, ~9 billion requests served) ships **vanilla**, not Lit; Vidstack's `lit-html + Maverick signals` stack is being publicly retired in 2026 by its own author (cf. mux.com "6 Years Building Video Players" retrospective). LVQR adopts the structured-vanilla pattern without the Mux dependency on strategic-peer grounds. Playwright project at `bindings/js/tests/e2e/dvr-player/` adds a second `webServer` profile in `playwright.config.ts` on non-overlapping ports (admin 18089, hls 18190, rtmp 11936, lvqr 14444) with `--archive-dir` + `--hls-dvr-window-secs=300` + `--no-auth-live-playback`; spec mounts the dist via importmap-routed `page.route` handlers and asserts custom-element registration, shadow-DOM structure (13 part landmarks), `muted` + `controls=native` attribute reflection, and programmatic `seek()` event flow. New docs at `docs/dvr-scrub.md` cover the operator embedding recipe, signed-URL / bearer-token auth precedence, theming via CSS custom properties (`--lvqr-accent`, `--lvqr-control-bg`, etc.) + `::part()` access (`video`, `seekbar`, `live-badge`, `go-live-button`, `play-button`, `mute-button`, `time-display`, `labels`, `preview`, `controls`, `live-overlay`, `status`), and the relationship between `--hls-dvr-window-secs` and the seekable range the component renders. README "Next up" #3 (Dedicated DVR scrub web UI) flips to strikethrough with a forward link to `docs/dvr-scrub.md`; Phase A v1.1 roadmap row flips `[ ] -> [x]`. Workspace 0.4.1 unchanged; `@lvqr/player` and `@lvqr/core` stay at 0.3.2; no Rust-side changes touched in this session. **Session 152 (2026-04-25 / 26) shipped SCTE-35 ad-marker passthrough v1** -- both ingest paths land in the same session: SRT MPEG-TS (PMT stream_type 0x86 with private-section reassembly across TS packet boundaries) and RTMP onCuePoint scte35-bin64 (Adobe AMF0 convention used by AWS Elemental, Wirecast, vMix, ffmpeg). RTMP required vendoring `rml_rtmp` v0.8.0 at `vendor/rml_rtmp/` with a 25-line patch adding `ServerSessionEvent::Amf0DataReceived` (upstream silently drops every AMF0 Data message that is not `@setDataFrame`-wrapped onMetaData); fork loads via `[patch.crates-io]` and passes 170/0/0 tests (168 upstream + 2 LVQR defense). Splice events flow through a reserved `"scte35"` parallel track on `FragmentBroadcasterRegistry` (mirroring the whisper-captions pattern under `lvqr_fragment::SCTE35_TRACK`); LL-HLS render adds `#EXT-X-DATERANGE` per HLS spec section 4.4.5.1 with `CLASS="urn:scte:scte35:2014:bin"` (industry convention) + SCTE35-OUT/IN/CMD attributes; DASH MPD render adds Period-level `<EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin">` per ISO/IEC 23009-1 G.7 + SCTE 214-1. New `lvqr-codec/src/scte35.rs` parses splice_info_section per ANSI/SCTE 35-2024 section 8.1 with CRC_32 verification; proptest harness (1536 random inputs) + libfuzzer target prove panic-free on adversarial input. Counter metrics `lvqr_scte35_events_total{ingest,command}` + `lvqr_scte35_drops_total{ingest,reason}`. All 8 CI workflows GREEN end-to-end (LL-HLS Conformance + MPEG-DASH Conformance + Feature matrix + Supply-chain audit + Tier 4 demos + SDK tests + Test Contract + CI). Workspace lib **824 / 0 / 0** + 8 SCTE-35 e2e tests through TestServer + real HTTP/1.1. Splice_info_section bytes preserved verbatim through both egress wire shapes; no semantic interpretation. New docs at `docs/scte35.md` (~430 lines) cover standards refs, ingest table, publisher quickstart (ffmpeg/AWS Elemental/Wirecast/vMix/OBS), wire shape examples, internal architecture diagram, client-side consumption snippets (hls.js/dash.js/Shaka/native HLS), anti-scope, metrics, operator runbook. README "Next up" #2 (SCTE-35 passthrough) flips to strikethrough; Phase A v1.1 roadmap row flips `[ ] -> [x]`. **Session 151 (2026-04-25) hardens lvqr-agent runner-test polling** -- replaces 4 fixed-100 ms `tokio::time::sleep` sites with a `poll_until` helper (10 ms tick, 2 s timeout) so the spawned drain-task's panic-counter increment can settle on a loaded macos-latest CI runner. The flake surfaced on session 150's substantive CI run but is orthogonal to the wasmtime upgrade (lvqr-agent has zero wasmtime deps); the OTHER 7 session-150 workflows including Feature matrix and Supply-chain audit landed green on the original push. **Session 150 (2026-04-25) closed the dominant audit-ignore cluster** -- wasmtime v25 -> v43 upgrade removes 16 RustSec advisories from `audit.toml` (including 2x CVSS-9 sandbox-escape entries), down from 22 ignores to 6. `lvqr-wasm` only uses the core WASM API surface (Engine/Module/Store/Instance/TypedFunc) which is stable across the upgrade range; total source diff was 7 lines (two Module::new error-conversion callsites). **Session 149 (2026-04-25) shipped hot config reload v3 (JWKS + webhook URL rotation)** -- `ConfigReloadHandle::reload` flipped to `async`; the reload pipeline now calls `JwksAuthProvider::new` and `WebhookAuthProvider::new` asynchronously and swaps the resulting provider into the `HotReloadAuthProvider` chain. Drop-old-on-swap leverages each provider's existing `Drop` to abort their spawned refresh / fetcher task. `applied_keys` grows entries (`"jwks"` / `"webhook"`) on URL diff. Feature-disabled builds emit a warning when the file names a feature-gated URL. `jwks_url` and `webhook_auth_url` are mutually exclusive within the same `[auth]` section (the route returns an error). The admin route closure shape widened from sync `Fn -> Result<...>` to async-flavored `Fn -> BoxFuture<Result<...>>` (internal-API change; SDK wire shape unchanged). With session 149, hot config reload is feature-complete -- every key the file format defines is honored at runtime. **Session 148 (2026-04-25) shipped hot config reload v2 (mesh ICE + HMAC secret)** -- `mesh_ice_servers` and `hmac_playback_secret` join the hot-reloadable surface alongside auth, swapped atomically via `arc_swap::ArcSwap` handles threaded through the `/signal` callback and the live HLS / DASH / DVR `/playback/*` middlewares. **Session 147 (2026-04-25) shipped hot config reload (auth-only v1)** -- `lvqr serve --config <path.toml>` + SIGHUP + `POST /api/v1/config-reload` swap the auth chain atomically via a new `lvqr_auth::HotReloadAuthProvider` (`arc_swap::ArcSwap` -- single-digit-ns reads on the auth-check fast path). Stream-key store preserved. Default-gate tests after 148: Rust workspace **1107** / 0 / 0 (was 1099 post-147; +8 net: 8 new lvqr-cli unit covering ice + hmac + applied_keys diff paths + clear semantics + no-deferred-warnings regression, 2 new RTMP-shape integration cases in `config_reload_e2e.rs` mesh ICE + HMAC rotation; the workshop-148 step rewrote one prior unit test from warnings-shape to applied_keys-shape, net unit delta = 8). Python pytest **38** unchanged. Vitest unchanged at 13. Admin surface unchanged at **12 route trees**. **Session 146 (2026-04-24) shipped runtime stream-key CRUD admin API**; **Session 145 (2026-04-24)** cut workspace 0.4.1 + republished all 26 publishable Rust crates.
 
-**Last Updated**: 2026-04-25 (session 154 close).
+**Last Updated**: 2026-04-26 (session 155 close).
+
+## Session 155 close (2026-04-26)
+
+Closed the three test-coverage follow-ups from session 154's
+HANDOFF in one push: (1) CI integration of the live-RTMP path,
+(2) stronger consumer-side LIVE-pill assertion, (3) real-RTMP
+`onCuePoint` -> `#EXT-X-DATERANGE` -> marker render Playwright
+e2e. The session is test + tooling close-out -- workspace stays
+at v0.4.1, SDK packages stay at 0.3.3 / 0.3.2, no production code
+path in `@lvqr/dvr-player` changes. The brief is at
+`tracking/SESSION_155_BRIEFING.md` (~850 lines, mirrors session
+154's brief shape).
+
+### What landed
+
+* **`vendor/rml_rtmp/src/sessions/client/mod.rs`** -- new
+  `publish_amf0_data(values: Vec<Amf0Value>) -> Result<ClientSessionResult, ClientSessionError>`
+  method (~25 LOC). Mirrors `publish_metadata`'s shape minus the
+  `@setDataFrame` + `onMetaData` hardcoding. The caller owns the
+  wire shape: typically `[Utf8String("onCuePoint"), Object{...}]`
+  for SCTE-35 ad markers. Symmetric to session 152's server-side
+  `Amf0DataReceived` patch; together the fork now has a complete
+  AMF0 Data round-trip surface for non-`@setDataFrame` carriages.
+  Two new tests in `vendor/rml_rtmp/src/sessions/client/tests.rs`:
+  `publisher_can_send_publish_amf0_data` (positive wire-shape
+  round-trip via `split_results` deserialization) +
+  `publish_amf0_data_errors_outside_publishing_state` (contract
+  guard for `SessionInInvalidState` pre-publish).
+* **`crates/lvqr-test-utils/src/scte35.rs`** -- new module hosting
+  the `splice_insert_section_bytes(event_id, pts_90k, duration_90k)`
+  helper extracted verbatim from
+  `crates/lvqr-cli/tests/scte35_hls_dash_e2e.rs:61-147`. Two unit
+  tests: a hex-pin on the canonical `(0xCAFEBABE, 8_100_000,
+  2_700_000)` fixture (regression safety for the move) + a
+  round-trip via `lvqr_codec::parse_splice_info_section` (cross-
+  check vs the relay's parser).
+* **`crates/lvqr-test-utils/src/h264.rs`** -- new module with
+  parseable Baseline-profile SPS / PPS const tables (lifted from
+  the `h264-reader` test fixtures already pinned in
+  `crates/lvqr-ingest/src/remux/flv.rs`) plus FLV-tag builders:
+  `flv_avc_sequence_header`, `flv_avc_nalu`, `synthetic_idr_nal`,
+  `synthetic_p_slice_nal`, `avcc_record`. Three unit tests
+  validate the FLV byte shape (codec=7 nibble, AVCPacketType=0/1,
+  4-byte NALU length prefix, 24-bit signed CTS).
+* **`crates/lvqr-test-utils/Cargo.toml`** -- adds `lvqr-codec`
+  (for the SCTE-35 constants), `rml_amf0`, `clap`, `base64`
+  workspace deps + `tokio` features (`rt-multi-thread`, `time`,
+  `sync`, `process`); declares the new `[[bin]]
+  scte35-rtmp-push` at `src/bin/scte35_rtmp_push.rs`.
+* **`crates/lvqr-test-utils/src/bin/scte35_rtmp_push.rs`** -- the
+  new test bin (~340 LOC). clap-derive CLI: `--rtmp-url`,
+  `--duration-secs` (default 8), `--inject-at-secs` (comma-list of
+  f64; default 3.0), `--scte35-hex` (optional; defaults to the
+  canonical fixture), `--video-fps` (default 30),
+  `--keyframe-interval-frames` (default 60). Drives a real RTMP
+  publisher session via `rml_rtmp::sessions::ClientSession` +
+  `lvqr_test_utils::rtmp` helpers; sends an AVC sequence header
+  (so the relay's bridge populates `video_config + video_init`),
+  then a 1-IDR-per-GOP video loop paced by `tokio::time::sleep`,
+  then injects `onCuePoint scte35-bin64` AMF0 Data messages at
+  the specified offsets. Multi-emission supported (each emission
+  patches the section's event_id + recomputes CRC-32/MPEG-2 so
+  the relay renders a unique DATERANGE ID per emission). Exits 0
+  on clean publish, non-zero on RTMP wire error. Single-line JSON
+  status on stdout: `{"events_sent":N,"frames_sent":M,"duration_secs":D}`.
+* **`crates/lvqr-test-utils/tests/scte35_rtmp_push_smoke.rs`** --
+  Rust integration smoke (default-gate). Spawns the bin via
+  `env!("CARGO_BIN_EXE_scte35-rtmp-push")` against a `TestServer`
+  with ephemeral RTMP + HLS ports; polls the variant playlist for
+  `#EXT-X-DATERANGE`; asserts the daterange ID is
+  `splice-3405691582` (from the bin's default event_id
+  `0xCAFEBABE`); asserts the bin's stdout JSON reports
+  `events_sent=1`. Real RTMP wire end-to-end without browser; the
+  load-bearing default-gate coverage for the bin.
+* **`crates/lvqr-cli/tests/scte35_hls_dash_e2e.rs`** -- imports
+  `splice_insert_section_bytes` from the new
+  `lvqr_test_utils::scte35` module; the previously-inlined
+  `build_splice_insert_section` is removed. The test's 3
+  assertions run unchanged (pure helper move; no behavior
+  change).
+* **`crates/lvqr-test-utils/src/rtmp.rs`** -- bug fix on
+  `read_until`. The helper previously returned on the FIRST
+  matching event in the result vector; in the
+  `ConnectionRequestAccepted` case the rml_rtmp client emits
+  `[OutboundResponse(WindowAck), RaisedEvent(ConnectionRequestAccepted), OutboundResponse(SetChunkSize)]`,
+  so the trailing `SetChunkSize` packet was silently dropped --
+  client serializer ramped to 4096 chunk_size, server stayed at
+  128. Latent until session 155's bin sent a >128-byte AMF0
+  onCuePoint that overflowed the server's chunk parser into
+  garbage `NoPreviousChunkOnStream` errors. Fix: drain ALL
+  `OutboundResponse` packets in the batch before returning on the
+  matching event. The bin's smoke test fails fast without this
+  fix.
+* **`bindings/js/tests/helpers/hls-poll.ts`** -- new helper
+  module. `waitForLiveVariantPlaylist({ masterUrl, timeoutMs,
+  minExtinfCount, pollIntervalMs })` polls master for
+  `#EXT-X-STREAM-INF` + first variant URI, then polls the variant
+  for `>= minExtinfCount` `#EXTINF` entries, then resolves with
+  `{ masterUrl, variantUrl, variantBody, extinfCount }`. Pure
+  Node-side `fetch` + regex; no browser context.
+  `scte35RtmpPushBinPath()` returns the absolute path to the
+  built bin so the Playwright spec can spawn it via
+  `child_process.spawn`.
+* **`bindings/js/tests/e2e/dvr-player/markers.spec.ts`** -- two
+  changes inside the existing live-RTMP describe block:
+  * The existing `rtmpPush helper publishes a real RTMP feed the
+    relay accepts` test grew into
+    `rtmpPush helper publishes; dvr-player LIVE pill flips into
+    is-live state`. Adds the variant-pre-check, mounts the
+    dvr-player against the live HLS endpoint via a Playwright
+    `page.route` proxy that bypasses the relay's missing CORS
+    headers (the LL-HLS server doesn't emit
+    `Access-Control-Allow-Origin`; deployments add it at the
+    reverse proxy). Calls `goLive()` programmatically so
+    `currentTime` jumps to `seekable.end` and the LIVE pill
+    threshold flips. Asserts both `lvqr-dvr-live-edge-changed`
+    fires with `isAtLiveEdge: true` AND the `.live-badge` shadow
+    element carries the `is-live` class.
+  * New `scte35-rtmp-push injects onCuePoint; dvr-player renders
+    DATERANGE marker` test. Spawns the bin via
+    `child_process.spawn`, waits for variant + DATERANGE-with-
+    SCTE35-OUT, mounts the dvr-player, stubs `videoEl.seekable`
+    (the synthetic NAL doesn't decode in MSE), waits for
+    `lvqr-dvr-markers-changed` with at least one OUT marker,
+    asserts the shadow-DOM `.marker-layer` carries an
+    `[data-kind="out"][data-id="splice-3405691582"]` tick.
+  * Both gated on `LVQR_LIVE_RTMP_TESTS=1`; auto-skip when ffmpeg
+    is missing or the bin is missing. Both wrapped in
+    `test.setTimeout(180_000)` for CI variance headroom.
+* **`.github/workflows/mesh-e2e.yml`** -- ffmpeg install step
+  (`sudo apt-get update && sudo apt-get install -y ffmpeg`);
+  `cargo build` step extended to
+  `cargo build -p lvqr-cli -p lvqr-test-utils --bins`; Playwright
+  step gains `env: LVQR_LIVE_RTMP_TESTS: "1"`; path filters
+  extended to cover `vendor/rml_rtmp/**` +
+  `crates/lvqr-test-utils/**` + `bindings/js/tests/helpers/**`.
+  Workflow header comment updated to describe the new env gate.
+* **Docs**: `docs/dvr-scrub.md` gains a `Running the live-RTMP
+  marker test locally` section before `Limits + edge cases`. The
+  recipe documents the `cargo build -p lvqr-cli -p lvqr-test-utils
+  --bins` step + the `LVQR_LIVE_RTMP_TESTS=1 npx playwright test`
+  invocation.
+* **Root `README.md`** -- "Recently shipped" gains a session-155
+  bullet above the session-154 bullet.
+
+### Decisions intentionally rejected
+
+* **Convenience wrapper inside `rml_rtmp` for the SCTE-35 wire
+  shape.** rml_rtmp is a low-level RTMP crate; SCTE-35 is a
+  payload carriage convention. The bin (LVQR-side) builds the
+  AMF0 onCuePoint shape via a small helper in `lvqr-test-utils`,
+  not in the vendored fork. Keeps the vendored patch surface
+  minimal (~25 LOC + ~50 LOC test).
+* **ffmpeg-only video for the bin.** ffmpeg cannot natively emit
+  AMF0 onCuePoint Data messages -- the very reason this session
+  authorized the rml_rtmp client patch. Using ffmpeg would have
+  forced a different solution (chunk-level RTMP rebuild inside
+  the bin, or splicing AMF0 packets onto an ffmpeg child's TCP
+  output -- both higher risk).
+* **Real macroblock-decode-friendly synthetic H.264.** The relay
+  doesn't decode video; it just packages NALUs into mdat boxes
+  with frame_type sniffed from the FLV tag header. So the SPS /
+  PPS need to PARSE (so the bridge's `extract_resolution` succeeds
+  and the avcC box is emitted) but the slice macroblock data is
+  opaque. Lifted SPS / PPS verbatim from the workspace's
+  `h264-reader` test fixtures already pinned in
+  `crates/lvqr-ingest/src/remux/flv.rs::tests`.
+* **Adding CORS to the relay's HLS server.** The session 153
+  `crates/lvqr-hls/src/server.rs:7` comment notes "no CORS (the
+  deployment adds that at the reverse proxy)"; CORS is a
+  deployment concern, not a relay one. Fixed for the test only
+  via Playwright's `page.route` + `route.fetch` proxy pattern.
+
+### What is NOT touched
+
+* Cargo workspace, all 26 publishable Rust crates' source paths
+  (other than the additive helpers + bin on `lvqr-test-utils`
+  which is `publish = false`), all relay-side wire shapes (HLS
+  DATERANGE, DASH EventStream, splice_info_section passthrough).
+* `@lvqr/core` and `@lvqr/player` remain at 0.3.2;
+  `@lvqr/dvr-player` stays at 0.3.3 (test + tooling deltas only,
+  no production source change).
+* No CHANGELOG entry beyond the README "Recently shipped" block;
+  no version bump on the workspace; no `cargo publish`; no
+  `npm publish`.
+* The mesh Playwright project is unchanged. The dvr-player
+  project's existing 17 tests (mount 4 + interactions 11 + 2
+  routed-stub markers) are unchanged.
+
+### Verification status
+
+* `cargo test -p rml_rtmp --lib` -- **172 / 0 / 0** (was 170; +2
+  new client tests).
+* `cargo test -p lvqr-test-utils` -- **12 lib + 1 integration
+  smoke + 2 test_server + 1 doctest = 16 / 0 / 0**.
+* `cargo test -p lvqr-cli --test scte35_hls_dash_e2e` --
+  **3 / 0 / 0** (the helper extraction is byte-equivalent).
+* `cd bindings/js && npx playwright test --project=dvr-player` --
+  **17 passed + 2 skipped** (gated live tests skip on default
+  invocation).
+* `LVQR_LIVE_RTMP_TESTS=1 npx playwright test --project=dvr-player
+  markers.spec.ts -g "live RTMP publish"` -- **2 / 0** (live-pill
+  test 4.6 s; scte35-rtmp-push marker test 4.7 s).
+* `cd bindings/js && npx playwright test --list --project=dvr-player`
+  -- 19 tests total parse cleanly.
+* `cargo build -p lvqr-cli -p lvqr-test-utils --bins` -- clean
+  (the relay binary the Playwright webServer spawns plus the new
+  `target/debug/scte35-rtmp-push` bin).
+
+### Pending follow-ups (NOT in this session)
+
+* npm publish of `@lvqr/dvr-player@0.3.3` (and any companion
+  publish of @lvqr/core / @lvqr/player; they stayed at 0.3.2).
+  Release happens in a separate session.
+* Future v1.2 candidates: `engine="dash"` mode (Shaka Player);
+  server-side WEBVTT thumbnail spritesheet; mobile-touch-
+  optimised seek bar; native HLS Safari mode parity for the
+  marker layer.
+* Cross-browser Playwright matrix (Firefox + WebKit). Phase D
+  scope per the session 153 brief.
 
 ## Session 154 close (2026-04-25)
 

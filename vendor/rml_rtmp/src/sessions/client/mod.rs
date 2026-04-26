@@ -459,6 +459,47 @@ impl ClientSession {
         Ok(ClientSessionResult::OutboundResponse(packet))
     }
 
+    /// If publishing, this allows us to send arbitrary AMF0 Data messages on the publishing
+    /// stream. Unlike [`Self::publish_metadata`], which hard-codes `@setDataFrame` +
+    /// `onMetaData` and a `StreamMetadata`-shaped property object, this method emits the
+    /// supplied `Amf0Value` vector verbatim. Use cases include `onCuePoint` /
+    /// `onTextData` / `onFI` and other AMF0 data carriages that flash-era publishers adopted
+    /// for in-band signalling.
+    ///
+    /// The caller owns the wire shape: typically the first value is a `Utf8String` carrying
+    /// the method name (e.g. `"onCuePoint"`) and the second is an `Object` carrying the
+    /// payload.
+    ///
+    /// LVQR session 155 patch: symmetric with the session 152 server-side
+    /// `ServerSessionEvent::Amf0DataReceived` patch that surfaces non-`@setDataFrame` AMF0
+    /// Data on the receive side; this addition lets the client side emit them.
+    pub fn publish_amf0_data(
+        &mut self,
+        values: Vec<Amf0Value>,
+    ) -> Result<ClientSessionResult, ClientSessionError> {
+        match self.current_state {
+            ClientState::Publishing => (),
+            _ => {
+                return Err(ClientSessionError::SessionInInvalidState {
+                    current_state: self.current_state.clone(),
+                });
+            }
+        }
+
+        let active_stream_id = match self.active_stream_id {
+            Some(x) => x,
+            None => {
+                return Err(ClientSessionError::NoKnownActiveStreamIdWhenRequired);
+            }
+        };
+
+        let message = RtmpMessage::Amf0Data { values };
+        let payload = message.into_message_payload(self.get_epoch(), active_stream_id)?;
+        let packet = self.serializer.serialize(&payload, false, false)?;
+
+        Ok(ClientSessionResult::OutboundResponse(packet))
+    }
+
     /// If publishing, this allows us to send video data to the server on the publishing stream.
     pub fn publish_video_data(
         &mut self,

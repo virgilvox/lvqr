@@ -2,8 +2,10 @@ use bytes::Bytes;
 use std::net::TcpListener;
 
 pub mod flv;
+pub mod h264;
 pub mod http;
 pub mod rtmp;
+pub mod scte35;
 mod test_server;
 pub use test_server::{TestServer, TestServerConfig};
 

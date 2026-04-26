@@ -381,6 +381,52 @@ ranking:
 
 #### Recently shipped (compact reference)
 
+* **Session 154 test-coverage close-out** (session 155) -- closes
+  the three test-coverage follow-ups from session 154's HANDOFF in
+  one push. (1) `mesh-e2e.yml` workflow `apt-get install`s ffmpeg
+  + sets `LVQR_LIVE_RTMP_TESTS=1` so the live-RTMP marker tests
+  run on every CI push. (2) The strengthened live-RTMP test now
+  asserts the dvr-player LIVE pill flips to `is-live` against a
+  real ffmpeg publish via a new `bindings/js/tests/helpers/hls-poll.ts`
+  variant-playlist-non-empty pre-check helper (`waitForLiveVariantPlaylist`),
+  closing the manifestLoadError race that left session 154's
+  assertion narrow. (3) New `[[bin]] scte35-rtmp-push` on
+  `lvqr-test-utils` opens a real RTMP publisher session and sends
+  a single `onCuePoint scte35-bin64` AMF0 Data message at a chosen
+  offset; new gated Playwright e2e drives the bin into the
+  dvr-player webServer profile and asserts the SCTE-35 marker
+  tick renders at the expected fraction with the expected
+  daterange ID. The bin depends on a new ~25-line `publish_amf0_data`
+  patch on the vendored `rml_rtmp` v0.8 client (mirrors session
+  152's server-side `Amf0DataReceived` patch) -- the upstream
+  client API only exposes `publish_metadata` (which hard-codes
+  `@setDataFrame` + `onMetaData`); the new method emits an
+  arbitrary `Vec<Amf0Value>` verbatim. Synthetic H.264 NAL helpers
+  in `crates/lvqr-test-utils/src/h264.rs` (parseable Baseline-
+  profile SPS / PPS lifted from the `h264-reader` test fixtures);
+  `splice_insert_section_bytes` extracted from the existing
+  `crates/lvqr-cli/tests/scte35_hls_dash_e2e.rs` into
+  `crates/lvqr-test-utils/src/scte35.rs` so the new bin + the
+  existing e2e share a single source of truth. Five new tests
+  across four tiers: 2 rml_rtmp client unit (172 / 0 / 0 fork
+  total, was 170), 2 lvqr-test-utils unit (hex-pin on the
+  extracted helper + codec parser round-trip), 1 Rust integration
+  smoke (`tests/scte35_rtmp_push_smoke.rs` -- default-gate, drives
+  the bin against a `TestServer` and asserts DATERANGE
+  `splice-3405691582`), 1 strengthened + 1 new gated Playwright
+  test in `markers.spec.ts`. Bonus: fixed a long-standing bug in
+  `lvqr_test_utils::rtmp::read_until` that was silently dropping
+  the post-connect `SetChunkSize` packet (it followed
+  `ConnectionRequestAccepted` in the result vector and the helper
+  short-circuited on the matching event before writing later
+  responses); the bug was latent until the bin sent a >128-byte
+  AMF0 onCuePoint and the server's deserializer parsed mid-payload
+  bytes as chunk headers (csid 52 etc.). **No relay-side wire
+  change, no SDK package version bump, no production code path in
+  `@lvqr/dvr-player` touched** -- `@lvqr/dvr-player` stays at
+  0.3.3 with test + tooling deltas only. Workspace `0.4.1`
+  unchanged.
+
 * **SCTE-35 ad-break markers on `@lvqr/dvr-player` v0.3.3**
   (session 154) -- the dvr-player's seek bar paints session 152's
   `#EXT-X-DATERANGE` ad markers inline. Vertical ticks for

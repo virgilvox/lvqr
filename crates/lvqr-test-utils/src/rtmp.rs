@@ -117,6 +117,18 @@ pub async fn send_result(stream: &mut TcpStream, result: &ClientSessionResult) {
 ///
 /// The deadline is computed once at entry; the whole event wait
 /// budget is `timeout`, not a per-read timeout.
+///
+/// Session 155: ALL `OutboundResponse` packets in the result batch
+/// are written BEFORE the predicate returns -- previously this
+/// helper short-circuited on the first matching event and skipped
+/// later responses in the same batch, which silently dropped the
+/// post-connect `SetChunkSize` packet (it follows the
+/// `ConnectionRequestAccepted` event in the rml_rtmp client's
+/// result vector). The skipped `SetChunkSize` left the server's
+/// deserializer at the default 128-byte chunk size while the
+/// client's serializer ramped to 4096, breaking subsequent
+/// long-message sends (e.g. `publish_amf0_data` with a base64
+/// payload).
 pub async fn read_until<F>(stream: &mut TcpStream, session: &mut ClientSession, timeout: Duration, predicate: F)
 where
     F: Fn(&ClientSessionEvent) -> bool,
@@ -134,7 +146,8 @@ where
         let results = session
             .handle_input(&buf[..n])
             .expect("read_until: ClientSession::handle_input");
-        for r in results {
+        let mut event_matched = false;
+        for r in &results {
             match r {
                 ClientSessionResult::OutboundResponse(packet) => {
                     stream
@@ -142,9 +155,14 @@ where
                         .await
                         .expect("read_until: write outbound");
                 }
-                ClientSessionResult::RaisedEvent(ref event) if predicate(event) => return,
+                ClientSessionResult::RaisedEvent(event) if predicate(event) => {
+                    event_matched = true;
+                }
                 _ => {}
             }
+        }
+        if event_matched {
+            return;
         }
     }
 }

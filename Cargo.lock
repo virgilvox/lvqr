@@ -3560,12 +3560,15 @@ name = "lvqr-test-utils"
 version = "0.4.1"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
+ "clap",
  "lvqr-agent",
  "lvqr-archive",
  "lvqr-auth",
  "lvqr-cli",
  "lvqr-cluster",
+ "lvqr-codec",
  "lvqr-core",
  "lvqr-fragment",
  "lvqr-mesh",
@@ -3575,6 +3578,7 @@ dependencies = [
  "lvqr-wasm",
  "rand 0.8.5",
  "rcgen 0.13.2",
+ "rml_amf0",
  "rml_rtmp",
  "tempfile",
  "tokio",

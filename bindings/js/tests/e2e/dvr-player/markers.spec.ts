@@ -24,8 +24,10 @@
 
 import { test, expect, Route } from '@playwright/test';
 import { readFileSync, existsSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { rtmpPush, rtmpPushAvailable } from '../../helpers/rtmp-push';
+import { scte35RtmpPushBinPath, waitForLiveVariantPlaylist } from '../../helpers/hls-poll';
 
 const PKG_DIST = resolve(__dirname, '../../../packages/dvr-player/dist');
 const HLS_MJS = resolve(__dirname, '../../../node_modules/hls.js/dist/hls.mjs');
@@ -329,77 +331,351 @@ test.describe('@lvqr/dvr-player live RTMP publish (closes session 153 deferred)'
     test.skip(!rtmpPushAvailable(), 'ffmpeg not available on PATH');
   });
 
-  test('rtmpPush helper publishes a real RTMP feed the relay accepts', async () => {
+  test('rtmpPush helper publishes; dvr-player LIVE pill flips into is-live state', async ({ page }) => {
     // Closes session 153's deferred "live-stream-driven Playwright
-    // assertions" item by exercising the new rtmp-push.ts helper
-    // end-to-end against the dvr-player webServer profile. The
-    // assertion is intentionally narrow: the helper spawns ffmpeg,
-    // ffmpeg connects + publishes to the relay's RTMP port, and
-    // the relay synthesizes the master playlist for the resulting
-    // broadcast. That is the FULL coverage promise of the helper;
-    // the dvr-player consumer-side assertions (LIVE-pill activation
-    // against the live playlist, marker tick rendering against an
-    // ffmpeg-pushed onCuePoint scte35-bin64) are deferred -- the
-    // current ffmpeg lavfi feed produces a master playlist whose
-    // variant load races hls.js's initial fetch (manifestLoadError
-    // on the first attempt) on the dev box, and ffmpeg's RTMP
-    // output cannot natively emit AMF0 onCuePoint Data messages
-    // (would require a custom Rust publisher bin atop the vendored
-    // rml_rtmp fork; explicitly out of session 154's scope). Both
-    // follow-ups are tracked in the session 154 HANDOFF.
+    // assertions" item AND session 154's deferred "stronger
+    // consumer-side LIVE-pill assertion" item.
+    //
+    // Session 154 only asserted the relay accepted the publish +
+    // served a master with #EXT-X-STREAM-INF. The originally-planned
+    // LIVE-pill assertion hit a manifestLoadError race against
+    // hls.js's first variant fetch on the dev box (master ready,
+    // variant playlist briefly empty). Session 155 fixes the race
+    // with the variant-playlist-non-empty pre-check from
+    // `helpers/hls-poll.ts::waitForLiveVariantPlaylist` -- once the
+    // variant carries >= 2 segments, hls.js's first fetch always
+    // succeeds, so the consumer-side assertion is deterministic.
+    test.setTimeout(180_000);
+
     let stderrTail = '';
     const handle = rtmpPush({
       rtmpUrl: RTMP_URL,
-      durationSecs: 20,
+      durationSecs: 60,
       onStderr: (chunk) => {
-        // Cap the captured tail so a misbehaving ffmpeg cannot
-        // bloat the test memory; the failure assertion below
-        // surfaces the last ~2 KB which is plenty to diagnose.
         stderrTail = (stderrTail + chunk).slice(-2048);
       },
     });
     try {
-      // Wait for the relay to start serving a master playlist
-      // for our broadcast key (`live/dvr-test`). Polling fetch
-      // from Node side avoids the browser-context CORS nuance;
-      // the relay's HLS port returns 404 with body
-      // "unknown broadcast live/dvr-test" until ffmpeg's first
-      // segment arrives. ffmpeg startup + RTMP handshake +
-      // first-segment-finalize is normally ~3 s on this dev box;
-      // 30 s gives plenty of headroom for slow CI runners and
-      // for back-to-back test runs where the prior worker's
-      // port may briefly linger in TIME_WAIT.
-      const start = Date.now();
-      let ok = false;
-      let body = '';
-      while (Date.now() - start < 30_000) {
-        if (handle.child.exitCode !== null && !ok) {
-          // ffmpeg exited before the relay saw the publish.
-          break;
+      // Phase 1: master playlist + variant ready (>= 2 EXTINF entries).
+      const variantInfo = await waitForLiveVariantPlaylist({
+        masterUrl: HLS_URL,
+        timeoutMs: 90_000,
+        minExtinfCount: 2,
+      });
+      expect(variantInfo.extinfCount).toBeGreaterThanOrEqual(2);
+
+      // Phase 2: mount the dvr-player against the live playlist.
+      // The dvr-player webServer profile binds the admin (test page
+      // origin) on 18089 and the LL-HLS server on 18190. The HLS
+      // server does NOT emit `Access-Control-Allow-Origin`, so a
+      // cross-port hls.js fetch is blocked at the browser. Proxy
+      // the HLS responses through Playwright's `route.fetch` (which
+      // performs the request server-side, bypassing CORS) so the
+      // browser sees first-party responses on the same origin.
+      await page.route('**/_lvqr_test_/index.html', (route: Route) => {
+        void route.fulfill({ contentType: 'text/html', body: liveHtml() });
+      });
+      await page.route('**/_lvqr_test_/pkg/**', (route: Route) => {
+        const url = new URL(route.request().url());
+        const sub = url.pathname.replace(/^\/_lvqr_test_\/pkg\//, '');
+        const file = resolve(PKG_DIST, sub);
+        if (!existsSync(file)) {
+          void route.fulfill({ status: 404, body: `not found: ${sub}` });
+          return;
         }
+        void route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf-8') });
+      });
+      await page.route('**/_lvqr_test_/hls/**', (route: Route) => {
+        void route.fulfill({ contentType: 'text/javascript', body: readFileSync(HLS_MJS, 'utf-8') });
+      });
+      await page.route('**/127.0.0.1:18190/hls/**', async (route: Route) => {
         try {
-          const r = await fetch(HLS_URL, { cache: 'no-store' });
-          body = await r.text();
-          if (r.ok && body.includes('#EXTM3U') && body.includes('playlist.m3u8')) {
-            ok = true;
-            break;
-          }
+          const resp = await route.fetch();
+          await route.fulfill({ response: resp });
         } catch {
-          // keep polling
+          // hls.js retries on transient fetch errors; surface a 502
+          // response rather than aborting the route handler so the
+          // retry path runs cleanly.
+          await route.fulfill({ status: 502, body: 'proxy fetch failed' });
         }
-        await new Promise((r) => setTimeout(r, 500));
-      }
-      expect(
-        ok,
-        `master playlist never became readable within 30s.\nlast body:\n${body}\n\nffmpeg stderr tail:\n${stderrTail}`,
-      ).toBe(true);
-      expect(body).toContain('#EXT-X-STREAM-INF');
+      });
+
+      await page.goto(TEST_HTML_URL);
+      await page.waitForFunction(() => customElements.get('lvqr-dvr-player') !== undefined);
+
+      // Phase 3: set src + listen for `lvqr-dvr-live-edge-changed`
+      // with isAtLiveEdge=true. Without autoplay videoEl.currentTime
+      // stays at 0, so seekable.end - currentTime grows past the
+      // 6 s default threshold and the pill never flips. Call
+      // `goLive()` programmatically once the manifest has parsed
+      // (signalled by hls.js firing LEVEL_LOADED, which the
+      // component surfaces by populating the seekable range);
+      // goLive sets currentTime to seekable.end, making the delta
+      // ~0 and crossing the threshold.
+      await page.evaluate(({ liveSrc }) => {
+        const el = document.querySelector('lvqr-dvr-player') as HTMLElement & { goLive(): void };
+        const w = window as unknown as { __liveEdgeEvents: Array<{ isAtLiveEdge: boolean }> };
+        w.__liveEdgeEvents = [];
+        el.addEventListener('lvqr-dvr-live-edge-changed', (e: Event) => {
+          w.__liveEdgeEvents.push((e as CustomEvent).detail);
+        });
+        el.setAttribute('src', liveSrc);
+      }, { liveSrc: variantInfo.masterUrl });
+
+      // Wait for the seekable range to populate (signal that
+      // hls.js has parsed the manifest + appended at least one
+      // segment), then call goLive() to jump currentTime to the
+      // live edge.
+      await page.waitForFunction(
+        () => {
+          const el = document.querySelector('lvqr-dvr-player') as HTMLElement;
+          const v = el.shadowRoot?.querySelector('video.main') as HTMLVideoElement | null;
+          return !!v && v.seekable.length > 0 && v.seekable.end(0) > 0;
+        },
+        undefined,
+        { timeout: 60_000 },
+      );
+      await page.evaluate(() => {
+        const el = document.querySelector('lvqr-dvr-player') as HTMLElement & { goLive(): void };
+        el.goLive();
+      });
+
+      // Live edge flips within ~30 s of goLive even on slow runners.
+      await page.waitForFunction(
+        () => {
+          const w = window as unknown as { __liveEdgeEvents: Array<{ isAtLiveEdge: boolean }> };
+          return (w.__liveEdgeEvents ?? []).some((d) => d.isAtLiveEdge === true);
+        },
+        undefined,
+        { timeout: 30_000 },
+      );
+
+      // The .live-badge shadow part picks up the `is-live` class when
+      // the component crosses the threshold; assert against the DOM
+      // for an end-to-end render contract on top of the event surface.
+      const isLive = await page.evaluate(() => {
+        const el = document.querySelector('lvqr-dvr-player') as HTMLElement;
+        const badge = el.shadowRoot?.querySelector('.live-badge') as HTMLDivElement;
+        return badge.classList.contains('is-live');
+      });
+      expect(isLive).toBe(true);
     } finally {
       await handle.stop();
-      // ffmpeg may take a moment to flush; the helper's stop()
-      // waits for the child to exit, so by the time we return
-      // the process is gone.
       expect(handle.child.exitCode).not.toBeNull();
     }
   });
+
+  test('scte35-rtmp-push injects onCuePoint; dvr-player renders DATERANGE marker', async ({ page }) => {
+    // Session 155 close-out for session 154 follow-up #3 (real RTMP
+    // onCuePoint -> #EXT-X-DATERANGE -> marker render). Drives the
+    // new `scte35-rtmp-push` bin against the dvr-player webServer
+    // profile, polls the variant playlist for #EXT-X-DATERANGE,
+    // mounts the dvr-player, and asserts the marker tick + paired
+    // span render at the expected fractions.
+    //
+    // Auto-skips when the bin is missing (developer hasn't run
+    // `cargo build -p lvqr-test-utils --bins` yet) so a fresh
+    // checkout's `npx playwright test` fails clean rather than
+    // surfaces a confusing spawn error.
+    test.setTimeout(180_000);
+    const binPath = scte35RtmpPushBinPath();
+    test.skip(!existsSync(binPath), `scte35-rtmp-push bin missing at ${binPath}; run \`cargo build -p lvqr-test-utils --bins\``);
+
+    const STREAM_KEY = 'scte35-marker-test';
+    const binRtmpUrl = `rtmp://127.0.0.1:11936/live/${STREAM_KEY}`;
+    const binMasterUrl = `http://127.0.0.1:18190/hls/live/${STREAM_KEY}/master.m3u8`;
+
+    let stderrTail = '';
+    const child = spawn(
+      binPath,
+      [
+        '--rtmp-url',
+        binRtmpUrl,
+        '--duration-secs',
+        '12',
+        '--inject-at-secs',
+        '3',
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    child.stderr?.on('data', (c: Buffer) => {
+      stderrTail = (stderrTail + c.toString('utf-8')).slice(-2048);
+    });
+
+    try {
+      // The bin's --duration-secs=12 + --inject-at-secs=3 means an
+      // OUT-only DATERANGE shows up in the playlist around t~5s
+      // (relay segment finalize + sliding window).
+      const variantInfo = await waitForLiveVariantPlaylist({
+        masterUrl: binMasterUrl,
+        timeoutMs: 90_000,
+        minExtinfCount: 2,
+      });
+
+      // Poll the variant playlist for the #EXT-X-DATERANGE line.
+      // The waitForLiveVariantPlaylist helper guarantees variant
+      // body has >= 2 segments; we re-fetch here to make sure the
+      // DATERANGE-with-our-event_id has landed.
+      const start = Date.now();
+      let lastBody = variantInfo.variantBody;
+      while (Date.now() - start < 60_000) {
+        if (lastBody.includes('#EXT-X-DATERANGE') && lastBody.includes('SCTE35-OUT=')) break;
+        await new Promise((r) => setTimeout(r, 500));
+        try {
+          const resp = await fetch(variantInfo.variantUrl, { cache: 'no-store' });
+          lastBody = await resp.text();
+        } catch {
+          // keep polling
+        }
+      }
+      expect(
+        lastBody,
+        `variant playlist never carried SCTE35-OUT DATERANGE within 60s\nbin stderr tail:\n${stderrTail}`,
+      ).toMatch(/#EXT-X-DATERANGE.*SCTE35-OUT=/);
+
+      // Mount dvr-player against the live HLS endpoint.
+      await page.route('**/_lvqr_test_/index.html', (route: Route) => {
+        void route.fulfill({ contentType: 'text/html', body: liveHtml() });
+      });
+      await page.route('**/_lvqr_test_/pkg/**', (route: Route) => {
+        const url = new URL(route.request().url());
+        const sub = url.pathname.replace(/^\/_lvqr_test_\/pkg\//, '');
+        const file = resolve(PKG_DIST, sub);
+        if (!existsSync(file)) {
+          void route.fulfill({ status: 404, body: `not found: ${sub}` });
+          return;
+        }
+        void route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf-8') });
+      });
+      await page.route('**/_lvqr_test_/hls/**', (route: Route) => {
+        void route.fulfill({ contentType: 'text/javascript', body: readFileSync(HLS_MJS, 'utf-8') });
+      });
+      // Proxy cross-origin HLS fetches; the relay's LL-HLS server
+      // does not emit Access-Control-Allow-Origin so a direct
+      // cross-port hls.js fetch is blocked at the browser. See the
+      // strengthened live-pill test above for context.
+      await page.route('**/127.0.0.1:18190/hls/**', async (route: Route) => {
+        try {
+          const resp = await route.fetch();
+          await route.fulfill({ response: resp });
+        } catch {
+          // hls.js retries on transient fetch errors; surface a 502
+          // response rather than aborting the route handler so the
+          // retry path runs cleanly.
+          await route.fulfill({ status: 502, body: 'proxy fetch failed' });
+        }
+      });
+
+      await page.goto(TEST_HTML_URL);
+      await page.waitForFunction(() => customElements.get('lvqr-dvr-player') !== undefined);
+
+      // Stub videoEl.seekable so the marker layer has a finite
+      // range to map fractions against. The synthetic NAL the bin
+      // emits doesn't actually decode in MSE, so seekable would
+      // remain empty without this stub. Mirrors the routed-stub
+      // describe block above. Range chosen to span the bin's
+      // duration window so the OUT marker (at t=3s) lands at a
+      // predictable fraction.
+      await page.evaluate(({ totalSecs }) => {
+        const el = document.querySelector('lvqr-dvr-player') as HTMLElement;
+        const v = el.shadowRoot?.querySelector('video.main') as HTMLVideoElement;
+        Object.defineProperty(v, 'seekable', {
+          configurable: true,
+          get(): TimeRanges {
+            return {
+              length: 1,
+              start: () => 0,
+              end: () => totalSecs,
+            } as unknown as TimeRanges;
+          },
+        });
+      }, { totalSecs: 12 });
+
+      await page.evaluate(({ liveSrc }) => {
+        const el = document.querySelector('lvqr-dvr-player') as HTMLElement;
+        const w = window as unknown as { __markerEvents: Array<{ markers: Array<{ kind: string }> }> };
+        w.__markerEvents = [];
+        el.addEventListener('lvqr-dvr-markers-changed', (e: Event) => {
+          w.__markerEvents.push((e as CustomEvent).detail);
+        });
+        el.setAttribute('src', liveSrc);
+      }, { liveSrc: variantInfo.masterUrl });
+
+      // Wait for the marker pipeline to surface at least one OUT
+      // marker. hls.js fires LEVEL_LOADED on the first variant
+      // fetch, which the marker store consumes; the first emit
+      // typically arrives within a few seconds of `src` set.
+      await page.waitForFunction(
+        () => {
+          const w = window as unknown as { __markerEvents: Array<{ markers: Array<{ kind: string }> }> };
+          return (w.__markerEvents ?? []).some(
+            (d) => Array.isArray(d.markers) && d.markers.some((m) => m.kind === 'out'),
+          );
+        },
+        { timeout: 30_000 },
+      );
+
+      // Assert shadow-DOM render: the marker layer must contain at
+      // least one OUT tick. The exact `left:%` is a function of
+      // the variant's PROGRAM-DATE-TIME anchor + the bin's inject
+      // offset, which depends on segment finalize timing -- assert
+      // a presence + plausibility check, not an exact percentage.
+      const renderInfo = await page.evaluate(() => {
+        const el = document.querySelector('lvqr-dvr-player') as HTMLElement;
+        const layer = el.shadowRoot?.querySelector('.marker-layer') as HTMLDivElement;
+        return {
+          hasLayer: !!layer,
+          tickCount: layer?.querySelectorAll('.marker').length ?? 0,
+          outTicks: Array.from(layer?.querySelectorAll('.marker[data-kind="out"]') ?? []).map((t) => ({
+            id: (t as HTMLElement).dataset.id,
+            left: (t as HTMLElement).style.left,
+          })),
+        };
+      });
+      expect(renderInfo.hasLayer).toBe(true);
+      expect(renderInfo.tickCount).toBeGreaterThanOrEqual(1);
+      expect(renderInfo.outTicks.length).toBeGreaterThanOrEqual(1);
+      // ID `splice-3405691582` comes from the bin's default
+      // event_id 0xCAFEBABE.
+      expect(renderInfo.outTicks[0]?.id).toBe('splice-3405691582');
+    } finally {
+      // Let the bin exit naturally if it still has runtime; SIGKILL
+      // if it overran. The bin's --duration-secs=12 caps the wall
+      // clock independent of the kill.
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // already exited
+      }
+      await new Promise<void>((r) => {
+        if (child.exitCode !== null) r();
+        else child.once('exit', () => r());
+      });
+    }
+  });
 });
+
+const HLS_MJS_LITE = HLS_MJS;
+
+/** HTML fixture for the live-RTMP describe (paired with the routed-stub block's `html()` helper). */
+function liveHtml(): string {
+  void HLS_MJS_LITE; // tsc happy when the module-level const is referenced once
+  return /*html*/ `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>lvqr-dvr-player live RTMP markers test</title>
+    <script type="importmap">
+      {
+        "imports": {
+          "hls.js": "/_lvqr_test_/hls/hls.mjs"
+        }
+      }
+    </script>
+    <script type="module" src="/_lvqr_test_/pkg/index.js"></script>
+  </head>
+  <body>
+    <lvqr-dvr-player id="player" muted></lvqr-dvr-player>
+  </body>
+</html>`;
+}

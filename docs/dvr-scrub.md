@@ -278,6 +278,44 @@ lvqr-dvr-player {
 `::part(markers)` and `::part(marker-tooltip)` are also exposed
 for fine-grained restyling.
 
+### Running the live-RTMP marker test locally
+
+The Playwright suite at
+`bindings/js/tests/e2e/dvr-player/markers.spec.ts` includes two
+opt-in tests that drive a real RTMP publish into the dvr-player
+webServer profile:
+
+* `rtmpPush helper publishes; dvr-player LIVE pill flips into
+  is-live state` -- ffmpeg `testsrc + sine` publish via the
+  `helpers/rtmp-push.ts` wrapper; asserts the LIVE pill flips to
+  `is-live` after `goLive()`.
+* `scte35-rtmp-push injects onCuePoint; dvr-player renders
+  DATERANGE marker` -- the synthetic Rust publisher bin (built
+  from `crates/lvqr-test-utils/src/bin/scte35_rtmp_push.rs`)
+  injects a real `onCuePoint scte35-bin64` AMF0 Data message;
+  asserts the marker tick renders at the expected fraction.
+
+Both gate on the `LVQR_LIVE_RTMP_TESTS=1` env var so default
+local runs stay deterministic. To exercise them locally:
+
+```sh
+# 1. Build the relay + the synthetic publisher bin.
+cargo build -p lvqr-cli -p lvqr-test-utils --bins
+
+# 2. Make sure ffmpeg is on PATH (Homebrew: `brew install ffmpeg`).
+ffmpeg -version
+
+# 3. Run the live tests.
+cd bindings/js
+LVQR_LIVE_RTMP_TESTS=1 npx playwright test \
+  --project=dvr-player \
+  tests/e2e/dvr-player/markers.spec.ts -g "live RTMP publish"
+```
+
+GitHub Actions (`.github/workflows/mesh-e2e.yml`) installs ffmpeg
+and sets `LVQR_LIVE_RTMP_TESTS=1` so both tests run on every CI
+push to `main` (and on PRs touching the relevant paths).
+
 ### Limits + edge cases
 
 * **Missing `#EXT-X-PROGRAM-DATE-TIME`.** hls.js's

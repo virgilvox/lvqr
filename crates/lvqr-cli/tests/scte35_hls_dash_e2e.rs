@@ -25,6 +25,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use lvqr_fragment::{Fragment, FragmentFlags, FragmentMeta, SCTE35_TRACK};
 use lvqr_test_utils::http::{HttpGetOptions, HttpResponse, http_get_with};
+use lvqr_test_utils::scte35::splice_insert_section_bytes;
 use lvqr_test_utils::{TestServer, TestServerConfig};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -55,99 +56,12 @@ fn synthetic_video_fragment() -> Fragment {
     )
 }
 
-/// Build a real CRC-valid splice_insert splice_info_section with
-/// a known event_id, splice_time PTS, break_duration, and
-/// out_of_network=1 (so the egress emits SCTE35-OUT).
-fn build_splice_insert_section(event_id: u32, pts_90k: u64, duration_90k: u64) -> Vec<u8> {
-    use lvqr_codec::scte35::{CMD_SPLICE_INSERT, TABLE_ID};
-
-    // 14-byte prefix per SCTE 35-2024 section 8.1: table_id,
-    // section_length(2), protocol_version, encrypted/encryption_alg/pts_adj high
-    // bit, pts_adj_lower(4), cw_index, tier_high(1), tier_low|scl_high,
-    // scl_low, splice_command_type.
-    let mut prefix = vec![
-        TABLE_ID,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0xFF,
-        0xF0,
-        0x00,
-        CMD_SPLICE_INSERT,
-    ];
-
-    // splice_insert body fields per SCTE 35-2024 section 9.7.3:
-    // event_id(4) + flags(1: cancel=0, reserved=7) + flags(1: out=1, program=1,
-    // duration=1, immediate=0, reserved=4) + splice_time(5) + break_duration(5) +
-    // unique_program_id(2) + avail_num(1) + avails_expected(1).
-    let body = vec![
-        (event_id >> 24) as u8,
-        (event_id >> 16) as u8,
-        (event_id >> 8) as u8,
-        event_id as u8,
-        0x7F, // cancel=0, reserved=0x7F
-        0xEF, // out=1, program=1, duration=1, immediate=0, reserved=1111
-        0xFE | ((pts_90k >> 32) as u8 & 0x01),
-        (pts_90k >> 24) as u8,
-        (pts_90k >> 16) as u8,
-        (pts_90k >> 8) as u8,
-        pts_90k as u8,
-        0xFE | ((duration_90k >> 32) as u8 & 0x01),
-        (duration_90k >> 24) as u8,
-        (duration_90k >> 16) as u8,
-        (duration_90k >> 8) as u8,
-        duration_90k as u8,
-        0x00,
-        0x01, // unique_program_id
-        0x00, // avail_num
-        0x00, // avails_expected
-    ];
-
-    let total_minus_crc = prefix.len() + body.len() + 2;
-    let total = total_minus_crc + 4;
-    let section_length = total - 3;
-
-    prefix[1] = 0x30 | ((section_length >> 8) as u8 & 0x0F);
-    prefix[2] = section_length as u8;
-    prefix[11] = (prefix[11] & 0xF0) | ((body.len() >> 8) as u8 & 0x0F);
-    prefix[12] = body.len() as u8;
-
-    let mut section = Vec::with_capacity(total);
-    section.extend_from_slice(&prefix);
-    section.extend_from_slice(&body);
-    section.push(0x00); // descriptor_loop_length high
-    section.push(0x00); // descriptor_loop_length low
-
-    // CRC-32/MPEG-2 over [0..total-4].
-    let crc = {
-        let mut c: u32 = 0xFFFF_FFFF;
-        for &b in &section {
-            c ^= (b as u32) << 24;
-            for _ in 0..8 {
-                c = if c & 0x8000_0000 != 0 {
-                    (c << 1) ^ 0x04C1_1DB7
-                } else {
-                    c << 1
-                };
-            }
-        }
-        c
-    };
-    section.push((crc >> 24) as u8);
-    section.push((crc >> 16) as u8);
-    section.push((crc >> 8) as u8);
-    section.push(crc as u8);
-    section
-}
-
 fn synthetic_scte35_fragment(event_id: u32, pts_90k: u64, duration_90k: u64) -> Fragment {
-    let section = build_splice_insert_section(event_id, pts_90k, duration_90k);
+    // The splice_insert section builder lives in
+    // `lvqr-test-utils::scte35` since session 155 so the new
+    // `scte35-rtmp-push` bin and this e2e test share a single source
+    // of truth.
+    let section = splice_insert_section_bytes(event_id, pts_90k, duration_90k);
     Fragment::new(
         SCTE35_TRACK,
         event_id as u64,
