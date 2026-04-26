@@ -306,6 +306,7 @@ full model, ops recipes, and tuning knobs.
 | Rust | `cargo add lvqr-core` | 0.4.1 (crates.io) | Shared types, `EventBus`, admin client |
 | JavaScript | `npm i @lvqr/core` | 0.3.2 (npm) | MoQ-Lite subscriber over WebTransport, WebSocket fMP4 fallback, admin client (9/9 routes), `MeshPeer` WebRTC DataChannel relay with `pushFrame`, `onChildOpen`, `parentPeerId`, `forwardedFrameCount`, and `MeshConfig.capacity?: number` (per-peer relay capacity advertisement, session 144). Mesh data plane fully implemented as of session 144. |
 | JavaScript | `npm i @lvqr/player` | 0.3.2 (npm) | Drop-in `<lvqr-player>` web component with MSE fallback |
+| JavaScript | `npm i @lvqr/dvr-player` | 0.3.2 (npm); 0.3.3 on `main` | Drop-in `<lvqr-dvr-player>` HLS DVR scrub component (custom seek bar, LIVE pill, Go Live, hover thumbnails). Session 154 adds SCTE-35 ad-break marker rendering on the seek bar (paired OUT/IN spans, in-flight overlays, hover tooltip), `markers="visible|hidden"` attribute, `lvqr-dvr-markers-changed` + `lvqr-dvr-marker-crossed` events, and `getMarkers()` programmatic API. |
 | Python | `pip install lvqr` | 0.3.2 (PyPI) | Admin API client (9/9 routes), `MeshPeerStats.capacity` per-peer field (session 144), `bearer_token` kwarg, 16 dataclasses |
 
 See [`docs/sdk/javascript.md`](docs/sdk/javascript.md) for the JS
@@ -348,8 +349,12 @@ rotation, async reload pipeline) shipped in session 149.
 SCTE-35 ad-marker passthrough v1 shipped in session 152 (both
 SRT MPEG-TS PID 0x86 and RTMP onCuePoint scte35-bin64 ingest;
 HLS `#EXT-X-DATERANGE` + DASH Period-level `<EventStream>`
-egress). Two of the v1.1 ranked items are now closed; the
-remaining ranking:
+egress). Dedicated DVR scrub web UI shipped in session 153
+(`@lvqr/dvr-player`); SCTE-35 ad-break markers on the dvr-player
+seek bar shipped in session 154 (joined with the v1.1 close-out
+of marker rendering, originally session 153 anti-scope). All
+three of the v1.1 ranked items are now closed; the remaining
+ranking:
 
 1. ~~**Hot config reload.**~~ v1 / v2 / v3 shipped across
    sessions 147 + 148 + 149.
@@ -1231,12 +1236,14 @@ cargo bench -p lvqr-rtsp
 cargo bench -p lvqr-cmaf
 ```
 
-As of the latest close on `main`: 991 workspace tests passing,
+As of the latest close on `main`: 1111 workspace tests passing,
 0 failing, 3 ignored (the `moq_sink`, `sign_playback_url`, and
 `sign_live_url` doctests, all of which need a running-server
-fixture they do not bring up), plus a Playwright browser E2E
-(`bindings/js/tests/e2e/mesh/`) running via a dedicated
-`mesh-e2e.yml` CI workflow. Every close must be green on fmt +
+fixture they do not bring up), 60 dvr-player Vitest unit tests
+(14 attrs + 14 seekbar + 4 dispatch + 28 markers), plus 17/17
++ 1 opt-in skip on the dvr-player Playwright project and the
+two-peer / three-peer mesh Playwright project, all running
+via the dedicated `mesh-e2e.yml` CI workflow. Every close must be green on fmt +
 clippy + workspace test; session deltas are tracked in
 [`tracking/HANDOFF.md`](tracking/HANDOFF.md).
 
