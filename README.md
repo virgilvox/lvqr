@@ -395,15 +395,23 @@ ranking:
   Prometheus histogram. New `lvqr_slo_client_samples_total{transport}`
   counter for sample-rate visibility. Returns 204 on success, 400
   on validation failure, 503 when no tracker is wired (`AdminState`
-  built without `with_slo`). Rides the existing admin-token
-  middleware -- subscribe-token-gated alternative is a v1.2
-  follow-up. Closes the documented path forward for Phase A v1.1
-  #5 (MoQ egress latency SLO); the checkbox itself stays
+  built without `with_slo`), 401 when both auth paths reject.
+  **Dual-auth**: the route is mounted off the admin-only middleware
+  so Tier 5 client SDKs can push samples without holding an admin
+  token. The handler accepts either an `AuthContext::Admin` token
+  (operator scope) OR an `AuthContext::Subscribe` token validated
+  against the broadcast in the request body. The auth provider's
+  existing per-broadcast subscribe logic naturally enforces
+  "subscribers can only push samples for broadcasts they're
+  allowed to subscribe to", which prevents token-laundering /
+  sample pollution. Closes the documented path forward for Phase A
+  v1.1 #5 (MoQ egress latency SLO); the checkbox itself stays
   unchecked until a Tier 5 client SDK pushes samples by default,
-  but custom clients (browser / Rust / Python) can push today.
-  Seven new admin route tests cover happy path, no-tracker (503),
-  negative latency, oversized latency, empty broadcast, oversized
-  transport label, admin-auth check.
+  but custom clients (browser / Rust / Python) holding either
+  scope can push today. Ten new admin route tests cover happy
+  path (admin + subscribe), no-tracker (503), negative latency,
+  oversized latency, empty broadcast, oversized transport label,
+  no-token / wrong-token rejection.
 
 * **Hardware encoder backend v1 -- VideoToolbox on macOS**
   (session 156) -- new `lvqr_transcode::VideoToolboxTranscoderFactory`

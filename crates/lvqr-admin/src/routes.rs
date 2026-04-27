@@ -376,7 +376,6 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/api/v1/streams", get(list_streams))
         .route("/api/v1/mesh", get(get_mesh))
         .route("/api/v1/slo", get(get_slo))
-        .route("/api/v1/slo/client-sample", post(post_client_sample))
         .route("/api/v1/wasm-filter", get(get_wasm_filter))
         .route(
             "/api/v1/streamkeys",
@@ -403,10 +402,20 @@ pub fn build_router(state: AdminState) -> Router {
 
     let api_routes = api_routes.layer(middleware::from_fn_with_state(auth, auth_middleware));
 
+    // Session 156 follow-up: `/api/v1/slo/client-sample` lives off
+    // the admin-only middleware so subscribe-token-bearing clients
+    // (Tier 5 SDKs) can push samples without holding an admin
+    // token. The handler's own dual-auth check accepts EITHER an
+    // admin token or a subscribe token validated against the
+    // broadcast in the request body.
+    let api_dual_auth_routes: Router<AdminState> =
+        Router::new().route("/api/v1/slo/client-sample", post(post_client_sample));
+
     Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))
         .merge(api_routes)
+        .merge(api_dual_auth_routes)
         .with_state(state)
 }
 
@@ -512,14 +521,25 @@ const MAX_TRANSPORT_LEN: usize = 32;
 /// Returns 204 No Content on success, 400 on validation failure,
 /// 503 when no tracker is wired (the GET route returns an empty
 /// list silently in that case; POST cannot do the equivalent
-/// because the sample has nowhere to land).
+/// because the sample has nowhere to land), 401 when the
+/// dual-auth check rejects both admin AND subscribe paths.
 ///
-/// Auth: rides the existing admin-token middleware. v1 deployments
-/// configure the Tier 5 client SDK with an admin-scope token for
-/// telemetry pushback; subscribe-token-gated alternative is a
-/// future follow-up if a customer needs it.
+/// **Auth (dual)**: the handler is mounted OFF the admin-only
+/// middleware so subscribe-token-bearing clients (the natural
+/// future Tier 5 client SDK) can push samples without holding an
+/// admin scope. The bearer token is checked against
+/// [`AuthContext::Admin`] first; on deny the same token is
+/// re-checked against
+/// `AuthContext::Subscribe { broadcast: <body.broadcast> }`. Either
+/// path opens the sample. The auth provider's existing
+/// per-broadcast subscribe-token logic naturally enforces
+/// "subscribers can only push samples for broadcasts they're
+/// allowed to subscribe to", which prevents token-laundering /
+/// sample-pollution from a subscriber pushing samples against a
+/// broadcast it has no permission to read.
 async fn post_client_sample(
     State(state): State<AdminState>,
+    headers: axum::http::HeaderMap,
     Json(sample): Json<ClientLatencySample>,
 ) -> Result<StatusCode, AdminError> {
     let tracker = state
@@ -555,6 +575,36 @@ async fn post_client_sample(
         return Err(AdminError::BadRequest(format!(
             "latency_ms {latency_ms} exceeds {MAX_ACCEPTED_LATENCY_MS} ms cap (clock skew or bad sample)"
         )));
+    }
+
+    // Dual auth: try admin first (current operator-facing surface),
+    // then subscribe (Tier 5 client SDK path) against the broadcast
+    // in the body. The auth provider's existing per-broadcast
+    // subscribe-token logic enforces that subscribers can only push
+    // samples for broadcasts they're allowed to subscribe to.
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::to_string)
+        .unwrap_or_default();
+    let admin_decision = state.auth.check(&AuthContext::Admin { token: token.clone() });
+    let allowed = matches!(admin_decision, AuthDecision::Allow) || {
+        let sub_decision = state.auth.check(&AuthContext::Subscribe {
+            token: if token.is_empty() { None } else { Some(token.clone()) },
+            broadcast: broadcast.to_string(),
+        });
+        matches!(sub_decision, AuthDecision::Allow)
+    };
+    if !allowed {
+        metrics::counter!(
+            "lvqr_auth_failures_total",
+            "entry" => "slo_client_sample",
+        )
+        .increment(1);
+        return Err(AdminError::Unauthorized(
+            "admin or subscribe token required to push SLO samples".into(),
+        ));
     }
 
     tracker.record(broadcast, transport, latency_ms);
@@ -1098,9 +1148,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_sample_respects_admin_auth() {
+    async fn client_sample_rejects_request_with_no_token_when_auth_is_configured() {
+        // Session 156 follow-up: dual-auth contract. With static
+        // tokens configured (both admin + subscribe), an unauthed
+        // request must be rejected. Mirrors the auth gate's
+        // `AuthDecision::Deny` for both contexts.
         let auth: SharedAuth = Arc::new(StaticAuthProvider::new(StaticAuthConfig {
             admin_token: Some("secret".into()),
+            subscribe_token: Some("subtok".into()),
             ..Default::default()
         }));
         let tracker = crate::slo::LatencyTracker::new();
@@ -1118,6 +1173,109 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/slo/client-sample")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn client_sample_admin_token_is_accepted() {
+        let auth: SharedAuth = Arc::new(StaticAuthProvider::new(StaticAuthConfig {
+            admin_token: Some("secret".into()),
+            subscribe_token: Some("subtok".into()),
+            ..Default::default()
+        }));
+        let tracker = crate::slo::LatencyTracker::new();
+        let state = test_state(vec![]).with_auth(auth).with_slo(tracker.clone());
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "broadcast": "live/demo",
+            "transport": "moq",
+            "ingest_ts_ms": 0_u64,
+            "render_ts_ms": 100_u64,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/slo/client-sample")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(tracker.snapshot().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn client_sample_subscribe_token_is_accepted() {
+        // Session 156 follow-up: subscribers shouldn't need an
+        // admin token to push their own latency samples. The
+        // dual-auth path lets a subscriber-scoped token through
+        // when it's valid for the broadcast in the body.
+        let auth: SharedAuth = Arc::new(StaticAuthProvider::new(StaticAuthConfig {
+            admin_token: Some("admintok".into()),
+            subscribe_token: Some("subtok".into()),
+            ..Default::default()
+        }));
+        let tracker = crate::slo::LatencyTracker::new();
+        let state = test_state(vec![]).with_auth(auth).with_slo(tracker.clone());
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "broadcast": "live/demo",
+            "transport": "moq",
+            "ingest_ts_ms": 1_000_u64,
+            "render_ts_ms": 1_120_u64,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/slo/client-sample")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    // Subscribe-scope bearer; the static provider's
+                    // Subscribe match accepts it for any broadcast.
+                    .header(header::AUTHORIZATION, "Bearer subtok")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let snap = tracker.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].max_ms, 120);
+    }
+
+    #[tokio::test]
+    async fn client_sample_wrong_token_is_rejected() {
+        let auth: SharedAuth = Arc::new(StaticAuthProvider::new(StaticAuthConfig {
+            admin_token: Some("admintok".into()),
+            subscribe_token: Some("subtok".into()),
+            ..Default::default()
+        }));
+        let tracker = crate::slo::LatencyTracker::new();
+        let state = test_state(vec![]).with_auth(auth).with_slo(tracker);
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "broadcast": "live/demo",
+            "transport": "moq",
+            "ingest_ts_ms": 0_u64,
+            "render_ts_ms": 100_u64,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/slo/client-sample")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer not-the-token")
                     .body(Body::from(serde_json::to_vec(&body).unwrap()))
                     .unwrap(),
             )
