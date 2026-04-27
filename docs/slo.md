@@ -45,8 +45,21 @@ delta between two wall-clock timestamps:
      codec-mismatch, and AAC-to-Opus drops are excluded so the
      histogram only sees real RTP packets.
    Pure MoQ subscribers drinking directly from `OriginProducer`
-   stay out of scope for server-side measurement; their latency is
-   a Tier 5 client-SDK telemetry item.
+   stay out of scope for **server-side** measurement: there is no
+   server-side drain task to hook. Client-recorded samples are
+   accepted via [`POST /api/v1/slo/client-sample`](#client-pushed-samples-post-apiv1sloclient-sample)
+   below; the same `LatencyTracker` rings both server-stamped and
+   client-pushed entries on a shared
+   `lvqr_subscriber_glass_to_glass_ms` histogram, keyed by
+   `transport`. Coverage as of session 157:
+   * **HLS subscribers** push by default via the
+     `@lvqr/dvr-player` web component's built-in PDT-anchored
+     sampler.
+   * **Pure-MoQ subscribers** still cannot push: the session 157
+     audit confirmed the MoQ wire has no per-frame wall-clock
+     anchor a subscriber could lift. A sidecar
+     `<broadcast>/0.timing` MoQ track is the v1.2 close-out plan;
+     see [`tracking/SESSION_157_BRIEFING.md`](../tracking/SESSION_157_BRIEFING.md).
 
 The histogram labels are:
 
@@ -58,10 +71,19 @@ The histogram labels are:
 
 ### What it does NOT measure
 
-* **Client render latency**. Browser playback frame-display time is
-  a client SDK signal; pair these metrics with
-  `@lvqr/player` browser telemetry (Tier 5) for a full
-  glass-to-glass picture.
+* **Client render latency** (server-stamped samples only). The
+  server-stamped half of the histogram measures
+  `egress_emit_ms - ingest_time_ms` -- network from publisher to
+  egress + server-side processing, but not the subscriber's
+  network + decode + render contribution. The session 156
+  follow-up shipped a complementary signal: client-pushed samples
+  via [`POST /api/v1/slo/client-sample`](#client-pushed-samples-post-apiv1sloclient-sample).
+  When a client (e.g. `@lvqr/dvr-player`) records and pushes
+  `render_ts_ms - ingest_ts_ms`, the same histogram receives
+  end-to-end glass-to-glass values keyed on the same
+  `(broadcast, transport)` label pair. Operators reading the
+  Grafana dashboard see both halves merged into the same
+  percentile panels.
 * **Ingest network RTT**. The publisher's RTT to the server is not
   subtracted from the ingest stamp; a very slow uplink inflates
   every downstream sample.
@@ -127,6 +149,131 @@ histogram_quantile(
 The Grafana dashboard under
 [`deploy/grafana/dashboards/lvqr-slo.json`](../deploy/grafana/dashboards/lvqr-slo.json)
 panels p50 / p95 / p99 + the raw sample rate.
+
+### Client-pushed samples (`POST /api/v1/slo/client-sample`)
+
+Client SDKs that compute their own glass-to-glass latency on
+received frames push samples to this route; the server records
+each into the same `LatencyTracker` ring buffer that powers
+[`/api/v1/slo`](#apiv1slo-admin-route) and the
+`lvqr_subscriber_glass_to_glass_ms` histogram. Shipped in
+the session 156 follow-up; closes the documented path forward
+for transports the server cannot measure directly (LL-HLS / DASH
+/ WS / WHEP egress is server-stamped natively, so this route is
+the path for HLS subscriber-side render latency, MoQ once the
+v1.2 sidecar-track lands, or any other future transport).
+
+Request body (JSON):
+
+```json
+{
+  "broadcast": "live/cam1",
+  "transport": "hls",
+  "ingest_ts_ms": 1714066800000,
+  "render_ts_ms": 1714066800120
+}
+```
+
+* `broadcast` -- non-empty, <= 256 chars. Matches the broadcast
+  key used elsewhere in the admin surface.
+* `transport` -- non-empty, <= 32 chars. Free-form string label;
+  the recorder does not whitelist values, so new transports slot
+  in without a server-side change. Use `"hls"`, `"dash"`,
+  `"moq"`, `"whep"`, `"ws"` to merge with server-stamped samples
+  on the same Grafana panels.
+* `ingest_ts_ms` -- wall-clock UNIX-ms timestamp anchored on the
+  publisher's frame. Recovery is transport-specific. HLS
+  subscribers lift it from `#EXT-X-PROGRAM-DATE-TIME` via
+  `HTMLMediaElement.getStartDate() + currentTime` (see the
+  reference client at
+  [`bindings/js/packages/dvr-player/src/slo-sampler.ts`](../bindings/js/packages/dvr-player/src/slo-sampler.ts)).
+  MoQ subscribers cannot lift this from the wire today; v1.2
+  sidecar-track plan in
+  [`tracking/SESSION_157_BRIEFING.md`](../tracking/SESSION_157_BRIEFING.md).
+* `render_ts_ms` -- wall-clock UNIX-ms timestamp the client
+  recorded at frame render (typically `Date.now()` on the next
+  animation frame after the video element advanced past the
+  frame).
+
+Validation (server-side):
+
+* `render_ts_ms >= ingest_ts_ms` (negative latency is rejected
+  as client clock skew).
+* `render_ts_ms - ingest_ts_ms <= 300_000 ms` (5 minute cap;
+  beyond is almost certainly clock skew between publisher and
+  subscriber, not real latency, and would corrupt the
+  percentile histogram).
+* Both `broadcast` and `transport` non-empty within their length
+  caps.
+
+Response codes:
+
+| Code | Meaning |
+|---|---|
+| 204 No Content | Recorded into the tracker. |
+| 400 Bad Request | Validation failed (see body for which rule). |
+| 401 Unauthorized | Bearer token rejected by both auth paths (admin and subscribe). |
+| 503 Service Unavailable | `LatencyTracker` not configured on this server (operator built `AdminState` without `with_slo`). |
+
+#### Authentication: dual
+
+The route is mounted off the admin-only middleware so subscribers
+can push samples for the broadcasts they're already authorized to
+read, without needing to hold an admin token. The bearer token
+on the `Authorization: Bearer <token>` header is checked against
+two scopes in order:
+
+1. `AuthContext::Admin { token }` -- operator scope. If the
+   token is a valid admin token, the sample is accepted.
+2. `AuthContext::Subscribe { token, broadcast: <body.broadcast> }`
+   -- subscriber scope. If the token is a valid subscribe token
+   for the broadcast in the request body, the sample is accepted.
+
+The configured `AuthProvider`'s existing per-broadcast subscribe
+logic naturally enforces "subscribers can only push samples for
+broadcasts they're allowed to subscribe to," which prevents
+token-laundering / sample-pollution from a subscriber pushing
+samples against a broadcast it has no permission to read.
+
+#### Reference client: `@lvqr/dvr-player`
+
+The dvr-player web component ships with a built-in opt-in SLO
+sampler. Three attributes:
+
+```html
+<lvqr-dvr-player
+  src="https://relay.example.com:8080/hls/live/cam1/master.m3u8"
+  token="<subscribe_token>"
+  slo-sampling="enabled"
+  slo-endpoint="https://relay.example.com:8080/api/v1/slo/client-sample"
+  slo-sample-interval-secs="5">
+</lvqr-dvr-player>
+```
+
+The sampler computes `latency_ms = Date.now() -
+(videoEl.getStartDate() + videoEl.currentTime * 1000)` every
+`slo-sample-interval-secs` (default 5 s) and POSTs to the
+configured endpoint. Failures are silently dropped so SLO
+sampling never disrupts playback. The component's existing
+`token` attribute rides the dual-auth subscribe-token path.
+
+#### Sample-rate counter
+
+Each accepted sample increments
+`lvqr_slo_client_samples_total{transport}` -- a Prometheus
+counter scoped by transport label. Use it to confirm that a
+deployed dvr-player fleet is actually pushing:
+
+```promql
+sum by (transport) (
+  rate(lvqr_slo_client_samples_total[5m])
+)
+```
+
+A non-zero rate on `transport="hls"` confirms the dvr-player
+sampler fleet is healthy; zero (with a known-good fleet) points
+at a network or auth misconfiguration on the relay's
+client-sample route.
 
 ## Alert rule pack
 
@@ -246,23 +393,39 @@ histogram_quantile(
 * **LL-HLS (107 A) + MPEG-DASH (109 A) + WS (110 A) + WHEP (110 B)
   egress instrumentation is live**. The fifth egress surface --
   pure MoQ subscribers drinking directly from `OriginProducer` --
-  has no server-side drain task to hook, so its latency is a
-  Tier 5 client-SDK telemetry item rather than a server-side
-  metric. The alert pack + dashboard label-match generically on
-  `transport`, so adding `transport="moq"` samples later (via a
-  client-SDK push endpoint, for example) lights up the existing
-  panels automatically. The 110 scoping decision explicitly
-  rejected the alternative of prefixing every MoQ frame payload
-  with an 8-byte `ingest_time_ms` header, because `moq_lite` 0.15
-  frames are bare `Bytes` with no extension slot and a payload
-  prefix would break every foreign MoQ client that decodes
-  frames as raw CMAF bytes.
+  has no server-side drain task to hook. The 110 / v1.1-B scoping
+  decision explicitly rejected the alternative of prefixing every
+  MoQ frame payload with an 8-byte `ingest_time_ms` header,
+  because `moq_lite` 0.15 frames are bare `Bytes` with no
+  extension slot and a payload prefix would break every foreign
+  MoQ client that decodes frames as raw CMAF bytes. The
+  documented path forward shipped in the session 156 follow-up
+  ([`POST /api/v1/slo/client-sample`](#client-pushed-samples-post-apiv1sloclient-sample)
+  above): client-recorded samples merge into the same histogram
+  via a generic transport label. HLS subscribers can already push
+  by default through the `@lvqr/dvr-player` web component.
+  **Pure-MoQ subscribers cannot push yet**: the session 157 audit
+  confirmed the wire carries no per-frame wall-clock anchor a
+  pure-MoQ client could lift -- `lvqr_fragment::MoqTrackSink::push`
+  writes only the fMP4 payload bytes; the inverse `MoqGroupStream`
+  emits zero `ingest_time_ms` by documented contract. The v1.2
+  close-out plan is a sibling `<broadcast>/0.timing` MoQ track
+  emitting `(group_id, ingest_time_ms)` anchors per keyframe;
+  additive (foreign clients ignore the unknown track name), so
+  the 110 / v1.1-B in-band rejection stays untouched. Sketch in
+  [`tracking/SESSION_157_BRIEFING.md`](../tracking/SESSION_157_BRIEFING.md).
 * **No time-windowed retention on the admin snapshot**. The ring
   buffer is size-bounded (1024 samples per key); a quiet broadcast
   keeps stale samples until new traffic arrives. Operators who need
   time-aligned views read Prometheus directly.
-* **Server-side measurement only**. True glass-to-glass requires
-  browser SDK telemetry (Tier 5).
+* **Server-side measurement is half the picture; client-pushed is
+  the other half**. The histogram now ingests both halves on
+  the same percentile panels: server-stamped samples
+  (`ingest_time_ms -> egress_emit_ms`) and client-pushed samples
+  (`ingest_ts_ms -> render_ts_ms`) merge under a shared
+  `(broadcast, transport)` label pair. The HLS half is live as
+  of session 156 follow-up via the `@lvqr/dvr-player` built-in
+  sampler; pure-MoQ remains open as v1.2 per the bullet above.
 * **No admission control**. Operators react to alerts; the server
   does not refuse subscribers preemptively. "Refuse subscribers that
   would blow the budget" is research scope, not v1.
