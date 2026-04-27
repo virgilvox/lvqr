@@ -372,14 +372,38 @@ ranking:
    VAAPI, QSV) stay deferred to v1.2. See
    [`crates/lvqr-transcode/src/videotoolbox.rs`](crates/lvqr-transcode/src/videotoolbox.rs)
    and the operator quickstart below.
-5. **MoQ egress latency SLO.** Server-side measurement would
+5. **MoQ egress latency SLO.** ~~Server-side measurement would
    require a MoQ wire change that was explicitly rejected in
    the v1.1-B scoping call (keeps foreign MoQ clients
    compatible). Likely path forward: Tier 5 client SDK pushes
    sampled render-side timestamps to a future
-   `POST /api/v1/slo/client-sample` endpoint.
+   `POST /api/v1/slo/client-sample` endpoint.~~ Server side
+   shipped in session 156 follow-up; awaiting Tier 5 client SDK
+   to push samples by default. See Phase A v1.1 row below.
 
 #### Recently shipped (compact reference)
+
+* **MoQ egress latency SLO server-side endpoint** (session 156
+  follow-up) -- new `POST /api/v1/slo/client-sample` route on
+  `lvqr-admin` accepting JSON
+  `{broadcast, transport, ingest_ts_ms, render_ts_ms}` from any
+  subscriber. Validates the inputs (non-empty broadcast +
+  transport, render >= ingest, latency <= 5 min cap to filter
+  clock skew), computes `latency_ms = render_ts_ms - ingest_ts_ms`,
+  and feeds the existing `LatencyTracker` already powering
+  `GET /api/v1/slo` + the `lvqr_subscriber_glass_to_glass_ms`
+  Prometheus histogram. New `lvqr_slo_client_samples_total{transport}`
+  counter for sample-rate visibility. Returns 204 on success, 400
+  on validation failure, 503 when no tracker is wired (`AdminState`
+  built without `with_slo`). Rides the existing admin-token
+  middleware -- subscribe-token-gated alternative is a v1.2
+  follow-up. Closes the documented path forward for Phase A v1.1
+  #5 (MoQ egress latency SLO); the checkbox itself stays
+  unchecked until a Tier 5 client SDK pushes samples by default,
+  but custom clients (browser / Rust / Python) can push today.
+  Seven new admin route tests cover happy path, no-tracker (503),
+  negative latency, oversized latency, empty broadcast, oversized
+  transport label, admin-auth check.
 
 * **Hardware encoder backend v1 -- VideoToolbox on macOS**
   (session 156) -- new `lvqr_transcode::VideoToolboxTranscoderFactory`
@@ -869,9 +893,18 @@ test.
 - [ ] **MoQ egress latency SLO.** Server-side measurement would
   require a MoQ wire change that was explicitly rejected in the
   v1.1-B scoping call (keeps foreign MoQ clients compatible).
-  Likely path forward: Tier 5 client SDK pushes back sampled
+  ~~Likely path forward: Tier 5 client SDK pushes back sampled
   render-side timestamps to a future
-  `POST /api/v1/slo/client-sample` endpoint.
+  `POST /api/v1/slo/client-sample` endpoint.~~ Server side
+  complete (session 156 follow-up): `POST /api/v1/slo/client-sample`
+  ships in `lvqr-admin` accepting JSON
+  `{broadcast, transport, ingest_ts_ms, render_ts_ms}` from any
+  client, records into the existing `LatencyTracker`, and
+  surfaces on `GET /api/v1/slo` + the
+  `lvqr_subscriber_glass_to_glass_ms` Prometheus histogram.
+  Pending: a Tier 5 client SDK that pushes samples by default
+  (custom clients can push today). Checkbox stays unchecked
+  until that flow is real in the wild.
 
 ### Auth + ops polish
 - [x] ~~**Webhook auth provider.**~~ Shipped in session 135.

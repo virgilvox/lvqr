@@ -344,6 +344,15 @@ pub enum AdminError {
     Unauthorized(String),
     NotFound(String),
     Internal(String),
+    /// Session 156 follow-up: 400 for client-supplied JSON whose
+    /// shape parsed but whose values fail server-side validation
+    /// (negative latency, oversized strings, bogus transport label).
+    BadRequest(String),
+    /// Session 156 follow-up: 503 for routes that depend on a
+    /// runtime handle the operator did not wire (e.g.
+    /// `POST /api/v1/slo/client-sample` when the SLO tracker was
+    /// not installed via `AdminState::with_slo`).
+    Unavailable(String),
 }
 
 impl IntoResponse for AdminError {
@@ -352,6 +361,8 @@ impl IntoResponse for AdminError {
             AdminError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
             AdminError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             AdminError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+            AdminError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            AdminError::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
         };
         (status, Json(json!({ "error": msg }))).into_response()
     }
@@ -365,6 +376,7 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/api/v1/streams", get(list_streams))
         .route("/api/v1/mesh", get(get_mesh))
         .route("/api/v1/slo", get(get_slo))
+        .route("/api/v1/slo/client-sample", post(post_client_sample))
         .route("/api/v1/wasm-filter", get(get_wasm_filter))
         .route(
             "/api/v1/streamkeys",
@@ -441,6 +453,117 @@ async fn get_slo(State(state): State<AdminState>) -> Result<Json<serde_json::Val
         None => Vec::new(),
     };
     Ok(Json(json!({ "broadcasts": broadcasts })))
+}
+
+/// JSON body for [`post_client_sample`]. Tier 5 client SDK callers
+/// (browser / Rust / Python subscribers) record their own
+/// glass-to-glass latency on every received frame and POST a
+/// summary sample here so the relay's per-(broadcast, transport)
+/// tracker can include MoQ / WHEP / etc. egress in its SLO
+/// snapshot.
+///
+/// Session 156 follow-up: the v1.1-B scoping call rejected a MoQ
+/// wire-format change that would let the server measure pure-MoQ
+/// subscriber latency directly (would break foreign MoQ clients).
+/// This endpoint is the documented path forward: clients push back
+/// sampled timestamps, the server records them into the same
+/// [`crate::slo::LatencyTracker`] surface that already powers the
+/// existing `lvqr_subscriber_glass_to_glass_ms` Prometheus
+/// histogram.
+#[derive(Debug, Deserialize)]
+struct ClientLatencySample {
+    /// Source broadcast name (e.g. `"live/demo"`).
+    broadcast: String,
+    /// Egress surface: `"moq"`, `"whep"`, `"hls"`, `"dash"`, `"ws"`.
+    /// Free-form to keep the contract additive for future
+    /// transports; the tracker stores the label verbatim.
+    transport: String,
+    /// Wall-clock UNIX-ms timestamp the publisher stamped on the
+    /// frame at ingest. The `lvqr_fragment::Fragment` already
+    /// carries this via `Fragment::ingest_time_ms`; clients lift it
+    /// from the frame's per-track metadata when they get one.
+    ingest_ts_ms: u64,
+    /// Wall-clock UNIX-ms timestamp the client recorded on render
+    /// (the moment the frame's pixels reached the consumer's
+    /// pipeline -- usually `videoEl.currentTime` advancing past the
+    /// frame, or the equivalent on a non-browser client).
+    render_ts_ms: u64,
+}
+
+/// Upper bound on the latency value the tracker will accept (5 min).
+/// Anything beyond this is almost certainly clock skew between
+/// publisher + subscriber, not real glass-to-glass latency, and
+/// would corrupt the percentile histogram. Reject with 400 so the
+/// caller can fix their clock-sync setup.
+const MAX_ACCEPTED_LATENCY_MS: u64 = 300_000;
+
+/// Cap on the broadcast-name string length. Matches LVQR's existing
+/// broadcast-key constraints throughout the workspace.
+const MAX_BROADCAST_LEN: usize = 256;
+
+/// Cap on the transport-label length. Real labels are <=8 chars
+/// (`moq`, `whep`, `hls`, `dash`, `ws`); 32 is generous headroom for
+/// future qualifiers (e.g. `moq-v2`).
+const MAX_TRANSPORT_LEN: usize = 32;
+
+/// `POST /api/v1/slo/client-sample` handler. Validates the JSON
+/// body, computes `latency_ms = render_ts_ms - ingest_ts_ms`, and
+/// records into the configured [`crate::slo::LatencyTracker`].
+/// Returns 204 No Content on success, 400 on validation failure,
+/// 503 when no tracker is wired (the GET route returns an empty
+/// list silently in that case; POST cannot do the equivalent
+/// because the sample has nowhere to land).
+///
+/// Auth: rides the existing admin-token middleware. v1 deployments
+/// configure the Tier 5 client SDK with an admin-scope token for
+/// telemetry pushback; subscribe-token-gated alternative is a
+/// future follow-up if a customer needs it.
+async fn post_client_sample(
+    State(state): State<AdminState>,
+    Json(sample): Json<ClientLatencySample>,
+) -> Result<StatusCode, AdminError> {
+    let tracker = state
+        .slo
+        .as_ref()
+        .ok_or_else(|| AdminError::Unavailable("SLO tracker not configured on this server".into()))?;
+
+    let broadcast = sample.broadcast.trim();
+    if broadcast.is_empty() {
+        return Err(AdminError::BadRequest("broadcast must be non-empty".into()));
+    }
+    if broadcast.len() > MAX_BROADCAST_LEN {
+        return Err(AdminError::BadRequest(format!(
+            "broadcast exceeds max length ({MAX_BROADCAST_LEN} chars)"
+        )));
+    }
+    let transport = sample.transport.trim();
+    if transport.is_empty() {
+        return Err(AdminError::BadRequest("transport must be non-empty".into()));
+    }
+    if transport.len() > MAX_TRANSPORT_LEN {
+        return Err(AdminError::BadRequest(format!(
+            "transport exceeds max length ({MAX_TRANSPORT_LEN} chars)"
+        )));
+    }
+    if sample.render_ts_ms < sample.ingest_ts_ms {
+        return Err(AdminError::BadRequest(
+            "render_ts_ms must be >= ingest_ts_ms (client clock skew?)".into(),
+        ));
+    }
+    let latency_ms = sample.render_ts_ms - sample.ingest_ts_ms;
+    if latency_ms > MAX_ACCEPTED_LATENCY_MS {
+        return Err(AdminError::BadRequest(format!(
+            "latency_ms {latency_ms} exceeds {MAX_ACCEPTED_LATENCY_MS} ms cap (clock skew or bad sample)"
+        )));
+    }
+
+    tracker.record(broadcast, transport, latency_ms);
+    metrics::counter!(
+        "lvqr_slo_client_samples_total",
+        "transport" => transport.to_string(),
+    )
+    .increment(1);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /api/v1/wasm-filter` handler. Returns the chain length +
@@ -813,6 +936,194 @@ mod tests {
         assert_eq!(first["total_observed"], 50);
         assert!(first["p50_ms"].as_u64().unwrap() > 0);
         assert!(first["max_ms"].as_u64().unwrap() >= first["p99_ms"].as_u64().unwrap());
+    }
+
+    #[tokio::test]
+    async fn client_sample_records_into_tracker_and_returns_204() {
+        let tracker = crate::slo::LatencyTracker::new();
+        let state = test_state(vec![]).with_slo(tracker.clone());
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "broadcast": "live/demo",
+            "transport": "moq",
+            "ingest_ts_ms": 1_714_066_800_000_u64,
+            "render_ts_ms": 1_714_066_800_120_u64,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/slo/client-sample")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let snap = tracker.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].broadcast, "live/demo");
+        assert_eq!(snap[0].transport, "moq");
+        assert_eq!(snap[0].sample_count, 1);
+        assert_eq!(snap[0].max_ms, 120);
+    }
+
+    #[tokio::test]
+    async fn client_sample_returns_503_without_tracker() {
+        let state = test_state(vec![]);
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "broadcast": "live/demo",
+            "transport": "moq",
+            "ingest_ts_ms": 0_u64,
+            "render_ts_ms": 100_u64,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/slo/client-sample")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn client_sample_rejects_negative_latency_400() {
+        let tracker = crate::slo::LatencyTracker::new();
+        let state = test_state(vec![]).with_slo(tracker);
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "broadcast": "live/demo",
+            "transport": "moq",
+            "ingest_ts_ms": 200_u64,
+            "render_ts_ms": 100_u64,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/slo/client-sample")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn client_sample_rejects_oversized_latency_400() {
+        let tracker = crate::slo::LatencyTracker::new();
+        let state = test_state(vec![]).with_slo(tracker);
+        let app = build_router(state);
+        // 10 minutes apart -- well past the 5-minute clock-skew cap.
+        let body = serde_json::json!({
+            "broadcast": "live/demo",
+            "transport": "moq",
+            "ingest_ts_ms": 0_u64,
+            "render_ts_ms": 600_000_u64,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/slo/client-sample")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn client_sample_rejects_empty_broadcast_400() {
+        let tracker = crate::slo::LatencyTracker::new();
+        let state = test_state(vec![]).with_slo(tracker);
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "broadcast": "",
+            "transport": "moq",
+            "ingest_ts_ms": 0_u64,
+            "render_ts_ms": 100_u64,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/slo/client-sample")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn client_sample_rejects_oversized_transport_label_400() {
+        let tracker = crate::slo::LatencyTracker::new();
+        let state = test_state(vec![]).with_slo(tracker);
+        let app = build_router(state);
+        // > 32 chars
+        let big_label: String = "a".repeat(64);
+        let body = serde_json::json!({
+            "broadcast": "live/demo",
+            "transport": big_label,
+            "ingest_ts_ms": 0_u64,
+            "render_ts_ms": 100_u64,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/slo/client-sample")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn client_sample_respects_admin_auth() {
+        let auth: SharedAuth = Arc::new(StaticAuthProvider::new(StaticAuthConfig {
+            admin_token: Some("secret".into()),
+            ..Default::default()
+        }));
+        let tracker = crate::slo::LatencyTracker::new();
+        let state = test_state(vec![]).with_auth(auth).with_slo(tracker);
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "broadcast": "live/demo",
+            "transport": "moq",
+            "ingest_ts_ms": 0_u64,
+            "render_ts_ms": 100_u64,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/slo/client-sample")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
