@@ -383,6 +383,31 @@ ranking:
 
 #### Recently shipped (compact reference)
 
+* **`@lvqr/dvr-player` SLO sampler** (session 156 follow-up) --
+  the dvr-player web component now ships with opt-in client-side
+  glass-to-glass latency sampling. Set `slo-sampling="enabled"` +
+  `slo-endpoint="<URL>"` (and the existing `token` attribute for
+  bearer auth) and the component pushes one sample every 5 s
+  (configurable via `slo-sample-interval-secs`) computed as
+  `render_ms - (videoEl.getStartDate() + currentTime * 1000)` --
+  HLS-spec PDT-anchored client-render latency, the half of the
+  glass-to-glass measurement the relay's server-side stamping
+  cannot see (network + buffer + decode latency). Pushes via
+  `fetch()` to the new `POST /api/v1/slo/client-sample` route;
+  the bearer token rides the dual-auth path so a
+  subscribe-token-bearing playback session pushes legitimately.
+  Best-effort: any failure is silently dropped to keep playback
+  uninterrupted. New `bindings/js/packages/dvr-player/src/slo-sampler.ts`
+  (pure helpers: `computeLatencyMs`, `broadcastFromHlsSrc`,
+  `pushSample`) covered by 16 Vitest unit tests in
+  `bindings/js/tests/sdk/dvr-player-slo-sampler.spec.ts`. The
+  three new attributes are observed + reactive (toggling at
+  runtime starts / stops the sampler timer cleanly). dvr-player
+  Vitest count goes from 60 to 76 tests; Playwright count
+  unchanged at 19 (the SLO push surface is small + cleanly
+  unit-testable; e2e coverage rides any future Tier 5 SDK
+  integration test).
+
 * **MoQ egress latency SLO server-side endpoint** (session 156
   follow-up) -- new `POST /api/v1/slo/client-sample` route on
   `lvqr-admin` accepting JSON

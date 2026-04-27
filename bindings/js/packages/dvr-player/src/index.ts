@@ -37,6 +37,7 @@ import {
   groupOutInPairs,
   markerToFraction,
 } from './markers.js';
+import { broadcastFromHlsSrc, computeLatencyMs, pushSample } from './slo-sampler.js';
 
 const ATTR_SRC = 'src';
 const ATTR_AUTOPLAY = 'autoplay';
@@ -46,6 +47,12 @@ const ATTR_THUMBNAILS = 'thumbnails';
 const ATTR_LIVE_THRESHOLD = 'live-edge-threshold-secs';
 const ATTR_CONTROLS = 'controls';
 const ATTR_MARKERS = 'markers';
+// Session 156 follow-up: client-side glass-to-glass SLO sampling
+// (see `src/slo-sampler.ts`). Default disabled; opt in by setting
+// `slo-sampling="enabled"` + `slo-endpoint="<URL>"` on the host.
+const ATTR_SLO_SAMPLING = 'slo-sampling';
+const ATTR_SLO_ENDPOINT = 'slo-endpoint';
+const ATTR_SLO_INTERVAL_SECS = 'slo-sample-interval-secs';
 
 const DEFAULT_LIVE_THRESHOLD_SECS = 6;
 const THUMBNAIL_CACHE_CAP = 60;
@@ -53,6 +60,11 @@ const LIVE_EDGE_POLL_HZ = 4;
 const LIVE_BADGE_DEBOUNCE_MS = 250;
 const MARKER_CROSSING_DEBOUNCE_MS = 100;
 const MARKER_TOOLTIP_ID_TRUNCATE = 24;
+/// Default sample period for SLO pushback. 5 s is loose enough to
+/// keep server-side sample-rate metrics manageable but tight enough
+/// to surface a latency regression within a few minutes of one
+/// occurring. Operators can override via `slo-sample-interval-secs`.
+const DEFAULT_SLO_SAMPLE_INTERVAL_SECS = 5;
 
 function getTemplateHTML(): string {
   return /*html*/ `
@@ -388,6 +400,9 @@ export class LvqrDvrPlayerElement extends HTMLElement {
       ATTR_LIVE_THRESHOLD,
       ATTR_CONTROLS,
       ATTR_MARKERS,
+      ATTR_SLO_SAMPLING,
+      ATTR_SLO_ENDPOINT,
+      ATTR_SLO_INTERVAL_SECS,
     ];
   }
 
@@ -418,6 +433,8 @@ export class LvqrDvrPlayerElement extends HTMLElement {
   private dragPointerId: number | null = null;
   private isAtLiveEdgeState = false;
   private liveEdgePollTimer: number | null = null;
+  // Session 156 follow-up: client-side SLO sampling timer.
+  private sloSamplingTimer: number | null = null;
   private liveBadgeDebounceTimer: number | null = null;
   private thumbCache = new Map<number, ImageBitmap>();
   private thumbSeekToken = 0;
@@ -486,6 +503,11 @@ export class LvqrDvrPlayerElement extends HTMLElement {
       case ATTR_MARKERS:
         this.applyMarkersVisibility();
         this.renderMarkers();
+        break;
+      case ATTR_SLO_SAMPLING:
+      case ATTR_SLO_ENDPOINT:
+      case ATTR_SLO_INTERVAL_SECS:
+        this.applySloSampling();
         break;
     }
   }
@@ -653,6 +675,68 @@ export class LvqrDvrPlayerElement extends HTMLElement {
       clearTimeout(this.liveBadgeDebounceTimer);
       this.liveBadgeDebounceTimer = null;
     }
+    this.stopSloSampling();
+  }
+
+  // Session 156 follow-up: client-side glass-to-glass SLO sampling.
+  // Driven by the `slo-sampling` + `slo-endpoint` attributes plus
+  // the existing `token` attribute (used as the bearer token; the
+  // server's dual-auth path validates it as either an admin or
+  // subscribe scope). Default off; opt in by setting both attrs.
+
+  private applySloSampling(): void {
+    const enabled = getStringAttr(this, ATTR_SLO_SAMPLING, 'disabled') === 'enabled';
+    const endpoint = getStringAttr(this, ATTR_SLO_ENDPOINT, '');
+    if (!enabled || !endpoint) {
+      this.stopSloSampling();
+      return;
+    }
+    this.startSloSampling();
+  }
+
+  private startSloSampling(): void {
+    if (this.sloSamplingTimer !== null) return;
+    const intervalSecs = getNumericAttr(this, ATTR_SLO_INTERVAL_SECS, DEFAULT_SLO_SAMPLE_INTERVAL_SECS);
+    const intervalMs = Math.max(1_000, Math.floor(intervalSecs * 1000));
+    this.sloSamplingTimer = window.setInterval(() => {
+      void this.fireSloSample();
+    }, intervalMs);
+  }
+
+  private stopSloSampling(): void {
+    if (this.sloSamplingTimer === null) return;
+    clearInterval(this.sloSamplingTimer);
+    this.sloSamplingTimer = null;
+  }
+
+  private async fireSloSample(): Promise<void> {
+    // Best-effort: any failure is silently dropped so SLO push
+    // cannot disrupt playback. The server-side endpoint emits its
+    // own `lvqr_auth_failures_total` + `lvqr_slo_client_samples_total`
+    // counters so operators see push success / failure on the
+    // metrics surface, not on the client console.
+    if (this.videoEl.paused || this.videoEl.readyState < 2) return;
+    // `getStartDate()` is a standard HLS extension on
+    // HTMLMediaElement (Safari + hls.js implement it) but absent
+    // from TypeScript's stock DOM lib; the local interface
+    // VideoElementWithStartDate captures the runtime shape.
+    const sample = computeLatencyMs(this.videoEl as unknown as Parameters<typeof computeLatencyMs>[0]);
+    if (!sample) return;
+    const src = this.getAttribute(ATTR_SRC);
+    if (!src) return;
+    const broadcast = broadcastFromHlsSrc(src);
+    if (!broadcast) return;
+    const endpoint = getStringAttr(this, ATTR_SLO_ENDPOINT, '');
+    if (!endpoint) return;
+    const token = this.getAttribute(ATTR_TOKEN) ?? undefined;
+    await pushSample({
+      endpoint,
+      broadcast,
+      transport: 'hls',
+      ingestTsMs: sample.ingestTsMs,
+      renderTsMs: sample.renderTsMs,
+      token,
+    });
   }
 
   private teardownThumbnails(): void {
