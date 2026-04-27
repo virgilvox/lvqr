@@ -487,10 +487,30 @@ struct ClientLatencySample {
     /// Free-form to keep the contract additive for future
     /// transports; the tracker stores the label verbatim.
     transport: String,
-    /// Wall-clock UNIX-ms timestamp the publisher stamped on the
-    /// frame at ingest. The `lvqr_fragment::Fragment` already
-    /// carries this via `Fragment::ingest_time_ms`; clients lift it
-    /// from the frame's per-track metadata when they get one.
+    /// Wall-clock UNIX-ms timestamp anchored on the publisher's
+    /// frame. Recovery is transport-specific:
+    ///
+    /// * HLS subscribers lift it from `#EXT-X-PROGRAM-DATE-TIME`
+    ///   via `HTMLMediaElement.getStartDate() + currentTime`. See
+    ///   `bindings/js/packages/dvr-player/src/slo-sampler.ts` for
+    ///   the reference client.
+    /// * MoQ subscribers do not have a per-frame wall-clock channel
+    ///   on the wire today. `lvqr_fragment::MoqTrackSink::push`
+    ///   writes only the fMP4 payload bytes
+    ///   (`crates/lvqr-fragment/src/moq_sink.rs`); the v1.1-B
+    ///   scoping call rejected adding a per-frame wall-clock to the
+    ///   in-band frame format. Closing pure-MoQ glass-to-glass is
+    ///   tracked as a v1.2 follow-up; the session 157 audit
+    ///   (`tracking/SESSION_157_BRIEFING.md`) sketches a sibling
+    ///   `<broadcast>/0.timing` MoQ track as the candidate
+    ///   non-breaking design.
+    ///
+    /// `lvqr_fragment::Fragment::ingest_time_ms` carries the same
+    /// stamp on the in-memory ingest pipeline (server-side
+    /// stamping for the existing
+    /// `lvqr_subscriber_glass_to_glass_ms` histogram), but it is
+    /// NOT part of any wire format -- a network client cannot lift
+    /// it from a received frame.
     ingest_ts_ms: u64,
     /// Wall-clock UNIX-ms timestamp the client recorded on render
     /// (the moment the frame's pixels reached the consumer's

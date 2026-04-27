@@ -377,11 +377,59 @@ ranking:
    the v1.1-B scoping call (keeps foreign MoQ clients
    compatible). Likely path forward: Tier 5 client SDK pushes
    sampled render-side timestamps to a future
-   `POST /api/v1/slo/client-sample` endpoint.~~ Server side
-   shipped in session 156 follow-up; awaiting Tier 5 client SDK
-   to push samples by default. See Phase A v1.1 row below.
+   `POST /api/v1/slo/client-sample` endpoint.~~ Server-side
+   endpoint + the first client (`@lvqr/dvr-player` HLS-side
+   PDT-anchored sampler) shipped in session 156 follow-up.
+   **Pure-MoQ subscriber glass-to-glass remains open**: the
+   session 157 audit confirmed the MoQ wire carries no
+   per-frame wall-clock anchor (init segment + payload bytes
+   only; `MoqTrackSink::push` writes `frag.payload.clone()`
+   verbatim). A pure-MoQ sample-pusher cannot derive a latency
+   value to push without a sidecar timing track. Closing this
+   is tracked as a v1.2 follow-up; the design sketch (sibling
+   `<broadcast>/0.timing` MoQ track, additive so foreign
+   clients ignore it) is in
+   [`tracking/SESSION_157_BRIEFING.md`](tracking/SESSION_157_BRIEFING.md).
+   See Phase A v1.1 row below.
 
 #### Recently shipped (compact reference)
+
+* **MoQ glass-to-glass SLO audit + scenario-(c) close-out**
+  (session 157, 2026-04-27) -- the audit confirmed the MoQ wire
+  carries no per-frame wall-clock anchor:
+  `lvqr_fragment::MoqTrackSink::push` writes only
+  `frag.payload.clone()` to the underlying `moq-lite` track
+  (`crates/lvqr-fragment/src/moq_sink.rs:99-105`), and the
+  inverse `MoqGroupStream::next_fragment` constructs received
+  Fragments with hard-zero `dts` / `pts` / `duration` /
+  `ingest_time_ms` by documented contract
+  (`crates/lvqr-fragment/src/moq_stream.rs:35-41,142-152`).
+  HLS subscribers can already push samples by default via
+  `@lvqr/dvr-player`'s PDT-anchored sampler (session 156
+  follow-up); pure-MoQ subscribers cannot, because the wire has
+  no manifest analog. Per the original session-157 brief's
+  scenario-(c) guard ("strategy call, NOT engineering -- don't
+  ship the bin until the scoping is locked"), no Rust MoQ
+  sample-pusher bin shipped this session. Instead: (1) the
+  misleading doc comment on
+  `crates/lvqr-admin/src/routes.rs::ClientLatencySample::ingest_ts_ms`
+  (which previously implied clients could lift `ingest_time_ms`
+  "from the frame's per-track metadata") is rewritten with a
+  transport-specific recovery table; (2) the Phase A v1.1 #5
+  row + "Next up" #5 row are updated to reflect that the
+  HLS-side close-out shipped + the pure-MoQ side is open as
+  v1.2; (3) `tracking/SESSION_157_BRIEFING.md` records the
+  audit, the Path Y / X / Z scoping decision, and the v1.2
+  sidecar-track design sketch (sibling `<broadcast>/0.timing`
+  MoQ track emitting `(group_id_u64_le, ingest_time_ms_u64_le)`
+  anchors per keyframe; additive, foreign MoQ clients ignore
+  the unknown track name). **No Rust crate logic touched, no
+  wire change, no new feature flag, no SDK package version
+  bump, no relay route change.** Workspace `0.4.1` unchanged;
+  SDK packages unchanged; the 1111 default-gate workspace lib
+  count is unmoved. The doc-comment edit is the only
+  behaviour-relevant change and it is in a `///` block, so the
+  `lvqr-admin` lib test count (54 / 0 / 0) is unchanged.
 
 * **`@lvqr/dvr-player` SLO sampler** (session 156 follow-up) --
   the dvr-player web component now ships with opt-in client-side
@@ -934,10 +982,27 @@ test.
   `{broadcast, transport, ingest_ts_ms, render_ts_ms}` from any
   client, records into the existing `LatencyTracker`, and
   surfaces on `GET /api/v1/slo` + the
-  `lvqr_subscriber_glass_to_glass_ms` Prometheus histogram.
-  Pending: a Tier 5 client SDK that pushes samples by default
-  (custom clients can push today). Checkbox stays unchecked
-  until that flow is real in the wild.
+  `lvqr_subscriber_glass_to_glass_ms` Prometheus histogram. The
+  first real client also shipped (session 156 follow-up):
+  `@lvqr/dvr-player`'s built-in PDT-anchored sampler pushes by
+  default for HLS subscribers (lifts the publisher wall-clock
+  via `HTMLMediaElement.getStartDate() + currentTime`).
+  **Pending: pure-MoQ subscriber measurement.** The session 157
+  audit confirmed the MoQ wire carries only init-segment +
+  payload bytes -- there is no per-frame wall-clock anchor that
+  a pure-MoQ subscriber could lift to compute latency
+  (`crates/lvqr-fragment/src/moq_sink.rs::push` writes
+  `frag.payload.clone()` only; the inverse `MoqTrackStream`
+  emits zero for `dts` / `pts` / `duration` / `ingest_time_ms`
+  by contract). Closing pure-MoQ glass-to-glass is tracked as a
+  v1.2 follow-up that ships either a sibling
+  `<broadcast>/0.timing` MoQ track (additive, foreign clients
+  ignore) or reopens the v1.1-B scoping call for an in-band
+  per-frame wall-clock field. The sidecar-track design sketch
+  is in
+  [`tracking/SESSION_157_BRIEFING.md`](tracking/SESSION_157_BRIEFING.md).
+  Checkbox stays unchecked until pure-MoQ subscribers can also
+  push.
 
 ### Auth + ops polish
 - [x] ~~**Webhook auth provider.**~~ Shipped in session 135.
