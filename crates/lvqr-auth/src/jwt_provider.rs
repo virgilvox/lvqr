@@ -127,6 +127,10 @@ mod tests {
 
     fn make_token(secret: &str, scope: AuthScope, broadcast: Option<&str>) -> String {
         let exp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as usize + 3600;
+        make_token_with_exp(secret, scope, broadcast, exp)
+    }
+
+    fn make_token_with_exp(secret: &str, scope: AuthScope, broadcast: Option<&str>, exp: usize) -> String {
         let claims = JwtClaims {
             sub: "alice".into(),
             exp,
@@ -243,6 +247,119 @@ mod tests {
                 audience: None,
             })
             .is_err()
+        );
+    }
+
+    /// Adversarial: a token whose `exp` claim is in the past must be
+    /// rejected. The previous test corpus only exercised
+    /// `exp = now + 3600`, leaving the expiration gate untested. This
+    /// proves the JWT layer actually validates the claim.
+    #[test]
+    fn expired_token_is_rejected_for_admin() {
+        let p = JwtAuthProvider::new(JwtAuthConfig {
+            secret: "secret".into(),
+            issuer: None,
+            audience: None,
+        })
+        .unwrap();
+        // exp = 1 (1970-01-01 UTC + 1s); jsonwebtoken's leeway is 0
+        // by default, so this is unambiguously expired.
+        let token = make_token_with_exp("secret", AuthScope::Admin, None, 1);
+        let decision = p.check(&AuthContext::Admin { token });
+        assert!(
+            !decision.is_allow(),
+            "expired tokens must be rejected; got Allow on exp=1"
+        );
+    }
+
+    /// Adversarial: a token whose `exp` claim is in the past must
+    /// also fail subscribe + publish auth, not just admin.
+    #[test]
+    fn expired_token_is_rejected_for_subscribe_and_publish() {
+        let p = JwtAuthProvider::new(JwtAuthConfig {
+            secret: "secret".into(),
+            issuer: None,
+            audience: None,
+        })
+        .unwrap();
+        let sub_token = make_token_with_exp("secret", AuthScope::Subscribe, Some("live/x"), 1);
+        let pub_token = make_token_with_exp("secret", AuthScope::Publish, Some("live/x"), 1);
+        assert!(
+            !p.check(&AuthContext::Subscribe {
+                token: Some(sub_token),
+                broadcast: "live/x".into(),
+            })
+            .is_allow(),
+            "expired subscribe token must be rejected"
+        );
+        assert!(
+            !p.check(&AuthContext::Publish {
+                app: "whip".into(),
+                key: pub_token,
+                broadcast: Some("live/x".into()),
+            })
+            .is_allow(),
+            "expired publish token must be rejected"
+        );
+    }
+
+    /// Adversarial: a token signed with a different secret must be
+    /// rejected. Catches a regression where the provider stops
+    /// validating the HS256 signature (e.g., a refactor that splits
+    /// validation into a "decode then check claims" path and forgets
+    /// the verify step).
+    #[test]
+    fn token_signed_with_wrong_secret_is_rejected() {
+        let p = JwtAuthProvider::new(JwtAuthConfig {
+            secret: "real-secret".into(),
+            issuer: None,
+            audience: None,
+        })
+        .unwrap();
+        let attacker_token = make_token("attacker-secret", AuthScope::Admin, None);
+        let decision = p.check(&AuthContext::Admin {
+            token: attacker_token,
+        });
+        assert!(
+            !decision.is_allow(),
+            "tokens signed with a different secret must be rejected"
+        );
+    }
+
+    /// Adversarial: a token whose payload is mutated post-signing
+    /// must be rejected. Catches a regression where signature
+    /// verification is bypassed for "trusted" claims.
+    #[test]
+    fn token_with_tampered_payload_is_rejected() {
+        let p = JwtAuthProvider::new(JwtAuthConfig {
+            secret: "secret".into(),
+            issuer: None,
+            audience: None,
+        })
+        .unwrap();
+        // Mint a Subscribe-scoped token, then mutate one byte in the
+        // base64url-encoded payload. JWTs are dot-separated
+        // header.payload.signature; flipping a payload byte without
+        // re-signing must fail HMAC verification.
+        let token = make_token("secret", AuthScope::Subscribe, Some("live/x"));
+        let mut bytes: Vec<u8> = token.into_bytes();
+        // Find the first '.' (end of header), then mutate one byte
+        // shortly after to land in the payload.
+        let first_dot = bytes.iter().position(|&b| b == b'.').expect("jwt has header.payload.sig");
+        // `+ 4` lands inside the payload (well before the second
+        // dot for any reasonable claim set).
+        let mutate_at = first_dot + 4;
+        // Pick a byte that's still valid base64url alphabet so the
+        // decode itself doesn't fail before the signature check.
+        bytes[mutate_at] = if bytes[mutate_at] == b'A' { b'B' } else { b'A' };
+        let mutated = String::from_utf8(bytes).unwrap();
+        let decision = p.check(&AuthContext::Subscribe {
+            token: Some(mutated),
+            broadcast: "live/x".into(),
+        });
+        assert!(
+            !decision.is_allow(),
+            "tokens with mutated payloads must fail signature verification"
         );
     }
 }

@@ -43,9 +43,7 @@ pub fn generate_aac_access_units(duration_ms: u64) -> Option<Vec<Vec<u8>>> {
         "aacparse",
         "appsink",
     ] {
-        if gst::ElementFactory::find(elem).is_none() {
-            return None;
-        }
+        gst::ElementFactory::find(elem)?;
     }
 
     let pipeline_str = format!(

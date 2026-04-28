@@ -613,4 +613,90 @@ mod tests {
         // 0x0376E6E7.
         assert_eq!(crc32_mpeg2(b"123456789"), 0x0376E6E7);
     }
+
+    /// Adversarial proptest: drive the parser with arbitrary single-
+    /// byte mutations on a valid splice_info_section and assert the
+    /// outcome is one of (a) accepts the mutation if the mutated byte
+    /// happened to land somewhere CRC-recoverable AND the mutation
+    /// happened to keep the section's structural fields valid (rare),
+    /// (b) rejects with `Scte35BadCrc` (most common -- the CRC stops
+    /// matching), (c) rejects with another structural error
+    /// (`Scte35Malformed`, `EndOfStream`, etc.). The contract under
+    /// test is that the parser NEVER panics on adversarial input and
+    /// NEVER silently accepts a mutated section without re-deriving
+    /// the CRC from the mutated bytes.
+    ///
+    /// Closes the audit gap that the existing `rejects_bad_crc` test
+    /// only ever flips one specific bit in a single section shape.
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            ..ProptestConfig::default()
+        })]
+        #[test]
+        fn parse_handles_arbitrary_byte_mutations_without_panic(
+            byte_index in 0usize..64,
+            xor_mask in 1u8..=0xFFu8,
+        ) {
+            // Build a valid splice_null section (the smallest variant
+            // we have). 17 bytes total: 13 prefix + 0 command body +
+            // 2 desc-loop-length + 0 descriptors + 4 CRC.
+            let prefix = default_prefix(CMD_SPLICE_NULL);
+            let original = build_section(&prefix, &[], &[]);
+
+            // Sanity: the unmutated section must parse cleanly. If
+            // this ever fails the harness is wrong, not the parser.
+            assert!(
+                parse_splice_info_section(&original).is_ok(),
+                "harness baseline: unmutated section must parse",
+            );
+
+            // Mutate one byte at a deterministic index. byte_index is
+            // clamped into the section length; xor_mask=0 would be a
+            // no-op so the strategy excludes it.
+            let idx = byte_index % original.len();
+            let mut mutated = original.clone();
+            mutated[idx] ^= xor_mask;
+
+            // The mutated section either parses (CRC happens to still
+            // match for this specific bit pattern + the mutation didn't
+            // break a structural field), or fails with a documented
+            // error variant. Panic-freedom is the load-bearing
+            // contract: a SCTE-35 wire from an adversarial publisher
+            // must never crash the parser.
+            match parse_splice_info_section(&mutated) {
+                Ok(_info) => {
+                    // If the parser accepted, the wire must literally
+                    // produce a matching CRC under the same algorithm
+                    // we use for emit. This catches a regression where
+                    // CRC verification is silently disabled: in that
+                    // failure mode, the parser would always Ok() under
+                    // mutation and the CRC check below would catch it.
+                    let body = &mutated[..mutated.len() - 4];
+                    let computed = crc32_mpeg2(body);
+                    let wire = u32::from_be_bytes([
+                        mutated[mutated.len() - 4],
+                        mutated[mutated.len() - 3],
+                        mutated[mutated.len() - 2],
+                        mutated[mutated.len() - 1],
+                    ]);
+                    assert_eq!(
+                        computed, wire,
+                        "if parse accepted, CRC must match: idx={idx} mask={xor_mask:#x}",
+                    );
+                }
+                Err(CodecError::Scte35BadCrc { .. })
+                | Err(CodecError::Scte35Malformed(_))
+                | Err(CodecError::EndOfStream { .. }) => {
+                    // All documented rejection paths.
+                }
+                Err(other) => panic!(
+                    "unexpected error variant for mutated section: {other:?} \
+                     (idx={idx} mask={xor_mask:#x})",
+                ),
+            }
+        }
+    }
 }

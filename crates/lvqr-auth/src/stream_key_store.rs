@@ -443,6 +443,74 @@ mod tests {
         assert_ne!(a.token, b.token);
     }
 
+    /// Math + clock check on `mint(ttl_seconds=N)`. The previous test
+    /// suite covered the lazy filter (manual insert with
+    /// `expires_at = Some(1)`) and the rotate-override path, but
+    /// nothing proved that `mint` itself populates `expires_at` to
+    /// `now + ttl` within a sane window. A regression here would
+    /// silently produce keys that never expire.
+    #[test]
+    fn mint_with_ttl_seconds_sets_expires_at_within_window() {
+        let store = InMemoryStreamKeyStore::new();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let key = store.mint(StreamKeySpec {
+            label: None,
+            broadcast: None,
+            ttl_seconds: Some(60),
+        });
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let exp = key.expires_at.expect("ttl_seconds=60 must populate expires_at");
+        assert!(
+            exp >= before + 60 && exp <= after + 60,
+            "expires_at must be now + 60s within sampling jitter; before={before} after={after} exp={exp}"
+        );
+    }
+
+    /// End-to-end test of TTL-driven expiry: mint a key with
+    /// `ttl_seconds=1`, sleep 1.5s in real wall-clock time, and assert
+    /// `get_by_token` now returns `None`. Closes the loop the
+    /// `lazy_expiry_filters_get_by_token_but_not_list` test left open
+    /// (that one inserts an already-expired key directly, bypassing
+    /// the mint path). The combination of `mint(ttl=1)` -> wait ->
+    /// `get_by_token` proves the auth-side gate fires under actual
+    /// time progression rather than manipulated state.
+    ///
+    /// 1.5s is well past the 1s TTL so even a slow CI runner clears
+    /// the boundary; total cost ~1.5s on the wall clock for one of
+    /// the most security-relevant invariants in the workspace.
+    #[test]
+    fn mint_with_one_second_ttl_actually_expires_via_real_time() {
+        let store = InMemoryStreamKeyStore::new();
+        let key = store.mint(StreamKeySpec {
+            label: None,
+            broadcast: None,
+            ttl_seconds: Some(1),
+        });
+        // Pre-expiry: still resolves.
+        assert!(
+            store.get_by_token(&key.token).is_some(),
+            "freshly minted ttl=1 key must resolve before its window closes"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        // Post-expiry: must not resolve via the auth-path lookup.
+        assert!(
+            store.get_by_token(&key.token).is_none(),
+            "ttl=1 key must lazy-expire via get_by_token after 1.5s elapse"
+        );
+        // The list endpoint must still surface the entry so an
+        // operator can revoke it.
+        assert!(
+            store.list().iter().any(|k| k.id == key.id),
+            "expired entries must remain visible to list() so operators can revoke them"
+        );
+    }
+
     #[test]
     fn streamkey_serde_round_trips_with_optional_fields_omitted() {
         // Pre-146 client perspective: a server adding `expires_at` on
