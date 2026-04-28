@@ -82,10 +82,7 @@ async fn federation_link_propagates_broadcast_between_two_clusters() {
     let connect_deadline = Instant::now() + CONNECT_TIMEOUT;
     loop {
         let snap = status_handle.snapshot();
-        if snap
-            .iter()
-            .any(|s| s.state == FederationConnectState::Connected)
-        {
+        if snap.iter().any(|s| s.state == FederationConnectState::Connected) {
             break;
         }
         if Instant::now() >= connect_deadline {
@@ -145,12 +142,37 @@ async fn federation_link_propagates_broadcast_between_two_clusters() {
 
     // Subscribe to the `0.mp4` track and read the frame bytes that A
     // wrote. The forward_track loop copies the bytes verbatim.
-    let mut track_sub = bc.subscribe_track(&Track::new("0.mp4")).expect("subscribe 0.mp4 on B");
-    let mut group_sub = tokio::time::timeout(PROPAGATION_TIMEOUT, track_sub.next_group())
-        .await
-        .expect("next_group timeout on B")
-        .expect("next_group error on B")
-        .expect("0.mp4 track on B closed before a group landed");
+    //
+    // Retry the subscribe-and-next_group sequence: the federation
+    // session being Connected (verified above) is necessary but not
+    // sufficient for this to succeed first try. After the announcement
+    // arrives on B's origin, the per-track `forward_track` task still
+    // has to spin up, open its own subscription against A, and start
+    // forwarding before B's origin can serve a downstream subscriber.
+    // On macOS CI runners under load this race window can land the
+    // first subscribe before forwarding is ready, surfacing as a
+    // moq-lite remote error (code=13/24) on `next_group`. Retrying
+    // for up to PROPAGATION_TIMEOUT is robust without bounding the
+    // happy-path latency.
+    let mut group_sub = {
+        let deadline = Instant::now() + PROPAGATION_TIMEOUT;
+        loop {
+            let mut track_sub = bc.subscribe_track(&Track::new("0.mp4")).expect("subscribe 0.mp4 on B");
+            let attempt_label = match tokio::time::timeout(Duration::from_millis(500), track_sub.next_group()).await {
+                Ok(Ok(Some(g))) => break g,
+                Ok(Ok(None)) => "track closed before a group landed",
+                Ok(Err(_)) => "next_group remote error",
+                Err(_) => "next_group inner timeout (500ms)",
+            };
+            if Instant::now() >= deadline {
+                panic!(
+                    "0.mp4 track on B never produced a group within {:?}; last attempt: {}",
+                    PROPAGATION_TIMEOUT, attempt_label
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
 
     let frame = tokio::time::timeout(PROPAGATION_TIMEOUT, group_sub.read_frame())
         .await

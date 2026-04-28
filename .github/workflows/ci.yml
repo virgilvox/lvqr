@@ -101,8 +101,31 @@ jobs:
         run: ffprobe -version | head -n 1
       - name: Build
         run: cargo build --workspace
+      # Surface the runner's disk + memory state right before
+      # `cargo test --workspace` so future failures of the form
+      # "Test step started, no output, runner died" can be told
+      # apart from "tests ran and one failed". The previous round
+      # of CI hardening freed ~30 GB up front; if that turns out
+      # not to be enough for the integration test binary tree we
+      # can see it here.
+      - name: Pre-test resource check
+        run: |
+          echo "--- disk ---"; df -h /
+          if [ "$(uname -s)" = "Linux" ]; then
+            echo "--- mem ---"; free -h
+            echo "--- target/ size ---"; du -sh target/ 2>/dev/null || true
+          fi
       - name: Test (lib + integration + doc)
-        run: cargo test --workspace
+        # --test-threads=2 caps parallel integration-test binaries.
+        # Each integration test in this workspace links the entire
+        # ingest + relay + admin + cluster + auth surface in debug
+        # mode; running them all in parallel under default
+        # tokio::test multi-threading on a 4-core / 16 GB
+        # GitHub-hosted runner can OOM the runner without producing
+        # any test-result output, which looks identical to a
+        # disk-space failure in the workflow log. Two-at-a-time
+        # keeps the runner healthy with negligible wall-clock cost.
+        run: cargo test --workspace -- --test-threads=2
 
   # Tier 4 item 4.1 session A2: exercise the tokio-uring write path in
   # lvqr-archive's `io-uring` feature. Linux-only (tokio-uring only compiles
