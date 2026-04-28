@@ -4,230 +4,337 @@
 [![crates.io](https://img.shields.io/crates/v/lvqr-core.svg)](https://crates.io/crates/lvqr-core)
 [![License](https://img.shields.io/badge/license-AGPL--3.0%20or%20commercial-blue.svg)](LICENSE)
 
-A single-binary Rust live video server. Ingests RTMP, WHIP, SRT,
-RTSP, and WebSocket fMP4; serves LL-HLS, MPEG-DASH, WHEP, MoQ over
-QUIC/WebTransport, and WebSocket fMP4; records + archives to disk
-with a DVR index and optional C2PA signing; optionally forms a
-gossip cluster with broadcast ownership and redirect-to-owner.
+**Programmable real-time media infrastructure for AI, broadcast,
+provenance, and low-latency interactive video.**
+
+LVQR is a single Rust binary that ingests RTMP, WHIP, SRT, RTSP, and
+WebSocket fMP4; serves LL-HLS, MPEG-DASH, WHEP, MoQ over
+QUIC/WebTransport, and WebSocket fMP4 from one unified fragment
+model; carries SCTE-35 ad markers verbatim from publisher to player;
+runs WASM per-fragment filter chains and in-process AI agents on the
+data plane; signs archived media with C2PA; and forms a
+chitchat-gossiped cluster with broadcast ownership, redirect-to-owner,
+cross-cluster federation, and a browser peer mesh -- without a
+separate Redis, Kafka, external segmenter, or signaling server.
 
 ```bash
 cargo install lvqr-cli
 lvqr serve
 ```
 
-## Why LVQR
+The server boots with sensible defaults (MoQ on 4443/udp, RTMP on
+1935/tcp, LL-HLS on 8888/tcp, admin + WebSocket on 8080/tcp), a
+self-signed TLS cert if none is supplied, no auth, and zero external
+dependencies.
 
-Every ingest and every egress is a projection over the same
-unified fragment model, so adding a protocol is a projection, not
-a rewrite. The data plane is zero-copy (`bytes::Bytes`), the
-control plane is `async-trait`, and cluster state is chitchat
-gossip with ownership leases rather than a consensus bolt-on.
+---
 
-Target positioning: **MediaMTX-grade ergonomics + Kinesis-grade
-archive + MoQ as a first-class transport**, on a path toward
-LiveKit-class differentiators (WASM per-fragment filters,
-in-process AI agents, cross-cluster federation, peer mesh).
+## Contents
 
-## Feature overview
+- [What's in the binary](#whats-in-the-binary)
+- [What LVQR uniquely ships](#what-lvqr-uniquely-ships)
+- [Quickstart](#quickstart)
+- [Programmable data plane](#programmable-data-plane)
+- [Authentication](#authentication)
+- [Storage and DVR](#storage-and-dvr)
+- [Cluster, federation, and peer mesh](#cluster-federation-and-peer-mesh)
+- [Observability](#observability)
+- [Client SDKs](#client-sdks)
+- [Architecture](#architecture)
+- [CLI reference](#cli-reference)
+- [Operational notes](#operational-notes)
+- [Documentation](#documentation)
+- [Built on](#built-on)
+- [License](#license)
+
+---
+
+## What's in the binary
 
 ### Ingest
-- **RTMP** over TCP (OBS, ffmpeg, Larix, vMix). Includes
-  AMF0 onCuePoint scte35-bin64 passthrough for SCTE-35 ad
-  markers (session 152), via a vendored `rml_rtmp` fork at
-  `vendor/rml_rtmp/` that surfaces non-`@setDataFrame` AMF0
-  Data messages the upstream library silently drops.
-- **WHIP** over HTTPS (WebRTC; H.264, HEVC, Opus)
-- **SRT** over UDP (MPEG-TS from broadcast encoders).
-  Includes SCTE-35 ad-marker passthrough on PMT stream_type
-  0x86 (typically PID 0x1FFB) with private-section
-  reassembly across TS packet boundaries (session 152).
-- **RTSP/1.0** over TCP (ANNOUNCE/RECORD, interleaved RTP)
-- **WebSocket fMP4** (browser publishers)
+
+| Protocol | Codecs | Auth shape |
+|---|---|---|
+| **RTMP** over TCP (OBS, ffmpeg, Larix, vMix) | H.264, AAC | Stream key (literal token or JWT-as-stream-key); SCTE-35 onCuePoint scte35-bin64 passthrough |
+| **WHIP** over HTTPS (WebRTC, OBS 30+) | H.264, HEVC, Opus | `Authorization: Bearer` |
+| **SRT** over UDP (broadcast encoders) | H.264, HEVC, AAC over MPEG-TS | `streamid=m=publish,r=<broadcast>,t=<jwt>`; SCTE-35 PMT 0x86 passthrough |
+| **RTSP/1.0** over TCP (ANNOUNCE/RECORD) | H.264, HEVC, AAC | `Authorization: Bearer` |
+| **WebSocket fMP4** (browser publishers) | Whatever the publisher sends | `lvqr.bearer.<jwt>` subprotocol or `?token=` |
+
+Every ingest produces `Fragment` records on a shared
+`FragmentBroadcasterRegistry`. Adding a new ingest protocol is a
+projection into that type, not a rewrite of the egress side.
 
 ### Egress
-- **LL-HLS** (RFC 8216bis): blocking playlist reload, delta
-  playlists, `EXT-X-PART` + `PRELOAD-HINT`, per-segment
-  `PROGRAM-DATE-TIME`, configurable DVR, audio renditions, master
-  playlist, ABR ladder variants, automatic `ENDLIST` on disconnect.
-  SCTE-35 ad markers render as `#EXT-X-DATERANGE` lines per HLS
-  spec section 4.4.5.1 with the `CLASS="urn:scte:scte35:2014:bin"`
-  attribute and SCTE35-OUT / SCTE35-IN / SCTE35-CMD hex blobs
-  (session 152).
-- **MPEG-DASH**: live-profile dynamic MPD with flip to
-  `type="static"` on disconnect. SCTE-35 ad markers render at
-  Period level as `<EventStream
-  schemeIdUri="urn:scte:scte35:2014:xml+bin">` with
-  base64-encoded splice_info_section inside a
-  `<Signal><Binary>` body per ISO/IEC 23009-1 G.7 + SCTE 214-1
-  (session 152).
-- **WHEP** WebRTC egress via `str0m` (H.264 + HEVC video, Opus
-  audio). WHIP Opus publishers pass through; RTMP / SRT / RTSP
-  AAC publishers reach WHEP subscribers via an in-process
-  `AacToOpusEncoder` (GStreamer, behind the `transcode` Cargo
-  feature). **Fixed on `main` in session 113**; see
-  [Known v0.4.0 limitations](#known-v040-limitations)
-- **MoQ** over QUIC / WebTransport via `moq-lite`, zero-copy
-  fanout. Chrome / Edge 107+ via the `@lvqr/player` web component
-  (published at v0.3.2 on npm).
-- **WebSocket fMP4** for browsers without WebTransport
-- **DVR scrub** via `/playback/*` backed by a `redb` segment index.
-  Segment fetches honor RFC 7233 `Range: bytes=` single-range
-  requests, so HTML5 `<video>` seekability works out of the box.
+
+| Protocol | Notable surface |
+|---|---|
+| **LL-HLS** (RFC 8216bis) | Blocking playlist reload, delta playlists, `EXT-X-PART` + `PRELOAD-HINT`, per-segment `PROGRAM-DATE-TIME`, configurable DVR window, audio + subtitle renditions, multivariant master playlist with one `EXT-X-STREAM-INF` per ABR rendition, automatic `ENDLIST` on disconnect, SCTE-35 markers as `EXT-X-DATERANGE` per spec section 4.4.5.1 with `CLASS="urn:scte:scte35:2014:bin"` and SCTE35-OUT / SCTE35-IN / SCTE35-CMD hex blobs |
+| **MPEG-DASH** (live profile) | Dynamic MPD with auto-flip to `type="static"` on disconnect, SCTE-35 markers as Period-level `<EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin">` with base64 `<Signal><Binary>` per ISO/IEC 23009-1 G.7 + SCTE 214-1 |
+| **WHEP** (WebRTC egress via str0m) | H.264 + HEVC video, Opus audio; AAC publishers reach WHEP subscribers via the in-process `AacToOpusEncoder` (GStreamer, `aac-opus` feature) |
+| **MoQ** over QUIC / WebTransport | First-class egress on `moq-lite`; zero-copy fan-out via `OriginProducer`; sibling `<broadcast>/0.timing` track stamps a 16-byte LE `(group_id, ingest_time_ms)` anchor per video keyframe so subscribers can compute glass-to-glass latency without a wire-format change (foreign MoQ clients ignore the unknown track name per the moq-lite contract) |
+| **WebSocket fMP4** | Browser fallback for clients without WebTransport |
+| **DVR scrub** via `/playback/*` | `redb` segment index, RFC 7233 `Range: bytes=` single-range support so HTML5 `<video>` seekability works out of the box |
 
 ### Programmable data plane
-- **WASM per-fragment filter chains** (`--wasm-filter <path>...`,
-  `LVQR_WASM_FILTER`) via `wasmtime 25`. Guests observe every
-  ingested fragment and may drop it (negative return) or rewrite
-  its payload bytes (non-negative length return). Repeat
-  `--wasm-filter` (or comma-separate `LVQR_WASM_FILTER`) to
-  install an ordered chain; the first filter that drops a
-  fragment short-circuits the rest. `notify`-backed hot-reload
-  atomically swaps any single slot in the chain without
-  disturbing the others. Fragment metadata (track id, PTS, DTS,
-  flags) is read-only in v1. Examples under
-  `crates/lvqr-wasm/examples/`.
-- **In-process AI agents** (`lvqr-agent`, `lvqr-agent-whisper`).
-  One drain task per agent per `(broadcast, track)`,
-  panic-isolated, per-agent metrics. `--whisper-model <path>`
-  with `--features whisper` turns on a WhisperCaptionsAgent that
-  emits WebVTT at `/hls/{broadcast}/captions/playlist.m3u8`.
-- **Server-side transcoding** (`lvqr-transcode`, `--features
-  transcode`). Software ABR ladder via a GStreamer pipeline on
-  a dedicated worker thread, plus an always-available
-  `AudioPassthroughTranscoderFactory`. Drive via
-  `--transcode-rendition <NAME>` (presets `720p`/`480p`/`240p` or
-  a `.toml` `RenditionSpec`). The LL-HLS master playlist composer
-  emits one `#EXT-X-STREAM-INF` per rendition automatically.
 
-### Provenance + signing
-- **C2PA signed media** (`--features c2pa`). Drain-terminated
-  finalize on broadcast end writes
-  `<archive>/<broadcast>/<track>/finalized.mp4` +
-  `finalized.c2pa`. Admin route `GET /playback/verify/{*broadcast}`
-  returns a JSON validation report
-  (`{ signer, signed_at, valid, validation_state, errors }`).
-  Dual signer source: on-disk PEMs via `--c2pa-signing-cert` +
-  `--c2pa-signing-key` (plus optional `--c2pa-signing-alg`,
-  `--c2pa-trust-anchor`, `--c2pa-timestamp-authority`) or a
-  custom `Arc<dyn c2pa::Signer>` for HSM/KMS-backed keys passed
-  programmatically through `ServeConfig.c2pa`.
+- **WASM per-fragment filter chains.** Repeat `--wasm-filter <path>`
+  (or comma-separate `LVQR_WASM_FILTER`) to install an ordered chain
+  of `wasmtime`-loaded modules. Each guest exports
+  `on_fragment(ptr: i32, len: i32) -> i32`; a negative return drops
+  the fragment, a non-negative N keeps it and treats the first N
+  bytes of guest memory as the rewritten payload. The first drop
+  short-circuits the rest of the chain. Each slot has its own
+  `notify`-backed file watcher, so swapping one module hot-reloads
+  without disturbing the others. Counters, slot states, and the
+  configured chain are exposed at `GET /api/v1/wasm-filter`.
+  Examples under [`crates/lvqr-wasm/examples/`](crates/lvqr-wasm/examples/).
+- **In-process AI agents** via the `Agent` + `AgentFactory` traits
+  on [`lvqr-agent`](crates/lvqr-agent). One drain task per agent per
+  `(broadcast, track)`, panic-isolated, with per-agent metrics. The
+  shipping `WhisperCaptionsAgent` (`--whisper-model <path>` with
+  `--features whisper`) drives `whisper.cpp` over the audio track and
+  republishes WebVTT cues onto a `captions` track that the LL-HLS
+  composer drains into a subtitles rendition group at
+  `/hls/{broadcast}/captions/playlist.m3u8`.
+- **Server-side transcoding** via [`lvqr-transcode`](crates/lvqr-transcode)
+  (`--features transcode`). Software ABR ladder backed by a GStreamer
+  pipeline on a dedicated worker thread, plus an always-available
+  `AudioPassthroughTranscoderFactory`. Drive via repeatable
+  `--transcode-rendition <NAME>` (presets `720p`/`480p`/`240p` or a
+  `.toml` `RenditionSpec`); the LL-HLS master playlist composes one
+  `EXT-X-STREAM-INF` per rendition automatically. macOS VideoToolbox
+  HW backend ships behind `--features hw-videotoolbox`
+  (`--transcode-encoder videotoolbox`).
 
-### Auth
-- Pluggable: noop, static tokens, HS256 JWT with `iss` + `aud`
-  validation, or dynamic asymmetric JWT (RS256 / ES256 / EdDSA)
-  with keys discovered from a JWKS endpoint (`--jwks-url`,
-  `--features jwks`).
-- **Runtime stream-key CRUD** (session 146):
-  `/api/v1/streamkeys/{,/:id,/:id/rotate}` lets admin clients
-  mint, list, revoke, and rotate ingest stream keys without
+### Provenance
+
+- **C2PA signed archives** (`--features c2pa`). On broadcast finalize
+  the drain task walks the redb segment index in `start_dts` order,
+  writes a coalesced
+  `<archive>/<broadcast>/<track>/finalized.mp4`, and emits a sidecar
+  `finalized.c2pa` manifest. Signing alg is configurable
+  (`es256`/`es384`/`es512`/`ps256`/`ps384`/`ps512`/`ed25519`); trust
+  anchors and an RFC 3161 timestamp authority can be wired via flags.
+  Two signer sources: on-disk PEMs via `--c2pa-signing-cert` +
+  `--c2pa-signing-key`, or a custom `Arc<dyn c2pa::Signer>` for
+  HSM/KMS-backed keys passed programmatically through
+  `ServeConfig.c2pa`. `GET /playback/verify/{broadcast}` returns a
+  JSON validation report (`{ signer, signed_at, valid,
+  validation_state, errors }`).
+
+### Authentication
+
+- **Pluggable provider chain**: noop, static tokens, HS256 JWT with
+  `iss` + `aud` validation, RS256 / ES256 / EdDSA via JWKS
+  (`--jwks-url`, `--features jwks`), or a webhook delegating
+  `publish` / `subscribe` / `admin` decisions to your own HTTP
+  endpoint (`--webhook-auth-url`, `--features webhook`, with
+  separate allow / deny TTL caches).
+- **Runtime stream-key CRUD**: `POST /api/v1/streamkeys` to mint,
+  `GET` to list, `DELETE /api/v1/streamkeys/{id}` to revoke,
+  `POST /api/v1/streamkeys/{id}/rotate` to rotate -- all without
   bouncing the server. Tokens are
-  `lvqr_sk_<43-char base64url-no-pad>`. The wrap is purely
-  additive over whichever provider above is configured;
-  `Subscribe` + `Admin` auth always delegate to the wrapped chain
-  so a misconfigured store cannot lock the operator out. Default
-  on; opt out with `--no-streamkeys`.
-  See [`docs/auth.md#stream-key-crud-admin-api`](docs/auth.md#stream-key-crud-admin-api).
-- **Hot config reload** (sessions 147 + 148 + 149):
-  `lvqr serve --config <path.toml>` plus SIGHUP and
-  `POST /api/v1/config-reload` rotate the full auth chain
-  (Static / HS256 JWT / JWKS / webhook), mesh ICE servers, and
-  HMAC playback secret atomically without restarting the relay.
-  The swap uses `arc_swap::ArcSwap` handles with single-digit-ns
-  reads; in-flight requests finish against the prior snapshot.
-  Stream-key store handles are preserved across reloads. The
-  reload pipeline is async (session 149) so it can call the JWKS
-  /webhook providers' async constructors mid-process and drop the
-  old provider (whose `Drop` aborts its background refresh /
-  fetcher task). Every key the file format defines is honored at
-  runtime. See [`docs/config-reload.md`](docs/config-reload.md).
-- **One token, every ingest.** The same JWT admits a publisher
-  across RTMP (stream key IS the JWT), WHIP
-  (`Authorization: Bearer`), SRT (`streamid=m=publish,r=<broadcast>,t=<jwt>`),
-  RTSP (`Authorization: Bearer`), and WebSocket ingest
-  (`lvqr.bearer.<jwt>` subprotocol). Per-broadcast claim binding
-  enforced where the carrier knows the broadcast name at auth
-  time. Subscribe-side: WHEP handshake, WebSocket relay
-  (`/ws/*`), live LL-HLS + MPEG-DASH playback, DVR playback
-  (`/playback/*`), and admin (`/api/v1/*`) all apply the
-  `SubscribeAuth` provider. Tokens ride the
-  `Authorization: Bearer` header; live HLS + DASH also accept
-  `?token=<token>` as a fallback for native `<video>` players
-  that cannot set headers. `--no-auth-live-playback` is the
-  escape hatch for deployments that want open live HLS + DASH
-  with auth scoped to ingest, admin, and DVR only. **Not gated
-  today: the mesh `/signal` WebSocket.** See
-  [Known v0.4.0 limitations](#known-v040-limitations) and
-  [`docs/auth.md`](docs/auth.md).
+  `lvqr_sk_<43-char base64url-no-pad>`. Additive over whichever
+  provider above is configured; `Subscribe` + `Admin` always delegate
+  to the wrapped chain so a misconfigured store cannot lock the
+  operator out. Default on; opt out with `--no-streamkeys`.
+- **Hot config reload** via `lvqr serve --config <path.toml>` plus
+  SIGHUP and `POST /api/v1/config-reload`. Atomically rotates the
+  full auth chain (Static / HS256 JWT / JWKS / webhook), the mesh
+  ICE server list, and the HMAC playback secret using
+  `arc_swap::ArcSwap` handles -- single-digit-ns reads on the
+  auth-check fast path; in-flight requests finish against the prior
+  snapshot; old providers' background refresh / fetcher tasks abort
+  via their `Drop` impls. Every key the file format defines is
+  honored at runtime.
+- **One token, every protocol.** The same JWT admits a publisher
+  across RTMP (stream key IS the JWT), WHIP (`Authorization: Bearer`),
+  SRT (`streamid=m=publish,r=<broadcast>,t=<jwt>`), RTSP
+  (`Authorization: Bearer`), and WebSocket ingest
+  (`lvqr.bearer.<jwt>` subprotocol). Subscribe-side: WHEP, WebSocket
+  relay, live LL-HLS + DASH playback, DVR `/playback/*`, and the
+  admin API all apply the same `SubscribeAuth` provider. Live HLS
+  + DASH also accept `?token=<token>` for native players that cannot
+  set headers; `--no-auth-live-playback` is the escape hatch for
+  deployments wanting open live playback with auth scoped to ingest,
+  admin, and DVR only.
+- **HMAC-signed playback URLs** via `--hmac-playback-secret`. One
+  secret signs `/playback/*` (DVR), `/hls/*` (live HLS), and
+  `/dash/*` (live DASH); valid `?exp=<unix_ts>&sig=<base64url>` query
+  params short-circuit the subscribe-token gate.
+  `lvqr_cli::sign_playback_url` and `sign_live_url` mint URLs.
 
 ### Storage
-- **fMP4 recorder** (`--record-dir`) subscribed to `EventBus`.
-- **DVR archive** (`--archive-dir`) with a `redb` segment index +
-  `/playback/*` scrub routes + Linux `io-uring` writes behind the
-  `io-uring` feature flag.
+
+- **fMP4 recorder** (`--record-dir`) subscribed to the `EventBus`,
+  one file per `(broadcast, track)` plus an init segment.
+- **DVR archive** (`--archive-dir`) with a `redb` segment index, the
+  `/playback/*` scrub routes, range-request support, and Linux
+  `io-uring` writes behind the `io-uring` feature flag.
 
 ### Observability
-- Prometheus scrape at `/metrics`.
-- OTLP gRPC span + metric export (`LVQR_OTLP_ENDPOINT`) with
-  `metrics-util::FanoutBuilder` composition alongside Prometheus.
-- **Latency SLO tracker** + alert pack. `lvqr_subscriber_glass_to_glass_ms`
-  histogram captures per-`(broadcast, transport)` server-side
-  glass-to-glass latency. Four transports instrumented today:
-  `"hls"`, `"dash"`, `"ws"`, `"whep"`. Query
-  `GET /api/v1/slo` for a ring-buffered p50/p95/p99/max snapshot;
-  scrape the histogram for time-aligned views. Prometheus rule
-  pack + Grafana dashboard under `deploy/grafana/`. Operator
-  runbook at [`docs/slo.md`](docs/slo.md).
-- See [`docs/observability.md`](docs/observability.md) for the
-  full surface.
 
-### Cluster
+- Prometheus scrape at `/metrics` with histograms +
+  `lvqr_subscriber_glass_to_glass_ms{broadcast, transport}`,
+  counters for SCTE-35, WASM filter outcomes, stream-key changes,
+  client SLO samples, and auth failures.
+- OTLP gRPC export of spans + metrics via `LVQR_OTLP_ENDPOINT`,
+  composed alongside Prometheus through `metrics-util::FanoutBuilder`.
+- **Latency SLO tracker** with five transports instrumented:
+  `"hls"`, `"dash"`, `"ws"`, `"whep"`, and `"moq"`. Server-side
+  glass-to-glass for HLS / DASH / WHEP / WS rides
+  `Fragment::ingest_time_ms`. The HLS-side client (the
+  `@lvqr/dvr-player` web component's PDT-anchored sampler) and the
+  pure-MoQ side (the `0.timing` sidecar track + the
+  `lvqr-moq-sample-pusher` reference subscriber bin) close the
+  client-render half of the round trip. Both push to the dual-auth
+  `POST /api/v1/slo/client-sample` route. Operator runbook:
+  [`docs/slo.md`](docs/slo.md).
+
+### Cluster and federation
+
 - **Chitchat gossip plane**: broadcast-ownership KV with lease
   renewal, per-node capacity advertisement, LWW config,
-  redirect-to-owner for HLS / DASH / RTSP, and a full admin
-  surface at `/api/v1/cluster/{nodes,broadcasts,config}`.
-- **Cross-cluster federation**: one-way authenticated MoQ pulls
-  from peer clusters via `FederationLink`. Exponential-backoff
-  reconnect (base 1 s, 60 s cap, +/-10% jitter).
-  `GET /api/v1/cluster/federation` returns per-link
-  `state` / `last_connected_at_ms` / `last_error` /
-  `connect_attempts`. See [`docs/cluster.md`](docs/cluster.md).
-- **Peer mesh**: topology planner + WebSocket signaling server
-  + server-side subscriber registration + client-side WebRTC
-  DataChannel parent/child relay ship today
-  (`--mesh-enabled`, `--max-peers`, `--mesh-root-peer-count`,
-  `--mesh-ice-servers`). Two-browser AND three-peer (depth-2
-  chain) Playwright E2Es exercise signal-to-DataChannel delivery
-  on every CI run. Actual-vs-intended offload reporting (session
-  141), three-peer matrix (142), and TURN deployment recipe
-  (143) all ship; per-peer capacity advertisement remains the
-  one open phase-D row; see [`docs/mesh.md`](docs/mesh.md).
+  redirect-to-owner for HLS / DASH / RTSP, full admin surface at
+  `/api/v1/cluster/{nodes,broadcasts,config}`.
+- **Cross-cluster federation**: authenticated one-way MoQ pulls from
+  peer clusters via `FederationLink`. Exponential-backoff reconnect
+  (base 1 s, 60 s cap, ±10% jitter); `GET /api/v1/cluster/federation`
+  returns per-link `state` / `last_connected_at_ms` / `last_error` /
+  `connect_attempts`.
+- **Browser peer mesh**: topology planner + WebSocket signaling +
+  server-side subscriber registration + WebRTC DataChannel
+  parent/child relay. CLI knobs: `--mesh-enabled`, `--max-peers`,
+  `--mesh-root-peer-count`, `--mesh-ice-servers`. Per-peer self-
+  reported capacity influences the planner so a peer claiming
+  `capacity: 1` forces subsequent peers to descend even when the
+  global ceiling is higher. Client-side relay ships in
+  [`@lvqr/core`](bindings/js/packages/core); the three-peer-chain
+  Playwright project exercises signal-to-DataChannel delivery on
+  every CI run; TURN deployment recipe + sample `coturn.conf` ship
+  in [`deploy/turn/`](deploy/turn/).
+
+---
+
+## What LVQR uniquely ships
+
+The matrix below lists capabilities present in LVQR against the
+upstream open-source state of the closest comparable projects as
+of April 2026. Marks reflect OSS releases only; commercial tiers
+and third-party forks are noted in the footnotes when they shift
+the read.
+
+Legend: ✓ supported · ◐ partial / via separate component / commercial
+tier · ✗ not supported · ? no public evidence either way.
+
+| Capability | LVQR | MediaMTX | OvenMediaEngine | SRS | MistServer | Ant Media CE |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| MoQ over QUIC/WebTransport, first-class egress | ✓ | ✗[¹] | ✗ | ✗ | ✗ | ◐[²] |
+| Pure-MoQ glass-to-glass latency SLO via sidecar timing track | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| WASM per-fragment filter chain with hot-reload per slot | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| In-process AI agent framework with shipping Whisper VTT captions | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| C2PA signed archive + on-server verify endpoint | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| SCTE-35 passthrough across SRT 0x86 + RTMP onCuePoint, rendered as both HLS DATERANGE and DASH EventStream | ✓ | ✗ | ✗ | ✗ | ◐[³] | ◐[⁴] |
+| Browser peer-mesh DataChannel relay with capacity advertisement | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Optional Linux `io_uring` archive writes | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Hot reload of full auth chain (Static / JWT / JWKS / webhook) atomically without restart | ✓ | ◐[⁵] | ? | ◐[⁶] | ◐ | ✗ |
+| Single JWT across every ingest (RTMP key, WHIP/RTSP bearer, SRT streamid, WS subprotocol) | ✓ | ◐ | ◐[⁷] | ✗ | ◐ | ◐ |
+| HMAC-signed playback URLs across `/hls`, `/dash`, and `/playback` | ✓ | ✗ | ✓[⁸] | ✗ | ? | ◐ |
+| Single binary, no Redis / Kafka / external segmenter / signaling | ✓ | ✓ | ✗[⁹] | ✓ | ◐[¹⁰] | ✗[¹¹] |
+| Native ingest set: RTMP + WHIP + SRT + RTSP + WS-fMP4 | ✓ | ◐ (no WS-fMP4) | ◐ (no WS-fMP4) | ◐ (no RTSP / WS-fMP4) | ✓ | ◐ (no WS-fMP4) |
+| Native egress set: LL-HLS + DASH + WHEP + MoQ + WS-fMP4 | ✓ | ◐ (no DASH, no MoQ, no WS-fMP4) | ◐ (no DASH, no MoQ) | ◐ (no MoQ) | ◐ (no MoQ) | ◐ (no MoQ in CE confirmed) |
+
+[¹]: Upstream MediaMTX has no MoQ; a third-party fork
+([winkmichael/mediamtx-moq](https://github.com/winkmichael/mediamtx-moq))
+shipped August 2025.
+
+[²]: Demonstrated in Ant Media Enterprise; CE parity not confirmed.
+See [Ant Media WebRTC vs MoQ](https://antmedia.io/webrtc-vs-moq-media-over-quic-ant-media-server/)
+and [CE vs EE comparison](https://github.com/ant-media/Ant-Media-Server/wiki/Community-Edition-vs-Enterprise-Edition).
+
+[³]: MistServer's SCTE-35 integration emits markers on TS-based
+outputs only (UDP/TCP/SRT/RIST) and does not render as HLS DATERANGE
+or DASH EventStream. See
+[MistServer SCTE-35 docs](https://docs.mistserver.org/mistserver/integration/scte35/).
+
+[⁴]: Ant Media's SCTE-35 SSAI plugin renders SRT markers into HLS
+cues only.
+
+[⁵]: MediaMTX supports config reload; JWT header support has known
+issues (see issue #3630 referenced in
+[authentication docs](https://mediamtx.org/docs/usage/authentication)).
+
+[⁶]: SRS uses HTTP callback hooks rather than an atomic provider
+swap. See [SRS HTTP Callback](https://ossrs.net/lts/en-us/docs/v4/doc/http-callback).
+
+[⁷]: OvenMediaEngine offers SignedPolicy (HMAC-SHA1 URL signing) +
+AdmissionWebhooks but not a single-JWT-everywhere model. See
+[SignedPolicy](https://docs.ovenmediaengine.com/access-control/signedpolicy)
+and [AdmissionWebhooks](https://docs.ovenmediaengine.com/access-control/admission-webhooks).
+
+[⁸]: OvenMediaEngine's SignedPolicy is HMAC-SHA1 URL signing.
+
+[⁹]: OvenMediaEngine's Origin-Edge clustering uses a Redis OriginMap.
+See [Origin-Edge Clustering](https://docs.ovenmediaengine.com/origin-edge-clustering).
+
+[¹⁰]: MistServer's LoadBalancer is a separate binary; clustering and
+several production features sit in the commercial Pro tier.
+
+[¹¹]: Ant Media CE runs on a Java application server; clustering and
+many production features (adaptive bitrate, full SCTE-35 plugin
+behavior, scaling) are gated to Enterprise.
+
+This is not a horse race -- LVQR is built around a different
+operational shape (single Rust binary, unified Fragment model, MoQ
+as a peer transport rather than a bolt-on). The matrix exists to
+help operators figure out whether LVQR closes a gap they currently
+fill with multiple components, not to argue that anyone listed is
+inferior at what they do.
+
+---
 
 ## Quickstart
 
-### 1. Start the server
+### Install
+
+```bash
+# From crates.io
+cargo install lvqr-cli
+
+# From source
+git clone https://github.com/virgilvox/lvqr.git
+cd lvqr
+cargo build --release
+./target/release/lvqr serve
+```
+
+Optional features at build time: `c2pa`, `transcode`,
+`hw-videotoolbox`, `whisper`, `jwks`, `webhook`, `aac-opus`,
+`io-uring`, plus `full` to enable the major optional auth providers.
+
+### Start the server
 
 ```bash
 lvqr serve
 ```
-
-Zero-config defaults:
 
 | Surface | Port | Protocol | Default |
 |---|---|---|---|
 | MoQ relay | 4443/udp | QUIC / WebTransport | always on |
 | RTMP ingest | 1935/tcp | RTMP | always on |
 | LL-HLS | 8888/tcp | HTTP/1.1 | always on |
-| Admin + WebSocket | 8080/tcp | HTTP/1.1 + WebSocket | always on |
+| Admin + WebSocket | 8080/tcp | HTTP/1.1 + WS | always on |
 | DASH | `--dash-port` | HTTP/1.1 | off |
-| WHEP | `--whep-port` | HTTPS/WebRTC | off |
-| WHIP | `--whip-port` | HTTPS/WebRTC | off |
-| RTSP | `--rtsp-port` | RTSP/1.0 over TCP | off |
-| SRT | `--srt-port` | SRT over UDP | off |
+| WHEP | `--whep-port` | HTTPS / WebRTC | off |
+| WHIP | `--whip-port` | HTTPS / WebRTC | off |
+| RTSP | `--rtsp-port` | RTSP/1.0 | off |
+| SRT | `--srt-port` | SRT / UDP | off |
 
-A self-signed TLS cert is generated at boot if `--tls-cert` /
-`--tls-key` are not supplied. Fine for local dev, not production.
+A self-signed TLS cert generates at boot when `--tls-cert` /
+`--tls-key` are not supplied -- fine for local dev, not production.
 
-### 2. Publish
+### Publish
 
 ```bash
 # RTMP from ffmpeg
@@ -237,48 +344,348 @@ ffmpeg -re -f lavfi -i testsrc=size=640x360:rate=30 \
   -c:a aac -b:a 128k \
   -f flv rtmp://localhost:1935/live/demo
 
-# RTSP from ffmpeg (requires --rtsp-port 8554)
+# RTSP (requires --rtsp-port 8554)
 ffmpeg -re -i source.mp4 -c copy -f rtsp rtsp://localhost:8554/live/demo
 
-# SRT from ffmpeg (requires --srt-port 8890)
-ffmpeg -re -i source.mp4 -c copy -f mpegts srt://localhost:8890?streamid=live/demo
+# SRT (requires --srt-port 8890)
+ffmpeg -re -i source.mp4 -c copy -f mpegts \
+  srt://localhost:8890?streamid=live/demo
 
-# WHIP from OBS 30+ or ffmpeg (requires --whip-port 8443)
-# Service: WHIP, URL: https://localhost:8443/whip/live/demo
+# WHIP from OBS 30+ (requires --whip-port 8443)
+# Service: WHIP   URL: https://localhost:8443/whip/live/demo
 ```
 
-### 3. Play back
+For OBS / vMix / Wirecast / AWS Elemental SCTE-35 publisher recipes
+see [`docs/scte35.md`](docs/scte35.md).
+
+### Play back
 
 - **LL-HLS**: `http://localhost:8888/hls/live/demo/playlist.m3u8`
 - **DASH**: `http://localhost:8889/dash/live/demo/manifest.mpd`
 - **WHEP**: browser WebRTC player at
   `https://localhost:8443/whep/live/demo`
-- **MoQ**: Chrome/Edge 107+ via the `@lvqr/player` web component
-  (published at `@lvqr/player@0.3.2` on npm)
+- **MoQ**: Chrome / Edge 107+ via the `@lvqr/player` web component
+  (`npm i @lvqr/player`)
+- **DVR scrub**: `<lvqr-dvr-player>` web component
+  (`npm i @lvqr/dvr-player`); see
+  [`docs/dvr-scrub.md`](docs/dvr-scrub.md)
 - **WebSocket fMP4**: `ws://localhost:8080/ws/live/demo` (MSE
   fallback for browsers without WebTransport)
 
-The `test-app/` directory demonstrates the WebSocket path end to
-end: `cd test-app && ./serve.sh` exposes a browser demo at
-`http://localhost:3000`.
+The [`test-app/`](test-app/) directory demonstrates the WebSocket
+path end to end: `cd test-app && ./serve.sh` exposes a browser demo
+at `http://localhost:3000`.
 
-### 4. Observe
+### Observe
 
 ```bash
-curl http://localhost:8080/healthz             # liveness
-curl http://localhost:8080/api/v1/streams      # active broadcasts
-curl http://localhost:8080/api/v1/stats        # connection counts
-curl http://localhost:8080/api/v1/slo          # latency SLO snapshot
-curl http://localhost:8080/api/v1/wasm-filter  # WASM chain length + counters
-curl http://localhost:8080/api/v1/streamkeys   # runtime stream-key catalog
-curl http://localhost:8080/api/v1/config-reload # hot config reload status
-curl http://localhost:8080/metrics             # Prometheus scrape
+curl http://localhost:8080/healthz                # liveness
+curl http://localhost:8080/api/v1/streams         # active broadcasts
+curl http://localhost:8080/api/v1/stats           # connection counts
+curl http://localhost:8080/api/v1/slo             # latency snapshot
+curl http://localhost:8080/api/v1/wasm-filter     # WASM chain state
+curl http://localhost:8080/api/v1/streamkeys      # stream-key catalog
+curl http://localhost:8080/api/v1/config-reload   # hot reload status
+curl http://localhost:8080/api/v1/mesh            # mesh topology
+curl http://localhost:8080/api/v1/cluster/nodes   # gossip members
+curl http://localhost:8080/api/v1/cluster/federation # federation links
+curl http://localhost:8080/metrics                # Prometheus scrape
 ```
 
 Set `LVQR_OTLP_ENDPOINT=http://collector:4317` to stream spans +
 metrics to an OTLP gRPC collector.
 
-## Running as a cluster
+---
+
+## Programmable data plane
+
+### WASM filter chains
+
+Each module exports `on_fragment(ptr: i32, len: i32) -> i32` against
+host memory. The host writes the fragment payload at offset 0 before
+the call; the guest:
+
+- returns a negative integer to **drop** the fragment (the rest of
+  the chain short-circuits);
+- returns a non-negative integer `N` to **keep** it, treating the
+  first `N` bytes of guest memory as the rewritten payload (`N=0`
+  means keep with empty payload).
+
+Fragment metadata (`track_id`, `group_id`, `object_id`, `priority`,
+`dts`, `pts`, `duration`, `flags`) is read-only in v1.
+
+```bash
+# Single filter
+lvqr serve --wasm-filter ./drop_low_bitrate.wasm
+
+# Ordered chain (first drop short-circuits the rest)
+lvqr serve \
+  --wasm-filter ./normalize.wasm \
+  --wasm-filter ./watermark.wasm \
+  --wasm-filter ./rate_limit.wasm
+
+# Or via env, comma-separated
+LVQR_WASM_FILTER=normalize.wasm,watermark.wasm,rate_limit.wasm \
+  lvqr serve
+```
+
+Each slot holds its own `notify`-backed file watcher; rewriting one
+`.wasm` file hot-swaps just that slot. Examples and a starter
+template under [`crates/lvqr-wasm/examples/`](crates/lvqr-wasm/examples/).
+Inspect the chain at runtime via
+`GET /api/v1/wasm-filter`.
+
+### AI agents (Whisper captions)
+
+Implement [`Agent`](crates/lvqr-agent/src/lib.rs) on your own type
+plus an [`AgentFactory`](crates/lvqr-agent/src/lib.rs) that returns
+one per `(broadcast, track)` you care about. The runner gives each
+agent a single drain task with panic isolation, per-agent metrics,
+and a snapshot `AgentContext` at construction.
+
+The shipping `WhisperCaptionsAgent` (`--features whisper`) drives
+`whisper.cpp` over the audio track and republishes WebVTT cues onto
+a `captions` track that the LL-HLS composer drains into a subtitles
+rendition group:
+
+```bash
+lvqr serve --whisper-model ggml-tiny.en.bin
+# Subtitles playlist:
+# http://localhost:8888/hls/live/demo/captions/playlist.m3u8
+```
+
+### Server-side transcoding (ABR)
+
+```bash
+# Software ladder: 720p + 480p + 240p plus the source variant
+lvqr serve \
+  --transcode-rendition 720p \
+  --transcode-rendition 480p \
+  --transcode-rendition 240p
+
+# Custom rendition from a TOML file
+lvqr serve --transcode-rendition ./renditions/360p.toml
+
+# macOS hardware encoder (build with --features hw-videotoolbox)
+lvqr serve --transcode-rendition 720p --transcode-encoder videotoolbox
+```
+
+The LL-HLS master playlist composes one `EXT-X-STREAM-INF` per
+rendition automatically. NVENC / VAAPI / QSV backends are on the
+v1.2 roadmap; the current macOS HW path is HW-only by design (a
+factory that silently falls back to CPU under load defeats the
+purpose of an operator-pickable hardware tier).
+
+### C2PA provenance
+
+```bash
+lvqr serve \
+  --archive-dir ./archive \
+  --c2pa-signing-cert ./signer.pem \
+  --c2pa-signing-key ./signer.key \
+  --c2pa-signing-alg es256 \
+  --c2pa-trust-anchor ./trust-anchors.pem \
+  --c2pa-timestamp-authority http://timestamp.digicert.com
+```
+
+On broadcast finalize the drain task walks the archive index and
+writes:
+
+- `<archive>/<broadcast>/<track>/finalized.mp4` -- the coalesced
+  CMAF asset
+- `<archive>/<broadcast>/<track>/finalized.c2pa` -- the sidecar
+  manifest
+
+Verify any signed asset over HTTP:
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  http://localhost:8080/playback/verify/live/demo
+# {
+#   "signer": "CN=Operator, O=Example",
+#   "signed_at": "2026-04-28T18:21:09Z",
+#   "valid": true,
+#   "validation_state": "Trusted",
+#   "errors": []
+# }
+```
+
+For HSM/KMS-backed keys pass an `Arc<dyn c2pa::Signer>`
+programmatically through `ServeConfig.c2pa` instead of using the PEM
+flags. Trust-anchor PEMs let you sign with private CAs that don't
+chain to a public C2PA trust root.
+
+---
+
+## Authentication
+
+### One JWT, every protocol
+
+| Carrier | How the token rides |
+|---|---|
+| RTMP | Stream key IS the JWT (`rtmp://host/live/demo` with stream key set to the JWT) |
+| WHIP / RTSP | `Authorization: Bearer <jwt>` |
+| SRT | `streamid=m=publish,r=<broadcast>,t=<jwt>` |
+| WebSocket ingest / `/signal` / `/ws/*` | `Sec-WebSocket-Protocol: lvqr.bearer.<jwt>` (preferred) or `?token=<jwt>` query fallback |
+| LL-HLS / DASH / WHEP / DVR / admin | `Authorization: Bearer <jwt>`; live HLS + DASH also accept `?token=<jwt>` for native players |
+
+Per-broadcast claim binding is enforced wherever the carrier knows
+the broadcast name at auth time. `--no-auth-live-playback` is the
+escape hatch for deployments that want open live HLS + DASH with
+auth scoped to ingest, admin, and DVR only.
+
+### Providers
+
+```bash
+# Static tokens (env or CLI)
+lvqr serve \
+  --admin-token   $ADMIN \
+  --publish-key   $PUBLISH \
+  --subscribe-token $SUBSCRIBE
+
+# HS256 JWT
+lvqr serve \
+  --jwt-secret    $JWT_SECRET \
+  --jwt-issuer    https://issuer.example.com \
+  --jwt-audience  lvqr-prod
+
+# JWKS (RS256 / ES256 / EdDSA)  -- needs --features jwks at build
+lvqr serve \
+  --jwks-url https://issuer.example.com/.well-known/jwks.json \
+  --jwks-refresh-interval-seconds 300
+
+# Webhook delegation  -- needs --features webhook
+lvqr serve \
+  --webhook-auth-url https://auth.example.com/decide \
+  --webhook-auth-cache-ttl-seconds 60 \
+  --webhook-auth-deny-cache-ttl-seconds 10
+```
+
+Full reference: [`docs/auth.md`](docs/auth.md).
+
+### Runtime stream-key CRUD
+
+```bash
+# Mint a key (the only response that ever shows the literal token)
+curl -H "Authorization: Bearer $ADMIN" \
+  -H 'Content-Type: application/json' \
+  -d '{"broadcasts": ["live/cam1"], "expires_in_secs": 86400}' \
+  http://localhost:8080/api/v1/streamkeys
+
+# List
+curl -H "Authorization: Bearer $ADMIN" \
+  http://localhost:8080/api/v1/streamkeys
+
+# Rotate
+curl -X POST -H "Authorization: Bearer $ADMIN" \
+  http://localhost:8080/api/v1/streamkeys/$ID/rotate
+
+# Revoke
+curl -X DELETE -H "Authorization: Bearer $ADMIN" \
+  http://localhost:8080/api/v1/streamkeys/$ID
+```
+
+Tokens look like `lvqr_sk_<43-char base64url-no-pad>`. The store is
+additive over the configured provider chain, so rotating a key never
+risks bricking subscribe + admin auth that flows through the wrapped
+provider.
+[`docs/auth.md#stream-key-crud-admin-api`](docs/auth.md#stream-key-crud-admin-api).
+
+### Hot config reload
+
+```toml
+# /etc/lvqr/config.toml
+[auth]
+provider = "jwks"
+jwks_url = "https://issuer.example.com/.well-known/jwks.json"
+issuer = "https://issuer.example.com"
+audience = "lvqr-prod"
+
+[mesh]
+ice_servers = [
+  { urls = ["stun:stun.example.com:3478"] },
+  { urls = ["turn:turn.example.com:3478"], username = "lvqr", credential = "..." },
+]
+
+[hmac]
+playback_secret = "rotated-via-config-reload"
+```
+
+```bash
+# Run with the config file
+lvqr serve --config /etc/lvqr/config.toml
+
+# Apply edits
+kill -HUP $(pgrep lvqr)
+# or
+curl -X POST -H "Authorization: Bearer $ADMIN" \
+  http://localhost:8080/api/v1/config-reload
+
+# Inspect last reload
+curl -H "Authorization: Bearer $ADMIN" \
+  http://localhost:8080/api/v1/config-reload
+```
+
+The reload is atomic via `arc_swap::ArcSwap`: in-flight requests
+finish against the prior snapshot, the auth-check fast path stays
+single-digit-ns, and old JWKS / webhook providers' background tasks
+abort via `Drop` when the new provider takes over.
+[`docs/config-reload.md`](docs/config-reload.md).
+
+### HMAC-signed playback URLs
+
+```bash
+lvqr serve --hmac-playback-secret $HMAC_SECRET --archive-dir ./archive
+
+# Mint a playback URL valid for 5 minutes
+EXP=$(($(date +%s) + 300))
+SIG=$(printf '%s' "/playback/live/demo/0/00000042.m4s?exp=$EXP" \
+       | openssl dgst -binary -sha256 -hmac "$HMAC_SECRET" \
+       | basenc --base64url -w0 | tr -d '=')
+echo "http://host:8888/playback/live/demo/0/00000042.m4s?exp=$EXP&sig=$SIG"
+```
+
+In Rust, the `lvqr_cli::sign_playback_url` and
+`lvqr_cli::sign_live_url(secret, LiveScheme::Hls|Dash, broadcast, exp)`
+helpers do this for you. Live HLS / DASH signed URLs are
+broadcast-scoped (one signed URL grants access to the master
+playlist plus every numbered / partial segment under that broadcast,
+because LL-HLS partials roll over every ~200 ms making path-bound
+signatures impractical).
+
+---
+
+## Storage and DVR
+
+```bash
+lvqr serve \
+  --record-dir ./recordings \
+  --archive-dir ./archive \
+  --hls-dvr-window 600
+```
+
+- `--record-dir` writes raw fMP4 segments per `(broadcast, track)`
+  with init segments for offline post-production.
+- `--archive-dir` populates a `redb` segment index, exposes the
+  `/playback/*` scrub routes, and (with the right build features
+  on Linux) writes via `io_uring`.
+- `--hls-dvr-window <secs>` controls the live LL-HLS sliding window
+  the `<lvqr-dvr-player>` web component renders against; `0` is
+  unbounded.
+
+The [`@lvqr/dvr-player`](bindings/js/packages/dvr-player) web
+component drops in as `<lvqr-dvr-player>` against the relay's live
+HLS endpoint with a custom seek bar, percentile labels, LIVE pill,
+Go Live button, client-side hover thumbnails, SCTE-35 ad-break
+marker rendering, and an opt-in client-side glass-to-glass SLO
+sampler that posts to `POST /api/v1/slo/client-sample`. See
+[`docs/dvr-scrub.md`](docs/dvr-scrub.md).
+
+---
+
+## Cluster, federation, and peer mesh
+
+### Single-cluster setup
 
 ```bash
 # Node A
@@ -293,1228 +700,337 @@ lvqr serve \
   --cluster-advertise-hls http://10.0.0.2:8888
 ```
 
-The first publisher for `live/demo` on either node auto-claims
-ownership and renews on a lease. A subscriber hitting the
-non-owner receives a 302 to the owner's advertised URL for HLS,
-DASH, or RTSP. See [`docs/cluster.md`](docs/cluster.md) for the
-full model, ops recipes, and tuning knobs.
+The first publisher for `live/demo` on either node auto-claims the
+broadcast and renews on a lease. Subscribers hitting the non-owner
+receive a 302 redirect to the owner's advertised URL for HLS, DASH,
+or RTSP. Inspect membership at `/api/v1/cluster/nodes`,
+`/api/v1/cluster/broadcasts`, `/api/v1/cluster/config`. Full model:
+[`docs/cluster.md`](docs/cluster.md).
 
-## Client libraries
+### Federation (cross-cluster MoQ pulls)
 
-| Language | Install | Version | Description |
-|---|---|---|---|
-| Rust | `cargo add lvqr-core` | 0.4.2 (crates.io) | Shared types, `EventBus`, admin client |
-| JavaScript | `npm i @lvqr/core` | 0.3.3 (npm) | MoQ-Lite subscriber over WebTransport, WebSocket fMP4 fallback, admin client (`configReload` / `triggerConfigReload` for hot config reload, `listStreamKeys` / `mintStreamKey` / `revokeStreamKey` / `rotateStreamKey` for runtime stream-key CRUD, plus the existing 9 health / stats / mesh / SLO / wasm-filter routes), `MeshPeer` WebRTC DataChannel relay with `pushFrame`, `onChildOpen`, `parentPeerId`, `forwardedFrameCount`, and `MeshConfig.capacity?: number` (per-peer relay capacity advertisement, session 144). Mesh data plane fully implemented as of session 144. |
-| JavaScript | `npm i @lvqr/player` | 0.3.2 (npm) | Drop-in `<lvqr-player>` web component with MSE fallback |
-| JavaScript | `npm i @lvqr/dvr-player` | 0.3.3 (npm) | Drop-in `<lvqr-dvr-player>` HLS DVR scrub component (custom seek bar, LIVE pill, Go Live, hover thumbnails, SCTE-35 ad-break marker rendering with `markers="visible|hidden"` attribute + `lvqr-dvr-markers-changed` / `lvqr-dvr-marker-crossed` events + `getMarkers()` programmatic API, opt-in client-side glass-to-glass SLO sampler via `slo-sampling="enabled"` + `slo-endpoint="<URL>"` posting to the v0.4.2 `/api/v1/slo/client-sample` route). |
-| Python | `pip install lvqr` | 0.3.3 (PyPI) | Admin API client (`config_reload_status` / `trigger_config_reload` for hot config reload, `list_streamkeys` / `mint_streamkey` / `revoke_streamkey` / `rotate_streamkey` for runtime stream-key CRUD, plus the existing 9 health / stats / mesh / SLO / wasm-filter routes), `MeshPeerStats.capacity` per-peer field (session 144), `bearer_token` kwarg, dataclass returns. |
+Configure a `FederationLink` between clusters and authenticated MoQ
+fan-in flows through with exponential-backoff reconnect (base 1 s,
+60 s cap, ±10% jitter). Per-link state is visible at
+`/api/v1/cluster/federation`.
 
-See [`docs/sdk/javascript.md`](docs/sdk/javascript.md) for the JS
-API reference and
-[`bindings/python/python/lvqr/`](bindings/python/python/lvqr/) for
-the Python module.
-
-## Roadmap
-
-Tier 1 (protocols), Tier 2 (unified fragment model + cluster
-plane), Tier 3 (cluster auth + redirect-to-owner), and Tier 4
-(programmable data plane: WASM filters, io_uring archive, C2PA,
-cross-cluster federation, AI agents, ABR transcoding, latency
-SLO, one-token auth) all **ship** as of v0.4.0. The Tier 4 exit
-criterion -- a working
-[`examples/tier4-demos/`](examples/tier4-demos/) public demo
-script -- landed on `main` post-v0.4.0 in session 117
-(`demo-01.sh` chains WASM filter + whisper captions + ABR
-transcode + DVR archive end to end; C2PA sign + verify is
-opt-in via `LVQR_DEMO_C2PA=1`).
-
-Full v1.1 phase plan with session-by-session sequencing lives in
-[`tracking/PLAN_V1.1.md`](tracking/PLAN_V1.1.md). The 29-crate
-inventory was anchored in the session-121 close block; the
-[`tracking/HANDOFF.md`](tracking/HANDOFF.md) file's status header
-always names the latest shipped session and links the matching
-PLAN row state.
-
-### Next up (ranked by impact / ship-ability)
-
-Ordering reflects a 2026-04-24 codebase audit against the v1.1
-plan after the workspace 0.4.1 republish (session 145). Higher
-items are smaller, closer to shippable, and close gaps explicitly
-named in Known v0.4.0 limitations.
-
-Stream-key CRUD admin API shipped in session 146; hot config
-reload v1 (auth-only) shipped in session 147; v2 (mesh ICE +
-HMAC secret) shipped in session 148; v3 (JWKS + webhook URL
-rotation, async reload pipeline) shipped in session 149.
-SCTE-35 ad-marker passthrough v1 shipped in session 152 (both
-SRT MPEG-TS PID 0x86 and RTMP onCuePoint scte35-bin64 ingest;
-HLS `#EXT-X-DATERANGE` + DASH Period-level `<EventStream>`
-egress). Dedicated DVR scrub web UI shipped in session 153
-(`@lvqr/dvr-player`); SCTE-35 ad-break markers on the dvr-player
-seek bar shipped in session 154 (joined with the v1.1 close-out
-of marker rendering, originally session 153 anti-scope). All
-three of the v1.1 ranked items are now closed; the remaining
-ranking:
-
-1. ~~**Hot config reload.**~~ v1 / v2 / v3 shipped across
-   sessions 147 + 148 + 149.
-2. ~~**SCTE-35 passthrough.**~~ v1 shipped in session 152
-   (both ingest paths + both egress wire shapes;
-   splice_info_section passthrough verbatim, no semantic
-   interpretation). See [`docs/scte35.md`](docs/scte35.md).
-3. ~~**Dedicated DVR scrub web UI.**~~ v1 shipped in session 153
-   (`@lvqr/dvr-player` web component, vanilla `HTMLElement` + hls.js,
-   custom seek bar with HH:MM:SS percentile labels, LIVE pill,
-   Go Live button, client-side hover thumbnails). See
-   [`docs/dvr-scrub.md`](docs/dvr-scrub.md).
-4. ~~**One hardware encoder backend** (VideoToolbox on macOS).~~
-   Shipped in session 156. The three others (NVENC for Linux,
-   VAAPI, QSV) stay deferred to v1.2. See
-   [`crates/lvqr-transcode/src/videotoolbox.rs`](crates/lvqr-transcode/src/videotoolbox.rs)
-   and the operator quickstart below.
-5. ~~**MoQ egress latency SLO.**~~ Shipped end-to-end across
-   sessions 156 follow-up + 159 (the last open Phase A v1.1
-   roadmap row). Server-side `POST /api/v1/slo/client-sample`
-   endpoint + the HLS-side first client
-   (`@lvqr/dvr-player` PDT-anchored sampler) shipped in session
-   156 follow-up. The pure-MoQ subscriber path closed in
-   session 159 PATH-X: a sibling `<broadcast>/0.timing` MoQ
-   track stamps a 16-byte LE
-   `(group_id_u64_le || ingest_time_ms_u64_le)` anchor per
-   video keyframe (additive; foreign MoQ clients ignore the
-   unknown track name per the moq-lite contract), and a new
-   `[[bin]] lvqr-moq-sample-pusher` on `lvqr-test-utils`
-   subscribes to both `0.mp4` + `0.timing`, joins anchors by
-   `group_id`, and POSTs samples through the dual-auth route.
-   The default-feature `moq_timing_e2e.rs` integration test
-   drives the full RTMP -> relay -> bin -> SLO endpoint loop
-   and asserts a non-empty `transport="moq"` entry on
-   `GET /api/v1/slo`. See
-   [`crates/lvqr-fragment/src/moq_timing_sink.rs`](crates/lvqr-fragment/src/moq_timing_sink.rs)
-   and
-   [`tracking/SESSION_159_BRIEFING.md`](tracking/SESSION_159_BRIEFING.md).
-
-#### Recently shipped (compact reference)
-
-* **MoQ glass-to-glass SLO audit + scenario-(c) close-out**
-  (session 157, 2026-04-27) -- the audit confirmed the MoQ wire
-  carries no per-frame wall-clock anchor:
-  `lvqr_fragment::MoqTrackSink::push` writes only
-  `frag.payload.clone()` to the underlying `moq-lite` track
-  (`crates/lvqr-fragment/src/moq_sink.rs:99-105`), and the
-  inverse `MoqGroupStream::next_fragment` constructs received
-  Fragments with hard-zero `dts` / `pts` / `duration` /
-  `ingest_time_ms` by documented contract
-  (`crates/lvqr-fragment/src/moq_stream.rs:35-41,142-152`).
-  HLS subscribers can already push samples by default via
-  `@lvqr/dvr-player`'s PDT-anchored sampler (session 156
-  follow-up); pure-MoQ subscribers cannot, because the wire has
-  no manifest analog. Per the original session-157 brief's
-  scenario-(c) guard ("strategy call, NOT engineering -- don't
-  ship the bin until the scoping is locked"), no Rust MoQ
-  sample-pusher bin shipped this session. Instead: (1) the
-  misleading doc comment on
-  `crates/lvqr-admin/src/routes.rs::ClientLatencySample::ingest_ts_ms`
-  (which previously implied clients could lift `ingest_time_ms`
-  "from the frame's per-track metadata") is rewritten with a
-  transport-specific recovery table; (2) the Phase A v1.1 #5
-  row + "Next up" #5 row are updated to reflect that the
-  HLS-side close-out shipped + the pure-MoQ side is open as
-  v1.2; (3) `tracking/SESSION_157_BRIEFING.md` records the
-  audit, the Path Y / X / Z scoping decision, and the v1.2
-  sidecar-track design sketch (sibling `<broadcast>/0.timing`
-  MoQ track emitting `(group_id_u64_le, ingest_time_ms_u64_le)`
-  anchors per keyframe; additive, foreign MoQ clients ignore
-  the unknown track name). **No Rust crate logic touched, no
-  wire change, no new feature flag, no SDK package version
-  bump, no relay route change.** Workspace `0.4.1` unchanged;
-  SDK packages unchanged; the 1111 default-gate workspace lib
-  count is unmoved. The doc-comment edit is the only
-  behaviour-relevant change and it is in a `///` block, so the
-  `lvqr-admin` lib test count (54 / 0 / 0) is unchanged.
-
-* **`@lvqr/dvr-player` SLO sampler** (session 156 follow-up) --
-  the dvr-player web component now ships with opt-in client-side
-  glass-to-glass latency sampling. Set `slo-sampling="enabled"` +
-  `slo-endpoint="<URL>"` (and the existing `token` attribute for
-  bearer auth) and the component pushes one sample every 5 s
-  (configurable via `slo-sample-interval-secs`) computed as
-  `render_ms - (videoEl.getStartDate() + currentTime * 1000)` --
-  HLS-spec PDT-anchored client-render latency, the half of the
-  glass-to-glass measurement the relay's server-side stamping
-  cannot see (network + buffer + decode latency). Pushes via
-  `fetch()` to the new `POST /api/v1/slo/client-sample` route;
-  the bearer token rides the dual-auth path so a
-  subscribe-token-bearing playback session pushes legitimately.
-  Best-effort: any failure is silently dropped to keep playback
-  uninterrupted. New `bindings/js/packages/dvr-player/src/slo-sampler.ts`
-  (pure helpers: `computeLatencyMs`, `broadcastFromHlsSrc`,
-  `pushSample`) covered by 16 Vitest unit tests in
-  `bindings/js/tests/sdk/dvr-player-slo-sampler.spec.ts`. The
-  three new attributes are observed + reactive (toggling at
-  runtime starts / stops the sampler timer cleanly). dvr-player
-  Vitest count goes from 60 to 76 tests; Playwright count
-  unchanged at 19 (the SLO push surface is small + cleanly
-  unit-testable; e2e coverage rides any future Tier 5 SDK
-  integration test).
-
-* **MoQ egress latency SLO server-side endpoint** (session 156
-  follow-up) -- new `POST /api/v1/slo/client-sample` route on
-  `lvqr-admin` accepting JSON
-  `{broadcast, transport, ingest_ts_ms, render_ts_ms}` from any
-  subscriber. Validates the inputs (non-empty broadcast +
-  transport, render >= ingest, latency <= 5 min cap to filter
-  clock skew), computes `latency_ms = render_ts_ms - ingest_ts_ms`,
-  and feeds the existing `LatencyTracker` already powering
-  `GET /api/v1/slo` + the `lvqr_subscriber_glass_to_glass_ms`
-  Prometheus histogram. New `lvqr_slo_client_samples_total{transport}`
-  counter for sample-rate visibility. Returns 204 on success, 400
-  on validation failure, 503 when no tracker is wired (`AdminState`
-  built without `with_slo`), 401 when both auth paths reject.
-  **Dual-auth**: the route is mounted off the admin-only middleware
-  so Tier 5 client SDKs can push samples without holding an admin
-  token. The handler accepts either an `AuthContext::Admin` token
-  (operator scope) OR an `AuthContext::Subscribe` token validated
-  against the broadcast in the request body. The auth provider's
-  existing per-broadcast subscribe logic naturally enforces
-  "subscribers can only push samples for broadcasts they're
-  allowed to subscribe to", which prevents token-laundering /
-  sample pollution. Closes the documented path forward for Phase A
-  v1.1 #5 (MoQ egress latency SLO); the checkbox itself stays
-  unchecked until a Tier 5 client SDK pushes samples by default,
-  but custom clients (browser / Rust / Python) holding either
-  scope can push today. Ten new admin route tests cover happy
-  path (admin + subscribe), no-tracker (503), negative latency,
-  oversized latency, empty broadcast, oversized transport label,
-  no-token / wrong-token rejection.
-
-* **Hardware encoder backend v1 -- VideoToolbox on macOS**
-  (session 156) -- new `lvqr_transcode::VideoToolboxTranscoderFactory`
-  ships behind a per-encoder `hw-videotoolbox` Cargo feature on
-  `lvqr-transcode` + `lvqr-cli`. Mirrors the existing
-  `SoftwareTranscoderFactory` (105 B / 106 C) shape verbatim --
-  same `Transcoder` trait, same lifecycle, same
-  `<source>/<rendition>` output broadcast naming -- but swaps the
-  `x264enc bitrate=... tune=zerolatency speed-preset=superfast
-  key-int-max=60` GStreamer encoder element for `vtenc_h264_hw
-  bitrate=... realtime=true allow-frame-reordering=false
-  max-keyframe-interval=60` (Apple's HW-only H.264 encoder via
-  the `applemedia` plugin from `gst-plugins-bad`). HW-only path
-  is intentional: a HW factory that silently falls back to CPU
-  encoding under load defeats the purpose of an operator-pickable
-  hardware tier; missing-element probe at factory construction
-  opts out cleanly with a warn log when `vtenc_h264_hw` is absent.
-  Per-rendition output broadcasts ride the same
-  `FragmentBroadcasterRegistry` flow as the software ladder; HLS
-  master-playlist composition + DASH MPD + archive indexer + MoQ
-  fanout all see the new outputs without per-protocol wiring.
-  CLI flag `--transcode-encoder software|videotoolbox` (default
-  `software`); the `videotoolbox` value is rejected at parse time
-  on builds without the `hw-videotoolbox` feature with a clear
-  error pointing at the build command. Six new Vitest-style unit
-  tests in `crates/lvqr-transcode/src/videotoolbox.rs` (factory
-  build / opt-out / naming / metric label / suffix-skip /
-  pipeline string), one new Rust integration test
-  `crates/lvqr-transcode/tests/videotoolbox_ladder.rs` (gated on
-  `cfg(target_os = "macos")` + the feature; drives the CMAF H.264
-  baseline 360p conformance fixture through the full HW pipeline,
-  asserts three renditions emit non-empty fragments + 720p output
-  exceeds 240p output bytes), four new lvqr-cli config tests
-  covering both feature variants of the
-  `--transcode-encoder` parser. Default-feature workspace
-  unchanged (the new module + bin only compile under
-  `--features hw-videotoolbox`); CI matrix unchanged
-  (ubuntu-latest cannot exercise VideoToolbox; a future macos-runner
-  CI lane is unrelated workflow scope). Workspace `0.4.1`
-  unchanged; SDK packages unchanged. The `[ ] One hardware
-  encoder backend` checkbox under Phase A v1.1 (above) flips to
-  `[x]`. NVENC / VAAPI / QSV stay deferred to v1.2 per the README's
-  prior language. Operator quickstart: `cargo build --release
-  --features hw-videotoolbox -p lvqr-cli` then `lvqr serve
-  --transcode-rendition 720p,480p,240p --transcode-encoder
-  videotoolbox`. Requires GStreamer 1.22+ with the `applemedia`
-  plugin (the official `.framework` installer at
-  `https://gstreamer.freedesktop.org/download/` ships it; on a
-  Homebrew-based dev box `brew install gstreamer
-  gst-plugins-base gst-plugins-good gst-plugins-bad`).
-
-* **Session 154 test-coverage close-out** (session 155) -- closes
-  the three test-coverage follow-ups from session 154's HANDOFF in
-  one push. (1) `mesh-e2e.yml` workflow `apt-get install`s ffmpeg
-  + sets `LVQR_LIVE_RTMP_TESTS=1` so the live-RTMP marker tests
-  run on every CI push. (2) The strengthened live-RTMP test now
-  asserts the dvr-player LIVE pill flips to `is-live` against a
-  real ffmpeg publish via a new `bindings/js/tests/helpers/hls-poll.ts`
-  variant-playlist-non-empty pre-check helper (`waitForLiveVariantPlaylist`),
-  closing the manifestLoadError race that left session 154's
-  assertion narrow. (3) New `[[bin]] scte35-rtmp-push` on
-  `lvqr-test-utils` opens a real RTMP publisher session and sends
-  a single `onCuePoint scte35-bin64` AMF0 Data message at a chosen
-  offset; new gated Playwright e2e drives the bin into the
-  dvr-player webServer profile and asserts the SCTE-35 marker
-  tick renders at the expected fraction with the expected
-  daterange ID. The bin depends on a new ~25-line `publish_amf0_data`
-  patch on the vendored `rml_rtmp` v0.8 client (mirrors session
-  152's server-side `Amf0DataReceived` patch) -- the upstream
-  client API only exposes `publish_metadata` (which hard-codes
-  `@setDataFrame` + `onMetaData`); the new method emits an
-  arbitrary `Vec<Amf0Value>` verbatim. Synthetic H.264 NAL helpers
-  in `crates/lvqr-test-utils/src/h264.rs` (parseable Baseline-
-  profile SPS / PPS lifted from the `h264-reader` test fixtures);
-  `splice_insert_section_bytes` extracted from the existing
-  `crates/lvqr-cli/tests/scte35_hls_dash_e2e.rs` into
-  `crates/lvqr-test-utils/src/scte35.rs` so the new bin + the
-  existing e2e share a single source of truth. Five new tests
-  across four tiers: 2 rml_rtmp client unit (172 / 0 / 0 fork
-  total, was 170), 2 lvqr-test-utils unit (hex-pin on the
-  extracted helper + codec parser round-trip), 1 Rust integration
-  smoke (`tests/scte35_rtmp_push_smoke.rs` -- default-gate, drives
-  the bin against a `TestServer` and asserts DATERANGE
-  `splice-3405691582`), 1 strengthened + 1 new gated Playwright
-  test in `markers.spec.ts`. Bonus: fixed a long-standing bug in
-  `lvqr_test_utils::rtmp::read_until` that was silently dropping
-  the post-connect `SetChunkSize` packet (it followed
-  `ConnectionRequestAccepted` in the result vector and the helper
-  short-circuited on the matching event before writing later
-  responses); the bug was latent until the bin sent a >128-byte
-  AMF0 onCuePoint and the server's deserializer parsed mid-payload
-  bytes as chunk headers (csid 52 etc.). **No relay-side wire
-  change, no SDK package version bump, no production code path in
-  `@lvqr/dvr-player` touched** -- `@lvqr/dvr-player` stays at
-  0.3.3 with test + tooling deltas only. Workspace `0.4.1`
-  unchanged.
-
-* **SCTE-35 ad-break markers on `@lvqr/dvr-player` v0.3.3**
-  (session 154) -- the dvr-player's seek bar paints session 152's
-  `#EXT-X-DATERANGE` ad markers inline. Vertical ticks for
-  CMD / time-signal singletons, coloured break-range spans for
-  paired SCTE35-OUT + SCTE35-IN entries (joined by their shared
-  DATERANGE `ID`), faint in-flight overlays for an OUT whose IN
-  has not yet landed; hover tooltip with kind / id / time /
-  duration. New `markers="visible|hidden"` attribute, two new
-  events `lvqr-dvr-markers-changed` (diff vs prior LEVEL_LOADED)
-  and `lvqr-dvr-marker-crossed` (per-id with 100 ms debounce),
-  new programmatic `getMarkers()` returning sorted store + pairs.
-  Reads markers from hls.js's `LevelDetails.dateRanges` (v1.5+)
-  and trusts `DateRange.startTime` for the PDT-anchored
-  currentTime mapping. **No relay-side wire change** -- pure
-  consumer of session 152's existing `#EXT-X-DATERANGE` surface.
-  CSS hooks: `--lvqr-marker-color`, `--lvqr-marker-tick-color`,
-  `--lvqr-marker-in-flight`, `--lvqr-marker-tooltip-bg`. Pure
-  helpers in `src/markers.ts` (classifyMarker /
-  dvrMarkersFromHlsDateRanges / markerToFraction /
-  groupOutInPairs / formatDuration) covered by 28 Vitest tests
-  in `bindings/js/tests/sdk/dvr-player-markers.spec.ts`.
-  Playwright project gains two routed-stub-playlist marker tests
-  (LEVEL_LOADED -> store + emit -> rendered ticks at OUT/IN
-  fractions; `markers="hidden"` empties layer + getMarkers
-  still exposes store) plus one opt-in live-RTMP test using the
-  new `bindings/js/tests/helpers/rtmp-push.ts` ffmpeg wrapper
-  (gated behind `LVQR_LIVE_RTMP_TESTS=1` because the back-to-back
-  ffmpeg-to-loopback-RTMP flow is flake-prone on macOS dev
-  boxes; closes session 153's deferred "live-stream-driven
-  Playwright assertions" item by exercising the helper end-to-
-  end against the dvr-player webServer profile). Three e2e
-  tests; the live one skips by default + when ffmpeg is missing.
-  **Workspace test count delta:** +28 Vitest dvr-player-markers,
-  +3 Playwright dvr-player markers (2 default + 1 opt-in).
-  `@lvqr/player` and `@lvqr/core` stay at 0.3.2; workspace stays
-  at 0.4.1.
-* **Dedicated DVR scrub web UI v1** (session 153) -- new
-  `@lvqr/dvr-player` package at `bindings/js/packages/dvr-player/`
-  ships as a sister to `@lvqr/player`. Vanilla `class extends
-  HTMLElement` (no Lit, no Stencil; structured-vanilla pattern
-  with template-literal HTML strings + small attribute helpers
-  + shadow DOM + `attributeChangedCallback`-driven reactivity).
-  Wraps hls.js against the relay's existing live HLS endpoint
-  (`/hls/{broadcast}/master.m3u8`) with the sliding-window DVR
-  depth driven by `--hls-dvr-window-secs`; **no new server route
-  was added**. Custom seek bar with HH:MM:SS percentile labels
-  (or MM:SS for sub-hour spans), LIVE pill that toggles based
-  on `seekable.end - currentTime` crossing
-  `max(6, 3 * #EXT-X-TARGETDURATION)` (configurable via
-  `live-edge-threshold-secs`), explicit "Go Live" button (no
-  implicit live-snap on resume), client-side hover thumbnails
-  via canvas `drawImage` against a lazy second hls.js instance
-  (LRU-capped at 60 entries, opt-out via `thumbnails="disabled"`),
-  bearer-token auth via hls.js `xhrSetup` (`Authorization: Bearer`
-  header) plus query-string fallback for native HLS. Public events
-  `lvqr-dvr-seek`, `lvqr-dvr-live-edge-changed`, `lvqr-dvr-error`;
-  programmatic API `play()` / `pause()` / `seek(time)` / `goLive()`
-  / `getHlsInstance()`. ESM-only via tsc, MIT OR Apache-2.0,
-  initial version 0.3.2 lockstep with the rest of the SDK.
-  Vitest suite split across three SDK specs in
-  `bindings/js/tests/sdk/`: 14 tests over the seek-bar pure
-  arithmetic (`dvr-player-seekbar.spec.ts` -- fraction-time round-
-  trip + clamping + degenerate range + MM:SS / HH:MM:SS
-  formatting + percentile labels + threshold checks), 14 tests
-  over the attribute helpers (`dvr-player-attrs.spec.ts` --
-  boolean / numeric / string getters with fallback semantics
-  including NaN / Infinity / empty-string edge cases), and 4
-  tests over the typed event dispatcher
-  (`dvr-player-dispatch.spec.ts` -- detail-shape preservation
-  for all three event names + `bubbles: true` flag). 32 unit
-  tests total. Playwright project at
-  `bindings/js/tests/e2e/dvr-player/` runs 15 tests across two
-  spec files: `mount.spec.ts` covers custom-element registration,
-  13 shadow-DOM part landmarks, `muted` attribute reflection,
-  `controls=native` toggle, programmatic `seek()` event flow;
-  `interactions.spec.ts` covers `goLive()` jumping to seekable
-  end + user-source event, `seek()` clamping at both endpoints,
-  multi-seek event chaining (fromTime threading), keyboard
-  `ArrowLeft` / `ArrowRight` (+/-5 s scrub) + `Home` / `End`
-  (range endpoints), `live-edge-threshold-secs` attribute
-  driving the `isLiveEdge` classification at default vs
-  custom thresholds, `controls="custom"` restoration after a
-  prior `native` set + default-fallback when removed,
-  pointer-drag (pointerdown + move + up) on the seek bar
-  updating currentTime + firing user-source events, hover
-  preview show / hide on pointermove + pointerleave,
-  `getHlsInstance()` returning null pre-playback, and event
-  bubbling past the host element to `document`. New docs at [`docs/dvr-scrub.md`](docs/dvr-scrub.md)
-  cover the operator embedding recipe, signed-URL / bearer-token
-  semantics, theming via CSS custom properties + `::part()`, and
-  the relationship between `--hls-dvr-window-secs` and the
-  seekable range the component renders. Workspace 0.4.1
-  unchanged; `@lvqr/player` and `@lvqr/core` stay at 0.3.2.
-
-* **SCTE-35 ad-marker passthrough v1** (session 152) -- ingest
-  on both **SRT MPEG-TS** (PMT stream_type 0x86 with private-
-  section reassembly across TS packet boundaries; typically
-  PID 0x1FFB) AND **RTMP onCuePoint scte35-bin64** (Adobe AMF0
-  convention used by AWS Elemental, Wirecast, vMix, ffmpeg).
-  RTMP onCuePoint required vendoring `rml_rtmp` v0.8.0 at
-  `vendor/rml_rtmp/` with a ~25-line patch that adds an
-  `Amf0DataReceived` ServerSessionEvent variant; upstream
-  silently drops every AMF0 Data message that is not
-  `@setDataFrame`-wrapped onMetaData. The fork loads via
-  `[patch.crates-io]` in the workspace root and passes 170 / 0
-  / 0 tests (168 upstream + 2 LVQR-side defensive tests for
-  the new variant). New `lvqr-codec/src/scte35.rs` parses
-  splice_info_section per ANSI/SCTE 35-2024 section 8.1 with
-  CRC_32 verification (MPEG-2 polynomial 0x04C11DB7) and
-  surfaces the timing fields egress renderers need (event_id,
-  pts, break_duration, command_type, cancel,
-  out_of_network_indicator) while preserving the raw section
-  bytes verbatim. Events flow through a reserved `"scte35"`
-  parallel track on the existing `FragmentBroadcasterRegistry`
-  (mirroring the whisper-captions pattern under
-  `lvqr_fragment::SCTE35_TRACK`). LL-HLS render adds
-  `#EXT-X-DATERANGE` per HLS spec section 4.4.5.1 with a
-  `CLASS="urn:scte:scte35:2014:bin"` attribute (industry
-  convention so client-side ad pipelines can filter without
-  parsing the SCTE35-* hex blob) and SCTE35-OUT / SCTE35-IN /
-  SCTE35-CMD attributes driven by splice_command_type +
-  out_of_network_indicator; DASH MPD render adds Period-level
-  `<EventStream schemeIdUri="urn:scte:scte35:2014:xml+bin">`
-  per ISO/IEC 23009-1 G.7 + SCTE 214-1 with base64
-  splice_info_section inside a `<Signal><Binary>` body.
-  Counter metrics `lvqr_scte35_events_total{ingest, command}`
-  and `lvqr_scte35_drops_total{ingest, reason}` cover both
-  ingest paths. New docs at [`docs/scte35.md`](docs/scte35.md)
-  cover the full standards reference, ingest paths, operator
-  publisher quickstart (ffmpeg, AWS Elemental, Wirecast,
-  vMix, OBS), wire shape examples, internal architecture,
-  anti-scope, and metrics surface.
-
-* **lvqr-agent test polling** (session 151) -- four
-  `tokio::time::sleep(Duration::from_millis(100))` sites in
-  `crates/lvqr-agent/src/runner.rs` tests replaced with a
-  `poll_until` helper (10 ms tick, 2 s timeout). The fixed-100
-  ms shape raced the spawned drain task's panic-counter
-  increment under macos-latest CI runner load (surfaced as a
-  flake on the session 150 push: `panic_in_on_start_skips_drain
-  _loop` and `panic_in_on_fragment_is_caught_and_counted_loop_
-  continues` reported `left: 0, right: 1` on `assert_eq!(handle.
-  panics(...), 1)`). The flake was unrelated to the wasmtime
-  upgrade -- `lvqr-agent` has zero wasmtime / wasi / wasm
-  references in its dep tree -- but the upgrade's CI run
-  surfaced it. Polling lets a heavily-loaded runner take up to
-  2 s while a fast runner finishes in tens of ms.
-* **wasmtime v25 -> v43 upgrade** (session 150) -- closes 16
-  RustSec advisories on the workspace's WASM filter host crate,
-  including 2x CVSS-9 sandbox-escape entries
-  (`RUSTSEC-2026-0095`, `RUSTSEC-2026-0096`). The upgrade
-  required only two `Module::new` callsite tweaks in
-  `lvqr-wasm` (wasmtime v43 dropped `std::error::Error` from its
-  top-level error type; converted via `anyhow::anyhow!`).
-  Workspace tests stay at 1111/0/0; `cargo audit --deny
-  warnings` cleanly passes against the new ignore list (down to
-  6 documented advisories: rsa Marvin attack with no upstream
-  fix, 4 unmaintained transitives, and 2 soundness items not
-  reachable from LVQR call sites). Audit-debt removed: the 16
-  wasmtime ignores in `audit.toml` are gone.
-* **Hot config reload v3: JWKS + webhook URL rotation** (session 149)
-  -- `ConfigReloadHandle::reload` flips to `async` so it can call
-  `JwksAuthProvider::new` / `WebhookAuthProvider::new`
-  asynchronously inside the reload pipeline; the resulting provider
-  is atomically swapped into the `HotReloadAuthProvider` chain. The
-  old provider's `Drop` aborts its background refresh / fetcher
-  task. `applied_keys` grows entries `"jwks"` / `"webhook"` when
-  their URL diffs against the prior snapshot. Feature-disabled
-  builds emit a warning when the file names a feature-gated URL.
-  `jwks_url` and `webhook_auth_url` are mutually exclusive in the
-  same `[auth]` section (the route returns an error). The route
-  closure shape widened from sync `Fn -> Result<...>` to async-
-  flavored `Fn -> BoxFuture<Result<...>>` (internal-API change; SDK
-  wire shape unchanged). See
-  [`docs/config-reload.md`](docs/config-reload.md).
-* **Hot config reload v2: mesh ICE + HMAC secret** (session 148)
-  -- `mesh_ice_servers` and `hmac_playback_secret` join the
-  hot-reloadable surface. The `/signal` callback `load_full`s the
-  swapped ICE list per `Register`; live HLS / DASH and DVR
-  `/playback/*` middlewares `load_full` the swapped HMAC secret
-  per request. Outstanding URLs signed under a rotated secret stop
-  verifying immediately (the documented rotation intent).
-  `applied_keys` on the route response grows to include
-  `"mesh_ice"` / `"hmac_secret"` when those reload effectively;
-  session 147's deferred-warning emissions for these two keys
-  drop. `jwks_url` / `webhook_auth_url` reload remain deferred.
-  See [`docs/config-reload.md`](docs/config-reload.md).
-* **Hot config reload (auth-only v1)** (session 147) --
-  `lvqr serve --config <path.toml>` + SIGHUP +
-  `POST /api/v1/config-reload`. The `[auth]` section
-  hot-reloads via a new `lvqr_auth::HotReloadAuthProvider`
-  (`arc_swap::ArcSwap` swap with single-digit-ns reads; in-flight
-  `check()` calls finish against the prior snapshot). Stream-key
-  store is preserved. See
-  [`docs/config-reload.md`](docs/config-reload.md).
-* **Stream-key CRUD admin API** (session 146) -- runtime mint /
-  list / revoke / rotate over `/api/v1/streamkeys/*` backed by
-  `lvqr_auth::MultiKeyAuthProvider`. Additive over the existing
-  JWT / Static / JWKS / Webhook chain. Tokens are
-  `lvqr_sk_<43-char base64url-no-pad>`. Subscribe + Admin auth
-  always delegate to the wrapped chain so a misconfigured store
-  cannot lock the operator out. Default-on; opt out with
-  `--no-streamkeys`. See
-  [`docs/auth.md#stream-key-crud-admin-api`](docs/auth.md#stream-key-crud-admin-api).
-* **Workspace 0.4.1 republish** (session 145) -- all 26
-  publishable Rust crates flipped from 0.4.0 to 0.4.1 so
-  sessions 141-144 source reaches `cargo install`; supply-chain
-  audit cleaned up (rustls-webpki bumped + `audit.toml` ignores
-  for deferred wasmtime / rsa / unmaintained transitives).
-* **Mesh data-plane Phase D** (sessions 141-144) -- offload
-  reporting, three-peer Playwright E2E, TURN recipe +
-  server-driven ICE config, per-peer capacity advertisement.
-  `docs/mesh.md` is IMPLEMENTED.
-* **WASM filter chain composition** (session 136) --
-  `--wasm-filter` accepts multiple paths; ordered `ChainFilter`
-  with short-circuit drop semantics; per-slot hot-reload.
-* **Webhook auth provider** (session 135) --
-  `--webhook-auth-url` delegates publish / subscribe / admin
-  decisions to an operator HTTP endpoint with TTL-cached
-  allow / deny. See `docs/auth.md#webhook-auth-provider`.
-* **HMAC-signed playback URLs** (sessions 124, 128) --
-  `--hmac-playback-secret` short-circuits auth on DVR + live
-  HLS + DASH routes via `?exp=<unix_ts>&sig=<base64url>`.
-  `lvqr_cli::sign_playback_url` + `sign_live_url` mint URLs.
-* **Feature-flag CI matrix** (session 123) --
-  `feature-matrix.yml` runs `c2pa`, `transcode`, and `whisper`
-  cells per push + PR.
-* **SDK CI** (session 122) -- `sdk-tests.yml` runs Vitest +
-  pytest against a live `lvqr serve`. `@lvqr/core` admin client
-  expanded from 3 to 9 of 9 routes in the same session.
-
-The list below groups the same remaining work by logical area.
-
-### Client SDKs (shipped; completion work pending)
-JavaScript (`@lvqr/core`, `@lvqr/player` at 0.3.2 on npm), Python
-(`lvqr` at 0.3.2 on PyPI, admin client only), and Rust
-(`lvqr-core` at 0.4.1 on crates.io) already ship. Remaining work:
-- [x] ~~**Expand `@lvqr/core` admin client** from 3 of 9
-  `/api/v1/*` routes to all 9.~~ Shipped in session 122:
-  `LvqrAdminClient` now exposes `mesh()`, `slo()`,
-  `clusterNodes()`, `clusterBroadcasts()`, `clusterConfig()`,
-  `clusterFederation()` alongside the existing `healthz()`,
-  `stats()`, `listStreams()`. TypeScript response types for
-  every route land at the next npm publish cycle.
-- [x] ~~**Vitest + pytest in CI.**~~ Shipped in session 122 as
-  [`sdk-tests.yml`](.github/workflows/sdk-tests.yml): boots
-  `lvqr serve` with `--mesh-enabled` + `--cluster-listen`,
-  then runs `@lvqr/core`'s Vitest suite
-  ([10 admin-client shape tests](bindings/js/tests/sdk/admin-client.spec.ts))
-  and the Python client's existing pytest suite
-  ([8 type + mocked-httpx tests](bindings/python/tests/test_client.py)).
-- [x] ~~**Expand Python admin client** from 3 of 9 routes to
-  all 9.~~ Shipped in session 123:
-  `bindings/python/python/lvqr/client.py` now mirrors the JS
-  admin client 1:1 (`mesh`, `slo`, `cluster_nodes`,
-  `cluster_broadcasts`, `cluster_config`, `cluster_federation`)
-  with matching dataclasses + an optional `bearer_token` kwarg.
-  Pytest coverage grows from 8 to 21 tests. Lands on PyPI at
-  the next publish cycle.
-- [x] ~~Document reconnect + retry semantics in the SDK docs.~~
-  Shipped in session 125.
-  [`docs/sdk/javascript.md`](docs/sdk/javascript.md) gains a
-  "Timeouts + reconnect" section documenting `connectTimeoutMs`,
-  `fetchTimeoutMs`, `bearerToken`, a canonical jittered-
-  exponential-backoff reconnect loop, and an admin-side retry
-  recipe. [`docs/sdk/python.md`](docs/sdk/python.md) mirrors
-  with httpx-specific retry patterns + a `bearer_token` kwarg
-  reference + a `0.3.1` -> `0.3.2` migration section.
-- [x] ~~First `examples/tier4-demos/` public demo script.~~ Shipped
-  in session 117 as
-  [`examples/tier4-demos/demo-01.sh`](examples/tier4-demos/demo-01.sh),
-  chaining the WASM filter, whisper captions, ABR transcode,
-  DVR archive surfaces end to end, plus opt-in C2PA sign +
-  verify via `LVQR_DEMO_C2PA=1` (session 121). Closes the
-  Tier 4 exit criterion that was left open when Tier 4 was
-  marked COMPLETE.
-
-### Peer mesh data plane
-Topology planner, WebSocket signaling, `/api/v1/mesh` admin route,
-and the client-side `MeshPeer` (WebRTC DataChannel forwarding,
-opening `RTCPeerConnection` to the assigned parent, forwarding to
-children) already exist. The data-plane gap is
-browser-to-browser DataChannel media relay and an end-to-end
-test.
-- [x] ~~Server-side subscriber registration.~~ Every
-  `ws_relay_session` now calls `MeshCoordinator::add_peer` at
-  connect time (server-generated `ws-{counter}` peer_id) and
-  sends a leading `peer_assignment` JSON text frame on the WS
-  before any binary MoQ frames. Shipped in session 111-B2.
-- [x] ~~Subscribe-token admission on `/signal`.~~ Shipped in
-  sessions 111-B1 + 111-B3 via
-  `Sec-WebSocket-Protocol: lvqr.bearer.<token>` (preferred) and
-  `?token=<token>` query fallback.
-- [x] ~~`ServerHandle::mesh_coordinator()` snapshot accessor.~~
-  Shipped in session 111-B1 for in-process integration tests.
-- [x] ~~MoQ-over-DataChannel wire format decision.~~ Locked in
-  session 111-B1 as an 8-byte big-endian `object_id` prefix +
-  raw MoQ frame bytes per DataChannel message. Documented in
-  `docs/mesh.md`.
-- [x] ~~**Two-peer end-to-end browser test** proving a subscriber
-  connected through the DataChannel mesh receives the same
-  bytes via the peer relay as via the server-direct path.~~
-  Shipped in session 115 (row 115) as
-  [`bindings/js/tests/e2e/mesh/two-peer-relay.spec.ts`](bindings/js/tests/e2e/mesh/two-peer-relay.spec.ts).
-  The `mesh-e2e.yml` CI workflow runs it on every push to `main`.
-  `MeshPeer.pushFrame(data)` was added on `main` in the same
-  session so the root peer can forward server-drained media
-  into the mesh tree; `MeshConfig.onChildOpen(id, dc)` was
-  added as a post-116 follow-up for integrators who need a
-  deterministic one-shot push on DataChannel open.
-- [x] ~~**Actual-vs-intended offload reporting**: clients report
-  "served by peer X"; coordinator aggregates; `/api/v1/mesh`
-  returns measured offload.~~ Shipped in session 141. Browser
-  peers maintain a cumulative forwarded-frame counter and emit a
-  `ForwardReport` signal message every second
-  (skip-on-unchanged); the coordinator aggregates and surfaces
-  the values via a new `peers: MeshPeerStats[]` array on
-  `/api/v1/mesh` alongside the topology planner's
-  `intended_children` count.
-- [x] ~~**Per-peer capacity advertisement** so rebalancing uses
-  bandwidth + CPU instead of hardcoded `max-children`.~~ Shipped in
-  session 144. `SignalMessage::Register` grows an optional
-  `capacity: Option<u32>` field; the lvqr-cli signal-callback
-  bridge clamps the client claim to `--max-peers` at register
-  time; `MeshCoordinator::find_best_parent` consults
-  `PeerInfo.capacity` so a peer self-reporting `capacity: 1`
-  forces subsequent peers to descend even when the global ceiling
-  is higher. `@lvqr/core`'s `MeshConfig.capacity?: number`
-  threads the value through to the wire; `GET /api/v1/mesh`
-  surfaces it on the `MeshPeerStats` row alongside
-  `intended_children` and `forwarded_frames`.
-- [x] ~~**TURN deployment recipe** + STUN fallback config. Document
-  coturn integration for peers behind symmetric NAT.~~ Shipped in
-  session 143. New `--mesh-ice-servers <JSON>` CLI flag pushes
-  operator-configured STUN/TURN entries to every browser peer via
-  the `AssignParent` message; the runbook + sample `coturn.conf`
-  ship in [`deploy/turn/`](deploy/turn/).
-- [x] ~~**Three-peer browser Playwright E2E** feeding the
-  5-artifact test contract.~~ Shipped in session 142 as
-  [`bindings/js/tests/e2e/mesh/three-peer-chain.spec.ts`](bindings/js/tests/e2e/mesh/three-peer-chain.spec.ts).
-  Three Chromium contexts form a depth-2 chain
-  (peer-1 -> peer-2 -> peer-3); the test asserts both byte-
-  equality at the leaf and the session-141 per-peer offload-report
-  shape across the chain. Browser matrix beyond Chromium remains
-  v1.2 scope.
-- [x] ~~Flip [`docs/mesh.md`](docs/mesh.md) from "topology planner
-  only" to "IMPLEMENTED".~~ Flipped in session 144 alongside the
-  per-peer capacity row; the four phase-D mesh-data-plane bullets
-  (offload reporting, three-peer Playwright, TURN recipe, capacity)
-  all ship and the doc status line is now IMPLEMENTED.
-
-### Egress + encoders
-- [x] ~~**WHEP audio transcoder (AAC to Opus)** atop the 4.6
-  GStreamer pipeline so RTMP publishers reach browser WebRTC
-  with audio.~~ Shipped on `main` in session 113 as
-  `lvqr-transcode::AacToOpusEncoder` (behind the `transcode`
-  Cargo feature). Exercised by
-  `crates/lvqr-cli/tests/rtmp_whep_audio_e2e.rs` on the
-  GStreamer-enabled CI matrix.
-- [x] ~~Live HLS and DASH subscribe auth.~~ Shipped in session
-  112 via a tower middleware applied to the HLS and DASH
-  routers at the CLI composition root. Auth on by default when
-  the `SubscribeAuth` provider is configured (Noop provider
-  deployments see no behavior change);
-  `--no-auth-live-playback` is the escape hatch for deployments
-  that want open live playback with auth scoped to ingest,
-  admin, and DVR.
-- [x] ~~**One hardware encoder backend** (VideoToolbox for macOS).~~
-  Shipped in session 156. New `[[bin]]` factory
-  `lvqr_transcode::VideoToolboxTranscoderFactory` parallels the
-  existing `SoftwareTranscoderFactory` (105 B / 106 C shape) but
-  swaps `x264enc` for `vtenc_h264_hw` (HW-only path; falls out
-  loud when the host's VideoToolbox HW is unavailable). Gated on
-  the new `hw-videotoolbox` Cargo feature; CLI exposes
-  `--transcode-encoder software|videotoolbox` (default software,
-  videotoolbox value rejected at parse time on builds without the
-  feature). Remaining three backends (NVENC for Linux, VAAPI,
-  QSV) stay deferred to v1.2.
-- [x] ~~**WASM filter chain composition.**~~ Shipped in session
-  136. `--wasm-filter` now accepts multiple values (repeat the
-  flag or comma-separate) and installs a `lvqr_wasm::ChainFilter`
-  in the configured order; the first filter that drops a fragment
-  short-circuits the rest. Each slot keeps its own
-  `WasmFilterReloader` so hot-swapping one module does not
-  disturb the others. The per-filter `apply` contract is
-  unchanged: payload-rewrite is allowed at the filter level,
-  downstream subscribers still see the original bytes (tap mode).
-  True stream-modifying downstream propagation remains
-  anti-scope; see `crates/lvqr-wasm/src/observer.rs`.
-- [x] **MoQ egress latency SLO.** Closed across two sessions.
-  The HLS side shipped in session 156 follow-up:
-  `POST /api/v1/slo/client-sample` on `lvqr-admin` accepting
-  `{broadcast, transport, ingest_ts_ms, render_ts_ms}` JSON
-  under dual-auth (admin OR per-broadcast subscribe), records
-  into the existing `LatencyTracker`, surfaces on
-  `GET /api/v1/slo` + the `lvqr_subscriber_glass_to_glass_ms`
-  histogram; `@lvqr/dvr-player`'s built-in PDT-anchored sampler
-  pushes by default for HLS subscribers. The pure-MoQ side
-  closed in session 159 PATH-X (the v1.2 follow-up the session
-  157 audit sketched): a sibling `<broadcast>/0.timing` MoQ
-  track stamps one 16-byte LE
-  `(group_id_u64_le || ingest_time_ms_u64_le)` anchor per video
-  keyframe (additive; foreign MoQ clients ignore the unknown
-  track name per the moq-lite contract), the new
-  `[[bin]] lvqr-moq-sample-pusher` on `lvqr-test-utils`
-  subscribes to both `0.mp4` + `0.timing`, joins anchors by
-  `group_id` against video frames in a 64-entry ring buffer
-  (exact-match + largest-less-than fallback + skip-on-miss),
-  and POSTs samples through the dual-auth route.
-  `crates/lvqr-test-utils/tests/moq_timing_e2e.rs` (default-
-  feature gate; ubuntu-latest CI exercises it on every push)
-  drives the full RTMP -> relay -> bin -> SLO endpoint loop
-  and asserts a non-empty `transport="moq"` entry on
-  `GET /api/v1/slo`. See
-  [`crates/lvqr-fragment/src/moq_timing_sink.rs`](crates/lvqr-fragment/src/moq_timing_sink.rs)
-  and
-  [`tracking/SESSION_159_BRIEFING.md`](tracking/SESSION_159_BRIEFING.md).
-
-### Auth + ops polish
-- [x] ~~**Webhook auth provider.**~~ Shipped in session 135.
-  `--webhook-auth-url <URL>` on `lvqr serve` enables a new
-  `WebhookAuthProvider` (feature-gated on `webhook`; included in
-  `--features full`) that delegates every `AuthContext` decision
-  (publish / subscribe / admin) to an operator-owned HTTP endpoint.
-  `POST` with a JSON body (`{"op":"publish", "app", "key",
-  "broadcast"?}` / `{"op":"subscribe", "token"?, "broadcast"}` /
-  `{"op":"admin", "token"}`); reply `{"allow": bool, "reason": str?}`.
-  Per-decision TTL cache with separate allow/deny TTLs absorbs repeat
-  traffic and keeps a flapping webhook from being hit per request.
-  Mutually exclusive with `--jwks-url` and `--jwt-secret`. See
-  `docs/auth.md#webhook-auth-provider`.
-- [x] ~~**OAuth2 / JWKS dynamic key discovery.**~~ Shipped in
-  session 126. `--jwks-url <URL>` on `lvqr serve` enables a new
-  `JwksAuthProvider` (feature-gated on `jwks`; included in
-  `--features full`) that fetches a JWKS endpoint, caches public
-  keys by `kid`, and validates incoming JWTs against RS256 / ES256
-  / EdDSA signatures. Background refresh on a configurable
-  interval plus kick-on-miss when a token carries an unknown
-  `kid`. HS256 tokens are rejected on this path (symmetric secrets
-  cannot safely be distributed via JWKS). Mutually exclusive with
-  `--jwt-secret`. See `docs/auth.md#jwks-dynamic-key-discovery`.
-- [x] ~~**HMAC-signed URLs** for one-off playback links.~~
-  Shipped in session 124 (`/playback/*`) and extended to live
-  `/hls/*` + `/dash/*` in session 128. `--hmac-playback-secret`
-  enables a short-circuit auth path on every playback route
-  via `?exp=<unix_ts>&sig=<base64url>`; a single secret mints
-  URLs across all three route trees. `lvqr_cli::sign_playback_url`
-  generates DVR suffixes; `lvqr_cli::sign_live_url(secret,
-  LiveScheme::Hls|Dash, broadcast, exp)` mints live-tree
-  suffixes where one signed URL grants access to the master
-  playlist + every numbered / partial segment under that
-  broadcast (path-bound sigs are impractical for LL-HLS
-  partials that roll over every 200 ms).
-  See `docs/auth.md#signed-playback-urls` and
-  `docs/auth.md#live-hls-+-dash-signed-urls`.
-- [x] **Stream-key CRUD admin API.** Shipped in session 146.
-  Runtime mint / list / revoke / rotate over
-  `/api/v1/streamkeys/*` backed by `lvqr_auth::MultiKeyAuthProvider`
-  (additive over the existing JWT / Static / JWKS / Webhook chain).
-  Tokens are `lvqr_sk_<43-char base64url-no-pad>`. Subscribe + Admin
-  auth always delegate to the wrapped chain so a misconfigured
-  store cannot lock the operator out. Default-on; opt out with
-  `--no-streamkeys`. See
-  [`docs/auth.md#stream-key-crud-admin-api`](docs/auth.md#stream-key-crud-admin-api).
-- [x] **Hot config reload.** Auth-only v1 shipped in session 147.
-  - Mesh ICE servers + HMAC playback secret hot-reload shipped in
-    session 148 (the deferred-warning emissions session 147 added
-    for those keys drop; `applied_keys` grows entries when they
-    reload effectively).
-  - JWKS + webhook URL rotation shipped in session 149 (the reload
-    pipeline became async; provider rebuild + drop-old-on-swap
-    leverages each provider's existing `Drop`-aborts-spawned-task
-    semantics). Hot config reload is feature-complete: every key
-    the file format defines is honored at runtime.
-  See [`docs/config-reload.md`](docs/config-reload.md).
-- [x] **Dedicated DVR scrub web UI.** Shipped in session 153.
-  New `@lvqr/dvr-player` web component at
-  `bindings/js/packages/dvr-player/`; vanilla `HTMLElement` with
-  shadow DOM (no Lit / no Stencil) wrapping hls.js against the
-  relay's existing live HLS endpoint with the
-  `--hls-dvr-window-secs` sliding window. Custom seek bar with
-  HH:MM:SS percentile labels, LIVE pill with configurable
-  threshold, "Go Live" button, client-side hover thumbnails
-  via canvas `drawImage` against a lazy second hls.js instance.
-  Typed events `lvqr-dvr-seek` / `lvqr-dvr-live-edge-changed` /
-  `lvqr-dvr-error`. Programmatic API
-  `play/pause/seek/goLive/getHlsInstance`. Vitest unit suite
-  + Playwright e2e mount suite. No new server route; the
-  `/playback/*` JSON surface and the `/hls/*` live endpoint are
-  unchanged. See [`docs/dvr-scrub.md`](docs/dvr-scrub.md).
-- [x] **SCTE-35 passthrough.** Shipped in session 152.
-  Splice events injected on the publisher side (SRT MPEG-TS
-  PID 0x86 OR RTMP onCuePoint scte35-bin64) flow ingest ->
-  parser (CRC-verified) -> parallel `"scte35"` track on the
-  shared `FragmentBroadcasterRegistry` -> per-broadcast bridge
-  drain -> LL-HLS `#EXT-X-DATERANGE` + DASH Period-level
-  `<EventStream>`. Splice_info_section bytes are preserved
-  verbatim through both egress wire shapes (hex on HLS, base64
-  inside `<Signal><Binary>` on DASH). RTMP onCuePoint
-  required vendoring `rml_rtmp` v0.8.0 at `vendor/rml_rtmp/`
-  with a 25-line patch that surfaces non-`@setDataFrame` AMF0
-  Data messages (the upstream library silently drops them).
-  See [`docs/scte35.md`](docs/scte35.md).
-
-**Source of truth for session-by-session progress:**
-[`tracking/HANDOFF.md`](tracking/HANDOFF.md).
-
-## Known v0.4.0 limitations
-
-Operators planning deployments should read these before shipping.
-Items flagged **Fixed on `main`** have shipped in commits on
-`origin/main` after the v0.4.0 crates.io release; they land for
-consumers on the next release cycle. Operators who need the fix
-today should build from `main` instead of pinning to the
-published crate.
-
-- **Mesh `/signal` WebSocket is not auth-gated.** The v0.4.0
-  crate accepts `Register` messages from any client. Operators
-  not using the peer mesh should leave `--mesh-enabled` off (the
-  default); operators using it should front `/signal` with a
-  reverse proxy gate. **Fixed on `main`** in sessions 111-B1 +
-  111-B3: `/signal` now accepts the subscribe bearer via
-  `Sec-WebSocket-Protocol: lvqr.bearer.<token>` (preferred) or
-  `?token=<token>` query fallback, with `--no-auth-signal` as
-  the escape hatch.
-- **Live HLS + DASH routes were not auth-gated in v0.4.0**
-  even when `--subscribe-token` or `--jwt-secret` was set.
-  **Fixed on `main`** in session 112: the HLS and DASH routers
-  are now wrapped with the same `SubscribeAuth` gate as
-  `/ws/*`, with `--no-auth-live-playback` as the escape hatch
-  for deployments that want open live playback.
-- **WHEP has no AAC audio.** The v0.4.0 crate dropped AAC audio
-  with a one-shot warning so every RTMP / SRT / RTSP / WS
-  publisher reached WHEP subscribers video-only. **Fixed on
-  `main`** in session 113: a new `lvqr-transcode::AacToOpusEncoder`
-  (behind the `transcode` feature) pipes AAC access units through
-  an in-process GStreamer pipeline (`appsrc ! aacparse !
-  avdec_aac ! audioresample ! opusenc ! appsink`) and pushes the
-  Opus packets back into the WHEP session's Opus writer. The
-  transcoder is lazily spawned per session once the publisher's
-  AAC AudioSpecificConfig arrives. Builds without the `transcode`
-  feature retain the legacy drop-with-warn behaviour.
-- **`/metrics` is unauthenticated.** Intentional, but document
-  this to your ops team. Scope the scrape endpoint via firewall
-  or reverse proxy if the deployment is multi-tenant.
-- **Hardware encoders are not shipped.** `lvqr-transcode` only
-  offers a software x264 pipeline (behind the `transcode` Cargo
-  feature). NVENC, VideoToolbox, VAAPI, and QSV backends are
-  on the v1.1 and v1.2 roadmap.
-- **C2PA signer paths are covered by two integration tests.**
-  `crates/lvqr-cli/tests/c2pa_cli_flags_e2e.rs` exercises the
-  on-disk `C2paSignerSource::CertKeyFiles` path through both
-  rcgen and openssl cert generation; `c2pa_verify_e2e.rs` covers
-  the programmatic `Custom(Arc<dyn Signer>)` path via
-  `c2pa::EphemeralSigner`. Any operator using a common PEM
-  layout (CA + leaf with `digitalSignature` KU,
-  `emailProtection` EKU, `CN` + `O` in the subject DN,
-  `AuthorityKeyIdentifier` on the leaf) hits the tested surface.
-- **Pure MoQ subscribers contribute to the latency SLO
-  histogram via the session 159 sidecar track.** **Fixed on
-  `main`**: the publisher-side bridge now writes one 16-byte
-  LE `(group_id, ingest_time_ms)` anchor per video keyframe to
-  a sibling `<broadcast>/0.timing` MoQ track (additive;
-  foreign clients ignore the unknown track name), and the
-  `lvqr-moq-sample-pusher` bin in `lvqr-test-utils` subscribes
-  to both `0.mp4` + `0.timing` and pushes samples through the
-  dual-auth `POST /api/v1/slo/client-sample` route. LL-HLS,
-  MPEG-DASH, WebSocket fMP4, WHEP, and pure MoQ are now all
-  represented under their `transport` label on the histogram.
-  See [`tracking/SESSION_159_BRIEFING.md`](tracking/SESSION_159_BRIEFING.md).
-- **No admission control.** The SLO tracker measures latency and
-  fires alerts; it does not refuse new subscribers when the SLO
-  is already burning.
-- **Nightly long-run soak in CI.** **Fixed on `main`** in
-  session 127: a new
-  [`soak-scheduled.yml`](.github/workflows/soak-scheduled.yml)
-  workflow runs `lvqr-soak` against a daily cron (07:23 UTC)
-  for a 60-minute duration with 10 concurrent RTSP subscribers
-  at 30 Hz fragments; the report (RSS + FD + CPU drift, RTP /
-  RTCP per-subscriber counts) uploads as an artifact with
-  30-day retention. The PLAN row name said "24 h" but a true
-  24 h run exceeds the 6 h GitHub-hosted job ceiling; 60 min
-  daily surfaces the same linear-drift signals within a 24 h
-  discovery window. `continue-on-error: true` initially; a
-  self-hosted-runner variant for true 24 h runs is a v1.2
-  follow-up.
-- **Feature-flag CI matrix initially soft-fail.**
-  [`feature-matrix.yml`](.github/workflows/feature-matrix.yml)
-  ships as of session 123 with dedicated jobs for the `c2pa`,
-  `transcode`, and `whisper` features on `lvqr-cli` (covering
-  every feature-gated integration test target explicitly); the
-  workflow is `continue-on-error: true` during its first weeks
-  on `main` per the convention every other new dedicated
-  workflow in this repo has followed. Promotion to a required
-  check after the first clean run. `whisper_cli_e2e` remains
-  `#[ignore]` because it needs a ~78 MB ggml model download;
-  a scheduled-workflow follow-up will cache the model + flip it
-  on.
-- **Client SDK admin coverage at 9/9 on the published 0.3.2
-  release.** Both `@lvqr/core` (session 122) and the Python
-  `lvqr` package (session 123) cover every `/api/v1/*` route
-  the admin router mounts. **Shipped to consumers** in the
-  2026-04-24 0.3.2 npm + PyPI publish.
-- **SDK reconnect + retry semantics are documented on `main`.**
-  **Fixed on `main`** in session 125:
-  [`docs/sdk/javascript.md`](docs/sdk/javascript.md) gains a
-  "Timeouts + reconnect" section covering `connectTimeoutMs`,
-  `fetchTimeoutMs`, `bearerToken`, and a canonical jittered-
-  exponential-backoff reconnect recipe + admin-side retry
-  recipe. [`docs/sdk/python.md`](docs/sdk/python.md) mirrors
-  with httpx-specific retry patterns + a `bearer_token` kwarg
-  reference + a `0.3.1` -> `0.3.2` migration section. **Shipped
-  to consumers** in the 2026-04-24 0.3.2 npm + PyPI publish.
-
-## CLI reference
-
-```
-lvqr serve [OPTIONS]
-
-  Core ports (always on):
-  --port <PORT>             QUIC/MoQ port [default: 4443]
-  --rtmp-port <PORT>        RTMP ingest port [default: 1935]
-  --admin-port <PORT>       Admin HTTP + WS port [default: 8080]
-  --hls-port <PORT>         LL-HLS HTTP port; 0 to disable [default: 8888]
-
-  Optional protocols (off unless port set):
-  --dash-port <PORT>        MPEG-DASH HTTP port
-  --whep-port <PORT>        WHEP WebRTC egress port
-  --whip-port <PORT>        WHIP WebRTC ingest port
-  --rtsp-port <PORT>        RTSP ingest port
-  --srt-port <PORT>         SRT ingest port
-
-  LL-HLS tuning:
-  --hls-dvr-window <SECS>   DVR depth [default: 120; 0 = unbounded]
-  --hls-target-duration <S> Segment duration [default: 2]
-  --hls-part-target <MS>    Partial duration [default: 200]
-
-  Auth (env LVQR_*):
-  --admin-token <T>         /api/v1/* bearer
-  --publish-key <K>         Required publish credential
-  --subscribe-token <T>     Required subscriber credential
-  --no-streamkeys           Disable runtime stream-key CRUD
-                            (`/api/v1/streamkeys/*`). Default on.
-                            Env: LVQR_NO_STREAMKEYS.
-  --config <PATH>           TOML config file for hot reload.
-                            Hot-reloadable keys: `[auth]` section
-                            (static + HS256 JWT), `mesh_ice_servers`,
-                            `hmac_playback_secret`. SIGHUP + admin
-                            POST re-apply. Env: LVQR_CONFIG.
-  --jwt-secret <S>          Enable HS256 JWT (replaces static tokens)
-  --jwt-issuer <I>          Expected iss claim
-  --jwt-audience <A>        Expected aud claim
-  --jwks-url <URL>          Enable JWKS dynamic key discovery
-                            (RS256/ES256/EdDSA). Requires
-                            --features jwks at build. Mutex
-                            with --jwt-secret.
-                            Env: LVQR_JWKS_URL.
-  --jwks-refresh-interval-seconds <S>
-                            JWKS cache refresh cadence
-                            [default: 300; minimum 10].
-                            Env: LVQR_JWKS_REFRESH_INTERVAL_SECONDS.
-
-  Storage:
-  --record-dir <PATH>       fMP4 recording directory
-  --archive-dir <PATH>      DVR archive dir, enables /playback/*
-  --hmac-playback-secret <SECRET>
-                            HMAC-SHA256 secret for signed
-                            playback URLs. When set, every
-                            /playback/* handler accepts
-                            ?exp=<ts>&sig=<b64url> as an
-                            alternative auth path that
-                            short-circuits the subscribe-token
-                            gate. See docs/auth.md for the URL
-                            shape + the `lvqr_cli::sign_playback_url`
-                            operator helper.
-                            Env: LVQR_HMAC_PLAYBACK_SECRET.
-
-  WASM filter chain (read-only tap in v1):
-  --wasm-filter <PATH>      Path to a .wasm module exporting
-                            on_fragment(ptr, len) -> i32. Hot-
-                            reloaded on file change.
-                            Repeat the flag (or comma-separate
-                            values) to install an ordered filter
-                            chain; the first drop in the chain
-                            short-circuits the remaining slots.
-                            Each slot has its own hot-reload
-                            watcher.
-                            Env: LVQR_WASM_FILTER
-                            (comma-separated for chains).
-
-  Captions (requires --features whisper at build):
-  --whisper-model <PATH>    Path to a whisper.cpp ggml model
-                            file (e.g. ggml-tiny.en.bin).
-                            Env: LVQR_WHISPER_MODEL.
-
-  C2PA signing (requires --features c2pa at build; needs
-  --archive-dir to be set because signing runs on the archive
-  drain-termination hook):
-  --c2pa-signing-cert <PATH>       PEM-encoded signing certificate
-                                   chain (leaf first, then CA).
-                                   Leaf EKU must be one of
-                                   emailProtection / documentSigning
-                                   / timeStamping / OCSPSigning /
-                                   MS C2PA / C2PA per c2pa-rs.
-                                   Env: LVQR_C2PA_SIGNING_CERT.
-  --c2pa-signing-key <PATH>        PKCS#8 private key matching
-                                   the leaf's subject public key.
-                                   Must be set together with
-                                   --c2pa-signing-cert.
-                                   Env: LVQR_C2PA_SIGNING_KEY.
-  --c2pa-signing-alg <ALG>         One of es256 / es384 / es512 /
-                                   ps256 / ps384 / ps512 / ed25519.
-                                   Defaults to es256.
-                                   Env: LVQR_C2PA_SIGNING_ALG.
-  --c2pa-assertion-creator <STR>   Creator name on the
-                                   schema-org CreativeWork
-                                   assertion. Defaults to "lvqr".
-                                   Env: LVQR_C2PA_ASSERTION_CREATOR.
-  --c2pa-trust-anchor <PATH>       PEM trust-anchor bundle for
-                                   private CAs; required when the
-                                   leaf does not chain to a
-                                   public C2PA trust root.
-                                   Env: LVQR_C2PA_TRUST_ANCHOR.
-  --c2pa-timestamp-authority <URL> RFC 3161 TSA URL for embedded
-                                   timestamp countersignatures.
-                                   Env: LVQR_C2PA_TIMESTAMP_AUTHORITY.
-
-  Server-side transcoding (requires --features transcode at
-  build; pulls gstreamer 0.23 + base/good/bad/ugly + gst-libav
-  from the host):
-  --transcode-rendition <NAME>    Repeatable. Preset (720p /
-                                  480p / 240p) or path to a
-                                  .toml RenditionSpec. Env
-                                  LVQR_TRANSCODE_RENDITION is
-                                  comma-separated.
-  --source-bandwidth-kbps <N>     Override master-playlist
-                                  source-variant BANDWIDTH.
-                                  Env: LVQR_SOURCE_BANDWIDTH_KBPS.
-
-  Cluster:
-  --cluster-listen <ADDR>         Gossip bind (enables cluster plane)
-  --cluster-seeds <LIST>          Comma-separated peer ip:port seeds
-  --cluster-node-id <ID>          Explicit node id
-  --cluster-id <ID>               Cluster tag (isolates subnets)
-  --cluster-advertise-hls <URL>   Base URL for HLS redirect-to-owner
-  --cluster-advertise-dash <URL>  Base URL for DASH redirect-to-owner
-  --cluster-advertise-rtsp <URL>  Base URL for RTSP redirect-to-owner
-
-  Peer mesh (topology planner + signaling + client-side relay
-  ship; operator-grade completion on the phase-D roadmap):
-  --mesh-enabled                  Enable peer mesh coordinator
-  --max-peers <N>                 Max children per peer [default: 3]
-  --mesh-root-peer-count <N>      Cap on direct-from-origin peers
-                                  (additional joiners become
-                                  children via AssignParent).
-                                  Env: LVQR_MESH_ROOT_PEER_COUNT.
-  --no-auth-signal                Disable subscribe-token auth on
-                                  the /signal WebSocket.
-                                  Env: LVQR_NO_AUTH_SIGNAL.
-
-  TLS:
-  --tls-cert <PATH>               TLS cert PEM (auto-generated if omitted)
-  --tls-key <PATH>                TLS key PEM
-
-Observability env (unset = stdout fmt only):
-  LVQR_OTLP_ENDPOINT              OTLP gRPC target (http://host:4317)
-  LVQR_SERVICE_NAME               service.name resource [default: lvqr]
-  LVQR_OTLP_RESOURCE              Extra resource attrs (k=v, comma-sep)
-  LVQR_TRACE_SAMPLE_RATIO         Head sampling ratio [default: 1.0]
-```
-
-## Install
+### Browser peer mesh
 
 ```bash
-# From crates.io
-cargo install lvqr-cli
-
-# From source
-git clone https://github.com/virgilvox/lvqr.git
-cd lvqr
-cargo build --release
-./target/release/lvqr serve
+lvqr serve \
+  --mesh-enabled \
+  --max-peers 3 \
+  --mesh-root-peer-count 30 \
+  --mesh-ice-servers '[{"urls":["stun:stun.example.com:3478"]}]'
 ```
+
+Browsers use the `MeshPeer` class from `@lvqr/core` to connect to
+their assigned parent (root peer of the tree, or another peer)
+over a WebRTC `RTCPeerConnection` and forward MoQ frames over a
+DataChannel to children. Peers self-report capacity in the
+`Register` signal; the planner respects the lower of the global
+`--max-peers` ceiling and the peer's claimed capacity. TURN
+deployment recipe + sample `coturn.conf` ship in
+[`deploy/turn/`](deploy/turn/). Full design:
+[`docs/mesh.md`](docs/mesh.md).
+
+---
+
+## Observability
+
+### Prometheus + OTLP
+
+```bash
+# Prometheus scrape
+curl http://localhost:8080/metrics
+
+# OTLP gRPC export to a collector
+LVQR_OTLP_ENDPOINT=http://collector:4317 \
+LVQR_SERVICE_NAME=lvqr-edge-1 \
+LVQR_TRACE_SAMPLE_RATIO=0.05 \
+  lvqr serve
+```
+
+Metrics fan out via `metrics-util::FanoutBuilder`, so the same
+counters and histograms reach both the Prometheus scrape endpoint
+and the OTLP exporter without duplicate instrumentation.
+
+### Latency SLO
+
+```bash
+# Server-side ring-buffered snapshot
+curl -H "Authorization: Bearer $ADMIN" \
+  http://localhost:8080/api/v1/slo
+# {
+#   "broadcasts": [
+#     { "broadcast": "live/demo", "transport": "hls",
+#       "p50_ms": 1850, "p95_ms": 2400, "p99_ms": 3100, "max_ms": 4200,
+#       "sample_count": 4096 },
+#     { "broadcast": "live/demo", "transport": "moq",
+#       "p50_ms": 320, "p95_ms": 540, "p99_ms": 880, "max_ms": 1200,
+#       "sample_count": 612 }
+#   ]
+# }
+
+# Client-side push (admin OR per-broadcast subscribe token)
+curl -X POST \
+  -H "Authorization: Bearer $SUBSCRIBE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"broadcast":"live/demo","transport":"moq","ingest_ts_ms":1714327219000,"render_ts_ms":1714327219420}' \
+  http://localhost:8080/api/v1/slo/client-sample
+```
+
+The Prometheus histogram
+`lvqr_subscriber_glass_to_glass_ms{broadcast, transport}` exposes the
+same data for time-aligned views; alert pack and Grafana dashboard
+under [`deploy/grafana/`](deploy/grafana/). Operator runbook:
+[`docs/slo.md`](docs/slo.md).
+
+For pure-MoQ subscribers, the MoQ side ships a sibling
+`<broadcast>/0.timing` track that stamps a 16-byte LE
+`(group_id_u64_le || ingest_time_ms_u64_le)` anchor per video
+keyframe. The reference subscriber bin
+[`crates/lvqr-test-utils/src/bin/moq_sample_pusher.rs`](crates/lvqr-test-utils/src/bin/moq_sample_pusher.rs)
+joins anchors against `0.mp4` group sequences and pushes samples
+through the same dual-auth client-sample endpoint. Foreign MoQ
+clients ignore the unknown track name per the moq-lite contract,
+so the addition is non-breaking.
+
+---
+
+## Client SDKs
+
+| Package | Install | Surface |
+|---|---|---|
+| `lvqr-core` (Rust) | `cargo add lvqr-core` | Shared types, `EventBus`, admin client. Latest: 0.4.2 (crates.io). |
+| `@lvqr/core` (TS) | `npm i @lvqr/core` | MoQ-Lite subscriber over WebTransport, WebSocket fMP4 fallback, full admin client (`configReload` / `triggerConfigReload` + `listStreamKeys` / `mintStreamKey` / `revokeStreamKey` / `rotateStreamKey` plus health / stats / mesh / SLO / wasm-filter), `MeshPeer` WebRTC DataChannel relay with `pushFrame` + `onChildOpen` + `parentPeerId` + `forwardedFrameCount` + `MeshConfig.capacity`. Latest: 0.3.3. |
+| `@lvqr/player` | `npm i @lvqr/player` | Drop-in `<lvqr-player>` web component with MSE fallback. Latest: 0.3.2. |
+| `@lvqr/dvr-player` | `npm i @lvqr/dvr-player` | Drop-in `<lvqr-dvr-player>` HLS DVR scrub component with custom seek bar, LIVE pill, Go Live, hover thumbnails, SCTE-35 ad-break marker rendering (`markers="visible/hidden"` + `lvqr-dvr-markers-changed` / `lvqr-dvr-marker-crossed` events + `getMarkers()` API), opt-in client-side glass-to-glass SLO sampler. Latest: 0.3.3. |
+| `lvqr` (Python) | `pip install lvqr` | Admin API client (`config_reload_status` / `trigger_config_reload`, `list_streamkeys` / `mint_streamkey` / `revoke_streamkey` / `rotate_streamkey`, plus health / stats / mesh / SLO / wasm-filter), `bearer_token` kwarg, dataclass returns. Latest: 0.3.3. |
+
+Full TypeScript reference: [`docs/sdk/javascript.md`](docs/sdk/javascript.md).
+Python module: [`bindings/python/python/lvqr/`](bindings/python/python/lvqr/).
+
+---
 
 ## Architecture
 
-The workspace is 29 crates organised along the unified data
+The workspace is 29 Rust crates organised around the unified data
 plane: one segmenter, every protocol is a projection.
 
 ```
 Data model + fanout
-  lvqr-core           -- StreamId, TrackName, EventBus, RelayStats
-  lvqr-fragment      -- Fragment, FragmentMeta, FragmentStream
-  lvqr-moq           -- facade over moq-lite
+  lvqr-core           StreamId, TrackName, EventBus, RelayStats
+  lvqr-fragment       Fragment, FragmentMeta, MoqTrackSink, MoqTimingTrackSink
+  lvqr-moq            facade over moq-lite
 
 Codecs + segmenter
-  lvqr-codec         -- AVC / HEVC / AAC / Opus / AV1 parsers
-  lvqr-cmaf          -- RawSample coalescer, CmafPolicy, fMP4 writer
+  lvqr-codec          AVC / HEVC / AAC / Opus / AV1 parsers + SCTE-35 splice_info_section
+  lvqr-cmaf           RawSample coalescer, CmafPolicy, fMP4 writer
 
 Ingest protocols
-  lvqr-ingest        -- RTMP + FLV + bridge
-  lvqr-whip          -- WebRTC ingest via str0m (H.264/HEVC/Opus)
-  lvqr-srt           -- SRT + MPEG-TS demux
-  lvqr-rtsp          -- RTSP/1.0 server with interleaved RTP
+  lvqr-ingest         RTMP + FLV + bridge + onCuePoint scte35-bin64 surface
+  lvqr-whip           WebRTC ingest via str0m
+  lvqr-srt            SRT + MPEG-TS demux + PMT 0x86 SCTE-35 reassembly
+  lvqr-rtsp           RTSP/1.0 server with interleaved RTP
 
 Egress protocols
-  lvqr-relay         -- MoQ/QUIC relay over moq-lite
-  lvqr-hls           -- LL-HLS + MultiHlsServer + DVR + SubtitlesServer
-  lvqr-dash          -- MPEG-DASH + MultiDashServer
-  lvqr-whep          -- WebRTC egress via str0m
-  lvqr-mesh          -- peer mesh topology planner
+  lvqr-relay          MoQ/QUIC relay over moq-lite
+  lvqr-hls            LL-HLS + MultiHlsServer + DVR + SubtitlesServer + DATERANGE
+  lvqr-dash           MPEG-DASH + MultiDashServer + EventStream
+  lvqr-whep           WebRTC egress via str0m
+  lvqr-mesh           peer mesh topology planner
 
 Auth, storage, admin, signaling
-  lvqr-auth          -- noop / static / HS256 JWT providers
-  lvqr-record        -- fMP4 recorder subscribed to EventBus
-  lvqr-archive       -- redb segment index + C2PA finalize/verify
-  lvqr-signal        -- WebRTC signaling (mesh assignments)
-  lvqr-admin         -- /api/v1/*, /metrics, /healthz
+  lvqr-auth           noop / static / HS256 JWT / JWKS / webhook + stream-key store
+  lvqr-record         fMP4 recorder subscribed to EventBus
+  lvqr-archive        redb segment index + C2PA finalize + verify
+  lvqr-signal         WebRTC signaling (mesh assignments)
+  lvqr-admin          /api/v1/*, /metrics, /healthz
 
 Cluster + observability
-  lvqr-cluster       -- chitchat + FederationRunner
-  lvqr-observability -- OTLP export + metrics-crate bridge
+  lvqr-cluster        chitchat + FederationRunner
+  lvqr-observability  OTLP export + metrics-crate bridge
 
 Programmable data plane
-  lvqr-wasm          -- wasmtime fragment-filter runtime + hot-reload
-  lvqr-agent         -- AI-agents framework (trait + runner)
-  lvqr-agent-whisper -- WhisperCaptionsAgent (AAC -> PCM -> cues)
-  lvqr-transcode     -- GStreamer ABR ladder (feature-gated)
+  lvqr-wasm           wasmtime fragment-filter runtime + hot-reload
+  lvqr-agent          AI-agents framework (trait + runner)
+  lvqr-agent-whisper  WhisperCaptionsAgent (AAC -> PCM -> WebVTT)
+  lvqr-transcode      GStreamer ABR ladder (software + VideoToolbox)
 
 Infrastructure
-  lvqr-cli           -- single-binary composition root
-  lvqr-conformance   -- reference fixtures + external validators
-  lvqr-test-utils    -- TestServer harness
-  lvqr-soak          -- long-run soak driver
+  lvqr-cli            single-binary composition root
+  lvqr-conformance    reference fixtures + external validators
+  lvqr-test-utils     TestServer harness + bins
+  lvqr-soak           long-run soak driver
 ```
 
-### Load-bearing decisions
+### Three load-bearing decisions
 
-Three that every contributor needs to internalise before touching
-cross-crate boundaries:
+Every contributor needs to internalise these before touching cross-
+crate boundaries:
 
 - **Unified Fragment Model.** Every track is a sequence of
   `Fragment { track_id, group_id, object_id, priority, dts, pts,
-  duration, flags, payload, ingest_time_ms }`. Every ingest
-  produces fragments; every egress is a projection.
-- **Control vs hot path split.** Control-plane traits use
+  duration, flags, payload, ingest_time_ms }`. Every ingest produces
+  fragments; every egress is a projection. New protocols are wiring,
+  not architecture.
+- **Control vs hot-path split.** Control-plane traits use
   `async-trait`; the data plane uses concrete types or enum
-  dispatch. No per-fragment `dyn` dispatch anywhere.
+  dispatch. There is no per-fragment `dyn` dispatch anywhere on the
+  hot path.
 - **chitchat scope discipline.** Gossip carries membership,
-  ownership pointers, capacity, config, feature flags.
-  Per-fragment / per-subscriber state stays node-local and uses
-  direct RPC keyed off chitchat pointers.
+  ownership pointers, capacity, config, and feature flags --
+  nothing else. Per-fragment / per-subscriber state stays node-local
+  and uses direct RPC keyed off chitchat pointers.
 
-Any change that violates one of these is a red flag and must be
-re-scoped before implementation starts. The full ten-decision
-list lives in [`tracking/ROADMAP.md`](tracking/ROADMAP.md).
+The full ten-decision list lives in
+[`tracking/ROADMAP.md`](tracking/ROADMAP.md).
+
+---
+
+## CLI reference
+
+Compact tour grouped by area; full set with descriptions is
+`lvqr serve --help`.
+
+```
+Core ports (always on):
+  --port <PORT>              QUIC/MoQ port [default: 4443]
+  --rtmp-port <PORT>         RTMP ingest port [default: 1935]
+  --admin-port <PORT>        Admin HTTP + WS port [default: 8080]
+  --hls-port <PORT>          LL-HLS HTTP port; 0 to disable [default: 8888]
+
+Optional egress / ingest (off unless port set):
+  --dash-port <PORT>         MPEG-DASH HTTP port
+  --whep-port <PORT>         WHEP WebRTC egress port
+  --whip-port <PORT>         WHIP WebRTC ingest port
+  --rtsp-port <PORT>         RTSP ingest port
+  --srt-port <PORT>          SRT ingest port
+
+LL-HLS tuning:
+  --hls-dvr-window <SECS>    DVR depth [default: 120; 0 = unbounded]
+  --hls-target-duration <S>  Segment duration [default: 2]
+  --hls-part-target <MS>     Partial duration [default: 200]
+
+Auth (env LVQR_*):
+  --admin-token <T>          /api/v1/* bearer
+  --publish-key <K>          Required publish credential
+  --subscribe-token <T>      Required subscriber credential
+  --no-streamkeys            Disable runtime stream-key CRUD
+  --no-auth-live-playback    Open live HLS+DASH; auth on ingest/admin/DVR
+  --no-auth-signal           Disable subscribe-token auth on /signal WS
+  --config <PATH>            TOML config file for hot reload (SIGHUP / admin POST)
+  --jwt-secret <S>           Enable HS256 JWT
+  --jwt-issuer <I>           Expected iss claim
+  --jwt-audience <A>         Expected aud claim
+  --jwks-url <URL>           Enable JWKS dynamic key discovery (--features jwks)
+  --jwks-refresh-interval-seconds <S>     [default: 300; min 10]
+  --webhook-auth-url <URL>   Webhook auth provider (--features webhook)
+  --webhook-auth-cache-ttl-seconds <S>    [default: 60]
+  --webhook-auth-deny-cache-ttl-seconds <S> [default: 10]
+
+Storage:
+  --record-dir <PATH>        fMP4 recording directory
+  --archive-dir <PATH>       DVR archive dir, enables /playback/*
+  --hmac-playback-secret <S> HMAC for signed /playback /hls /dash URLs
+
+WASM filter chain:
+  --wasm-filter <PATH>       Repeatable; ordered chain; per-slot hot-reload
+
+Captions (--features whisper):
+  --whisper-model <PATH>     ggml-*.bin model file
+
+Server-side transcoding (--features transcode):
+  --transcode-rendition <NAME>          Repeatable; preset or .toml
+  --transcode-encoder software|videotoolbox  [default: software]
+  --source-bandwidth-kbps <N>           Override master variant BANDWIDTH
+
+C2PA signing (--features c2pa, requires --archive-dir):
+  --c2pa-signing-cert <PATH>
+  --c2pa-signing-key <PATH>
+  --c2pa-signing-alg <ALG>              es256/es384/es512/ps256/ps384/ps512/ed25519
+  --c2pa-assertion-creator <STR>
+  --c2pa-trust-anchor <PATH>
+  --c2pa-timestamp-authority <URL>
+
+Cluster:
+  --cluster-listen <ADDR>               Gossip bind (enables cluster plane)
+  --cluster-seeds <LIST>                Comma-separated peer seeds
+  --cluster-node-id <ID>
+  --cluster-id <ID>                     Cluster tag (isolates subnets)
+  --cluster-advertise-hls <URL>
+  --cluster-advertise-dash <URL>
+  --cluster-advertise-rtsp <URL>
+
+Browser peer mesh:
+  --mesh-enabled
+  --max-peers <N>                       [default: 3]
+  --mesh-root-peer-count <N>            [default: 30]
+  --mesh-ice-servers <JSON>             RTCIceServer array
+
+TLS:
+  --tls-cert <PATH>                     Auto-generated if omitted
+  --tls-key <PATH>
+
+Observability env (unset = stdout fmt only):
+  LVQR_OTLP_ENDPOINT                    OTLP gRPC target (http://host:4317)
+  LVQR_SERVICE_NAME                     [default: lvqr]
+  LVQR_OTLP_RESOURCE                    Extra resource attrs (k=v, comma-sep)
+  LVQR_TRACE_SAMPLE_RATIO               Head sampling ratio [default: 1.0]
+```
+
+---
+
+## Operational notes
+
+A few things worth knowing before you ship:
+
+- **`/metrics` is unauthenticated by design.** Scope it via
+  firewall or a reverse proxy in multi-tenant deployments.
+- **No admission control.** The latency SLO tracker measures and
+  alerts on glass-to-glass; it does not refuse new subscribers when
+  the SLO is already burning. Wire that into your operator policy.
+- **Self-signed TLS certs at boot are for local dev only.** Use
+  real certificates in production or front the relay with a TLS-
+  terminating proxy.
+- **WHEP trickle ICE for inbound candidates is not yet wired.**
+  Outbound trickle works; inbound continues to ride the SDP
+  exchange.
+- **The HLS conformance harness uses internal validators by
+  default.** Wiring `mediastreamvalidator` (Apple's reference
+  validator) into CI is the single open conformance gap on
+  `lvqr-hls`.
+- **Hardware encoders.** macOS VideoToolbox ships behind
+  `--features hw-videotoolbox`; NVENC, VAAPI, and QSV are on the
+  v1.2 roadmap.
+
+---
 
 ## Documentation
 
 - [Quickstart](docs/quickstart.md) -- zero to streaming in five minutes
-- [Architecture](docs/architecture.md) -- the 29-crate workspace + the ten load-bearing decisions
+- [Architecture](docs/architecture.md) -- the 29-crate workspace + the load-bearing decisions
 - [Deployment](docs/deployment.md) -- systemd, TLS, Prometheus, OTLP
-- [Auth](docs/auth.md) -- one-token-all-protocols model
-- [Hot config reload](docs/config-reload.md) -- SIGHUP / admin POST atomic auth + mesh + HMAC + JWKS / webhook reload
-- [SCTE-35 ad-marker passthrough](docs/scte35.md) -- standards refs, ingest paths (SRT, RTMP), wire shape examples (HLS DATERANGE + DASH EventStream), publisher quickstart (ffmpeg, AWS Elemental, Wirecast, vMix), metrics, operator runbook
-- [Cluster plane](docs/cluster.md) -- chitchat membership, ownership, redirect-to-owner
+- [Auth](docs/auth.md) -- one-token-all-protocols model, providers, signed URLs
+- [Hot config reload](docs/config-reload.md) -- atomic auth + mesh + HMAC + JWKS / webhook reload
+- [SCTE-35 ad-marker passthrough](docs/scte35.md) -- standards refs, ingest paths, wire shape examples, publisher quickstart
+- [Cluster plane](docs/cluster.md) -- chitchat membership, ownership, redirect-to-owner, federation
 - [Observability](docs/observability.md) -- OTLP export, Prometheus fanout
-- [Latency SLO](docs/slo.md) -- operator runbook + alert tuning
-- [Peer mesh](docs/mesh.md) -- topology planner + WebSocket signaling + client-side MeshPeer relay (two-peer happy path verified; operator-grade completion on the phase-D roadmap)
+- [Latency SLO](docs/slo.md) -- operator runbook, alert tuning, the MoQ sidecar timing track
+- [Peer mesh](docs/mesh.md) -- topology planner + signaling + client-side relay
+- [DVR scrub UI](docs/dvr-scrub.md) -- `<lvqr-dvr-player>` operator embedding, theming, SLO sampler
 - [Roadmap](tracking/ROADMAP.md) -- the 18-24 month plan
-- [Handoff](tracking/HANDOFF.md) -- session-by-session log (current state)
 - [Test contract](tests/CONTRACT.md) -- the 5-artifact discipline per wire-format crate
 
-## Development
-
-```bash
-# Fast inner loop: one crate's lib + one integration test
-cargo test -p lvqr-hls --lib
-cargo test -p lvqr-cli --test rtmp_hls_e2e
-
-# Full workspace (the pre-commit gate)
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --benches -- -D warnings
-cargo test --workspace
-
-# Benchmarks
-cargo bench -p lvqr-hls
-cargo bench -p lvqr-rtsp
-cargo bench -p lvqr-cmaf
-```
-
-As of the latest close on `main`: 1111 workspace tests passing,
-0 failing, 3 ignored (the `moq_sink`, `sign_playback_url`, and
-`sign_live_url` doctests, all of which need a running-server
-fixture they do not bring up), 60 dvr-player Vitest unit tests
-(14 attrs + 14 seekbar + 4 dispatch + 28 markers), plus 17/17
-+ 1 opt-in skip on the dvr-player Playwright project and the
-two-peer / three-peer mesh Playwright project, all running
-via the dedicated `mesh-e2e.yml` CI workflow. Every close must be green on fmt +
-clippy + workspace test; session deltas are tracked in
-[`tracking/HANDOFF.md`](tracking/HANDOFF.md).
-
-Integration tests share three helper modules rather than
-reimplementing primitives per file:
-[`crates/lvqr-test-utils/src/http.rs`](crates/lvqr-test-utils/src/http.rs)
-(raw-TCP HTTP/1.1 GET with `HttpGetOptions::bearer` / `range` /
-`timeout` + `HttpResponse::header` case-insensitive lookup),
-[`crates/lvqr-test-utils/src/flv.rs`](crates/lvqr-test-utils/src/flv.rs)
-(FLV video seq-header + NALU tag builders + parameterized AAC-LC
-`flv_audio_aac_lc_seq_header(freq_idx, channels)` with a 44.1 kHz
-stereo convenience wrapper), and
-[`crates/lvqr-test-utils/src/rtmp.rs`](crates/lvqr-test-utils/src/rtmp.rs)
-(`rtmp_client_handshake` panic-variant + `send_results` /
-`send_result` packet writers + `read_until(stream, session,
-timeout, predicate)` event-loop driver with `tokio::time::Instant`
-+ `saturating_duration_since` deadline arithmetic). New
-integration tests should adopt all three rather than copy-paste
-the byte math. The `TestServer` harness in `lvqr-test-utils`
-exposes every `lvqr serve` surface (RTMP, SRT, RTSP, WHIP, WHEP,
-HLS, DASH, WS, admin, cluster, archive, mesh `/signal`) on
-ephemeral loopback ports so tests run without port contention.
-
-Feature flags and Docker recipes are in
-[`docs/deployment.md`](docs/deployment.md).
+---
 
 ## Built on
 
 - [moq-lite](https://github.com/kixelated/moq) -- Media over QUIC
 - [quinn](https://github.com/quinn-rs/quinn) -- Rust QUIC
 - [str0m](https://github.com/algesten/str0m) -- sans-IO WebRTC
-- [rml_rtmp](https://crates.io/crates/rml_rtmp) -- RTMP
+- [rml_rtmp](https://crates.io/crates/rml_rtmp) -- RTMP (vendored fork at `vendor/rml_rtmp/` for AMF0 onCuePoint surfacing)
 - [chitchat](https://github.com/quickwit-oss/chitchat) -- cluster gossip
 - [redb](https://github.com/cberner/redb) -- embedded archive index
 - [wasmtime](https://wasmtime.dev/) -- WASM runtime for per-fragment filters
@@ -1522,6 +1038,8 @@ Feature flags and Docker recipes are in
 - [whisper-rs](https://github.com/tazz4843/whisper-rs) -- whisper.cpp bindings
 - [opentelemetry-rust](https://github.com/open-telemetry/opentelemetry-rust) -- OTLP
 - [tokio](https://tokio.rs) + [bytes](https://docs.rs/bytes) -- runtime + zero-copy buffers
+
+---
 
 ## License
 
@@ -1535,13 +1053,13 @@ commercial terms for everyone else.
   counts as distribution for license purposes; you must publish
   your full SaaS source under AGPL too.
 - **Commercial license** for proprietary products, managed /
-  hosted services that do not want to open-source their code,
-  and deployments that need indemnification, warranty, or
-  priority security response. See
-  [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md) for the
-  process. Contact: `hackbuildvideo@gmail.com`.
+  hosted services that do not want to open-source their code, and
+  deployments that need indemnification, warranty, or priority
+  security response. See
+  [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md) for the process.
+  Contact: `hackbuildvideo@gmail.com`.
 
 Contributions are accepted under AGPL; see
-[`CONTRIBUTING.md`](CONTRIBUTING.md) and the "Contributing"
-section of the commercial-license document for the CLA-style
-relicensing grant that keeps the dual-license model honest.
+[`CONTRIBUTING.md`](CONTRIBUTING.md) and the "Contributing" section
+of the commercial-license document for the CLA-style relicensing
+grant that keeps the dual-license model honest.
