@@ -344,9 +344,13 @@ mod tests {
     }
 
     fn make_claims(scope: AuthScope, broadcast: Option<&str>) -> JwtClaims {
+        make_claims_with_exp(scope, broadcast, unix_exp_in(600))
+    }
+
+    fn make_claims_with_exp(scope: AuthScope, broadcast: Option<&str>, exp: usize) -> JwtClaims {
         JwtClaims {
             sub: "alice".into(),
-            exp: unix_exp_in(600),
+            exp,
             scope,
             iss: None,
             aud: None,
@@ -489,6 +493,93 @@ mod tests {
         let token = signer.sign("kid-unknown", &make_claims(AuthScope::Admin, None));
         let decision = provider.check(&AuthContext::Admin { token });
         assert!(!decision.is_allow(), "expected Deny on unknown kid");
+    }
+
+    /// Adversarial: the JWKS provider must reject tokens whose
+    /// `exp` claim is in the past, even though the kid + signature
+    /// + alg are otherwise valid. Mirrors the JWT-provider hardening
+    /// added in this audit cycle. A regression here would silently
+    /// accept stale tokens past their declared lifetime.
+    #[tokio::test]
+    async fn expired_token_is_rejected_for_admin_subscribe_and_publish() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let signer = Ed25519TestKey::new();
+        let jwks = serde_json::json!({ "keys": [signer.jwk_json("kid-1")] });
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&server)
+            .await;
+
+        let cfg = make_provider_config(format!("{}/jwks.json", server.uri()));
+        let provider = JwksAuthProvider::new(cfg).await.expect("provider");
+
+        // exp = 1 (1970-01-01 UTC + 1s); jsonwebtoken's default
+        // leeway is 0, so the gate fires unambiguously.
+        let admin = signer.sign("kid-1", &make_claims_with_exp(AuthScope::Admin, None, 1));
+        let sub = signer.sign("kid-1", &make_claims_with_exp(AuthScope::Subscribe, Some("live/x"), 1));
+        let pub_ = signer.sign("kid-1", &make_claims_with_exp(AuthScope::Publish, Some("live/x"), 1));
+
+        assert!(
+            !provider.check(&AuthContext::Admin { token: admin }).is_allow(),
+            "expired admin token must be denied",
+        );
+        assert!(
+            !provider
+                .check(&AuthContext::Subscribe {
+                    token: Some(sub),
+                    broadcast: "live/x".into(),
+                })
+                .is_allow(),
+            "expired subscribe token must be denied",
+        );
+        assert!(
+            !provider
+                .check(&AuthContext::Publish {
+                    app: "whip".into(),
+                    key: pub_,
+                    broadcast: Some("live/x".into()),
+                })
+                .is_allow(),
+            "expired publish token must be denied",
+        );
+    }
+
+    /// Adversarial: a token signed with a different keypair than
+    /// any kid-1 in the JWKS must be denied. Catches a regression
+    /// where the JWKS path stops verifying signatures (e.g. by
+    /// accepting any matching kid header without re-validating
+    /// against the cached public key).
+    #[tokio::test]
+    async fn token_signed_with_different_keypair_is_denied() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let trusted = Ed25519TestKey::new();
+        let attacker = Ed25519TestKey::new();
+        // JWKS publishes only the TRUSTED key under kid-1.
+        let jwks = serde_json::json!({ "keys": [trusted.jwk_json("kid-1")] });
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&server)
+            .await;
+
+        let cfg = make_provider_config(format!("{}/jwks.json", server.uri()));
+        let provider = JwksAuthProvider::new(cfg).await.expect("provider");
+
+        // Attacker signs with their OWN key but stamps the kid as
+        // kid-1, hoping the provider accepts on kid-match alone.
+        let token = attacker.sign("kid-1", &make_claims(AuthScope::Admin, None));
+        let decision = provider.check(&AuthContext::Admin { token });
+        assert!(
+            !decision.is_allow(),
+            "token signed with non-trusted keypair must be denied even when kid matches",
+        );
     }
 
     #[tokio::test]

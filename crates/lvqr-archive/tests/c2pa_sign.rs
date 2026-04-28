@@ -198,6 +198,92 @@ fn finalize_broadcast_signed_with_custom_signer_source_writes_pair_to_disk() {
     assert!(signed.manifest_bytes.len() > 64);
 }
 
+/// Sign an asset, verify the manifest validates against the
+/// signed bytes (round-trip), then mutate one byte of the asset
+/// and assert the same manifest no longer validates. Closes the
+/// audit gap that the existing c2pa-sign tests only assert
+/// "manifest_bytes is non-empty"; the headline provenance claim
+/// of LVQR is *integrity over time*, which requires the signed
+/// asset + manifest pair to actually fail validation under
+/// post-signing tampering.
+///
+/// Uses the same `c2pa::Reader` shape as the production verify
+/// route at `crates/lvqr-cli/src/archive.rs::handle_verify` --
+/// `Reader::from_context(Context::new()).with_manifest_data_and_stream`
+/// then read `reader.validation_state()`, which is the enum the
+/// verify route stringifies for the `/playback/verify/{broadcast}`
+/// JSON response. A clean signed pair must return
+/// `ValidationState::Valid`; a tampered pair must return
+/// `ValidationState::Invalid` (or fail to parse outright).
+#[test]
+fn signed_asset_bytes_round_trip_validates_clean_and_rejects_one_byte_tamper() {
+    let signer = ephemeral_signer();
+    let options = default_options();
+
+    let signed = sign_asset_with_signer(&signer, &options, "image/jpeg", MINIMAL_JPEG)
+        .expect("sign_asset_with_signer must succeed");
+
+    // 1. Clean round-trip: the signed manifest must validate
+    //    against the un-mutated asset bytes as Valid (or Trusted
+    //    if the operator wired a trust anchor; the EphemeralSigner
+    //    CA is not in c2pa-rs's default trust list so the
+    //    expectation is Valid). If this fails, the test harness
+    //    itself is wrong -- we'd be unable to tell apart "tamper
+    //    detected" from "library never validates anything".
+    let clean_reader = c2pa::Reader::from_context(c2pa::Context::new())
+        .with_manifest_data_and_stream(
+            &signed.manifest_bytes,
+            "image/jpeg",
+            std::io::Cursor::new(&signed.asset_bytes),
+        )
+        .expect("clean manifest+asset must parse");
+    let clean_state = clean_reader.validation_state();
+    assert!(
+        matches!(
+            clean_state,
+            c2pa::ValidationState::Valid | c2pa::ValidationState::Trusted
+        ),
+        "clean signed asset must validate as Valid or Trusted; got {clean_state:?}",
+    );
+
+    // 2. Tampered round-trip: flip one byte well inside the JPEG
+    //    payload (after the JFIF APP0 header, before the EOI
+    //    marker). The asset hash must no longer match the
+    //    manifest's recorded hash, so validation must downgrade
+    //    to Invalid (or the parse must fail outright with an
+    //    integrity error).
+    let mut tampered = signed.asset_bytes.clone();
+    let tamper_index = tampered.len() / 2;
+    tampered[tamper_index] ^= 0xFF;
+    assert_ne!(
+        tampered, signed.asset_bytes,
+        "tampered bytes must differ from clean (sanity check on the mutation)"
+    );
+
+    match c2pa::Reader::from_context(c2pa::Context::new()).with_manifest_data_and_stream(
+        &signed.manifest_bytes,
+        "image/jpeg",
+        std::io::Cursor::new(&tampered),
+    ) {
+        Err(_) => {
+            // c2pa::Reader rejected outright (e.g., asset hash
+            // mismatch surfaced as a parse-time error). Tamper
+            // detected.
+        }
+        Ok(reader) => {
+            // c2pa::Reader parsed but the validation_state must
+            // downgrade to Invalid -- the asset's binary hash no
+            // longer matches the recorded one in the manifest.
+            let state = reader.validation_state();
+            assert!(
+                matches!(state, c2pa::ValidationState::Invalid),
+                "tampered asset must report ValidationState::Invalid; \
+                 got {state:?} (validator may be broken if Valid/Trusted)",
+            );
+        }
+    }
+}
+
 #[test]
 fn sign_asset_bytes_reports_c2pa_error_on_missing_cert_file() {
     let tmp = TempDir::new().expect("create tempdir");

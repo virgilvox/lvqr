@@ -32,25 +32,34 @@ make progress.
 | **Stream-key TTL math window** (mint ttl=60, assert expires_at in [now+60, after+60]) | `crates/lvqr-auth/src/stream_key_store.rs::tests::mint_with_ttl_seconds_sets_expires_at_within_window` |
 | **SCTE-35 mutated-byte proptest** (256 cases of single-byte XOR mutation; assert no panic + CRC consistency on accept) | `crates/lvqr-codec/src/scte35.rs::tests::parse_handles_arbitrary_byte_mutations_without_panic` |
 | **HW encoder pipeline_str round-trip** (catches copy-paste swap of nvh264enc <-> vah264enc <-> qsvh264enc) | `crates/lvqr-transcode/src/{nvenc,vaapi,qsv,videotoolbox}.rs::tests::pipeline_str_uses_*_with_documented_property_mapping` |
+| **VideoToolbox NV12 capsfilter** (production fix + test assert -- catches Apple Silicon caps-negotiation regression that fails to preroll) | `videotoolbox.rs::pipeline_str_for` + smoke step |
+| **C2PA tamper-detection round-trip** (sign -> validate clean -> mutate one byte -> assert ValidationState::Invalid -- proves the headline provenance integrity claim) | `crates/lvqr-archive/tests/c2pa_sign.rs::signed_asset_bytes_round_trip_validates_clean_and_rejects_one_byte_tamper` |
+| **JWKS expired-token rejection** (admin / subscribe / publish scopes; mirrors JWT hardening) | `jwks_provider.rs::tests::expired_token_is_rejected_for_admin_subscribe_and_publish` |
+| **JWKS wrong-keypair rejection** (attacker signs with their key, claims kid-1; provider must deny on signature mismatch) | `jwks_provider.rs::tests::token_signed_with_different_keypair_is_denied` |
+| **Multi-agent panic isolation cross-contamination** (panicky agent + logging agent on same broadcast; logging receives all 3 fragments unaffected) | `crates/lvqr-agent/tests/integration_basic.rs::cross_agent_panic_does_not_affect_sibling` |
 
 ---
 
 ## Priority 1 -- Security boundaries still under-covered
 
-### P1.1 -- JWKS happy-path-only test surface
+### P1.1 -- JWKS happy-path-only test surface (PARTIAL)
 
 `crates/lvqr-auth/src/jwks_provider.rs:449-470` --
 `happy_path_accepts_signed_ed25519_token` only exercises a static
-JWKS endpoint with one key. No coverage for:
+JWKS endpoint with one key.
 
-- Token expiration enforcement (already fixed in the symmetric
-  HS256 path; mirror the same shape here).
+**Closed in this audit cycle**:
+
+- Token expiration enforcement: `expired_token_is_rejected_for_admin_subscribe_and_publish`.
+- Wrong-keypair rejection: `token_signed_with_different_keypair_is_denied`.
+- Algorithm downgrade: `validate_config_rejects_hmac_algs` (ships
+  the rejection at config-construct time).
+
+**Still open**:
+
 - Mismatched issuer (tokens with `iss` not in the configured
   allowlist).
-- Key rotation: start with kid-1 in JWKS, swap to kid-2; assert
-  tokens signed with kid-1 are rejected after the refresh.
-- Algorithm downgrade: token with `alg=none` or `alg=HS256` (using
-  the public key as the HMAC secret) -- must be rejected.
+- `alg=none` rejection at token-parse time.
 
 ### P1.2 -- HotReloadAuthProvider race-correctness
 
@@ -74,18 +83,22 @@ webhook returning `200 OK` with malformed JSON denies the request
 (rather than crashing or accepting). The TTL cache also lacks a
 "cached deny survives N seconds, then re-fetched" test.
 
-### P1.4 -- C2PA tamper detection round-trip
+### P1.4 -- C2PA tamper detection round-trip (CLOSED)
 
-`crates/lvqr-archive/tests/c2pa_sign.rs:75-97` -- only asserts the
-signed manifest is non-empty. No test that signs an asset, mutates
-one byte in the signed bytes, and verifies the resulting manifest
-fails validation. This is the load-bearing claim of the C2PA
-surface (the verify endpoint exists but isn't exercised against
-known-bad inputs).
+`crates/lvqr-archive/tests/c2pa_sign.rs::signed_asset_bytes_round_trip_validates_clean_and_rejects_one_byte_tamper`
+ships in this audit cycle:
 
-**Real test**: sign a small JPEG/MP4 fixture, write to disk, read
-back with `c2pa::Reader`, mutate one byte in the asset, re-read
-and assert validation fails with an integrity-violation reason.
+1. Sign the minimal JPEG fixture with the EphemeralSigner.
+2. Round-trip the signed asset + manifest through
+   `c2pa::Reader::from_context(...).with_manifest_data_and_stream(...)`
+   and assert `validation_state() == Valid | Trusted`.
+3. Mutate one byte at the JPEG midpoint.
+4. Re-validate: either the parser rejects outright or the reader
+   reports `ValidationState::Invalid`. Both are tamper-detected.
+
+Mirrors the production verify route at
+`crates/lvqr-cli/src/archive.rs::handle_verify` so a regression in
+either the verify route or the signing primitive trips this test.
 
 ### P1.5 -- Multi-key store revoke + fallback interaction
 
@@ -232,17 +245,23 @@ contract surfaces eviction explicitly. Today the assertion would
 catch a regression that silently drops middle fragments without
 signaling.
 
-### P3.5 -- Agent runner panic isolation untested
+### P3.5 -- Agent runner panic isolation (CLOSED)
 
-`crates/lvqr-agent/tests/integration_basic.rs:70-125` -- happy-path
-lifecycle (start -> fragments -> stop). No test that an agent
-panicking during `on_fragment` increments
-`handle.panics()` and that subsequent fragments still reach OTHER
-agents on the same broadcast.
+The single-agent panic-isolation case was already tested in
+`runner.rs::tests::panic_in_on_fragment_is_caught_and_counted_loop_continues`
+(audit was overcautious here). The cross-agent contamination
+case -- a panicky agent on the same `(broadcast, track)` as a
+healthy logging agent -- ships in
+`crates/lvqr-agent/tests/integration_basic.rs::cross_agent_panic_does_not_affect_sibling`:
 
-**Real test**: factory returns an agent that panics on the second
-fragment; assert `handle.panics() == 1`, assert the other agent
-on the same broadcast received all fragments unaffected.
+1. Two factories on the same broadcast: `panicky` (panics on every
+   `on_fragment`) and `logging` (records each fragment).
+2. Drive 3 fragments through the broadcaster.
+3. Assert `panicky` records 3 caught panics + 3 fragment-seen
+   counts, and `logging` receives all 3 fragments with 0 panics.
+
+Closes the load-bearing claim that a misbehaving WASM filter / AI
+agent that panics cannot kill its peers on the same broadcast.
 
 ---
 
