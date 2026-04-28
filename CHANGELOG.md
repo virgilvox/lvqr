@@ -6,7 +6,211 @@ summarises user-visible surface changes between tagged
 releases. For session-by-session engineering notes, see
 `tracking/HANDOFF.md`.
 
-## Unreleased (post-0.4.1)
+## [0.4.2] - 2026-04-28
+
+### Added
+
+* **WHIP-ingest timing-track wiring** (session 161 follow-up).
+  Mirrors session 159's RTMP-bridge wiring on `lvqr-whip`'s
+  `WhipMoqBridge`: `BroadcastState` grows a
+  `timing_sink: Option<MoqTimingTrackSink>` field, the broadcast
+  initializer creates a sibling `<broadcast>/0.timing` track at
+  the same lifecycle point as the existing `0.mp4` video track,
+  and the keyframe dispatch in `push_sample` pushes a 16-byte LE
+  `(group_id, ingest_time_ms)` anchor on every keyframe gated on
+  `frag.ingest_time_ms != 0`. WHIP-ingested broadcasts now
+  contribute to the pure-MoQ `lvqr_subscriber_glass_to_glass_ms`
+  histogram exactly like RTMP-ingested broadcasts. SRT / RTSP /
+  WS-fMP4 ingest bridges remain on the existing shape; mechanical
+  mirror pending an operator ask. No public API change.
+
+* **lvqr-srt test density brought to peer level** (session 160,
+  audit recommendation #3). Three new proptest harnesses (256
+  cases each) over `split_annex_b` / `annex_b_to_avcc` /
+  `annex_b_to_hvcc` proving panic-freedom + length-prefix
+  integrity on adversarial input. Three positive unit tests
+  mirroring the existing h264 sibling at `:677`:
+  `hevc_pes_publishes_init_and_keyframe_fragment_on_registry`,
+  `aac_adts_publishes_init_and_audio_fragment_on_registry`,
+  `scte35_section_with_valid_crc_publishes_event_on_registry`.
+  One negative test (`scte35_section_with_invalid_crc_drops`)
+  flips the trailing CRC byte and asserts no fragment publishes
+  within 50 ms via `tokio::time::timeout`. Workspace lib tests
+  go from 849 to 856; lvqr-srt's own count from 4 to 11.
+
+* **Pure-MoQ glass-to-glass SLO sample pusher** (session 159,
+  Phase A v1.1 #5 close-out). Sibling `<broadcast>/0.timing` MoQ
+  track stamps one 16-byte LE
+  `(group_id_u64_le || ingest_time_ms_u64_le)` anchor per video
+  keyframe (additive; foreign MoQ clients ignore the unknown
+  track name per the moq-lite contract). New
+  `lvqr_fragment::MoqTimingTrackSink` + `TimingAnchor` value
+  type with `encode` / `decode` round-trip helpers + new
+  `TIMING_TRACK_NAME = "0.timing"` + `TIMING_ANCHOR_SIZE = 16`
+  constants. `MoqTrackSink::push` return type widened from
+  `Result<(), MoqSinkError>` to `Result<Option<u64>, MoqSinkError>`
+  so the producer-side bridge knows the wire-side group sequence
+  to encode (backward-compatible at every existing callsite).
+  RTMP ingest bridge wires the timing track at broadcast-start
+  and pushes one anchor per video keyframe. New
+  `[[bin]] lvqr-moq-sample-pusher` on `lvqr-test-utils`
+  subscribes to both `0.mp4` + `0.timing`, joins anchors against
+  video frames by `group_id` in a 64-entry ring buffer
+  (exact-match + largest-less-than fallback + skip-on-miss),
+  throttles pushes to a configurable `--push-interval-secs`,
+  and POSTs JSON samples to the existing dual-auth
+  `POST /api/v1/slo/client-sample` route. New default-feature
+  integration test (`crates/lvqr-test-utils/tests/moq_timing_e2e.rs`)
+  drives the full RTMP -> relay -> bin -> SLO endpoint loop and
+  asserts a non-empty `transport="moq"` entry on
+  `GET /api/v1/slo`. **Phase A v1.1 #5 closed; the last open
+  v1.1 roadmap row.** See
+  [`tracking/SESSION_159_BRIEFING.md`](tracking/SESSION_159_BRIEFING.md).
+
+* **`POST /api/v1/slo/client-sample` admin endpoint** (session
+  156 follow-up). Accepts JSON
+  `{broadcast, transport, ingest_ts_ms, render_ts_ms}` from any
+  subscriber under dual-auth (admin OR per-broadcast subscribe
+  token). Validates non-empty fields, render >= ingest, and
+  latency <= 5 min clock-skew cap. Records into the existing
+  `LatencyTracker` powering `GET /api/v1/slo` + the
+  `lvqr_subscriber_glass_to_glass_ms` Prometheus histogram. New
+  `lvqr_slo_client_samples_total{transport}` counter for
+  sample-rate visibility.
+
+* **`@lvqr/dvr-player` SLO sampler** (session 156 follow-up).
+  Three new opt-in attributes (`slo-sampling="enabled"`,
+  `slo-endpoint="<URL>"`, `slo-sample-interval-secs`) drive a
+  client-side timer that lifts the publisher wall-clock via
+  `HTMLMediaElement.getStartDate() + currentTime`, computes
+  `latency_ms = Date.now() - that`, and POSTs to the new admin
+  route. Best-effort: any failure is silently dropped to keep
+  playback uninterrupted. Pure helpers in
+  `bindings/js/packages/dvr-player/src/slo-sampler.ts`
+  (`computeLatencyMs`, `broadcastFromHlsSrc`, `pushSample`)
+  covered by 16 Vitest unit tests.
+
+* **VideoToolbox hardware encoder backend on macOS** (session
+  156). New `lvqr_transcode::VideoToolboxTranscoderFactory`
+  behind a per-encoder `hw-videotoolbox` Cargo feature on
+  `lvqr-transcode` + `lvqr-cli`. Mirrors
+  `SoftwareTranscoderFactory` (105 B / 106 C) verbatim except
+  for the encoder element (`vtenc_h264_hw` instead of
+  `x264enc`) and its property mapping (`realtime=true` /
+  `allow-frame-reordering=false` / `max-keyframe-interval=60`).
+  HW-only path is intentional: the factory's `is_available()`
+  probe at construction returns false when `vtenc_h264_hw` is
+  missing and `build()` opts out of every stream with a warn
+  log so a HW-pickable tier never silently falls back to CPU.
+  CLI flag `--transcode-encoder software|videotoolbox`
+  (default `software`); the `videotoolbox` value is rejected
+  at parse time on builds without the feature. NVENC, VAAPI,
+  QSV stay deferred to v1.2.
+
+* **`videotoolbox-macos.yml` CI lane** (session 156 follow-up).
+  Runs the new HW-encoder integration test on `macos-latest`
+  for every PR touching the transcode crate, with
+  Homebrew-installed GStreamer + plugins.
+  `continue-on-error: true` initially while CI variance on the
+  GitHub-hosted Apple Silicon runner stabilises.
+
+* **lvqr-srt SCTE-35 PMT 0x86 reassembly + RTMP onCuePoint**
+  (session 152). PMT stream_type 0x86 with private-section
+  reassembly across TS packet boundaries; RTMP onCuePoint
+  scte35-bin64 via the vendored `rml_rtmp` v0.8 fork at
+  `vendor/rml_rtmp/`. Splice events flow through a reserved
+  `"scte35"` parallel track on the existing
+  `FragmentBroadcasterRegistry` and render as
+  `#EXT-X-DATERANGE` on LL-HLS + Period-level `<EventStream>`
+  on DASH. Splice_info_section bytes pass through verbatim
+  with CRC verification but no semantic interpretation. New
+  `lvqr-codec/src/scte35.rs` parser per ANSI/SCTE 35-2024
+  section 8.1 with proptest harness + libfuzzer target. New
+  metrics `lvqr_scte35_events_total{ingest, command}` +
+  `lvqr_scte35_drops_total{ingest, reason}`.
+
+### Changed
+
+* **Workspace `Cargo.toml` version 0.4.1 -> 0.4.2.** All 26
+  publishable Rust crates bump together. Run
+  `cargo publish -p <crate>` per the tier order in CLAUDE.md
+  (`lvqr-core` first, `lvqr-cli` last) to push to crates.io.
+
+* **`crates/lvqr-fragment::MoqTrackSink::push` return type
+  widens** from `Result<(), MoqSinkError>` to
+  `Result<Option<u64>, MoqSinkError>` so callers can read the
+  wire-side group sequence the call just opened (`Some(seq)` on
+  the keyframe path; `None` on the delta-frame / pre-keyframe
+  drop path). Backward-compatible at every existing in-tree
+  callsite (each used `.expect()` discarding the value or
+  `if let Err(...)`).
+
+### Documentation
+
+* **Codebase + roadmap audit** at
+  `tracking/CODEBASE_AUDIT_2026_04_27.md` (session 158).
+  12-section cite-by-line audit covering workspace shape,
+  per-crate review, public API drift, test coverage, TODO
+  markers, CI workflows, SDK packages, doc drift,
+  roadmap-vs-implementation matrix, tech debt, and ranked next
+  3-5 sessions. Recommendations 1-3 (DOC-DRIFT-A,
+  PATH-X-MOQ-TIMING, SRT-TEST-GAP) all closed in subsequent
+  sessions.
+
+* **DOC-DRIFT-A doc sweep** (session 158 follow-up).
+  `docs/architecture.md` + `docs/quickstart.md` flip 27-crate ->
+  29-crate (architecture doc gains `lvqr-agent-whisper` +
+  `lvqr-transcode`); seven Rust crate `lib.rs` doc-comments
+  rewritten to drop scaffold-session framing
+  (`lvqr-mesh`, `lvqr-whep`, `lvqr-hls`, `lvqr-cmaf`,
+  `lvqr-transcode`); four crates that previously had zero
+  module-level docstrings (`lvqr-relay`, `lvqr-rtsp`,
+  `lvqr-admin`, `lvqr-signal`) gain one. Dead `@lvqr/core/wasm`
+  SDK subpath dropped from `bindings/js/packages/core/package.json`
+  (the pre-built artefacts under `wasm/` were built against
+  the pre-0.4-session-44 browser-side `lvqr-wasm` crate that
+  no longer exists).
+
+* **`tracking/SESSION_159_BRIEFING.md`** (session 159 step 0).
+  ~590 lines locking eight engineering decisions for the
+  PATH-X-MOQ-TIMING close-out: sibling-track wire shape,
+  producer wiring location, return-type widening on
+  `MoqTrackSink::push`, subscriber-side bin shape, group-id
+  matching strategy, anchor ring-buffer capacity, test scope,
+  anti-scope.
+
+* **`docs/slo.md` operator runbook refresh** (session 157
+  follow-up). Documents the shipped
+  `POST /api/v1/slo/client-sample` route, the `@lvqr/dvr-player`
+  sampler as the reference HLS-side client, the new
+  `lvqr_slo_client_samples_total{transport}` counter, the
+  transport-specific recovery (HLS via PDT, MoQ via the
+  session-159 sidecar track), and the
+  Path X v1.2 sidecar-track plan with a forward-link.
+
+* **`tracking/SESSION_157_BRIEFING.md`** (session 157, MoQ
+  SLO audit). The audit confirmed the MoQ wire (then) carried
+  no per-frame wall-clock anchor; the brief locked the Path Y
+  / X / Z scoping decision (Y chosen at the time: document the
+  gap; X became session 159's actual close-out).
+
+### Removed
+
+* Browser-side `LvqrSubscriber` artefacts at
+  `bindings/js/packages/core/wasm/` (gitignored, never committed
+  -- session 158 follow-up local cleanup) and the dead
+  `./wasm` export + `build:wasm` script from `@lvqr/core`'s
+  `package.json`. The pre-deletion artefacts dated to before
+  the 0.4-session-44 refactor; the current `crates/lvqr-wasm`
+  is the server-side wasmtime filter host with no
+  `wasm-bindgen` surface.
+
+## [0.4.1] - 2026-04-24
+
+(See sessions 145 republish-only commit; no shape changes vs
+0.4.0 surface.)
+
+## Pre-0.4.2 unreleased entries (rolled into 0.4.2 above)
 
 ### Added
 

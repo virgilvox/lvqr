@@ -3083,7 +3083,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lvqr-admin"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum 0.8.8",
  "chitchat",
@@ -3105,7 +3105,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-agent"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "dashmap",
@@ -3118,7 +3118,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-agent-whisper"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "lvqr-agent",
@@ -3133,7 +3133,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-archive"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "c2pa",
  "criterion",
@@ -3147,7 +3147,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-auth"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arc-swap",
  "base64",
@@ -3167,7 +3167,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-cli"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3237,7 +3237,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-cluster"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3259,7 +3259,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-cmaf"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "criterion",
@@ -3277,7 +3277,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-codec"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "criterion",
@@ -3289,7 +3289,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-conformance"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "serde",
@@ -3299,7 +3299,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "dashmap",
@@ -3313,7 +3313,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-dash"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum 0.8.8",
  "bytes",
@@ -3331,7 +3331,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-fragment"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "lvqr-moq",
@@ -3343,7 +3343,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-hls"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum 0.8.8",
  "bytes",
@@ -3363,7 +3363,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-ingest"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64",
  "bytes",
@@ -3392,7 +3392,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-mesh"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "dashmap",
@@ -3410,7 +3410,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-moq"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "moq-lite",
@@ -3420,7 +3420,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-observability"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3440,7 +3440,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-record"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "lvqr-cmaf",
@@ -3456,7 +3456,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-relay"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3482,7 +3482,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-rtsp"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64",
  "bytes",
@@ -3502,7 +3502,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-signal"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum 0.8.8",
  "dashmap",
@@ -3519,7 +3519,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-soak"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3537,7 +3537,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-srt"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "futures-util",
@@ -3559,7 +3559,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-test-utils"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -3596,7 +3596,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-transcode"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "dashmap",
@@ -3616,7 +3616,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-wasm"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3635,7 +3635,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-whep"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum 0.8.8",
  "bytes",
@@ -3656,7 +3656,7 @@ dependencies = [
 
 [[package]]
 name = "lvqr-whip"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum 0.8.8",
  "bytes",

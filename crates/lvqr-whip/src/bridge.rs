@@ -38,7 +38,10 @@ use lvqr_cmaf::{
 };
 use lvqr_codec::hevc::{self as hevc_codec, HevcSps};
 use lvqr_core::{EventBus, RelayEvent, now_unix_ms};
-use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta, MoqTrackSink};
+use lvqr_fragment::{
+    Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta, MoqTimingTrackSink, MoqTrackSink,
+    TIMING_TRACK_NAME,
+};
 use lvqr_ingest::{MediaCodec, SharedRawSampleObserver, publish_fragment, publish_init};
 use lvqr_moq::{OriginProducer, Track};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -157,6 +160,15 @@ struct BroadcastState {
     /// have independent lifecycles and a late audio arrival does
     /// not disturb the video path.
     audio_init_emitted: bool,
+    /// Sibling `<broadcast>/0.timing` track sink (Phase A v1.1 #5,
+    /// session 161 follow-up). Mirrors the producer-side wiring
+    /// session 159 added on the RTMP bridge: emits one 16-byte LE
+    /// `(group_id, ingest_time_ms)` anchor per video keyframe so
+    /// pure-MoQ subscribers can compute glass-to-glass latency on
+    /// WHIP-ingested broadcasts. `None` when track creation
+    /// failed at broadcast-start; the video path keeps running
+    /// unaffected.
+    timing_sink: Option<MoqTimingTrackSink>,
 }
 
 /// Bridges WHIP inbound samples to a MoQ [`OriginProducer`] and the
@@ -267,6 +279,25 @@ impl WhipMoqBridge {
         };
         let mut video_sink = MoqTrackSink::new(video_track, FragmentMeta::new(codec_fourcc, 90_000));
         video_sink.set_init_segment(init.clone());
+
+        // Session 161 follow-up: sibling `<broadcast>/0.timing` MoQ
+        // track for pure-MoQ glass-to-glass SLO sampling on WHIP
+        // ingest. Mirrors the RTMP-bridge wiring session 159 added.
+        // Failure to create it is logged + tolerated -- the video
+        // path keeps running and the per-broadcast timing slot
+        // stays `None`.
+        let timing_sink = match producer.create_track(Track::new(TIMING_TRACK_NAME)) {
+            Ok(t) => Some(MoqTimingTrackSink::new(t)),
+            Err(e) => {
+                warn!(
+                    broadcast,
+                    error = ?e,
+                    "whip: failed to create 0.timing track; pure-MoQ SLO sampling disabled for this broadcast"
+                );
+                None
+            }
+        };
+
         info!(broadcast, width, height, ?codec, "whip: broadcast initialized");
 
         // Publish the init segment onto the shared registry. Every
@@ -286,6 +317,7 @@ impl WhipMoqBridge {
                 audio_sink: None,
                 audio_seq: 0,
                 audio_init_emitted: false,
+                timing_sink,
             },
         );
         true
@@ -405,8 +437,28 @@ impl WhipMoqBridge {
         };
         let frag = Fragment::new("0.mp4", seq as u64, 0, 0, dts, dts, raw.duration as u64, flags, seg)
             .with_ingest_time_ms(ingest_ms);
-        if let Err(e) = state.video_sink.push(&frag) {
-            debug!(broadcast, error = ?e, "whip: moq sink push failed");
+        match state.video_sink.push(&frag) {
+            Ok(Some(group_seq)) => {
+                // Session 161 follow-up: keyframe opened a new MoQ
+                // group; emit a sibling-track timing anchor so
+                // pure-MoQ subscribers can compute glass-to-glass
+                // latency. Skip the push when ingest_time_ms is
+                // zero (a `(group_id, 0)` anchor would compute
+                // 60-year latency on the subscriber side).
+                if frag.ingest_time_ms != 0 {
+                    if let Some(timing) = state.timing_sink.as_mut() {
+                        if let Err(e) = timing.push_anchor(group_seq, frag.ingest_time_ms) {
+                            debug!(broadcast, error = ?e, group = group_seq, "whip: timing anchor push failed");
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                // Delta or pre-keyframe drop; no timing anchor.
+            }
+            Err(e) => {
+                debug!(broadcast, error = ?e, "whip: moq sink push failed");
+            }
         }
 
         // Release the dashmap entry before publishing to the
