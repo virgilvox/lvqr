@@ -326,7 +326,7 @@ matrix: [`config-reload.md`](config-reload.md).
 
 ## Next steps
 
-- [`architecture.md`](architecture.md) -- how the 27 crates fit
+- [`architecture.md`](architecture.md) -- how the 29 crates fit
   together and the ten load-bearing architectural decisions
 - [`deployment.md`](deployment.md) -- systemd, TLS, reverse
   proxy, firewall, Prometheus + OTLP collectors
@@ -334,5 +334,7 @@ matrix: [`config-reload.md`](config-reload.md).
   tuning, redirect-to-owner semantics
 - [`observability.md`](observability.md) -- OTLP endpoint
   setup, resource attribution, sampling, Grafana dashboards
-- [`mesh.md`](mesh.md) -- peer mesh topology planner
-  (topology only today; media relay is Tier 4 on the roadmap)
+- [`mesh.md`](mesh.md) -- peer mesh topology planner +
+  browser-side WebRTC DataChannel data plane (data plane
+  shipped session 144; topology + signaling on the Rust side,
+  per-peer relay on the browser side via @lvqr/core)

@@ -1,19 +1,31 @@
-//! `lvqr-whep` — WHEP (WebRTC HTTP Egress Protocol) egress for LVQR.
+//! `lvqr-whep` -- WHEP (WebRTC HTTP Egress Protocol) egress for LVQR.
 //!
-//! The crate lands in stages. Session 15 shipped the H.264 RTP
-//! packetizer (the building block with no network dependency).
-//! Session 16 adds the signaling layer: the axum router for the
-//! WHEP HTTP surface (`POST` / `PATCH` / `DELETE` under
-//! `/whep/{broadcast}` and `/whep/{broadcast}/{session_id}`), the
-//! session registry, and the trait boundary
-//! ([`SdpAnswerer`] + [`SessionHandle`]) that decouples the router
-//! from the concrete WebRTC state machine.
+//! Axum signaling router on top of a trait boundary ([`SdpAnswerer`] +
+//! [`SessionHandle`]) that decouples the HTTP shape from the concrete
+//! WebRTC state machine. The HTTP surface mounts under
+//! `/whep/{broadcast}` and `/whep/{broadcast}/{session_id}` for the
+//! standard `POST` / `PATCH` / `DELETE` lifecycle. The concrete
+//! `str0m` backend ([`Str0mAnswerer`]) plugs into the trait and is
+//! re-exported below; lvqr-cli wires `WhepServer` into the relay
+//! through the existing `RawSampleObserver` tap on
+//! `RtmpMoqBridge::with_raw_sample_observer` so every published
+//! sample (RTMP, SRT, RTSP, WS, WHIP) flows into every subscribed
+//! WHEP client as RTP.
 //!
-//! A future session plugs in `str0m` behind the [`SdpAnswerer`]
-//! trait. Once that lands, [`WhepServer`] is wired into
-//! `lvqr-cli` via `RtmpMoqBridge::with_raw_sample_observer` so
-//! every published RTMP sample flows into every subscribed WHEP
-//! client as RTP.
+//! ## Codecs
+//!
+//! H.264, HEVC, and Opus pass through directly. AAC publishers
+//! (RTMP / SRT / RTSP / WS) reach Opus-negotiated WHEP subscribers
+//! via the in-process [`lvqr_transcode::AacToOpusEncoder`] (session
+//! 113), behind this crate's `aac-opus` Cargo feature which forwards
+//! to `lvqr-transcode/transcode` so the GStreamer dep graph stays
+//! opt-in.
+//!
+//! ## Open items
+//!
+//! Trickle ICE ingestion is still TODO (one-shot warn flag per
+//! session in [`Str0mSessionHandle`]); operators relying on
+//! candidate trickling should keep this in mind.
 //!
 //! The full design note lives at `crates/lvqr-whep/docs/design.md`.
 

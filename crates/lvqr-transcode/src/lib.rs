@@ -1,89 +1,69 @@
-//! Server-side transcoding for LVQR.
+//! Server-side transcoding for LVQR (Tier 4 item 4.6).
 //!
-//! **Tier 4 item 4.6, session 104 A scaffold.** This is the crate
-//! referenced by `tracking/TIER_4_PLAN.md` section 4.6. The goal is
-//! to let LVQR generate an ABR ladder (720p / 480p / 240p by
-//! default) from a single high-resolution source broadcast, with
-//! the output renditions re-injected into the local
-//! [`lvqr_fragment::FragmentBroadcasterRegistry`] so every egress
-//! surface (LL-HLS, DASH, MoQ relay, archive) serves them as if
-//! they had been ingested directly.
+//! Generates an ABR ladder (720p / 480p / 240p by default) from a
+//! single high-resolution source broadcast, with the output
+//! renditions re-injected into the caller-supplied
+//! [`lvqr_fragment::FragmentBroadcasterRegistry`] under
+//! `<source>/<rendition>` broadcast names. Every egress surface
+//! (LL-HLS, DASH, MoQ relay, archive) picks them up without
+//! per-protocol wiring; the LL-HLS master playlist composer emits
+//! one `#EXT-X-STREAM-INF` per rendition automatically.
 //!
-//! # Session 104 A scope
+//! ## What this crate ships
 //!
-//! Scaffold + one pass-through transcoder:
+//! Always available (default features):
 //!
-//! * [`Transcoder`] trait + [`TranscoderFactory`] + [`TranscoderContext`]
-//!   modeled on the `lvqr-agent` crate's
-//!   [`Agent`](lvqr_fragment::FragmentBroadcasterRegistry) shape so
-//!   operators see one consistent "subscriber-with-lifecycle"
-//!   idiom across WASM filters, AI agents, and transcoders.
-//! * [`TranscodeRunner`] + [`TranscodeRunnerHandle`]: registry-side
-//!   installer + cheaply-cloneable handle, exactly mirroring
-//!   `AgentRunner` in `lvqr-agent`.
-//! * [`RenditionSpec`] with width / height / bitrate fields and
-//!   three preset constructors ([`RenditionSpec::preset_720p`],
-//!   [`RenditionSpec::preset_480p`], [`RenditionSpec::preset_240p`])
-//!   plus [`RenditionSpec::default_ladder`] for the LVQR default
-//!   3-rung ladder.
-//! * [`PassthroughTranscoder`] + [`PassthroughTranscoderFactory`]:
-//!   the 104 A concrete implementation. Logs + counts per-fragment
-//!   but does NOT actually encode or republish output. Exists to
-//!   prove the end-to-end wiring (`FragmentBroadcasterRegistry`
-//!   callback -> drain task -> per-rendition transcoder
-//!   instance) before the `gstreamer-rs` pipelines land in
-//!   session 105 B.
+//! * [`Transcoder`] trait + [`TranscoderFactory`] +
+//!   [`TranscoderContext`] -- the "subscribe / drain / panic-isolate"
+//!   shape generalised from `lvqr_agent::Agent`. Each factory
+//!   carries its own [`RenditionSpec`].
+//! * [`TranscodeRunner`] + [`TranscodeRunnerHandle`] -- registry-side
+//!   installer + cheaply-cloneable handle, mirroring
+//!   `lvqr_agent::AgentRunner`.
+//! * [`RenditionSpec`] with width / height / bitrate fields,
+//!   [`RenditionSpec::preset_720p`] / `preset_480p` / `preset_240p`
+//!   constructors, and [`RenditionSpec::default_ladder`].
+//! * [`PassthroughTranscoder`] -- in-memory observer that proves
+//!   the registry-callback / drain / panic-isolation wiring; useful
+//!   for tests and as a metrics tap.
+//! * [`AudioPassthroughTranscoder`] -- copies `<source>/1.mp4` audio
+//!   fragments verbatim into every rendition's audio track so each
+//!   rendition broadcaster is a self-contained mp4 the LL-HLS
+//!   bridge drains without special-casing the missing audio.
 //!
-//! # What session 105 B adds
+//! Behind the `transcode` feature (pulls gstreamer-rs 0.23 +
+//! base/good/bad/ugly + gst-libav from the host):
 //!
-//! * Real `gstreamer-rs` pipelines gated behind a
-//!   `transcode` Cargo feature (default OFF so CI runners without
-//!   gstreamer plugins continue to build).
-//! * A `SoftwareTranscoder` using `appsrc -> qtdemux -> h264parse
-//!   -> avdec_h264 -> videoscale -> x264enc -> ... -> mp4mux ->
-//!   appsink` (plus passthrough audio) and re-injecting the output
-//!   into the caller-supplied
-//!   [`lvqr_fragment::FragmentBroadcasterRegistry`] as a new
-//!   broadcast named `<source>/<rendition>` (e.g. `live/foo/720p`).
-//! * Optional hardware-encoder backends behind per-encoder feature
-//!   flags (`hw-nvenc`, `hw-vaapi`, `hw-qsv`, `hw-videotoolbox`).
+//! * [`SoftwareTranscoder`] / [`SoftwareTranscoderFactory`] -- the
+//!   `appsrc -> qtdemux -> h264parse -> avdec_h264 -> videoscale ->
+//!   x264enc -> ... -> mp4mux -> appsink` ladder, one worker thread
+//!   per `(source, rendition)` pair, bounded mpsc.
+//! * [`AacToOpusEncoder`] / [`AacToOpusEncoderFactory`] -- AAC -> Opus
+//!   transcoder used by `lvqr-whep` (under its `aac-opus` feature)
+//!   so AAC publishers reach Opus-negotiated WHEP subscribers.
 //!
-//! # What session 106 C adds
+//! Behind the `hw-videotoolbox` feature (implies `transcode`;
+//! requires the `applemedia` plugin from gst-plugins-bad):
 //!
-//! * `lvqr-cli` wiring (`--transcode-rendition 720p,480p,240p`
-//!   flag + `ServeConfig::transcode_renditions`).
-//! * LL-HLS master playlist composition: the HLS bridge learns
-//!   about source -> rendition relationships so one master
-//!   playlist references every rendition as a variant with
-//!   `BANDWIDTH` / `RESOLUTION` matching
-//!   [`RenditionSpec`].
-//! * [`AudioPassthroughTranscoderFactory`]: always-available sibling of
-//!   [`SoftwareTranscoderFactory`] that copies `<source>/1.mp4`
-//!   fragments verbatim into `<source>/<rendition>/1.mp4` so each
-//!   rendition broadcaster is a self-contained mp4 the LL-HLS bridge
-//!   drains without special-casing the missing audio.
-//! * End-to-end demo: ingest one 1080p RTMP stream, watch the
-//!   LL-HLS master playlist advertise four variants
-//!   (source + three ladder rungs).
+//! * [`VideoToolboxTranscoder`] / [`VideoToolboxTranscoderFactory`]
+//!   -- mirrors `SoftwareTranscoderFactory` but swaps the
+//!   `x264enc bitrate=... tune=zerolatency speed-preset=superfast`
+//!   pipeline element for Apple's HW-only `vtenc_h264_hw bitrate=...
+//!   realtime=true allow-frame-reordering=false
+//!   max-keyframe-interval=60`. HW-only path is intentional: a
+//!   factory that silently falls back to CPU encoding under load
+//!   defeats the point of an operator-pickable hardware tier.
+//!   `is_available()` probes for the encoder element at construction
+//!   and `build()` opts out cleanly with a warn log when missing.
 //!
-//! # Anti-scope (session 104 A)
+//! NVENC, VAAPI, and QSV stay deferred to v1.2 per the README's
+//! existing language. When a third HW backend lands, that session
+//! is also the right moment to extract a shared `pipeline.rs`
+//! scaffolding module from `software.rs` + `videotoolbox.rs`.
 //!
-//! * **No `lvqr-cli` wiring.** 106 C owns the composition root.
-//! * **No gstreamer dependency.** 105 B owns the real pipeline.
-//!   Session 104 A ships a pass-through that exists only to
-//!   prove the `FragmentBroadcasterRegistry` subscribe /
-//!   drain / panic-isolation wiring without pulling a heavy C
-//!   dep into the workspace build.
-//! * **No output re-publish.** 104 A transcoders are observers
-//!   only. Session 105 B adds the output side.
-//! * **No config-file / admin-API ladder override.** 105 B +
-//!   106 C own operator-facing configuration.
-//! * **No HLS master-playlist integration.** 106 C owns the
-//!   egress wiring.
+//! ## Where this crate fits in the consumer family
 //!
-//! # Where this crate fits in the consumer family
-//!
-//! Pattern-matches the five existing
+//! Pattern-matches the existing
 //! [`lvqr_fragment::FragmentBroadcasterRegistry`] consumers:
 //!
 //! | Crate | Wires | Purpose |
@@ -93,14 +73,15 @@
 //! | `lvqr_wasm::install_wasm_filter_bridge` | `on_entry_created` | Per-fragment WASM filter tap |
 //! | `lvqr_cli::cluster_claim::install_cluster_claim_bridge` | `on_entry_created` | Renew cluster broadcast claim |
 //! | `lvqr_agent::AgentRunner` | `on_entry_created` | Per-broadcast user-defined agents |
-//! | **`lvqr_transcode::TranscodeRunner`** (new) | `on_entry_created` | Per-broadcast ABR-ladder transcoders |
+//! | `lvqr_transcode::TranscodeRunner` | `on_entry_created` | Per-broadcast ABR-ladder transcoders |
 //!
-//! No new abstractions invented: the trait surface is a
-//! one-method generalisation of [`lvqr_agent`]'s `Agent` /
-//! `AgentFactory` / `AgentRunner`, re-shaped so each factory
-//! carries its own [`RenditionSpec`]. Every existing consumer
-//! already encodes the same subscribe / drain / panic-isolate
-//! pattern by hand.
+//! ## Operator wiring
+//!
+//! `lvqr-cli` exposes `--transcode-rendition 720p,480p,240p` (or a
+//! `.toml` `RenditionSpec` path) and, on `hw-videotoolbox` builds,
+//! `--transcode-encoder software|videotoolbox`. End-to-end shape:
+//! ingest one source RTMP stream, the LL-HLS master playlist
+//! advertises one variant per rendition + the source.
 
 mod audio_passthrough;
 mod passthrough;

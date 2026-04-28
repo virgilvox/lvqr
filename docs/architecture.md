@@ -1,6 +1,6 @@
 # Architecture
 
-LVQR is a 27-crate Rust workspace built around one central
+LVQR is a 29-crate Rust workspace built around one central
 claim: every track in the system is a sequence of `Fragment`
 values, and every protocol the server speaks is a projection
 over that shared fragment stream. The architecture is
@@ -9,7 +9,7 @@ adding RTSP or WHIP does not turn into a data-plane rewrite.
 
 This document maps the system at the level that matters for
 new contributors: the unified data model, the three planes
-(data / cluster / observability), the 27 crates that
+(data / cluster / observability), the 29 crates that
 implement them, and the ten load-bearing architectural
 decisions you must preserve before touching cross-crate
 boundaries.
@@ -172,7 +172,7 @@ sites in `lvqr-ingest` / `lvqr-relay` / `lvqr-admin` /
 
 Full reference: [`docs/observability.md`](observability.md).
 
-## The 27 crates
+## The 29 crates
 
 ```
 Data model and transport facade
@@ -181,41 +181,43 @@ Data model and transport facade
   lvqr-moq           -- facade over moq-lite (version churn isolation)
 
 Codecs and segmenter
-  lvqr-codec         -- AVC / HEVC / AAC / Opus parsers + proptest + fuzz
+  lvqr-codec         -- AVC / HEVC / AAC / Opus / SCTE-35 parsers + proptest + fuzz
   lvqr-cmaf          -- RawSample coalescer, CmafPolicy, build_moof_mdat
 
 Ingest
-  lvqr-ingest        -- RTMP + FLV + RtmpMoqBridge + observer taps
+  lvqr-ingest        -- RTMP + FLV + RtmpMoqBridge + observer taps + AMF0 onCuePoint scte35-bin64
   lvqr-whip          -- WebRTC ingest (H.264 + HEVC + Opus via str0m)
-  lvqr-srt           -- SRT-over-UDP + MPEG-TS demuxer
+  lvqr-srt           -- SRT-over-UDP + MPEG-TS demuxer + PMT 0x86 SCTE-35 reassembly
   lvqr-rtsp          -- RTSP/1.0 server + interleaved RTP depacketizer
 
 Egress
   lvqr-relay         -- MoQ/QUIC relay over moq-lite, zero-copy fanout
-  lvqr-hls           -- LL-HLS + MultiHlsServer + sliding DVR window
-  lvqr-dash          -- MPEG-DASH + MultiDashServer + MPD lifecycle
-  lvqr-whep          -- WebRTC egress via str0m, RTP packetization
-  lvqr-mesh          -- peer mesh topology planner (media relay: Tier 4)
+  lvqr-hls           -- LL-HLS + MultiHlsServer + master playlist + sliding DVR window + DATERANGE
+  lvqr-dash          -- MPEG-DASH + MultiDashServer + MPD lifecycle + Period EventStream
+  lvqr-whep          -- WebRTC egress via str0m, RTP packetization, AAC->Opus transcoder
+  lvqr-mesh          -- peer mesh topology planner (browser data plane shipped session 144; see docs/mesh.md)
 
 Auth, storage, admin
-  lvqr-auth          -- noop / static-token / HS256 JWT providers + per-protocol extractors
+  lvqr-auth          -- noop / static / HS256 JWT / JWKS / webhook providers + hot-reload + stream-key store
   lvqr-record        -- fMP4 disk recorder subscribed to EventBus
   lvqr-archive       -- redb segment index for DVR scrub + /playback/* + io_uring writer + C2PA finalize
-  lvqr-signal        -- WebRTC signaling for mesh peer assignments
-  lvqr-admin         -- /api/v1/*, /metrics, /healthz, /readyz, auth mw
+  lvqr-signal        -- WebRTC signaling for mesh peer assignments + ICE server push
+  lvqr-admin         -- /api/v1/*, /metrics, /healthz, /readyz, auth mw, SLO tracker
 
 Cluster and observability
-  lvqr-cluster       -- chitchat membership, ownership, capacity, config
-  lvqr-observability -- tracing/OTLP, metrics-crate -> OTLP bridge
+  lvqr-cluster       -- chitchat membership, ownership, capacity, config, federation
+  lvqr-observability -- tracing/OTLP, metrics-crate -> OTLP bridge, Fanout to Prometheus
 
 Programmable data plane (Tier 4)
-  lvqr-wasm          -- wasmtime per-fragment filter host + notify hot-reload
+  lvqr-wasm          -- wasmtime per-fragment filter host + chain composition + notify hot-reload
   lvqr-agent         -- in-process AI agents framework (Agent trait + AgentRunner + lifecycle)
+  lvqr-agent-whisper -- WhisperCaptionsAgent (AAC -> PCM -> WebVTT cues, Tier 4 item 4.5)
+  lvqr-transcode     -- GStreamer ABR ladder + SoftwareTranscoder + VideoToolbox HW + AacToOpusEncoder
 
 Composition and test infrastructure
   lvqr-cli           -- single-binary composition root (lvqr serve)
   lvqr-conformance   -- reference fixtures + external validator wrappers (publish = false)
-  lvqr-test-utils    -- TestServer harness (publish = false)
+  lvqr-test-utils    -- TestServer harness + scte35-rtmp-push test bin (publish = false)
   lvqr-soak          -- long-run soak driver (publish = false)
 ```
 

@@ -43,14 +43,13 @@
 //!
 //! ## 5-artifact contract
 //!
-//! Day-one coverage is 4 of 5: proptest on the policy state machine,
+//! All five slots are filled: proptest on the policy state machine,
 //! integration test that drives a synthetic `FragmentStream` through
 //! the segmenter, workspace-level e2e (the `rtmp_ws_e2e` binary runs
-//! the end-to-end path that the segmenter will replace), and an
-//! ffprobe conformance check on the init segment. Fuzz slot opens when
-//! a parser attack surface lands in this crate (today there is none --
-//! the segmenter only reads `Bytes` from a trusted producer and writes
-//! mp4-atom structures).
+//! the end-to-end path the segmenter is gradually replacing), an
+//! ffprobe conformance check on the init segment, and a fuzz harness
+//! at `fuzz/fuzz_targets/detect_codec_strings.rs` covering the codec-
+//! string detection helpers (session 8 follow-up).
 
 pub mod chunk;
 pub mod coalescer;

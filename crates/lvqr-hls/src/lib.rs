@@ -8,60 +8,53 @@
 //! video server asks "can it serve HLS?" and the answer being "no,
 //! we only do MoQ and WS" is not acceptable.
 //!
-//! ## Scope of the day-one scaffold
+//! ## What this crate ships
 //!
-//! * A pure-library manifest generator that emits:
+//! * [`PlaylistBuilder`] -- pure state machine that consumes
+//!   [`lvqr_cmaf::CmafChunk`] values and produces an in-memory
+//!   [`Manifest`].
+//! * Manifest renderer ([`Manifest::render`]) emitting:
 //!   * the media playlist (`#EXTM3U` + `#EXT-X-VERSION:9` + part /
 //!     segment entries),
 //!   * `#EXT-X-PART` entries for every partial chunk,
-//!   * `#EXT-X-PART-INF` so the client knows the target part
-//!     duration up front,
+//!   * `#EXT-X-PART-INF` for the target part duration up front,
 //!   * `#EXT-X-SERVER-CONTROL` with `CAN-BLOCK-RELOAD=YES` because
-//!     LL-HLS without blocking reload is not LL-HLS.
-//! * Types ([`Manifest`], [`Segment`], [`Part`], [`ServerControl`])
-//!   that other code can construct without touching the renderer.
-//! * A text renderer via [`Manifest::render`] that emits UTF-8
-//!   compatible with Apple's `mediastreamvalidator`.
-//! * A pure state machine [`PlaylistBuilder`] that consumes
-//!   [`lvqr_cmaf::CmafChunk`] values and produces an in-memory
-//!   [`Manifest`]. No axum router yet; that lands when the first
-//!   real HTTP consumer appears (browser, hls.js, mediastreamvalidator).
+//!     LL-HLS without blocking reload is not LL-HLS,
+//!   * per-segment `#EXT-X-PROGRAM-DATE-TIME` (load-bearing for
+//!     glass-to-glass SLO recovery via `getStartDate()` in the
+//!     `@lvqr/dvr-player` SLO sampler),
+//!   * `#EXT-X-DATERANGE` for SCTE-35 ad markers (session 152) with
+//!     `CLASS="urn:scte:scte35:2014:bin"` and SCTE35-OUT/IN/CMD
+//!     attributes (see [`SCTE35_DATERANGE_CLASS`]).
+//! * Multivariant master playlist via [`MasterPlaylist`] +
+//!   [`VariantStream`] (session 106 C transcode ladder); each
+//!   transcode rendition surfaces as one `#EXT-X-STREAM-INF` line.
+//! * Subtitles rendition group via [`SubtitlesServer`] for the
+//!   whisper captions agent (Tier 4 item 4.5 session 99 C).
+//! * HTTP serving surface via [`HlsServer`] + [`MultiHlsServer`]
+//!   with cluster-aware [`OwnerResolver`] redirect-to-owner.
 //!
-//! ## What is NOT in this crate yet
+//! ## What is NOT in this crate
 //!
-//! * Multivariant master playlists (`#EXT-X-STREAM-INF`). Single
-//!   rendition only for now.
-//! * Byte-range delivery.
+//! * Byte-range delivery (segments are served whole today).
 //! * Media segment encryption (`#EXT-X-KEY`).
 //! * Discontinuity handling (`#EXT-X-DISCONTINUITY`).
-//! * Rendition groups (alternate audio / subtitles).
-//! * The actual axum router that serves `playlist.m3u8` and the
-//!   part / segment URIs. Session 8 will add this when there is a
-//!   real consumer to validate against.
-//! * Byte-level conformance against Apple `mediastreamvalidator`.
-//!   The 5-artifact contract slot stays open until the validator is
-//!   wired in via `lvqr-test-utils::mediastreamvalidator_bytes` (to
-//!   be written; same soft-skip pattern as `ffprobe_bytes`).
 //!
-//! ## 5-artifact contract (day-one state)
+//! ## 5-artifact contract
 //!
-//! * **proptest**: yes (`tests/proptest_manifest.rs` — manifest
+//! * **proptest**: shipped (`tests/proptest_manifest.rs` -- manifest
 //!   renderer never panics on arbitrary chunk sequences, output is
 //!   always well-formed UTF-8, every `#EXT-X-PART` URI appears in
 //!   ascending media sequence order).
-//! * **fuzz**: open. No parser attack surface yet; the renderer
-//!   only reads structured input. Fuzz lands when a playlist
-//!   parser ever enters the crate.
-//! * **integration**: minimal (`tests/integration_builder.rs` — drive
-//!   a scripted `CmafChunk` sequence through `PlaylistBuilder` and
-//!   snapshot the rendered manifest).
-//! * **e2e**: open. Lands with the axum router in a later session.
-//! * **conformance**: open. Lands when Apple `mediastreamvalidator`
-//!   is wired into CI.
-//!
-//! So day-one coverage is 2 of 5. The remaining three open slots all
-//! require code that does not yet exist (the axum router, the
-//! validator wrapper). Session 8 or later will fill them.
+//! * **fuzz**: shipped (`fuzz/fuzz_targets/playlist_builder.rs`).
+//! * **integration**: shipped (`tests/integration_builder.rs`).
+//! * **e2e**: shipped via the lvqr-cli RTMP -> HLS integration
+//!   tests under `crates/lvqr-cli/tests/`.
+//! * **conformance**: still open -- byte-level conformance against
+//!   Apple `mediastreamvalidator` lands when a `lvqr-test-utils::
+//!   mediastreamvalidator_bytes` helper is written (same soft-skip
+//!   pattern as `ffprobe_bytes`). This is the largest known
+//!   conformance gap on the HLS side.
 
 pub mod manifest;
 pub mod master;

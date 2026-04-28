@@ -559,18 +559,14 @@ byte-for-byte. Tokens carry the typed prefix `lvqr_sk_` (industry
 convention -- secret-scanners can recognise leaked LVQR keys in
 public commits).
 
-## WASM module
+<!--
+The pre-0.4-session-44 `@lvqr/core/wasm` browser subscriber
+(LvqrSubscriber, init, isWebTransportSupported) was retired
+when the browser-side `lvqr-wasm` crate was deleted in favour
+of the pure-TypeScript `LvqrClient` + `MoqSubscriber` path
+documented above. The current `crates/lvqr-wasm` is the
+server-side wasmtime per-fragment filter host (Tier 4 item
+4.2) and is intentionally not exposed via @lvqr/core; see
+`docs/architecture.md` for the deletion rationale.
+-->
 
-The `@lvqr/core` package includes a WASM module compiled from
-Rust for performance-critical operations. You can access it
-directly:
-
-```typescript
-import init, { LvqrSubscriber, isWebTransportSupported } from '@lvqr/core/wasm';
-
-await init();
-console.log(isWebTransportSupported());
-
-const sub = new LvqrSubscriber('https://relay.example.com:4443');
-await sub.connect();
-```

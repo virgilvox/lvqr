@@ -17,18 +17,12 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
-    },
-    "./wasm": {
-      "types": "./wasm/lvqr_wasm.d.ts",
-      "import": "./wasm/lvqr_wasm.js"
     }
   },
   "files": [
-    "dist",
-    "wasm"
+    "dist"
   ],
   "scripts": {
-    "build:wasm": "wasm-pack build ../../../../crates/lvqr-wasm --target web --out-dir ../../bindings/js/packages/core/wasm",
     "build:ts": "tsc",
     "build": "npm run build:ts",
     "prepublishOnly": "npm run build"
