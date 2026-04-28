@@ -28,9 +28,7 @@ use lvqr_test_utils::rtmp::{read_until, rtmp_client_handshake, send_result, send
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use lvqr_transcode::AacToOpusEncoderFactory;
 use lvqr_transcode::test_support::generate_aac_access_units;
-use rml_rtmp::sessions::{
-    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
-};
+use rml_rtmp::sessions::{ClientSession, ClientSessionConfig, ClientSessionEvent, PublishRequestType};
 use rml_rtmp::time::RtmpTimestamp;
 use str0m::change::SdpAnswer;
 use str0m::media::{Direction, MediaKind};

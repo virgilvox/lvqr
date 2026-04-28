@@ -39,9 +39,7 @@ use lvqr_test_utils::flv::{
 };
 use lvqr_test_utils::rtmp::{read_until, rtmp_client_handshake, send_result, send_results};
 use lvqr_test_utils::{TestServer, TestServerConfig};
-use rml_rtmp::sessions::{
-    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
-};
+use rml_rtmp::sessions::{ClientSession, ClientSessionConfig, ClientSessionEvent, PublishRequestType};
 use rml_rtmp::time::RtmpTimestamp;
 use std::net::SocketAddr;
 use std::time::Duration;
