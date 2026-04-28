@@ -80,7 +80,15 @@ impl MoqTrackSink {
     /// current group if one exists, and is dropped (with a debug log) if no
     /// group has been opened yet -- that state only happens before the first
     /// keyframe, when no subscriber could decode the fragment anyway.
-    pub fn push(&mut self, frag: &Fragment) -> Result<(), MoqSinkError> {
+    ///
+    /// Returns `Ok(Some(seq))` when the call opened a new MoQ group on the
+    /// underlying track (keyframe path); `seq` is the wire-side group
+    /// sequence the producer just allocated. The session-159
+    /// `MoqTimingTrackSink` uses this value to encode the matching anchor
+    /// on the sibling `<broadcast>/0.timing` track so subscribers can
+    /// join the two tracks by `group_id` without a side channel. Returns
+    /// `Ok(None)` for delta-frame appends and dropped pre-keyframe deltas.
+    pub fn push(&mut self, frag: &Fragment) -> Result<Option<u64>, MoqSinkError> {
         if frag.flags.keyframe {
             // Close any previous group and open a new one.
             if let Some(mut prev) = self.current_group.take() {
@@ -90,6 +98,7 @@ impl MoqTrackSink {
                 .track
                 .append_group()
                 .map_err(|e| MoqSinkError::AppendGroup(format!("{e:?}")))?;
+            let group_seq = group.info.sequence;
             if let Some(init) = &self.meta.init_segment {
                 group
                     .write_frame(init.clone())
@@ -99,18 +108,19 @@ impl MoqTrackSink {
                 .write_frame(frag.payload.clone())
                 .map_err(|e| MoqSinkError::WriteFrame(format!("{e:?}")))?;
             self.current_group = Some(group);
-            Ok(())
+            Ok(Some(group_seq))
         } else if let Some(group) = self.current_group.as_mut() {
             group
                 .write_frame(frag.payload.clone())
-                .map_err(|e| MoqSinkError::WriteFrame(format!("{e:?}")))
+                .map_err(|e| MoqSinkError::WriteFrame(format!("{e:?}")))?;
+            Ok(None)
         } else {
             debug!(
                 track = %frag.track_id,
                 dts = frag.dts,
                 "dropping delta fragment: no open group yet"
             );
-            Ok(())
+            Ok(None)
         }
     }
 

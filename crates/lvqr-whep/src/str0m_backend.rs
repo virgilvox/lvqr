@@ -951,12 +951,13 @@ fn avcc_to_annex_b(avcc: &[u8]) -> Vec<u8> {
 /// `select!` sees either the shutdown resolve or the sample
 /// channel return `None` and exits cleanly on the next wakeup.
 ///
-/// Warn flags: trickle ICE ingestion is still TODO, and unknown
-/// track kinds (anything outside the negotiated H.264 / HEVC video
-/// + Opus audio set) are dropped with a one-shot warn. Each flag
-/// fires once per session so a wedged stream cannot drown the
-/// tracing output. AAC publishers reach Opus-negotiated subscribers
-/// via the `aac-opus` feature's [`lvqr_transcode::AacToOpusEncoder`]
+/// Two warn-once flags ride alongside the senders. Trickle ICE
+/// ingestion is still TODO, and unknown track kinds (anything
+/// outside the negotiated H.264 / HEVC video + Opus audio set)
+/// are dropped with a one-shot warn. Each flag fires once per
+/// session so a wedged stream cannot drown the tracing output.
+/// AAC publishers reach Opus-negotiated subscribers via the
+/// `aac-opus` feature's [`lvqr_transcode::AacToOpusEncoder`]
 /// (session 113); the audio path is wired when that feature is on.
 pub struct Str0mSessionHandle {
     samples: mpsc::UnboundedSender<SessionMsg>,

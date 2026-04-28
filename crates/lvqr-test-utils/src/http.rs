@@ -159,3 +159,61 @@ pub async fn http_get_with(addr: SocketAddr, path: &str, opts: HttpGetOptions<'_
 pub async fn http_get_status(addr: SocketAddr, path: &str) -> u16 {
     http_get(addr, path).await.status
 }
+
+/// POST a JSON body and return the parsed response. Used by
+/// `lvqr-moq-sample-pusher` (session 159) to push glass-to-glass
+/// samples to `POST /api/v1/slo/client-sample` over the same raw
+/// TCP HTTP/1.1 path the GET helpers use, so the bin avoids a
+/// reqwest dep on `lvqr-test-utils`.
+///
+/// `body` is sent verbatim with `Content-Type: application/json`
+/// and the matching `Content-Length`. `bearer` rides as the
+/// `Authorization: Bearer` header when `Some`.
+pub async fn http_post_json(addr: SocketAddr, path: &str, bearer: Option<&str>, body: &[u8]) -> HttpResponse {
+    let timeout = Duration::from_secs(5);
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .expect("http_post_json: connect timed out")
+        .expect("http_post_json: connect failed");
+
+    let mut req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    if let Some(token) = bearer {
+        req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    req.push_str("\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .expect("http_post_json: write headers failed");
+    stream.write_all(body).await.expect("http_post_json: write body failed");
+
+    let mut raw = Vec::with_capacity(2048);
+    tokio::time::timeout(timeout, stream.read_to_end(&mut raw))
+        .await
+        .expect("http_post_json: read timed out")
+        .expect("http_post_json: read failed");
+
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("http_post_json: response missing header terminator");
+    let header_text = std::str::from_utf8(&raw[..split]).expect("http_post_json: headers are not utf-8");
+    let mut lines = header_text.lines();
+    let status_line = lines.next().expect("http_post_json: response missing status line");
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("http_post_json: could not parse status line: {status_line:?}"));
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            Some((k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect();
+    let body = raw[split + 4..].to_vec();
+    HttpResponse { status, headers, body }
+}

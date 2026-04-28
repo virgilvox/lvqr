@@ -91,6 +91,18 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 base64 = { workspace = true }
 tempfile = "3"
+# Session 159: the `lvqr-moq-sample-pusher` bin needs `moq-native`
+# for the outbound MoQ subscriber session, `moq-lite` directly to
+# name the announcement / broadcast consumer types, and `url` for
+# parsing both the relay URL and the SLO endpoint URL. All three
+# are already in the workspace dep graph (moq-native + moq-lite via
+# lvqr-cluster::federation, url via lvqr-cluster + lvqr-relay);
+# naming them as direct deps here documents the bin's reliance.
+moq-native = { workspace = true }
+moq-lite = { workspace = true }
+url = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 # Session 155: drives a real RTMP publisher session against the
 # relay's RTMP listener; sends synthetic H.264 + an `onCuePoint
@@ -101,3 +113,11 @@ tempfile = "3"
 [[bin]]
 name = "scte35-rtmp-push"
 path = "src/bin/scte35_rtmp_push.rs"
+
+# Session 159: subscribes to `<broadcast>/0.mp4` + `<broadcast>/0.timing`
+# on the relay, joins anchors against video frames, and pushes
+# pure-MoQ glass-to-glass samples to `POST /api/v1/slo/client-sample`.
+# Phase A v1.1 #5 close-out (the last open roadmap row).
+[[bin]]
+name = "lvqr-moq-sample-pusher"
+path = "src/bin/moq_sample_pusher.rs"

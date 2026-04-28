@@ -372,25 +372,27 @@ ranking:
    VAAPI, QSV) stay deferred to v1.2. See
    [`crates/lvqr-transcode/src/videotoolbox.rs`](crates/lvqr-transcode/src/videotoolbox.rs)
    and the operator quickstart below.
-5. **MoQ egress latency SLO.** ~~Server-side measurement would
-   require a MoQ wire change that was explicitly rejected in
-   the v1.1-B scoping call (keeps foreign MoQ clients
-   compatible). Likely path forward: Tier 5 client SDK pushes
-   sampled render-side timestamps to a future
-   `POST /api/v1/slo/client-sample` endpoint.~~ Server-side
-   endpoint + the first client (`@lvqr/dvr-player` HLS-side
-   PDT-anchored sampler) shipped in session 156 follow-up.
-   **Pure-MoQ subscriber glass-to-glass remains open**: the
-   session 157 audit confirmed the MoQ wire carries no
-   per-frame wall-clock anchor (init segment + payload bytes
-   only; `MoqTrackSink::push` writes `frag.payload.clone()`
-   verbatim). A pure-MoQ sample-pusher cannot derive a latency
-   value to push without a sidecar timing track. Closing this
-   is tracked as a v1.2 follow-up; the design sketch (sibling
-   `<broadcast>/0.timing` MoQ track, additive so foreign
-   clients ignore it) is in
-   [`tracking/SESSION_157_BRIEFING.md`](tracking/SESSION_157_BRIEFING.md).
-   See Phase A v1.1 row below.
+5. ~~**MoQ egress latency SLO.**~~ Shipped end-to-end across
+   sessions 156 follow-up + 159 (the last open Phase A v1.1
+   roadmap row). Server-side `POST /api/v1/slo/client-sample`
+   endpoint + the HLS-side first client
+   (`@lvqr/dvr-player` PDT-anchored sampler) shipped in session
+   156 follow-up. The pure-MoQ subscriber path closed in
+   session 159 PATH-X: a sibling `<broadcast>/0.timing` MoQ
+   track stamps a 16-byte LE
+   `(group_id_u64_le || ingest_time_ms_u64_le)` anchor per
+   video keyframe (additive; foreign MoQ clients ignore the
+   unknown track name per the moq-lite contract), and a new
+   `[[bin]] lvqr-moq-sample-pusher` on `lvqr-test-utils`
+   subscribes to both `0.mp4` + `0.timing`, joins anchors by
+   `group_id`, and POSTs samples through the dual-auth route.
+   The default-feature `moq_timing_e2e.rs` integration test
+   drives the full RTMP -> relay -> bin -> SLO endpoint loop
+   and asserts a non-empty `transport="moq"` entry on
+   `GET /api/v1/slo`. See
+   [`crates/lvqr-fragment/src/moq_timing_sink.rs`](crates/lvqr-fragment/src/moq_timing_sink.rs)
+   and
+   [`tracking/SESSION_159_BRIEFING.md`](tracking/SESSION_159_BRIEFING.md).
 
 #### Recently shipped (compact reference)
 
@@ -971,38 +973,34 @@ test.
   downstream subscribers still see the original bytes (tap mode).
   True stream-modifying downstream propagation remains
   anti-scope; see `crates/lvqr-wasm/src/observer.rs`.
-- [ ] **MoQ egress latency SLO.** Server-side measurement would
-  require a MoQ wire change that was explicitly rejected in the
-  v1.1-B scoping call (keeps foreign MoQ clients compatible).
-  ~~Likely path forward: Tier 5 client SDK pushes back sampled
-  render-side timestamps to a future
-  `POST /api/v1/slo/client-sample` endpoint.~~ Server side
-  complete (session 156 follow-up): `POST /api/v1/slo/client-sample`
-  ships in `lvqr-admin` accepting JSON
-  `{broadcast, transport, ingest_ts_ms, render_ts_ms}` from any
-  client, records into the existing `LatencyTracker`, and
-  surfaces on `GET /api/v1/slo` + the
-  `lvqr_subscriber_glass_to_glass_ms` Prometheus histogram. The
-  first real client also shipped (session 156 follow-up):
-  `@lvqr/dvr-player`'s built-in PDT-anchored sampler pushes by
-  default for HLS subscribers (lifts the publisher wall-clock
-  via `HTMLMediaElement.getStartDate() + currentTime`).
-  **Pending: pure-MoQ subscriber measurement.** The session 157
-  audit confirmed the MoQ wire carries only init-segment +
-  payload bytes -- there is no per-frame wall-clock anchor that
-  a pure-MoQ subscriber could lift to compute latency
-  (`crates/lvqr-fragment/src/moq_sink.rs::push` writes
-  `frag.payload.clone()` only; the inverse `MoqTrackStream`
-  emits zero for `dts` / `pts` / `duration` / `ingest_time_ms`
-  by contract). Closing pure-MoQ glass-to-glass is tracked as a
-  v1.2 follow-up that ships either a sibling
-  `<broadcast>/0.timing` MoQ track (additive, foreign clients
-  ignore) or reopens the v1.1-B scoping call for an in-band
-  per-frame wall-clock field. The sidecar-track design sketch
-  is in
-  [`tracking/SESSION_157_BRIEFING.md`](tracking/SESSION_157_BRIEFING.md).
-  Checkbox stays unchecked until pure-MoQ subscribers can also
-  push.
+- [x] **MoQ egress latency SLO.** Closed across two sessions.
+  The HLS side shipped in session 156 follow-up:
+  `POST /api/v1/slo/client-sample` on `lvqr-admin` accepting
+  `{broadcast, transport, ingest_ts_ms, render_ts_ms}` JSON
+  under dual-auth (admin OR per-broadcast subscribe), records
+  into the existing `LatencyTracker`, surfaces on
+  `GET /api/v1/slo` + the `lvqr_subscriber_glass_to_glass_ms`
+  histogram; `@lvqr/dvr-player`'s built-in PDT-anchored sampler
+  pushes by default for HLS subscribers. The pure-MoQ side
+  closed in session 159 PATH-X (the v1.2 follow-up the session
+  157 audit sketched): a sibling `<broadcast>/0.timing` MoQ
+  track stamps one 16-byte LE
+  `(group_id_u64_le || ingest_time_ms_u64_le)` anchor per video
+  keyframe (additive; foreign MoQ clients ignore the unknown
+  track name per the moq-lite contract), the new
+  `[[bin]] lvqr-moq-sample-pusher` on `lvqr-test-utils`
+  subscribes to both `0.mp4` + `0.timing`, joins anchors by
+  `group_id` against video frames in a 64-entry ring buffer
+  (exact-match + largest-less-than fallback + skip-on-miss),
+  and POSTs samples through the dual-auth route.
+  `crates/lvqr-test-utils/tests/moq_timing_e2e.rs` (default-
+  feature gate; ubuntu-latest CI exercises it on every push)
+  drives the full RTMP -> relay -> bin -> SLO endpoint loop
+  and asserts a non-empty `transport="moq"` entry on
+  `GET /api/v1/slo`. See
+  [`crates/lvqr-fragment/src/moq_timing_sink.rs`](crates/lvqr-fragment/src/moq_timing_sink.rs)
+  and
+  [`tracking/SESSION_159_BRIEFING.md`](tracking/SESSION_159_BRIEFING.md).
 
 ### Auth + ops polish
 - [x] ~~**Webhook auth provider.**~~ Shipped in session 135.
@@ -1144,11 +1142,18 @@ published crate.
   layout (CA + leaf with `digitalSignature` KU,
   `emailProtection` EKU, `CN` + `O` in the subject DN,
   `AuthorityKeyIdentifier` on the leaf) hits the tested surface.
-- **Pure MoQ subscribers do not contribute to the latency SLO
-  histogram.** LL-HLS, MPEG-DASH, WebSocket fMP4, and WHEP are
-  instrumented; MoQ subscribers are not, by design (the
-  alternative required a MoQ wire change that was rejected).
-  Client-side SDK push-back is the intended path.
+- **Pure MoQ subscribers contribute to the latency SLO
+  histogram via the session 159 sidecar track.** **Fixed on
+  `main`**: the publisher-side bridge now writes one 16-byte
+  LE `(group_id, ingest_time_ms)` anchor per video keyframe to
+  a sibling `<broadcast>/0.timing` MoQ track (additive;
+  foreign clients ignore the unknown track name), and the
+  `lvqr-moq-sample-pusher` bin in `lvqr-test-utils` subscribes
+  to both `0.mp4` + `0.timing` and pushes samples through the
+  dual-auth `POST /api/v1/slo/client-sample` route. LL-HLS,
+  MPEG-DASH, WebSocket fMP4, WHEP, and pure MoQ are now all
+  represented under their `transport` label on the histogram.
+  See [`tracking/SESSION_159_BRIEFING.md`](tracking/SESSION_159_BRIEFING.md).
 - **No admission control.** The SLO tracker measures latency and
   fires alerts; it does not refuse new subscribers when the SLO
   is already burning.

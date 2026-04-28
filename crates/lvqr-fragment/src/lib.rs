@@ -37,6 +37,7 @@ pub mod broadcaster;
 pub mod fragment;
 pub mod moq_sink;
 pub mod moq_stream;
+pub mod moq_timing_sink;
 pub mod registry;
 pub mod stream;
 
@@ -44,5 +45,6 @@ pub use broadcaster::{BroadcasterStream, DEFAULT_BROADCASTER_CAPACITY, FragmentB
 pub use fragment::{Fragment, FragmentFlags, FragmentMeta};
 pub use moq_sink::{MoqSinkError, MoqTrackSink};
 pub use moq_stream::{MoqGroupStream, MoqTrackStream};
+pub use moq_timing_sink::{MoqTimingTrackSink, TIMING_ANCHOR_SIZE, TIMING_TRACK_NAME, TimingAnchor, TimingSinkError};
 pub use registry::{FragmentBroadcasterRegistry, SCTE35_TRACK};
 pub use stream::FragmentStream;

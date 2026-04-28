@@ -61,8 +61,9 @@ changes when a new ingest lands, and vice versa.
 ```
 
 The registry's `(broadcast, track)` keying generalises beyond the
-default `"0.mp4"` (video) and `"1.mp4"` (audio) tracks. Three
-sibling tracks ship today:
+default `"0.mp4"` (video) and `"1.mp4"` (audio) tracks. Four
+sibling tracks ship today, plus the per-broadcast `.catalog`
+track for codec metadata:
 
 * **`"captions"`** -- WebVTT cues from
   `lvqr-agent-whisper::WhisperCaptionsAgent` (Tier 4 item 4.5);
@@ -80,6 +81,16 @@ sibling tracks ship today:
   bytes flow through verbatim with CRC verification but no
   semantic interpretation. The reserved track name is exported
   as `lvqr_fragment::SCTE35_TRACK`. See [`scte35.md`](scte35.md).
+* **`"0.timing"`** -- pure-MoQ glass-to-glass SLO sidecar
+  (session 159, Phase A v1.1 #5 close-out). One 16-byte LE
+  `(group_id, ingest_time_ms)` anchor per video keyframe; pure-
+  MoQ subscribers join the timing track against `0.mp4` group
+  sequences to compute `latency_ms = now - ingest_time_ms` and
+  push samples to `POST /api/v1/slo/client-sample`. The track
+  name is exported as `lvqr_fragment::TIMING_TRACK_NAME`. See
+  `crates/lvqr-fragment/src/moq_timing_sink.rs` for the wire
+  shape and `crates/lvqr-test-utils/src/bin/moq_sample_pusher.rs`
+  for the reference subscriber.
 * Per-broadcast / per-track dynamic surface for future agents.
 
 Every ingest goes through `lvqr-cmaf::TrackCoalescer` for AVC

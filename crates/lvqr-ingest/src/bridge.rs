@@ -8,7 +8,10 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use lvqr_auth::{NoopAuthProvider, SharedAuth, extract};
 use lvqr_core::{EventBus, RelayEvent, now_unix_ms};
-use lvqr_fragment::{Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta, MoqTrackSink};
+use lvqr_fragment::{
+    Fragment, FragmentBroadcasterRegistry, FragmentFlags, FragmentMeta, MoqTimingTrackSink, MoqTrackSink,
+    TIMING_TRACK_NAME,
+};
 use lvqr_moq::Track;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -32,6 +35,13 @@ struct ActiveStream {
     video_sink: MoqTrackSink,
     audio_sink: MoqTrackSink,
     catalog_track: lvqr_moq::TrackProducer,
+    /// Sibling `<broadcast>/0.timing` track sink (Phase A v1.1 #5,
+    /// session 159). Emits one 16-byte LE anchor
+    /// `(group_id_u64_le || ingest_time_ms_u64_le)` per video keyframe
+    /// so pure-MoQ subscribers can compute glass-to-glass latency.
+    /// `None` when track creation failed at broadcast-start; the
+    /// video path keeps running unaffected.
+    timing_sink: Option<MoqTimingTrackSink>,
     // Codec configuration (set when sequence headers arrive)
     video_config: Option<VideoConfig>,
     audio_config: Option<AudioConfig>,
@@ -182,6 +192,24 @@ impl RtmpMoqBridge {
                 }
             };
 
+            // Session 159 PATH-X: sibling `<broadcast>/0.timing` MoQ
+            // track for pure-MoQ glass-to-glass SLO sampling. Failure
+            // to create it is logged + tolerated -- the video path
+            // keeps running, the timing sink stays `None`, and the
+            // bin's subscribe blind probably fails silently which
+            // matches the "best-effort SLO push" contract.
+            let timing_sink = match broadcast.create_track(Track::new(TIMING_TRACK_NAME)) {
+                Ok(t) => Some(MoqTimingTrackSink::new(t)),
+                Err(e) => {
+                    warn!(
+                        stream = %stream_name,
+                        error = ?e,
+                        "failed to create 0.timing track; pure-MoQ SLO sampling disabled for this broadcast"
+                    );
+                    None
+                }
+            };
+
             metrics::gauge!("lvqr_active_streams").increment(1.0);
             if let Some(bus) = &events_publish {
                 bus.emit(RelayEvent::BroadcastStarted {
@@ -200,6 +228,7 @@ impl RtmpMoqBridge {
                     video_sink,
                     audio_sink,
                     catalog_track,
+                    timing_sink,
                     video_config: None,
                     audio_config: None,
                     video_init: None,
@@ -342,8 +371,35 @@ impl RtmpMoqBridge {
                         seg,
                     )
                     .with_ingest_time_ms(ingest_ms);
-                    if let Err(e) = stream.video_sink.push(&frag) {
-                        debug!(error = ?e, "failed to push video fragment through sink");
+                    let push_result = stream.video_sink.push(&frag);
+                    match push_result {
+                        Ok(Some(group_seq)) => {
+                            // Session 159: keyframe opened a new MoQ group.
+                            // Emit a sibling-track timing anchor so pure-MoQ
+                            // subscribers can join (group_seq, ingest_time_ms)
+                            // and compute glass-to-glass latency. Skip the
+                            // push when ingest_time_ms is unset (zero) -- a
+                            // (group_id, 0) anchor would compute 60-year
+                            // latency on the subscriber side and corrupt the
+                            // SLO histogram.
+                            if frag.ingest_time_ms != 0 {
+                                if let Some(timing) = stream.timing_sink.as_mut() {
+                                    if let Err(e) = timing.push_anchor(group_seq, frag.ingest_time_ms) {
+                                        debug!(
+                                            error = ?e,
+                                            group = group_seq,
+                                            "failed to push timing anchor"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // Delta or pre-keyframe drop; no timing anchor.
+                        }
+                        Err(e) => {
+                            debug!(error = ?e, "failed to push video fragment through sink");
+                        }
                     }
                     publish_fragment(&registry_video, &stream_name, "0.mp4", "avc1", 90_000, frag);
                 }

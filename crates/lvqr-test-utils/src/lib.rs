@@ -7,7 +7,9 @@ pub mod http;
 pub mod rtmp;
 pub mod scte35;
 mod test_server;
+pub mod timing_anchor;
 pub use test_server::{TestServer, TestServerConfig};
+pub use timing_anchor::{DEFAULT_RING_CAPACITY, TimingAnchorJoin};
 
 /// Find an available TCP port on localhost.
 pub fn find_available_port() -> u16 {
