@@ -6,7 +6,16 @@ file summarises shipped + unreleased work between npm releases.
 For session-by-session engineering notes see
 [`tracking/HANDOFF.md`](../../../../tracking/HANDOFF.md).
 
-## Unreleased (post-0.3.2)
+## [0.3.3] - 2026-04-28
+
+Cross-language SDK release wave alongside Python `lvqr` 0.3.3
+and the first npm publish of `@lvqr/dvr-player` 0.3.3. Brings
+the JS admin client in line with the v0.4.2 server surface
+(runtime stream-key CRUD + hot config reload). No MoQ subscriber
+or transport-layer changes; the Tier 5 browser MoQ glass-to-
+glass sampler that consumes the session 159 sidecar track is
+deferred to a future minor release once the wire shape has
+baked through one full release cycle.
 
 ### Added
 
@@ -19,10 +28,22 @@ For session-by-session engineering notes see
   149 (JWKS + webhook); the SDK accepts the expanded
   `applied_keys` array generically without a code change.
 
-* **`LvqrAdminClient.streamkeys.{list,mint,revoke,rotate}` +
-  `StreamKey` / `StreamKeySpec` types** (session 146).
+* **`LvqrAdminClient.{listStreamKeys, mintStreamKey,
+  revokeStreamKey, rotateStreamKey}` + `StreamKey` /
+  `StreamKeySpec` / `StreamKeyList` types** (session 146).
   Type-safe wrappers around the runtime stream-key CRUD admin
   API. See `docs/sdk/javascript.md`.
+
+### Removed
+
+* **`./wasm` subpath export, `wasm` entry from `files`, and
+  `build:wasm` script** (session 158 follow-up). The exported
+  artefacts pointed at a pre-built browser-side `lvqr-wasm`
+  bundle that was deleted in the 0.4-session-44 refactor; the
+  `build:wasm` script targeted the surviving server-side
+  wasmtime filter host crate which has no `wasm-bindgen`
+  surface. The export path was dead in 0.3.2 and is now
+  removed from the package surface entirely.
 
 ## [0.3.2] - 2026-04-24
 

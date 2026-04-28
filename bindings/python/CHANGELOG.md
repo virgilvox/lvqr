@@ -6,7 +6,12 @@ summarises shipped + unreleased work between PyPI releases. For
 session-by-session engineering notes see
 [`tracking/HANDOFF.md`](../../tracking/HANDOFF.md).
 
-## Unreleased (post-0.3.2)
+## [0.3.3] - 2026-04-28
+
+Cross-language SDK release wave alongside `@lvqr/core` 0.3.3
+and the first npm publish of `@lvqr/dvr-player` 0.3.3. Brings
+the Python admin client in line with the v0.4.2 server surface
+(runtime stream-key CRUD + hot config reload).
 
 ### Added
 
@@ -17,9 +22,11 @@ session-by-session engineering notes see
   a SDK change; the wire shape stays a simple
   `list[str]` / `list[str]` / etc.
 
-* **`LvqrClient.streamkeys_*` + `StreamKey` / `StreamKeySpec`
-  dataclasses** (session 146). Mint, list, revoke, and rotate
-  ingest stream keys from Python. See `docs/sdk/python.md`.
+* **`LvqrClient.list_streamkeys()` / `mint_streamkey()` /
+  `revoke_streamkey()` / `rotate_streamkey()` + `StreamKey` /
+  `StreamKeySpec` dataclasses** (session 146). Mint, list,
+  revoke, and rotate ingest stream keys from Python. See
+  `docs/sdk/python.md`.
 
 ## [0.3.2] - 2026-04-24
 
