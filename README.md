@@ -238,11 +238,11 @@ tier · ✗ not supported · ? no public evidence either way.
 | SCTE-35 passthrough across SRT 0x86 + RTMP onCuePoint, rendered as both HLS DATERANGE and DASH EventStream | ✓ | ✗ | ✗ | ✗ | ◐[³] | ◐[⁴] |
 | Browser peer-mesh DataChannel relay with capacity advertisement | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Optional Linux `io_uring` archive writes | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| Hot reload of full auth chain (Static / JWT / JWKS / webhook) atomically without restart | ✓ | ◐[⁵] | ? | ◐[⁶] | ◐ | ✗ |
+| Hot reload of full auth chain (Static / JWT / JWKS / webhook) atomically without restart | ✓ | ◐[⁵] | ? | ◐[⁶] | ? | ✗ |
 | Single JWT across every ingest (RTMP key, WHIP/RTSP bearer, SRT streamid, WS subprotocol) | ✓ | ◐ | ◐[⁷] | ✗ | ◐ | ◐ |
-| HMAC-signed playback URLs across `/hls`, `/dash`, and `/playback` | ✓ | ✗ | ✓[⁸] | ✗ | ? | ◐ |
+| HMAC-signed playback URLs across `/hls`, `/dash`, and `/playback` | ✓ | ✗ | ✓[⁸] | ✗ | ? | ? |
 | Single binary, no Redis / Kafka / external segmenter / signaling | ✓ | ✓ | ✗[⁹] | ✓ | ◐[¹⁰] | ✗[¹¹] |
-| Native ingest set: RTMP + WHIP + SRT + RTSP + WS-fMP4 | ✓ | ◐ (no WS-fMP4) | ◐ (no WS-fMP4) | ◐ (no RTSP / WS-fMP4) | ✓ | ◐ (no WS-fMP4) |
+| Native ingest set: RTMP + WHIP + SRT + RTSP + WS-fMP4 | ✓ | ◐ (no WS-fMP4) | ◐ (no WS-fMP4) | ◐ (no RTSP / WS-fMP4) | ◐ (WS-fMP4 not confirmed) | ◐ (no WS-fMP4) |
 | Native egress set: LL-HLS + DASH + WHEP + MoQ + WS-fMP4 | ✓ | ◐ (no DASH, no MoQ, no WS-fMP4) | ◐ (no DASH, no MoQ) | ◐ (no MoQ) | ◐ (no MoQ) | ◐ (no MoQ in CE confirmed) |
 
 [¹]: Upstream MediaMTX has no MoQ; a third-party fork
