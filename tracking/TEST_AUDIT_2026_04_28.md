@@ -373,5 +373,161 @@ hardcoded string comparisons.
    one cluster-side correctness invariant we have not actually
    tested fail-recover behaviour for.
 
+---
+
+## Priority 5 -- Hardware encoder CI strategy (research-backed)
+
+The four HW encoder backends (NVENC / VA-API / QSV / VideoToolbox)
+each need real silicon to runtime-validate. GitHub-hosted runners
+(`ubuntu-latest`, `macos-latest`) only carry the Apple Silicon
+path. Strategy after web research into how comparable OSS projects
+handle this:
+
+### Already shipped this cycle
+
+* **Apple Silicon caps-negotiation fix**: production
+  `pipeline_str_for` in `videotoolbox.rs` now includes an explicit
+  `video/x-raw,format=NV12` capsfilter between `videoconvert` and
+  `vtenc_h264_hw`. The `applemedia` plugin's caps negotiation got
+  stricter on macOS 14+ ARM64; the implicit pass-through fails with
+  `streaming stopped, reason not-negotiated`. This was a real
+  production bug that would have surfaced for any operator running
+  the macOS build on Apple Silicon -- not just a CI flake.
+* **Smoke step parity**: `videotoolbox-macos.yml`'s probe pipeline
+  now mirrors the production pipeline shape (NV12 capsfilter +
+  `allow-frame-reordering=false`) so a regression in either side
+  is caught by the smoke before cargo touches anything.
+
+### Industry survey (April 2026)
+
+| Project | HW encoder CI strategy | Source |
+|---|---|---|
+| LVQR (today) | compile-check on ubuntu-latest + Apple Silicon real-runtime on macos-latest + soft-skip elsewhere | this repo |
+| GStreamer upstream | VA-API / NVENC tests run only in vendor-donated lanes (Igalia / Centricular shared runners); ordinary MR CI is decoder + software-encoder only | <https://gitlab.freedesktop.org/gstreamer/gstreamer> |
+| FFmpeg FATE | distributed-reporting model: volunteers run `tests/fate.sh` on their own NVENC/QSV/VAAPI hardware and POST results to a central server; PR CI does not block on HW | <https://ffmpeg.org/fate.html> |
+| OBS Studio | static capability-table validation in CI (codec / format / colorspace tables); no NVENC/QSV/VT runtime exercise | <https://deepwiki.com/obsproject/obs-studio/4.4.2-hardware-video-encoders> |
+| rav1e | GitHub-hosted only; comparative validation against `dav1d` decoder. Side-stepped because their encoder is software | <https://github.com/xiph/rav1e/blob/master/.github/workflows/rav1e.yml> |
+| OvenMediaEngine, MistServer, Janus | none CI-test HW encoders; rely on user reports + tested-on matrices | docs |
+
+**Net**: across the OSS world, the median is "compile-check in
+CI, runtime-validate on operator hardware or vendor-donated lanes."
+LVQR is at the median. The Apple Silicon path on macos-latest puts
+LVQR above median for free.
+
+### Software emulation: confirmed dead end
+
+Researched the obvious paths so a future session does not waste
+cycles on them:
+
+* **NVENC**: no usable software emulator. `cuda-stub` resolves the
+  dlopen but every `nvEncodeAPICreateInstance` returns
+  `NV_ENC_ERR_NO_ENCODE_DEVICE`. nouveau has no NVENC. No QEMU
+  passthrough story for CI.
+* **VA-API**: libva ships a *null* / *fake* driver (`vainfo` reports
+  it; no encode entrypoints). Mesa `iHD` requires real Intel GEN.
+  AMD's `radeonsi_drv_video.so` requires a real Radeon. Net: VA-API
+  encoder runtime cannot run on an ubuntu-latest VM.
+* **QSV**: requires real Intel iGPU + iHD driver. No DXVA-software
+  fallback.
+* **VideoToolbox**: macos-latest has real Apple Silicon -- this is
+  the one that works.
+
+The current "soft-skip when factory unavailable" pattern in
+`lvqr-transcode` unit tests is the right shape. Don't waste future
+session cycles on emulators that don't exist.
+
+### GPU-backed CI providers (defer)
+
+* **BuildJet**: shut down January 2026.
+* **Cirrus CI managed cloud**: shutting down June 2026 (Cirrus
+  Labs joined OpenAI). Don't build new pipelines on this.
+* **Cirrus Runners** (separate product): $150/mo flat per
+  concurrent runner. Survives the shutdown but expensive for a
+  solo OSS maintainer.
+* **Blacksmith / Namespace / Warpbuild / Depot**: none currently
+  offer GPU runners (April 2026).
+* **RunsOn** (<https://runs-on.com>): open-source CloudFormation,
+  MIT-licensed, free for non-commercial. GPU runners (g4dn.xlarge,
+  T4) at $0.009/min on operator AWS. The only credible GPU-CI
+  path for a solo OSS maintainer in 2026. T4 supports NVENC; QSV
+  via Intel passthrough is theoretical-not-tested.
+* **Vendor free tiers**: none are GitHub-Actions-integrated.
+  NVIDIA's only OSS program is a 90-day vGPU evaluation (not
+  CI-friendly). Intel DevCloud retired.
+
+**Recommendation**: defer indefinitely. Revisit only if/when
+recurring NVENC regressions get reported by operators.
+
+### Self-hosted runner pattern (when NVENC matters)
+
+The GitHub-blessed posture for a solo maintainer on a public repo:
+
+1. Single ephemeral runner, `--ephemeral` flag, restart-after-job.
+2. **Never** trigger on `pull_request` from public forks
+   (script-injection vector). Trigger only on `push` to `main`
+   and `workflow_dispatch`.
+3. Use a runner group restricted to a single workflow file (e.g.
+   `hw-encoder-validation.yml`).
+4. Tunnel via Tailscale: install `tailscale/github-action` *inside*
+   the job, not at the runner level. The runner box stays off the
+   public internet.
+5. Repository secret access set to "selected workflows" so PR forks
+   cannot see runner secrets.
+
+Concrete template: <https://github.com/dduzgun-security/github-self-hosted-runners>.
+Skip ARC (Actions Runner Controller) -- overkill for one box.
+
+### Highest-ROI follow-up: golden-bitstream snapshot tests
+
+The pattern with the best leverage for LVQR's stage:
+
+* **Don't** snapshot the H.264 bitstream itself: NVENC / VT /
+  vah264enc bitstreams vary across driver minor versions, so a
+  snapshot will flake.
+* **Do** snapshot stable post-encoder metadata that any caps-negotiation
+  regression touches:
+    1. Negotiated caps strings (`GstStructure::to_string()` form)
+    2. Bitrate-control mode + profile + level fields actually
+       applied
+    3. Output container atom structure (mp4 box tree from
+       `mp4dump`, sans mdat bytes)
+    4. Codec-private data (avcC) length + hash
+
+These are deterministic across driver versions and would have
+caught the macOS not-negotiated regression before the integration
+test even ran.
+
+Tooling: `cargo-insta` (<https://github.com/mitsuhiko/insta>),
+mature in adjacent ecosystems (rust-analyzer, rustc, many crates).
+Implementation:
+
+```toml
+# crates/lvqr-transcode/Cargo.toml
+[dev-dependencies]
+insta = "1"
+```
+
+```rust
+// crates/lvqr-transcode/tests/snapshots/videotoolbox_caps.rs
+#[cfg(all(target_os = "macos", feature = "hw-videotoolbox"))]
+#[test]
+fn caps_round_trip() {
+    let pipeline = build_pipeline(&RenditionSpec::preset_720p()).unwrap();
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let caps = pipeline.appsink.caps().unwrap();
+    insta::assert_snapshot!(caps.to_string());
+}
+```
+
+The committed `.snap` file then becomes the contract any future
+caps-negotiation change must update or break.
+
+LVQR would be a leading example for this pattern in OSS video
+infrastructure (most projects don't snapshot encoder metadata
+because the bitstream-flake risk is overweighted). The underlying
+tooling is mature and trivially adapted.
+
+---
+
 This document is the work backlog. Each entry is independently
 actionable in a single session.

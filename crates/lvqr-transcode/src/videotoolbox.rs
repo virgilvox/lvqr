@@ -438,6 +438,15 @@ struct BuiltPipeline {
 ///   zerolatency intent
 /// * `max-keyframe-interval=60` -- replaces `key-int-max`
 ///
+/// The explicit `format=NV12` capsfilter between `videoconvert` and
+/// `vtenc_h264_hw` is required on Apple Silicon (macOS 14+ ARM64):
+/// the applemedia plugin's caps negotiation got stricter and the
+/// previous implicit format pass-through fails to preroll with
+/// `streaming stopped, reason not-negotiated`. NV12 is the
+/// CoreVideo `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`
+/// mapping VideoToolbox's HW path expects natively. Pre-Apple-Silicon
+/// builds accept the explicit capsfilter as a no-op.
+///
 /// No threads property: VT uses the AVFoundation framework's worker
 /// pool internally and ignores Pipeline-level thread hints, unlike
 /// x264enc which has its own pthread pool.
@@ -450,6 +459,7 @@ fn pipeline_str_for(rendition: &RenditionSpec) -> String {
          ! videoscale \
          ! video/x-raw,width={w},height={h} \
          ! videoconvert \
+         ! video/x-raw,format=NV12 \
          ! vtenc_h264_hw bitrate={kbps} realtime=true allow-frame-reordering=false max-keyframe-interval=60 \
          ! h264parse \
          ! mp4mux streamable=true fragment-duration=2000 \
@@ -731,6 +741,16 @@ mod tests {
         assert!(
             s.contains("max-keyframe-interval=60"),
             "max-keyframe-interval property: {s}"
+        );
+
+        // Explicit NV12 capsfilter is required on Apple Silicon to
+        // satisfy `vtenc_h264_hw`'s strict input format negotiation.
+        // A regression that drops this filter reproduces the
+        // "streaming stopped, reason not-negotiated" failure observed
+        // on macos-latest CI.
+        assert!(
+            s.contains("video/x-raw,format=NV12"),
+            "must explicitly request NV12 input for vtenc_h264_hw on Apple Silicon: {s}",
         );
 
         assert!(s.contains("width=1280"), "width substitution: {s}");

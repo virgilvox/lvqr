@@ -78,11 +78,21 @@ jobs:
           # Round-trip smoke: encode 30 frames of testsrc through
           # vtenc_h264_hw to confirm HW initialisation works on this
           # runner before cargo touches anything.
+          #
+          # The explicit `format=NV12` capsfilter between videoconvert
+          # and vtenc_h264_hw is mandatory on Apple Silicon macos-latest
+          # runners: the applemedia plugin's stricter caps negotiation
+          # rejects the implicit I420 pass-through with
+          # `streaming stopped, reason not-negotiated`. Mirrors the
+          # production pipeline in lvqr_transcode::videotoolbox so the
+          # smoke and production paths agree on the encoder's input
+          # format contract.
           gst-launch-1.0 -e \
             videotestsrc num-buffers=30 \
-            ! 'video/x-raw,width=320,height=180,framerate=30/1' \
+            ! 'video/x-raw,format=I420,width=320,height=180,framerate=30/1' \
             ! videoconvert \
-            ! vtenc_h264_hw bitrate=500 realtime=true \
+            ! 'video/x-raw,format=NV12' \
+            ! vtenc_h264_hw bitrate=500 realtime=true allow-frame-reordering=false \
             ! h264parse \
             ! mp4mux \
             ! filesink location=/tmp/vt_smoke.mp4
