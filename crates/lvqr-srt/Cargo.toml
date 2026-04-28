@@ -25,3 +25,13 @@ srt-tokio = "0.4"
 tokio = { workspace = true, features = ["net", "rt", "sync"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# Session 160 SRT-TEST-GAP: proptest covers panic-freedom on the
+# Annex-B / AVCC / HVCC parser surfaces, mirroring the proptest
+# harnesses lvqr-codec + lvqr-cmaf already ship.
+proptest = "1"
+# Async features for the new in-crate `tokio::test` cases on the
+# H264 / HEVC / AAC / SCTE-35 dispatch paths.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tracing-subscriber = { workspace = true }

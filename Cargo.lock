@@ -3549,10 +3549,12 @@ dependencies = [
  "lvqr-ingest",
  "lvqr-moq",
  "metrics",
+ "proptest",
  "srt-tokio",
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
