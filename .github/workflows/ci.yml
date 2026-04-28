@@ -29,6 +29,12 @@ jobs:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      # fail-fast off so a flake or fail on one OS does not cancel
+      # the other matrix cell mid-test. Cancellation hides whether
+      # the surviving cell would have passed and makes intermittent
+      # macOS-only / Linux-only failures look like both-OS regressions
+      # in the run summary.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:

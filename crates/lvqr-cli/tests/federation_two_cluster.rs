@@ -30,10 +30,10 @@
 //! federation peer) will use, so the test verifies the same path.
 
 use bytes::Bytes;
-use lvqr_cluster::FederationLink;
+use lvqr_cluster::{FederationConnectState, FederationLink};
 use lvqr_moq::{Origin, Track};
 use lvqr_test_utils::{TestServer, TestServerConfig};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -62,15 +62,40 @@ async fn federation_link_propagates_broadcast_between_two_clusters() {
         .expect("start server B");
     let relay_b = server_b.relay_addr();
 
-    assert!(
-        server_b.federation_runner().is_some(),
-        "B must have installed a FederationRunner for the configured link"
-    );
+    let runner = server_b
+        .federation_runner()
+        .expect("B must have installed a FederationRunner for the configured link");
 
-    // Give the federation task time to complete its outbound connect
-    // to A before we publish. 500 ms is comfortable on loopback where
-    // the QUIC + TLS handshake typically completes in under 100 ms.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Active-wait until the federation runner reports its outbound
+    // link as Connected. A previous version of this test blind-slept
+    // 500 ms here under the assumption that QUIC + TLS handshake
+    // would finish in under 100 ms on loopback. That assumption holds
+    // on dev hardware but races under macOS CI runner load, where the
+    // handshake can occasionally take longer than 500 ms and the
+    // subsequent subscribe lands before the federation MoQ session is
+    // open -- surfacing as `subscribe error code=13` warnings and a
+    // panic at the next_group expect below. Polling at 25 ms keeps
+    // the happy-path latency similar (~50 - 150 ms typical on
+    // loopback) while letting a contended runner take up to
+    // CONNECT_TIMEOUT.
+    let status_handle = runner.status_handle();
+    let connect_deadline = Instant::now() + CONNECT_TIMEOUT;
+    loop {
+        let snap = status_handle.snapshot();
+        if snap
+            .iter()
+            .any(|s| s.state == FederationConnectState::Connected)
+        {
+            break;
+        }
+        if Instant::now() >= connect_deadline {
+            panic!(
+                "federation link on B did not reach Connected within {:?}; latest snapshot: {:?}",
+                CONNECT_TIMEOUT, snap
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     // --- Inject a broadcast on A's origin. ---
     let mut broadcast_a = server_a
