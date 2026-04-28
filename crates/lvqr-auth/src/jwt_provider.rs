@@ -317,9 +317,7 @@ mod tests {
         })
         .unwrap();
         let attacker_token = make_token("attacker-secret", AuthScope::Admin, None);
-        let decision = p.check(&AuthContext::Admin {
-            token: attacker_token,
-        });
+        let decision = p.check(&AuthContext::Admin { token: attacker_token });
         assert!(
             !decision.is_allow(),
             "tokens signed with a different secret must be rejected"
@@ -345,7 +343,10 @@ mod tests {
         let mut bytes: Vec<u8> = token.into_bytes();
         // Find the first '.' (end of header), then mutate one byte
         // shortly after to land in the payload.
-        let first_dot = bytes.iter().position(|&b| b == b'.').expect("jwt has header.payload.sig");
+        let first_dot = bytes
+            .iter()
+            .position(|&b| b == b'.')
+            .expect("jwt has header.payload.sig");
         // `+ 4` lands inside the payload (well before the second
         // dot for any reasonable claim set).
         let mutate_at = first_dot + 4;

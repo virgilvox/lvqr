@@ -42,9 +42,7 @@ use lvqr_test_utils::http::{HttpGetOptions, HttpResponse, http_get_with};
 use lvqr_test_utils::rtmp::{read_until, rtmp_client_handshake, send_result, send_results};
 use lvqr_test_utils::{TestServer, TestServerConfig};
 use lvqr_transcode::{RenditionSpec, SoftwareTranscoderFactory};
-use rml_rtmp::sessions::{
-    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
-};
+use rml_rtmp::sessions::{ClientSession, ClientSessionConfig, ClientSessionEvent, PublishRequestType};
 use rml_rtmp::time::RtmpTimestamp;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
