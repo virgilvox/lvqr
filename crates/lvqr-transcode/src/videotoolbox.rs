@@ -426,17 +426,23 @@ struct BuiltPipeline {
     appsink: gst_app::AppSink,
 }
 
-fn build_pipeline(rendition: &RenditionSpec) -> Result<BuiltPipeline, WorkerSpawnError> {
-    // VideoToolbox property mapping (vs the x264enc software path):
-    //   bitrate=<kbps>           same units
-    //   realtime=true            replaces tune=zerolatency
-    //   allow-frame-reordering=false
-    //                            no B-frames; matches zerolatency intent
-    //   max-keyframe-interval=60 replaces key-int-max
-    // No threads property: VT uses the AVFoundation framework's
-    // worker pool internally and ignores Pipeline-level thread
-    // hints, unlike x264enc which has its own pthread pool.
-    let pipeline_str = format!(
+/// Build the GStreamer pipeline string for a VideoToolbox ladder
+/// rung. Extracted from [`build_pipeline`] so the test suite can
+/// call it directly; the runtime path always goes through
+/// `build_pipeline`.
+///
+/// VideoToolbox property mapping (vs the x264enc software path):
+/// * `bitrate=<kbps>` -- same units
+/// * `realtime=true` -- replaces `tune=zerolatency`
+/// * `allow-frame-reordering=false` -- no B-frames; matches the
+///   zerolatency intent
+/// * `max-keyframe-interval=60` -- replaces `key-int-max`
+///
+/// No threads property: VT uses the AVFoundation framework's worker
+/// pool internally and ignores Pipeline-level thread hints, unlike
+/// x264enc which has its own pthread pool.
+fn pipeline_str_for(rendition: &RenditionSpec) -> String {
+    format!(
         "appsrc name=src caps=video/quicktime is-live=false format=time \
          ! qtdemux \
          ! h264parse \
@@ -451,7 +457,11 @@ fn build_pipeline(rendition: &RenditionSpec) -> Result<BuiltPipeline, WorkerSpaw
         w = rendition.width,
         h = rendition.height,
         kbps = rendition.video_bitrate_kbps,
-    );
+    )
+}
+
+fn build_pipeline(rendition: &RenditionSpec) -> Result<BuiltPipeline, WorkerSpawnError> {
+    let pipeline_str = pipeline_str_for(rendition);
     let element = gst::parse::launch(&pipeline_str).map_err(|e| WorkerSpawnError::Pipeline(e.to_string()))?;
     let pipeline = element
         .downcast::<gst::Pipeline>()
@@ -692,19 +702,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pipeline_string_embeds_rendition_geometry_and_bitrate() {
-        // Echoes software.rs's smoke shape: regression guard against
-        // a pipeline that silently produces three identical 720p
-        // renditions if a substitution drift sneaks in.
-        let pipeline_str = format!(
-            "bitrate={kbps} ... width={w} height={h} ...",
-            w = 854,
-            h = 480,
-            kbps = 1_200,
+    fn pipeline_str_uses_vtenc_h264_hw_with_documented_property_mapping() {
+        let rendition = RenditionSpec {
+            name: "test720p".into(),
+            width: 1280,
+            height: 720,
+            video_bitrate_kbps: 2_500,
+            audio_bitrate_kbps: 128,
+        };
+        let s = pipeline_str_for(&rendition);
+
+        // Right encoder element for THIS backend. Catches a
+        // copy-paste from another HW backend that forgot to swap
+        // the encoder element name.
+        assert!(s.contains("vtenc_h264_hw"), "must use vtenc_h264_hw; got: {s}");
+        assert!(!s.contains("nvh264enc"), "must not use nvenc encoder; got: {s}");
+        assert!(!s.contains("vah264enc"), "must not use vaapi encoder; got: {s}");
+        assert!(!s.contains("qsvh264enc"), "must not use qsv encoder; got: {s}");
+        assert!(!s.contains("x264enc"), "must not use software encoder; got: {s}");
+
+        // VideoToolbox property mapping per module docs.
+        assert!(s.contains("bitrate=2500"), "bitrate substitution: {s}");
+        assert!(s.contains("realtime=true"), "realtime property: {s}");
+        assert!(
+            s.contains("allow-frame-reordering=false"),
+            "allow-frame-reordering property: {s}"
         );
-        assert!(pipeline_str.contains("width=854"));
-        assert!(pipeline_str.contains("height=480"));
-        assert!(pipeline_str.contains("bitrate=1200"));
+        assert!(
+            s.contains("max-keyframe-interval=60"),
+            "max-keyframe-interval property: {s}"
+        );
+
+        assert!(s.contains("width=1280"), "width substitution: {s}");
+        assert!(s.contains("height=720"), "height substitution: {s}");
+
+        for required in [
+            "appsrc",
+            "qtdemux",
+            "h264parse",
+            "avdec_h264",
+            "videoscale",
+            "videoconvert",
+            "mp4mux",
+            "appsink",
+        ] {
+            assert!(s.contains(required), "missing pipeline element {required}: {s}");
+        }
+    }
+
+    /// When the host has the `vtenc_h264_hw` plugin installed,
+    /// `gst::parse::launch` should accept the pipeline string we
+    /// generate. Soft-skips on hosts without the runtime.
+    #[test]
+    fn pipeline_str_parses_under_gstreamer_when_runtime_available() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gst::init() failed (gstreamer-rs runtime not installed)");
+            return;
+        }
+        if gst::ElementFactory::find("vtenc_h264_hw").is_none() {
+            eprintln!("skipping: vtenc_h264_hw plugin not registered (not on macOS / applemedia plugin missing)");
+            return;
+        }
+        let rendition = RenditionSpec::preset_720p();
+        let s = pipeline_str_for(&rendition);
+        let parsed = gst::parse::launch(&s);
+        assert!(
+            parsed.is_ok(),
+            "gst::parse::launch failed: {:?}\npipeline: {s}",
+            parsed.err()
+        );
     }
 
     #[test]

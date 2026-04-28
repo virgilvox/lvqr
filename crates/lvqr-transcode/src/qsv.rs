@@ -393,14 +393,18 @@ struct BuiltPipeline {
     appsink: gst_app::AppSink,
 }
 
-fn build_pipeline(rendition: &RenditionSpec) -> Result<BuiltPipeline, WorkerSpawnError> {
-    // QSV property mapping (vs the x264enc software path):
-    //   bitrate=<kbps>      same units (qsvh264enc takes kbit/s)
-    //   gop-size=60         replaces key-int-max=60
-    //   low-latency=true    matches tune=zerolatency intent (no
-    //                       look-ahead, no B-frames; uses the
-    //                       Media SDK low-latency target_usage).
-    let pipeline_str = format!(
+/// Build the GStreamer pipeline string for a QSV ladder rung.
+/// Extracted from [`build_pipeline`] so the test suite can call it
+/// directly; the runtime path always goes through `build_pipeline`.
+///
+/// QSV property mapping (vs the x264enc software path):
+/// * `bitrate=<kbps>` -- same units (qsvh264enc takes kbit/s)
+/// * `gop-size=60` -- replaces `key-int-max=60`
+/// * `low-latency=true` -- matches `tune=zerolatency` intent (no
+///   look-ahead, no B-frames; uses the Media SDK low-latency
+///   target_usage).
+fn pipeline_str_for(rendition: &RenditionSpec) -> String {
+    format!(
         "appsrc name=src caps=video/quicktime is-live=false format=time \
          ! qtdemux \
          ! h264parse \
@@ -415,7 +419,11 @@ fn build_pipeline(rendition: &RenditionSpec) -> Result<BuiltPipeline, WorkerSpaw
         w = rendition.width,
         h = rendition.height,
         kbps = rendition.video_bitrate_kbps,
-    );
+    )
+}
+
+fn build_pipeline(rendition: &RenditionSpec) -> Result<BuiltPipeline, WorkerSpawnError> {
+    let pipeline_str = pipeline_str_for(rendition);
     let element = gst::parse::launch(&pipeline_str).map_err(|e| WorkerSpawnError::Pipeline(e.to_string()))?;
     let pipeline = element
         .downcast::<gst::Pipeline>()
@@ -650,16 +658,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pipeline_string_embeds_rendition_geometry_and_bitrate() {
-        let pipeline_str = format!(
-            "bitrate={kbps} ... width={w} height={h} ...",
-            w = 854,
-            h = 480,
-            kbps = 1_200,
+    fn pipeline_str_uses_qsvh264enc_with_documented_property_mapping() {
+        let rendition = RenditionSpec {
+            name: "test720p".into(),
+            width: 1280,
+            height: 720,
+            video_bitrate_kbps: 2_500,
+            audio_bitrate_kbps: 128,
+        };
+        let s = pipeline_str_for(&rendition);
+
+        assert!(s.contains("qsvh264enc"), "must use qsvh264enc; got: {s}");
+        assert!(
+            !s.contains("vtenc_h264_hw"),
+            "must not use videotoolbox encoder; got: {s}"
         );
-        assert!(pipeline_str.contains("width=854"));
-        assert!(pipeline_str.contains("height=480"));
-        assert!(pipeline_str.contains("bitrate=1200"));
+        assert!(!s.contains("nvh264enc"), "must not use nvenc encoder; got: {s}");
+        assert!(!s.contains("vah264enc"), "must not use vaapi encoder; got: {s}");
+        assert!(!s.contains("x264enc"), "must not use software encoder; got: {s}");
+
+        assert!(s.contains("bitrate=2500"), "bitrate substitution: {s}");
+        assert!(s.contains("gop-size=60"), "gop-size property: {s}");
+        assert!(s.contains("low-latency=true"), "low-latency property: {s}");
+
+        assert!(s.contains("width=1280"), "width substitution: {s}");
+        assert!(s.contains("height=720"), "height substitution: {s}");
+
+        for required in [
+            "appsrc",
+            "qtdemux",
+            "h264parse",
+            "avdec_h264",
+            "videoscale",
+            "videoconvert",
+            "mp4mux",
+            "appsink",
+        ] {
+            assert!(s.contains(required), "missing pipeline element {required}: {s}");
+        }
+    }
+
+    #[test]
+    fn pipeline_str_parses_under_gstreamer_when_runtime_available() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gst::init() failed (gstreamer-rs runtime not installed)");
+            return;
+        }
+        if gst::ElementFactory::find("qsvh264enc").is_none() {
+            eprintln!("skipping: qsvh264enc plugin not registered (no Intel Media SDK / oneVPL)");
+            return;
+        }
+        let rendition = RenditionSpec::preset_720p();
+        let s = pipeline_str_for(&rendition);
+        let parsed = gst::parse::launch(&s);
+        assert!(
+            parsed.is_ok(),
+            "gst::parse::launch failed: {:?}\npipeline: {s}",
+            parsed.err()
+        );
     }
 
     #[test]

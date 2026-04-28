@@ -415,14 +415,18 @@ struct BuiltPipeline {
     appsink: gst_app::AppSink,
 }
 
-fn build_pipeline(rendition: &RenditionSpec) -> Result<BuiltPipeline, WorkerSpawnError> {
-    // NVENC property mapping (vs the x264enc software path):
-    //   bitrate=<kbps>      same units (nvh264enc takes kbit/s)
-    //   gop-size=60         replaces key-int-max=60
-    //   rc-mode=cbr         constant-bitrate rate control
-    //   zerolatency=true    matches tune=zerolatency intent (no B-frames,
-    //                       low-delay encode)
-    let pipeline_str = format!(
+/// Build the GStreamer pipeline string for a NVENC ladder rung.
+/// Extracted from [`build_pipeline`] so the test suite can call it
+/// directly; the runtime path always goes through `build_pipeline`.
+///
+/// NVENC property mapping (vs the x264enc software path):
+/// * `bitrate=<kbps>` -- same units (nvh264enc takes kbit/s)
+/// * `gop-size=60` -- replaces `key-int-max=60`
+/// * `rc-mode=cbr` -- constant-bitrate rate control
+/// * `zerolatency=true` -- matches `tune=zerolatency` intent
+///   (no B-frames, low-delay encode)
+fn pipeline_str_for(rendition: &RenditionSpec) -> String {
+    format!(
         "appsrc name=src caps=video/quicktime is-live=false format=time \
          ! qtdemux \
          ! h264parse \
@@ -437,7 +441,11 @@ fn build_pipeline(rendition: &RenditionSpec) -> Result<BuiltPipeline, WorkerSpaw
         w = rendition.width,
         h = rendition.height,
         kbps = rendition.video_bitrate_kbps,
-    );
+    )
+}
+
+fn build_pipeline(rendition: &RenditionSpec) -> Result<BuiltPipeline, WorkerSpawnError> {
+    let pipeline_str = pipeline_str_for(rendition);
     let element = gst::parse::launch(&pipeline_str).map_err(|e| WorkerSpawnError::Pipeline(e.to_string()))?;
     let pipeline = element
         .downcast::<gst::Pipeline>()
@@ -671,17 +679,84 @@ fn looks_like_rendition_output(broadcast: &str, extra: &[String]) -> bool {
 mod tests {
     use super::*;
 
+    /// Substantive coverage of the actual `pipeline_str_for` builder.
+    /// Catches:
+    /// * encoder-element swaps from a copy-paste between backends
+    ///   (the failure mode the original cosmetic test missed),
+    /// * geometry / bitrate substitution wiring (e.g. a typo of
+    ///   `width={kbps}` in the format! template),
+    /// * property-mapping drift (someone retunes `gop-size` or the
+    ///   rate-control mode without updating the comment / docs).
     #[test]
-    fn pipeline_string_embeds_rendition_geometry_and_bitrate() {
-        let pipeline_str = format!(
-            "bitrate={kbps} ... width={w} height={h} ...",
-            w = 854,
-            h = 480,
-            kbps = 1_200,
+    fn pipeline_str_uses_nvh264enc_with_documented_property_mapping() {
+        let rendition = RenditionSpec {
+            name: "test720p".into(),
+            width: 1280,
+            height: 720,
+            video_bitrate_kbps: 2_500,
+            audio_bitrate_kbps: 128,
+        };
+        let s = pipeline_str_for(&rendition);
+
+        // Right encoder element for THIS backend. Catches a
+        // copy-paste from another backend module.
+        assert!(s.contains("nvh264enc"), "must use nvh264enc; got: {s}");
+        assert!(
+            !s.contains("vtenc_h264_hw"),
+            "must not use videotoolbox encoder; got: {s}"
         );
-        assert!(pipeline_str.contains("width=854"));
-        assert!(pipeline_str.contains("height=480"));
-        assert!(pipeline_str.contains("bitrate=1200"));
+        assert!(!s.contains("vah264enc"), "must not use vaapi encoder; got: {s}");
+        assert!(!s.contains("qsvh264enc"), "must not use qsv encoder; got: {s}");
+        assert!(!s.contains("x264enc"), "must not use software encoder; got: {s}");
+
+        // NVENC property mapping per module docs.
+        assert!(s.contains("bitrate=2500"), "bitrate substitution: {s}");
+        assert!(s.contains("gop-size=60"), "gop-size property: {s}");
+        assert!(s.contains("rc-mode=cbr"), "rc-mode=cbr property: {s}");
+        assert!(s.contains("zerolatency=true"), "zerolatency property: {s}");
+
+        // Geometry substitution wiring.
+        assert!(s.contains("width=1280"), "width substitution: {s}");
+        assert!(s.contains("height=720"), "height substitution: {s}");
+
+        // Pipeline shape sanity: structure-defining elements present
+        // in the expected order.
+        for required in [
+            "appsrc",
+            "qtdemux",
+            "h264parse",
+            "avdec_h264",
+            "videoscale",
+            "videoconvert",
+            "mp4mux",
+            "appsink",
+        ] {
+            assert!(s.contains(required), "missing pipeline element {required}: {s}");
+        }
+    }
+
+    /// When the host has the `nvh264enc` plugin installed,
+    /// `gst::parse::launch` should accept the pipeline string we
+    /// generate. Soft-skips on hosts without the runtime (CI runners
+    /// without an Nvidia driver).
+    #[test]
+    fn pipeline_str_parses_under_gstreamer_when_runtime_available() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gst::init() failed (gstreamer-rs runtime not installed)");
+            return;
+        }
+        if gst::ElementFactory::find("nvh264enc").is_none() {
+            eprintln!("skipping: nvh264enc plugin not registered (no Nvidia driver / nvcodec plugin)");
+            return;
+        }
+        let rendition = RenditionSpec::preset_720p();
+        let s = pipeline_str_for(&rendition);
+        let parsed = gst::parse::launch(&s);
+        assert!(
+            parsed.is_ok(),
+            "gst::parse::launch failed: {:?}\npipeline: {s}",
+            parsed.err()
+        );
     }
 
     #[test]
