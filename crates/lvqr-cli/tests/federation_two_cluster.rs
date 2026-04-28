@@ -38,23 +38,15 @@ use std::time::{Duration, Instant};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(10);
 
-// FOLLOW-UP: ignored on macOS CI because the per-track forward_track
-// task in `lvqr-cluster::federation` never makes data available on
-// macos-latest GitHub-hosted runners. The federation MoQ session
-// reaches Connected (verified via the active wait below), the
-// broadcast announcement propagates to B's origin (verified by
-// `announcements.announced()` returning), but every subsequent
-// `subscribe_track` -> `next_group` on B comes back with moq-lite
-// remote error code=13 for the full PROPAGATION_TIMEOUT (~200
-// retries at 50 ms each). Linux CI + local macOS dev both pass; the
-// gap appears specific to GitHub's macos-latest image. Investigation
-// is its own session: likely a macOS-specific quinn/moq-native
-// timing issue with the federation runner's outbound subscribe
-// loop. Filed as v1.2 follow-up.
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "federation forward_track unreliable on macos-latest CI -- v1.2 follow-up"
-)]
+// Known to fail on the macos-latest GitHub-hosted CI runner: the
+// per-track forward_track task in `lvqr-cluster::federation` never
+// makes data available there even though the federation MoQ session
+// reaches Connected and the announcement propagates. Linux CI and
+// local macOS dev both pass. The macOS CI lane is informational
+// (continue-on-error) so this expected-red signal does not block
+// merges, and the test stays active so it will go green on its own
+// when the macOS forward_track timing issue gets diagnosed and
+// fixed in a future session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn federation_link_propagates_broadcast_between_two_clusters() {
     let _ = tracing_subscriber::fmt()

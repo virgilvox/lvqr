@@ -112,6 +112,55 @@ jobs:
       - name: Test lvqr-cli rtmp_whep_audio_e2e
         run: cargo test -p lvqr-cli --features transcode --test rtmp_whep_audio_e2e
 
+  hw-encoders-linux:
+    name: Feature `hw-{nvenc,vaapi,qsv}` (compile + unit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    continue-on-error: true
+    # Compile-checks the three Linux HW encoder backends. Runtime
+    # tests need actual hardware (Nvidia GPU for NVENC, Intel iGPU
+    # for VAAPI / QSV) which GitHub-hosted runners don't have, so
+    # this lane verifies the gstreamer-rs binding compiles cleanly
+    # and the unit tests (which soft-skip when the encoder element
+    # is missing at runtime) all pass. Real hardware validation is
+    # an operator-side step on the target deployment box.
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [hw-nvenc, hw-vaapi, hw-qsv]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: feature-matrix-${{ matrix.feature }}-v1
+      - name: Install GStreamer dev headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gstreamer1.0-tools \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libclang-dev
+      - name: Clippy with ${{ matrix.feature }}
+        run: cargo clippy -p lvqr-transcode --features ${{ matrix.feature }} --all-targets -- -D warnings
+      - name: Clippy lvqr-cli with ${{ matrix.feature }}
+        run: cargo clippy -p lvqr-cli --features ${{ matrix.feature }} --all-targets -- -D warnings
+      - name: Test lvqr-transcode unit + integration with ${{ matrix.feature }}
+        # Unit tests in the new module soft-skip when the runtime
+        # encoder element is unavailable (GitHub-hosted runners lack
+        # the matching HW), so this exercises the factory build /
+        # opt-out / pipeline string / metric label paths and the CLI
+        # parser flag-value tests.
+        run: cargo test -p lvqr-transcode --features ${{ matrix.feature }} --lib
+      - name: Test lvqr-cli config flag parsing with ${{ matrix.feature }}
+        run: cargo test -p lvqr-cli --features ${{ matrix.feature }} --lib
+
   whisper:
     name: Feature `whisper` (compile + unit)
     runs-on: ubuntu-latest

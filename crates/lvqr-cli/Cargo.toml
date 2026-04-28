@@ -74,6 +74,21 @@ transcode = [
 # (the new module reuses gstreamer-rs); macOS-only by element
 # requirement (`vtenc_h264_hw` lives in `applemedia` from gst-plugins-bad).
 hw-videotoolbox = ["transcode", "lvqr-transcode/hw-videotoolbox"]
+# Linux + Nvidia GPU HW encoder backend. Implies `transcode`; the
+# `nvh264enc` element comes from the `nvcodec` plugin in
+# `gst-plugins-bad` and probes the CUDA runtime + driver at element-
+# factory load time.
+hw-nvenc = ["transcode", "lvqr-transcode/hw-nvenc"]
+# Linux + Intel iGPU / AMD HW encoder backend via VA-API. Implies
+# `transcode`; the `vah264enc` element comes from the modern `va`
+# plugin in `gst-plugins-bad` and probes libva + a usable DRI device
+# at element-factory load time.
+hw-vaapi = ["transcode", "lvqr-transcode/hw-vaapi"]
+# Linux + Intel Quick Sync HW encoder backend. Implies `transcode`;
+# the `qsvh264enc` element comes from the `qsv` plugin in
+# `gst-plugins-bad` and probes Intel Media SDK / oneVPL at element-
+# factory load time.
+hw-qsv = ["transcode", "lvqr-transcode/hw-qsv"]
 
 [dependencies]
 lvqr-core = { workspace = true }

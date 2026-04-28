@@ -103,9 +103,22 @@ projection into that type, not a rewrite of the egress side.
   `AudioPassthroughTranscoderFactory`. Drive via repeatable
   `--transcode-rendition <NAME>` (presets `720p`/`480p`/`240p` or a
   `.toml` `RenditionSpec`); the LL-HLS master playlist composes one
-  `EXT-X-STREAM-INF` per rendition automatically. macOS VideoToolbox
-  HW backend ships behind `--features hw-videotoolbox`
-  (`--transcode-encoder videotoolbox`).
+  `EXT-X-STREAM-INF` per rendition automatically. **Four hardware
+  encoder backends** ship behind their own Cargo features and select
+  via `--transcode-encoder`:
+  | Backend | Feature flag | Platform | GStreamer element |
+  |---|---|---|---|
+  | VideoToolbox | `hw-videotoolbox` | macOS | `vtenc_h264_hw` (applemedia plugin) |
+  | NVENC | `hw-nvenc` | Linux + Nvidia | `nvh264enc` (nvcodec plugin) |
+  | VA-API | `hw-vaapi` | Linux + Intel iGPU / AMD | `vah264enc` (va plugin) |
+  | Quick Sync | `hw-qsv` | Linux + Intel | `qsvh264enc` (qsv plugin) |
+
+  HW-only path is intentional across all four: a factory that silently
+  falls back to CPU encoding under load defeats the point of an
+  operator-pickable hardware tier. Each backend's `is_available()`
+  probes its required GStreamer element at construction and `build()`
+  opts out cleanly with a warn log when the runtime hardware or driver
+  is missing.
 
 ### Provenance
 
@@ -466,8 +479,18 @@ lvqr serve \
 # Custom rendition from a TOML file
 lvqr serve --transcode-rendition ./renditions/360p.toml
 
-# macOS hardware encoder (build with --features hw-videotoolbox)
+# Hardware encoder; build with the matching feature
+# macOS VideoToolbox     -- cargo build --features hw-videotoolbox
 lvqr serve --transcode-rendition 720p --transcode-encoder videotoolbox
+
+# Linux NVENC (Nvidia)   -- cargo build --features hw-nvenc
+lvqr serve --transcode-rendition 720p --transcode-encoder nvenc
+
+# Linux VA-API (Intel iGPU / AMD) -- cargo build --features hw-vaapi
+lvqr serve --transcode-rendition 720p --transcode-encoder vaapi
+
+# Linux Quick Sync (Intel) -- cargo build --features hw-qsv
+lvqr serve --transcode-rendition 720p --transcode-encoder qsv
 ```
 
 The LL-HLS master playlist composes one `EXT-X-STREAM-INF` per
@@ -1001,9 +1024,13 @@ A few things worth knowing before you ship:
   default.** Wiring `mediastreamvalidator` (Apple's reference
   validator) into CI is the single open conformance gap on
   `lvqr-hls`.
-- **Hardware encoders.** macOS VideoToolbox ships behind
-  `--features hw-videotoolbox`; NVENC, VAAPI, and QSV are on the
-  v1.2 roadmap.
+- **Hardware encoders.** All four backends ship today: VideoToolbox
+  (`hw-videotoolbox`, macOS), NVENC (`hw-nvenc`, Linux + Nvidia),
+  VA-API (`hw-vaapi`, Linux + Intel iGPU / AMD), Quick Sync
+  (`hw-qsv`, Linux + Intel). Each requires the matching GStreamer
+  plugin and runtime hardware on the target host; `is_available()`
+  surfaces the missing-element list when the host can't drive the
+  selected backend.
 
 ---
 

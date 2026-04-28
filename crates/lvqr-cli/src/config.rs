@@ -399,23 +399,32 @@ impl ServeConfig {
     }
 }
 /// Encoder backend the composition root constructs per rendition.
-/// Session 156 introduces the choice between the pre-existing
-/// software (`x264enc`) ladder and the new VideoToolbox HW-only
-/// ladder (`vtenc_h264_hw`, macOS-only). Future hardware backends
-/// (NVENC, VAAPI, QSV) become additional variants under their own
-/// per-encoder Cargo features.
+/// Five variants ship today: the always-available software
+/// (`x264enc`) ladder plus four hardware backends gated on their
+/// own per-encoder Cargo features (`hw-videotoolbox` for macOS,
+/// `hw-nvenc` for Linux + Nvidia, `hw-vaapi` for Linux + Intel iGPU
+/// or AMD via libva, `hw-qsv` for Linux + Intel Quick Sync).
 #[cfg(feature = "transcode")]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum TranscodeEncoderKind {
     /// `x264enc`-backed software ladder (existing 105 B behavior).
     #[default]
     Software,
-    /// `vtenc_h264_hw`-backed VideoToolbox HW ladder. Only available
-    /// when the binary was built with `--features hw-videotoolbox`;
-    /// the CLI parser rejects this value at parse time on builds
-    /// that lack the feature.
+    /// `vtenc_h264_hw`-backed VideoToolbox HW ladder. macOS-only by
+    /// element requirement.
     #[cfg(feature = "hw-videotoolbox")]
     VideoToolbox,
+    /// `nvh264enc`-backed NVENC HW ladder. Linux + Nvidia GPU.
+    #[cfg(feature = "hw-nvenc")]
+    Nvenc,
+    /// `vah264enc`-backed VA-API HW ladder. Linux + Intel iGPU /
+    /// AMD via libva.
+    #[cfg(feature = "hw-vaapi")]
+    Vaapi,
+    /// `qsvh264enc`-backed Intel Quick Sync HW ladder. Linux +
+    /// Intel iGPU via Media SDK / oneVPL.
+    #[cfg(feature = "hw-qsv")]
+    Qsv,
 }
 
 #[cfg(feature = "transcode")]
@@ -426,15 +435,21 @@ impl TranscodeEncoderKind {
             TranscodeEncoderKind::Software => "software",
             #[cfg(feature = "hw-videotoolbox")]
             TranscodeEncoderKind::VideoToolbox => "videotoolbox",
+            #[cfg(feature = "hw-nvenc")]
+            TranscodeEncoderKind::Nvenc => "nvenc",
+            #[cfg(feature = "hw-vaapi")]
+            TranscodeEncoderKind::Vaapi => "vaapi",
+            #[cfg(feature = "hw-qsv")]
+            TranscodeEncoderKind::Qsv => "qsv",
         }
     }
 }
 
 /// Parse a `--transcode-encoder` CLI / env value into a
 /// [`TranscodeEncoderKind`]. The accepted values depend on the
-/// build's feature set: `software` is always available;
-/// `videotoolbox` is gated on the `hw-videotoolbox` feature. An
-/// unknown value surfaces a parse error at CLI time so misconfigured
+/// build's feature set: `software` is always available; each HW
+/// backend is gated on its respective `hw-*` feature. An unknown
+/// value surfaces a parse error at CLI time so misconfigured
 /// deployments do not silently fall back to software when the
 /// operator asked for HW.
 #[cfg(feature = "transcode")]
@@ -448,14 +463,60 @@ pub fn parse_transcode_encoder(value: &str) -> anyhow::Result<TranscodeEncoderKi
             "--transcode-encoder=videotoolbox requires the lvqr-cli binary to be built \
              with the `hw-videotoolbox` feature (e.g. `cargo build --features hw-videotoolbox`)"
         )),
-        other => Err(anyhow::anyhow!(
-            "--transcode-encoder: unknown value {other:?}; expected one of `software`{vt_hint}",
-            vt_hint = if cfg!(feature = "hw-videotoolbox") {
-                " / `videotoolbox`"
-            } else {
-                ""
-            },
+        #[cfg(feature = "hw-nvenc")]
+        "nvenc" | "nvh264" | "nvh264enc" => Ok(TranscodeEncoderKind::Nvenc),
+        #[cfg(not(feature = "hw-nvenc"))]
+        "nvenc" | "nvh264" | "nvh264enc" => Err(anyhow::anyhow!(
+            "--transcode-encoder=nvenc requires the lvqr-cli binary to be built \
+             with the `hw-nvenc` feature (e.g. `cargo build --features hw-nvenc`)"
         )),
+        #[cfg(feature = "hw-vaapi")]
+        "vaapi" | "va" | "vah264" | "vah264enc" => Ok(TranscodeEncoderKind::Vaapi),
+        #[cfg(not(feature = "hw-vaapi"))]
+        "vaapi" | "va" | "vah264" | "vah264enc" => Err(anyhow::anyhow!(
+            "--transcode-encoder=vaapi requires the lvqr-cli binary to be built \
+             with the `hw-vaapi` feature (e.g. `cargo build --features hw-vaapi`)"
+        )),
+        #[cfg(feature = "hw-qsv")]
+        "qsv" | "quicksync" | "qsvh264" | "qsvh264enc" => Ok(TranscodeEncoderKind::Qsv),
+        #[cfg(not(feature = "hw-qsv"))]
+        "qsv" | "quicksync" | "qsvh264" | "qsvh264enc" => Err(anyhow::anyhow!(
+            "--transcode-encoder=qsv requires the lvqr-cli binary to be built \
+             with the `hw-qsv` feature (e.g. `cargo build --features hw-qsv`)"
+        )),
+        other => Err(anyhow::anyhow!(
+            "--transcode-encoder: unknown value {other:?}; expected one of `software`{hw_hint}",
+            hw_hint = build_hw_hint(),
+        )),
+    }
+}
+
+#[cfg(feature = "transcode")]
+fn build_hw_hint() -> &'static str {
+    // Compile-time concatenation of available HW values. The current
+    // build's feature flags decide which backends appear in the
+    // operator-facing error message.
+    if cfg!(all(
+        feature = "hw-videotoolbox",
+        feature = "hw-nvenc",
+        feature = "hw-vaapi",
+        feature = "hw-qsv"
+    )) {
+        " / `videotoolbox` / `nvenc` / `vaapi` / `qsv`"
+    } else if cfg!(all(feature = "hw-nvenc", feature = "hw-vaapi", feature = "hw-qsv")) {
+        " / `nvenc` / `vaapi` / `qsv`"
+    } else if cfg!(feature = "hw-videotoolbox") && cfg!(feature = "hw-nvenc") {
+        " / `videotoolbox` / `nvenc`"
+    } else if cfg!(feature = "hw-videotoolbox") {
+        " / `videotoolbox`"
+    } else if cfg!(feature = "hw-nvenc") {
+        " / `nvenc`"
+    } else if cfg!(feature = "hw-vaapi") {
+        " / `vaapi`"
+    } else if cfg!(feature = "hw-qsv") {
+        " / `qsv`"
+    } else {
+        ""
     }
 }
 
@@ -559,9 +620,68 @@ mod transcode_serve_config_tests {
 
     #[test]
     fn parse_transcode_encoder_rejects_unknown_value() {
-        let err = parse_transcode_encoder("nvenc").expect_err("nvenc is v1.2 deferred");
+        let err = parse_transcode_encoder("totally-not-a-real-encoder").expect_err("nonsense value must be rejected");
         let msg = format!("{err:#}");
         assert!(msg.contains("unknown value"), "got: {msg}");
+    }
+
+    #[cfg(feature = "hw-nvenc")]
+    #[test]
+    fn parse_transcode_encoder_nvenc_aliases_when_feature_on() {
+        assert_eq!(parse_transcode_encoder("nvenc").unwrap(), TranscodeEncoderKind::Nvenc);
+        assert_eq!(parse_transcode_encoder("nvh264").unwrap(), TranscodeEncoderKind::Nvenc);
+        assert_eq!(
+            parse_transcode_encoder("nvh264enc").unwrap(),
+            TranscodeEncoderKind::Nvenc
+        );
+    }
+
+    #[cfg(not(feature = "hw-nvenc"))]
+    #[test]
+    fn parse_transcode_encoder_nvenc_errors_without_feature() {
+        let err = parse_transcode_encoder("nvenc").expect_err("must error without feature");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("hw-nvenc"), "got: {msg}");
+    }
+
+    #[cfg(feature = "hw-vaapi")]
+    #[test]
+    fn parse_transcode_encoder_vaapi_aliases_when_feature_on() {
+        assert_eq!(parse_transcode_encoder("vaapi").unwrap(), TranscodeEncoderKind::Vaapi);
+        assert_eq!(parse_transcode_encoder("va").unwrap(), TranscodeEncoderKind::Vaapi);
+        assert_eq!(parse_transcode_encoder("vah264").unwrap(), TranscodeEncoderKind::Vaapi);
+        assert_eq!(
+            parse_transcode_encoder("vah264enc").unwrap(),
+            TranscodeEncoderKind::Vaapi
+        );
+    }
+
+    #[cfg(not(feature = "hw-vaapi"))]
+    #[test]
+    fn parse_transcode_encoder_vaapi_errors_without_feature() {
+        let err = parse_transcode_encoder("vaapi").expect_err("must error without feature");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("hw-vaapi"), "got: {msg}");
+    }
+
+    #[cfg(feature = "hw-qsv")]
+    #[test]
+    fn parse_transcode_encoder_qsv_aliases_when_feature_on() {
+        assert_eq!(parse_transcode_encoder("qsv").unwrap(), TranscodeEncoderKind::Qsv);
+        assert_eq!(parse_transcode_encoder("quicksync").unwrap(), TranscodeEncoderKind::Qsv);
+        assert_eq!(parse_transcode_encoder("qsvh264").unwrap(), TranscodeEncoderKind::Qsv);
+        assert_eq!(
+            parse_transcode_encoder("qsvh264enc").unwrap(),
+            TranscodeEncoderKind::Qsv
+        );
+    }
+
+    #[cfg(not(feature = "hw-qsv"))]
+    #[test]
+    fn parse_transcode_encoder_qsv_errors_without_feature() {
+        let err = parse_transcode_encoder("qsv").expect_err("must error without feature");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("hw-qsv"), "got: {msg}");
     }
 
     #[test]

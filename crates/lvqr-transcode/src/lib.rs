@@ -42,24 +42,40 @@
 //!   transcoder used by `lvqr-whep` (under its `aac-opus` feature)
 //!   so AAC publishers reach Opus-negotiated WHEP subscribers.
 //!
-//! Behind the `hw-videotoolbox` feature (implies `transcode`;
-//! requires the `applemedia` plugin from gst-plugins-bad):
+//! Behind one of the `hw-*` features (each implies `transcode`):
 //!
-//! * [`VideoToolboxTranscoder`] / [`VideoToolboxTranscoderFactory`]
-//!   -- mirrors `SoftwareTranscoderFactory` but swaps the
-//!   `x264enc bitrate=... tune=zerolatency speed-preset=superfast`
-//!   pipeline element for Apple's HW-only `vtenc_h264_hw bitrate=...
-//!   realtime=true allow-frame-reordering=false
-//!   max-keyframe-interval=60`. HW-only path is intentional: a
-//!   factory that silently falls back to CPU encoding under load
-//!   defeats the point of an operator-pickable hardware tier.
-//!   `is_available()` probes for the encoder element at construction
-//!   and `build()` opts out cleanly with a warn log when missing.
+//! * `hw-videotoolbox` -- [`VideoToolboxTranscoder`] /
+//!   [`VideoToolboxTranscoderFactory`] for macOS via Apple's
+//!   `vtenc_h264_hw` (the `applemedia` plugin from gst-plugins-bad).
+//! * `hw-nvenc` -- [`NvencTranscoder`] / [`NvencTranscoderFactory`]
+//!   for Linux + Nvidia GPUs via `nvh264enc` (the `nvcodec` plugin
+//!   from gst-plugins-bad, driven by the CUDA runtime).
+//! * `hw-vaapi` -- [`VaapiTranscoder`] / [`VaapiTranscoderFactory`]
+//!   for Linux + Intel iGPU / AMD via `vah264enc` (the modern `va`
+//!   plugin from gst-plugins-bad, superseding the deprecated
+//!   `vaapih264enc` from `gstreamer-vaapi`).
+//! * `hw-qsv` -- [`QsvTranscoder`] / [`QsvTranscoderFactory`] for
+//!   Linux + Intel Quick Sync via `qsvh264enc` (the `qsv` plugin
+//!   from gst-plugins-bad, driving Intel Media SDK / oneVPL).
 //!
-//! NVENC, VAAPI, and QSV stay deferred to v1.2 per the README's
-//! existing language. When a third HW backend lands, that session
-//! is also the right moment to extract a shared `pipeline.rs`
-//! scaffolding module from `software.rs` + `videotoolbox.rs`.
+//! All four HW backends mirror `SoftwareTranscoderFactory` shape
+//! verbatim -- same `Transcoder` trait, same lifecycle, same
+//! `<source>/<rendition>` output broadcast naming, same bounded
+//! mpsc + dedicated worker thread per `(source, rendition)` pair --
+//! and only swap the GStreamer encoder element + property mapping.
+//! HW-only path is intentional across all four: a factory that
+//! silently falls back to CPU encoding under load defeats the point
+//! of an operator-pickable hardware tier. Each factory's
+//! `is_available()` probes the required encoder element at
+//! construction and `build()` opts out cleanly with a warn log when
+//! missing.
+//!
+//! Future sessions may extract the shared scaffolding into a
+//! dedicated `pipeline.rs` module (per the "three is the threshold
+//! for an abstraction" rule). The current shape is intentional code
+//! duplication: each backend stays readable on its own and the cost
+//! of cross-backend changes is small enough that the mechanical-
+//! sharing tradeoff is not yet a win.
 //!
 //! ## Where this crate fits in the consumer family
 //!
@@ -99,6 +115,15 @@ pub mod test_support;
 #[cfg(feature = "hw-videotoolbox")]
 mod videotoolbox;
 
+#[cfg(feature = "hw-nvenc")]
+mod nvenc;
+
+#[cfg(feature = "hw-vaapi")]
+mod vaapi;
+
+#[cfg(feature = "hw-qsv")]
+mod qsv;
+
 pub use audio_passthrough::{AudioPassthroughTranscoder, AudioPassthroughTranscoderFactory};
 pub use passthrough::{PassthroughTranscoder, PassthroughTranscoderFactory};
 pub use rendition::RenditionSpec;
@@ -112,3 +137,12 @@ pub use software::{SoftwareTranscoder, SoftwareTranscoderFactory};
 
 #[cfg(feature = "hw-videotoolbox")]
 pub use videotoolbox::{VideoToolboxTranscoder, VideoToolboxTranscoderFactory};
+
+#[cfg(feature = "hw-nvenc")]
+pub use nvenc::{NvencTranscoder, NvencTranscoderFactory};
+
+#[cfg(feature = "hw-vaapi")]
+pub use vaapi::{VaapiTranscoder, VaapiTranscoderFactory};
+
+#[cfg(feature = "hw-qsv")]
+pub use qsv::{QsvTranscoder, QsvTranscoderFactory};

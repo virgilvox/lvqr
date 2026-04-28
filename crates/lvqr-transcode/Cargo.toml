@@ -33,6 +33,25 @@ transcode = [
 # `brew install gstreamer gst-plugins-bad` (or the official .framework
 # installer at https://gstreamer.freedesktop.org/download/).
 hw-videotoolbox = ["transcode"]
+# NVENC (Nvidia GPU) HW encoder backend on Linux. Implies `transcode`;
+# requires the `nvcodec` plugin from gst-plugins-bad which ships
+# `nvh264enc`, plus a working CUDA runtime + Nvidia driver at runtime.
+# Install: `apt-get install gstreamer1.0-plugins-bad nvidia-cuda-toolkit`
+# plus a vendor driver. Default OFF so non-Nvidia builds do not pay the
+# nvcodec surface.
+hw-nvenc = ["transcode"]
+# VAAPI HW encoder backend on Linux + Intel iGPU / AMD. Implies
+# `transcode`; requires the `va` plugin from gst-plugins-bad which ships
+# `vah264enc` (the modern VA-API encoder superseding the deprecated
+# `vaapih264enc`), plus a libva driver (intel-media-va-driver-non-free
+# for Intel; mesa-va-drivers for AMD) and a usable DRI render node.
+# Default OFF.
+hw-vaapi = ["transcode"]
+# Intel Quick Sync Video HW encoder backend on Linux. Implies
+# `transcode`; requires the `qsv` plugin from gst-plugins-bad which
+# ships `qsvh264enc`, plus the Intel Media SDK / oneVPL runtime and a
+# usable DRI render node. Default OFF.
+hw-qsv = ["transcode"]
 
 [dependencies]
 bytes = { workspace = true }

@@ -568,12 +568,11 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         let mut runner = lvqr_transcode::TranscodeRunner::new();
         let skip_suffixes: Vec<String> = config.transcode_renditions.iter().map(|r| r.name.clone()).collect();
         for spec in &config.transcode_renditions {
-            // Session 156: switch the per-rendition video factory on
-            // the operator's `--transcode-encoder` choice. The
-            // VideoToolbox arm only exists when the binary was built
-            // with `--features hw-videotoolbox`; CLI parsing already
-            // rejected the `videotoolbox` value on builds without it,
-            // so the match is exhaustive at the live cfg.
+            // Switch the per-rendition video factory on the operator's
+            // `--transcode-encoder` choice. Each HW arm only exists
+            // when the binary was built with the matching `hw-*`
+            // feature; CLI parsing rejected unsupported values at
+            // parse time, so the match is exhaustive at the live cfg.
             runner = match config.transcode_encoder {
                 config::TranscodeEncoderKind::Software => runner.with_factory(
                     lvqr_transcode::SoftwareTranscoderFactory::new(spec.clone(), shared_registry.clone())
@@ -582,6 +581,21 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                 #[cfg(feature = "hw-videotoolbox")]
                 config::TranscodeEncoderKind::VideoToolbox => runner.with_factory(
                     lvqr_transcode::VideoToolboxTranscoderFactory::new(spec.clone(), shared_registry.clone())
+                        .skip_source_suffixes(skip_suffixes.clone()),
+                ),
+                #[cfg(feature = "hw-nvenc")]
+                config::TranscodeEncoderKind::Nvenc => runner.with_factory(
+                    lvqr_transcode::NvencTranscoderFactory::new(spec.clone(), shared_registry.clone())
+                        .skip_source_suffixes(skip_suffixes.clone()),
+                ),
+                #[cfg(feature = "hw-vaapi")]
+                config::TranscodeEncoderKind::Vaapi => runner.with_factory(
+                    lvqr_transcode::VaapiTranscoderFactory::new(spec.clone(), shared_registry.clone())
+                        .skip_source_suffixes(skip_suffixes.clone()),
+                ),
+                #[cfg(feature = "hw-qsv")]
+                config::TranscodeEncoderKind::Qsv => runner.with_factory(
+                    lvqr_transcode::QsvTranscoderFactory::new(spec.clone(), shared_registry.clone())
                         .skip_source_suffixes(skip_suffixes.clone()),
                 ),
             };
