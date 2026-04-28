@@ -32,6 +32,26 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
+      # Ubuntu-latest GitHub-hosted runners ship with ~14 GB free + ~30 GB
+      # of preinstalled tooling (Android SDK, .NET, Haskell, CodeQL,
+      # preloaded Docker images, swap) that LVQR doesn't use. The full
+      # workspace `cargo build` + `cargo test` + the rust-cache restore
+      # routinely pushes past that ceiling and crashes the runner with
+      # `IOException: No space left on device` mid-test. The free-disk
+      # action prunes ~30 GB up front so the build has headroom. The
+      # action is Linux-only (it operates on apt packages and Linux
+      # paths); macOS runners use a different image and do not need it.
+      - name: Free disk space (Linux only)
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -129,6 +149,22 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     steps:
+      # See `test` job above: free ~30 GB of preinstalled tooling the
+      # Docker build does not need so the layer cache + the multi-stage
+      # build do not race the runner's disk ceiling. We keep the
+      # preinstalled Docker images here too -- the LVQR Dockerfile
+      # builds from a Rust base it pulls itself, so the runner's
+      # preloaded images are unused weight.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
       - uses: actions/checkout@v4
       - name: Build Docker image
         run: docker build -f deploy/docker/Dockerfile .
