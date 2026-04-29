@@ -255,7 +255,27 @@ impl Manifest {
         // Apple LL-HLS requirement that EXT-X-INDEPENDENT-SEGMENTS
         // be present whenever the invariant holds.
         let _ = writeln!(out, "#EXT-X-INDEPENDENT-SEGMENTS");
-        let _ = writeln!(out, "#EXT-X-TARGETDURATION:{}", self.target_duration_secs);
+        // RFC 8216bis §4.4.3.1: TARGETDURATION must be the integer
+        // ceiling of the longest Media Segment in the playlist. Trust
+        // the configured value as a FLOOR (operators can over-declare
+        // a roomier target) but never under-declare; if a segment
+        // closed slightly longer than the configured target (e.g. 2.001 s
+        // when the configured target is 2 s), strict players including
+        // hls.js + Apple mediastreamvalidator reject the manifest with
+        // a fatal MANIFEST_PARSING_ERROR. Compute the observed ceiling
+        // off `Segment.duration_ticks / timescale` and take the max.
+        let observed_ceil = self
+            .segments
+            .iter()
+            .map(|s| s.duration_ticks)
+            .max()
+            .map(|ticks| {
+                let ts = self.timescale.max(1) as u64;
+                ticks.div_ceil(ts) as u32
+            })
+            .unwrap_or(0);
+        let effective_target = self.target_duration_secs.max(observed_ceil);
+        let _ = writeln!(out, "#EXT-X-TARGETDURATION:{}", effective_target);
         // EXT-X-SERVER-CONTROL line. CAN-SKIP-UNTIL is appended
         // when Some so LL-HLS clients know the server supports
         // the `_HLS_skip=YES` delivery directive.
@@ -933,6 +953,38 @@ mod tests {
         assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:0"));
         assert!(text.contains("#EXTINF:"));
         assert!(text.contains("seg-0.m4s"));
+    }
+
+    #[test]
+    fn render_target_duration_ceils_observed_segment_when_over_configured() {
+        // Configured target is 2 s but the encoder closes a segment at
+        // 2.1 s (189_000 ticks at the default 90 kHz timescale). RFC
+        // 8216bis §4.4.3.1 requires TARGETDURATION to round UP to the
+        // longest segment in the playlist; under-declaring is a fatal
+        // parse error in hls.js and Apple mediastreamvalidator. The
+        // renderer must emit `:3` here, not the configured `:2`.
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        // Two parts inside the segment summing to 189_000 ticks
+        // (105_000 + 84_000). The first carries the keyframe so the
+        // segment closes on the next push.
+        b.push(&mk_chunk(0, 105_000, CmafChunkKind::Segment)).unwrap();
+        b.push(&mk_chunk(105_000, 84_000, CmafChunkKind::Partial)).unwrap();
+        // Force the segment to close so it lands in `segments`.
+        b.close_pending_segment();
+        let text = b.manifest().render();
+        assert!(
+            text.contains("#EXT-X-TARGETDURATION:3"),
+            "expected ceil(2.1)=3; got:\n{text}"
+        );
+        // Configured floor still applies when no segment exceeds it.
+        let mut b2 = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        b2.push(&mk_chunk(0, 90_000, CmafChunkKind::Segment)).unwrap();
+        b2.close_pending_segment();
+        let text2 = b2.manifest().render();
+        assert!(
+            text2.contains("#EXT-X-TARGETDURATION:2"),
+            "configured floor not honored; got:\n{text2}"
+        );
     }
 
     #[test]
