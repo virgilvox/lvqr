@@ -30,6 +30,12 @@ const enableAudio = ref(true);
 const resolution = ref<'480p' | '720p' | '1080p'>('720p');
 const frameRate = ref(30);
 const previewVideo = ref<HTMLVideoElement | null>(null);
+// Operator override of the auto-derived WHIP URL. Empty means "use the
+// computed default below". Critical when the connection profile's
+// whipPort isn't set and the relay binds WHIP on a non-default port; the
+// override surfaces inline so the operator does not have to detour
+// through the connection drawer.
+const whipOverride = ref<string>('');
 
 const resolutionToConstraints = computed<{ width?: number; height?: number }>(() => {
   switch (resolution.value) {
@@ -40,12 +46,40 @@ const resolutionToConstraints = computed<{ width?: number; height?: number }>(()
   return {};
 });
 
-const whipUrl = computed(() => {
+const defaultWhipUrl = computed(() => {
   if (!conn.activeProfile) return '';
   const host = profileHost(conn.activeProfile);
   const scheme = profileScheme(conn.activeProfile) === 'https:' ? 'https' : 'http';
   const port = (conn.activeProfile as { whipPort?: number }).whipPort ?? DEFAULT_PROTOCOL_PORTS.whip;
   return `${scheme}://${host}:${port}/whip/${broadcast.value}`;
+});
+
+// What we actually post against. The override wins; otherwise we fall
+// back to the URL derived from the connection profile.
+const whipUrl = computed(() => whipOverride.value.trim() || defaultWhipUrl.value);
+
+// True when the override is empty AND the default URL points at the LVQR
+// default WHIP port (8443) while the admin URL is on a non-default port.
+// That combination almost always means the operator forgot to set
+// whipPort on their connection profile, so we surface a one-liner hint
+// rather than letting them eat a "Failed to fetch" later.
+const portMismatchHint = computed(() => {
+  if (!conn.activeProfile) return null;
+  if (whipOverride.value.trim()) return null;
+  const overrides = conn.activeProfile as { whipPort?: number };
+  if (overrides.whipPort != null) return null;
+  try {
+    const adminUrl = new URL(conn.activeProfile.baseUrl);
+    if (!adminUrl.port) return null;
+    const adminPort = parseInt(adminUrl.port, 10);
+    if (Number.isNaN(adminPort)) return null;
+    // 8080 is the documented admin default; only flag when admin is on a
+    // non-default port (suggesting the rest are non-default too).
+    if (adminPort === 8080) return null;
+    return `Admin is on :${adminPort} but WHIP defaults to :${DEFAULT_PROTOCOL_PORTS.whip}. If your relay's WHIP listener is elsewhere, set the WHIP port in the connection profile (Advanced) or paste the full URL in the override field.`;
+  } catch {
+    return null;
+  }
 });
 
 async function mintKey() {
@@ -261,12 +295,35 @@ const urls = computed(() =>
               <Button v-else variant="danger" @click="stop">Stop</Button>
             </div>
 
-            <p class="endpoint">
-              <span>WHIP endpoint</span>
-              <code>{{ whipUrl }}</code>
-            </p>
+            <div class="endpoint">
+              <label>
+                <span>WHIP endpoint</span>
+                <input
+                  v-model="whipOverride"
+                  :placeholder="defaultWhipUrl"
+                  :disabled="publisher.isPublishing.value"
+                />
+              </label>
+              <p class="endpoint-effective" v-if="whipOverride.trim()">
+                using override; default would be <code>{{ defaultWhipUrl }}</code>
+              </p>
+              <p class="endpoint-effective" v-else>
+                derived from connection profile; will POST to <code>{{ defaultWhipUrl }}</code>
+              </p>
+              <p v-if="portMismatchHint" class="warn-hint">
+                {{ portMismatchHint }}
+              </p>
+            </div>
             <p v-if="publisher.lastError.value" class="err">
               {{ publisher.lastError.value.message }}
+              <span v-if="/Failed to fetch/i.test(publisher.lastError.value.message)" class="err-hint">
+                <br />The browser could not reach the WHIP endpoint. Common
+                fixes: (1) confirm the WHIP port matches your relay
+                (<code>{{ whipUrl }}</code>); (2) the relay's WHIP listener
+                may not be enabled (boot with <code>--whip-port</code>);
+                (3) cross-origin block (LVQR v1.0.0 had no CORS layer on
+                WHIP -- rebuild from <code>main</code> for the fix).
+              </span>
             </p>
           </Card>
 
@@ -462,20 +519,60 @@ export default { components: { Icon } };
   margin-top: var(--s-3);
   padding-top: var(--s-3);
   border-top: 1px solid var(--chalk);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.endpoint label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.endpoint label > span {
   font-family: var(--font-mono);
   font-size: 10px;
-  color: var(--ink-faint);
+  letter-spacing: 0.15em;
   text-transform: uppercase;
-  letter-spacing: 0.12em;
+  color: var(--ink-faint);
 }
-.endpoint code {
+.endpoint input {
+  border: 1px solid var(--chalk-hi);
+  background: var(--paper-hi);
+  padding: 5px 8px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+.endpoint-effective {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-muted);
+}
+.endpoint-effective code {
+  background: var(--chalk-lo);
+  padding: 1px 5px;
+  border: 1px solid var(--chalk-hi);
+}
+.warn-hint {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--warn);
+  background: rgba(217, 119, 6, 0.06);
+  border: 1px solid var(--warn);
+  padding: var(--s-2);
+  line-height: 1.55;
+}
+.err-hint {
   display: block;
   margin-top: 4px;
-  font-size: 11px;
+  color: var(--ink-muted);
+  font-size: 10px;
+  font-weight: 400;
+}
+.err-hint code {
+  background: rgba(220, 38, 38, 0.06);
+  padding: 1px 5px;
+  border: 1px solid var(--on-air);
   color: var(--ink);
-  word-break: break-all;
-  text-transform: none;
-  letter-spacing: 0;
 }
 .err {
   margin-top: var(--s-3);
