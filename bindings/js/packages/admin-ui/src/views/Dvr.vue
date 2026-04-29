@@ -6,7 +6,7 @@ import EmptyState from '@/components/ui/EmptyState.vue';
 import { useStreamsStore } from '@/stores/streams';
 import { useConnectionStore } from '@/stores/connection';
 import { usePolling } from '@/composables/usePolling';
-import { joinUrl } from '@/api/url';
+import { broadcastUrls } from '@/api/protocolUrls';
 import '@lvqr/dvr-player';
 
 const streams = useStreamsStore();
@@ -15,12 +15,16 @@ const conn = useConnectionStore();
 usePolling(() => streams.fetch(), { intervalMs: 10_000 });
 
 const selected = ref<string>('');
-const baseUrl = computed(() => conn.activeProfile?.baseUrl ?? '');
-const streamSrc = computed(() =>
-  selected.value && baseUrl.value
-    ? joinUrl(baseUrl.value, `/hls/${encodeURIComponent(selected.value)}/master.m3u8`)
-    : '',
-);
+// Pull the HLS URL from the broadcastUrls helper, which honors the
+// connection profile's per-protocol port overrides. Using joinUrl
+// against the admin baseUrl was a real bug -- LVQR binds HLS on a
+// separate port (8888 by default, configurable via --hls-port) and
+// hitting the admin port for an HLS playlist returns 404 / a hls.js
+// `manifestLoadError`.
+const streamSrc = computed(() => {
+  if (!selected.value || !conn.activeProfile) return '';
+  return broadcastUrls(conn.activeProfile, selected.value, conn.activeProfile.bearerToken).subscribe.hls;
+});
 </script>
 
 <template>
