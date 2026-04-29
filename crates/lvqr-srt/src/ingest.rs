@@ -175,6 +175,13 @@ struct ConnectionState {
     /// time. Needed for the default duration fallback (1024
     /// samples at the track's native rate).
     audio_timescale: u32,
+    /// MPEG-TS `stream_type` values we have already warned about
+    /// for this connection. Keeps the `warn!` line one-per-codec
+    /// per session so a stream that ships an unsupported codec
+    /// in every PES packet does not flood the log; the
+    /// `lvqr_srt_unknown_stream_type_drops_total` counter still
+    /// increments unconditionally.
+    unknown_stream_types_seen: std::collections::HashSet<u8>,
 }
 
 async fn handle_connection(
@@ -196,6 +203,7 @@ async fn handle_connection(
         prev_video_dts: None,
         prev_audio_dts: None,
         audio_timescale: 44100,
+        unknown_stream_types_seen: std::collections::HashSet::new(),
     };
 
     loop {
@@ -246,7 +254,32 @@ fn process_pes(state: &mut ConnectionState, broadcast: &str, pes: &PesPacket, re
             // to keep the match exhaustive.
         }
         StreamType::Unknown(st) => {
-            debug!(%broadcast, stream_type = st, "SRT unknown stream type; dropping PES");
+            // Operator-visible. The previous `debug!` left HEVC / AV1
+            // over MPEG-TS (stream_type 0x24 / 0x42) silently dropped
+            // unless the deployment was running with RUST_LOG=debug,
+            // which is rare in production. A `warn!` plus a Prometheus
+            // counter labelled by stream_type lets dashboards alert on
+            // unsupported-codec drops without pulling logs. We log the
+            // first occurrence per (broadcast, stream_type) at warn and
+            // route the rest to debug to avoid log floods, but the
+            // counter increments unconditionally so the drop rate is
+            // observable.
+            let first = state.unknown_stream_types_seen.insert(st);
+            if first {
+                warn!(
+                    %broadcast,
+                    stream_type = st,
+                    "SRT carries unsupported stream_type; dropping PES (first occurrence; subsequent drops at debug)"
+                );
+            } else {
+                debug!(%broadcast, stream_type = st, "SRT unsupported stream_type; dropping PES");
+            }
+            metrics::counter!(
+                "lvqr_srt_unknown_stream_type_drops_total",
+                "broadcast" => broadcast.to_string(),
+                "stream_type" => format!("{st:#04x}"),
+            )
+            .increment(1);
         }
     }
 }
@@ -695,6 +728,7 @@ mod tests {
             prev_video_dts: None,
             prev_audio_dts: None,
             audio_timescale: 44100,
+            unknown_stream_types_seen: std::collections::HashSet::new(),
         };
 
         let mut annex_b = Vec::new();
@@ -771,6 +805,7 @@ mod tests {
             prev_video_dts: None,
             prev_audio_dts: None,
             audio_timescale: 44100,
+            unknown_stream_types_seen: std::collections::HashSet::new(),
         };
 
         // Build an Annex-B HEVC access unit: VPS + SPS + PPS + IDR slice.
@@ -832,6 +867,7 @@ mod tests {
             prev_video_dts: None,
             prev_audio_dts: None,
             audio_timescale: 0,
+            unknown_stream_types_seen: std::collections::HashSet::new(),
         };
 
         // Build a minimal ADTS frame: header (7 bytes) + 8 bytes of

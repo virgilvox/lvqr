@@ -27,6 +27,7 @@ lvqr-admin = { workspace = true }
 lvqr-cmaf = { workspace = true }
 lvqr-core = { workspace = true }
 lvqr-ingest = { workspace = true }
+metrics = { workspace = true }
 rand = { workspace = true }
 str0m = "0.18"
 thiserror = { workspace = true }

@@ -794,7 +794,10 @@ fn write_sample(
             // AAC -> Opus transcoder, so WHEP drops these
             // samples here. Warn once per session so a
             // misconfigured RTMP-to-WHEP flow is obvious in
-            // the logs without spamming.
+            // the logs without spamming. The Prometheus
+            // counter increments unconditionally so the drop
+            // rate is visible to dashboards even after the
+            // one-shot warn fires.
             if !ctx.unmatched_codec_logged {
                 ctx.unmatched_codec_logged = true;
                 tracing::warn!(
@@ -802,6 +805,13 @@ fn write_sample(
                     "whep: AAC audio publisher -> Opus-only subscriber surface; dropping audio (no transcoder)",
                 );
             }
+            metrics::counter!(
+                "lvqr_whep_codec_mismatch_drops_total",
+                "broadcast" => broadcast.to_string(),
+                "codec" => "aac",
+                "reason" => "no_transcoder",
+            )
+            .increment(1);
             return Ok(false);
         }
     };
@@ -817,6 +827,23 @@ fn write_sample(
                 "whep: publisher codec not present in subscriber offer; dropping samples"
             );
         }
+        // Same observability story as the AAC branch above: the warn
+        // is one-shot, but every dropped sample increments the
+        // counter so a stream that mismatches throughout its lifetime
+        // surfaces as a non-zero rate on the dashboard.
+        let codec_label = match codec {
+            MediaCodec::H264 => "h264",
+            MediaCodec::H265 => "h265",
+            MediaCodec::Aac => "aac",
+            MediaCodec::Opus => "opus",
+        };
+        metrics::counter!(
+            "lvqr_whep_codec_mismatch_drops_total",
+            "broadcast" => broadcast.to_string(),
+            "codec" => codec_label,
+            "reason" => "no_subscriber_pt",
+        )
+        .increment(1);
         return Ok(false);
     };
 
