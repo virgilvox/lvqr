@@ -6,6 +6,14 @@ summarises shipped + unreleased work between PyPI releases. For
 session-by-session engineering notes see
 [`tracking/HANDOFF.md`](../../tracking/HANDOFF.md).
 
+## [1.0.0] - 2026-04-28
+
+Stability commitment for the Python admin client. Same source as
+0.3.3; the version label moves with the rest of the SDK family
+(`@lvqr/core`, `@lvqr/dvr-player`, `@lvqr/player`,
+`@lvqr/admin-ui`) and the Rust workspace. No API change; every
+method on `LvqrClient` keeps its existing signature.
+
 ## [0.3.3] - 2026-04-28
 
 Cross-language SDK release wave alongside `@lvqr/core` 0.3.3

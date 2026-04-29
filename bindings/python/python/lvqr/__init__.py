@@ -1,6 +1,6 @@
 """LVQR - Live Video QUIC Relay Python client."""
 
-__version__ = "0.3.2"
+__version__ = "1.0.0"
 
 from .client import LvqrClient
 from .types import (

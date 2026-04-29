@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lvqr"
-version = "0.3.3"
+version = "1.0.0"
 description = "LVQR client for Python - Live Video QUIC Relay admin and monitoring"
 license = {text = "MIT OR Apache-2.0"}
 requires-python = ">=3.9"

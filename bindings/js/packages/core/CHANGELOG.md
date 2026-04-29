@@ -6,6 +6,20 @@ file summarises shipped + unreleased work between npm releases.
 For session-by-session engineering notes see
 [`tracking/HANDOFF.md`](../../../../tracking/HANDOFF.md).
 
+## [1.0.0] - 2026-04-28
+
+Stability commitment for the admin client surface. Same source as
+0.3.3; the version label moves with the rest of the SDK family
+(`@lvqr/dvr-player`, `@lvqr/player`, `@lvqr/admin-ui`) and the Rust
+workspace + Python `lvqr`. No API change.
+
+### Changed
+
+* **Renamed 0.3.3 -> 1.0.0.** Every method on `LvqrAdminClient`
+  keeps its existing signature; every TypeScript interface keeps
+  its existing shape. Consumers upgrading from 0.3.3 do not need
+  to touch their code beyond the version pin.
+
 ## [0.3.3] - 2026-04-28
 
 Cross-language SDK release wave alongside Python `lvqr` 0.3.3

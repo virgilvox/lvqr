@@ -1,0 +1,56 @@
+{
+  "name": "@lvqr/admin-ui",
+  "version": "1.0.0",
+  "description": "LVQR operator admin console - Vue 3 SPA for managing one or many LVQR relays",
+  "license": "MIT OR Apache-2.0",
+  "author": "Moheeb Zara <hackbuildvideo@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/virgilvox/lvqr",
+    "directory": "bindings/js/packages/admin-ui"
+  },
+  "type": "module",
+  "main": "dist/index.html",
+  "files": [
+    "dist",
+    "src",
+    "index.html",
+    "vite.config.ts",
+    "tsconfig.json",
+    "tsconfig.node.json",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test:unit": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "lvqr",
+    "admin",
+    "console",
+    "vue",
+    "streaming",
+    "video",
+    "operator"
+  ],
+  "dependencies": {
+    "@lvqr/core": "1.0.0",
+    "@lvqr/dvr-player": "1.0.0",
+    "pinia": "^2.2.0",
+    "vue": "^3.5.0",
+    "vue-router": "^4.4.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.1.0",
+    "@vue/test-utils": "^2.4.6",
+    "jsdom": "^25.0.0",
+    "typescript": "^5.0.0",
+    "vite": "^5.4.0",
+    "vitest": "^2.0.0",
+    "vue-tsc": "^2.1.0"
+  }
+}

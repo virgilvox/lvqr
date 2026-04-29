@@ -6,7 +6,8 @@
   "scripts": {
     "build": "npm --workspaces --if-present run build",
     "test:e2e": "playwright test",
-    "test:sdk": "vitest run"
+    "test:sdk": "vitest run",
+    "test:admin-ui": "npm --workspace @lvqr/admin-ui run test:unit"
   },
   "devDependencies": {
     "@playwright/test": "^1.49.0",

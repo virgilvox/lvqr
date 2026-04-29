@@ -6,6 +6,13 @@ truth; this file summarises shipped + unreleased work between
 npm releases. For session-by-session engineering notes see
 [`tracking/HANDOFF.md`](../../../../tracking/HANDOFF.md).
 
+## [1.0.0] - 2026-04-28
+
+Stability commitment for the DVR scrub component. Same source as
+0.3.3; the version label moves with the rest of the SDK family. No
+API change; every attribute, event, and shadow part keeps its
+existing shape.
+
 ## [0.3.3] - 2026-04-28
 
 First publish to npm. The package was scaffolded at version

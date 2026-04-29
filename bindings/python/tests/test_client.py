@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
+import lvqr
 from lvqr import (
     BroadcastSummary,
     ClusterNodeView,
@@ -22,6 +23,15 @@ from lvqr import (
     WasmFilterSlotStats,
     WasmFilterState,
 )
+
+
+class TestPackageMetadata:
+    def test_version_matches_pyproject(self):
+        # Lock the importable __version__ so it cannot drift from
+        # pyproject.toml without the test catching the skew. The two
+        # diverged silently across the 0.3.2 -> 0.3.3 -> 1.0.0 wave
+        # before this guard landed.
+        assert lvqr.__version__ == "1.0.0"
 
 
 class TestTypes:

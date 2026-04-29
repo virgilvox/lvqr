@@ -6,6 +6,51 @@ summarises user-visible surface changes between tagged
 releases. For session-by-session engineering notes, see
 `tracking/HANDOFF.md`.
 
+## [1.0.0] - 2026-04-28
+
+Stability commitment for the v0.4 surface. The 0.4.2 wave (sessions
+156-162 + the 2026-04-28 audit cycle) closed the last open v1.1 plan
+row (Phase A v1.1 #5, the pure-MoQ glass-to-glass SLO close-out via
+the sidecar `0.timing` track), shipped four hardware encoder backends
+instead of the planned one (VideoToolbox + NVENC + VA-API + QSV),
+landed adversarial test coverage on every security-critical surface
+(JWT expiration / wrong-secret / tampered-payload, JWKS expired /
+wrong-keypair, stream-key TTL real-time expiry, SCTE-35 mutated-byte
+proptest, C2PA tamper-detection round-trip, cross-agent panic
+isolation), restructured CI to a Linux-required / macOS-informational
+gate, and rewrote the README around the operator-facing capability
+shape rather than competitive positioning. v1.0.0 publishes the same
+artefact as v0.4.2 with a stability-commitment version label.
+
+### Added
+
+* **`@lvqr/admin-ui` 1.0.0** -- new sister npm package shipping the
+  operator admin console. Vue 3 + Vite + TypeScript + Pinia + Vue
+  Router; static SPA build; design tokens lifted from
+  `mockups/tallyboard-storybook.html`; mobile-first responsive
+  layout; multi-relay connection profiles via localStorage; plugin
+  plumbing via `window.__LVQR_ADMIN_PLUGINS__`. Wires every shipped
+  `/api/v1/*` route through `@lvqr/core 1.0.0`'s `LvqrAdminClient`;
+  surfaces a clear placeholder + v1.x backlog hint for views the
+  server does not currently expose (recordings list, transcode-edit,
+  agent-edit, log tail, full config GET/PUT, WASM chain edit). See
+  `bindings/js/packages/admin-ui/README.md` for deployment recipes
+  (local dev, Digital Ocean App Platform, nginx static-host,
+  multi-relay).
+
+### Changed
+
+* **Workspace renamed 0.4.2 -> 1.0.0.** No code change beyond the
+  version label; every Rust crate published to crates.io as 1.0.0
+  carries the same source as the 0.4.2 tag. v1.0.0 is a stability
+  commitment, not a refactor.
+* **JS SDK family renamed to 1.0.0.** `@lvqr/core` 0.3.3 -> 1.0.0,
+  `@lvqr/dvr-player` 0.3.3 -> 1.0.0, `@lvqr/player` 0.3.2 -> 1.0.0
+  with its `@lvqr/core` dep pinned exact at `1.0.0` (matches the
+  pre-existing exact-pin pattern that prevents semver drift on the
+  player surface).
+* **Python `lvqr` renamed to 1.0.0.** No API change vs. 0.3.3.
+
 ## [0.4.2] - 2026-04-28
 
 ### Added

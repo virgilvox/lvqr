@@ -825,11 +825,12 @@ so the addition is non-breaking.
 
 | Package | Install | Surface |
 |---|---|---|
-| `lvqr-core` (Rust) | `cargo add lvqr-core` | Shared types, `EventBus`, admin client. Latest: 0.4.2 (crates.io). |
-| `@lvqr/core` (TS) | `npm i @lvqr/core` | MoQ-Lite subscriber over WebTransport, WebSocket fMP4 fallback, full admin client (`configReload` / `triggerConfigReload` + `listStreamKeys` / `mintStreamKey` / `revokeStreamKey` / `rotateStreamKey` plus health / stats / mesh / SLO / wasm-filter), `MeshPeer` WebRTC DataChannel relay with `pushFrame` + `onChildOpen` + `parentPeerId` + `forwardedFrameCount` + `MeshConfig.capacity`. Latest: 0.3.3. |
-| `@lvqr/player` | `npm i @lvqr/player` | Drop-in `<lvqr-player>` web component with MSE fallback. Latest: 0.3.2. |
-| `@lvqr/dvr-player` | `npm i @lvqr/dvr-player` | Drop-in `<lvqr-dvr-player>` HLS DVR scrub component with custom seek bar, LIVE pill, Go Live, hover thumbnails, SCTE-35 ad-break marker rendering (`markers="visible/hidden"` + `lvqr-dvr-markers-changed` / `lvqr-dvr-marker-crossed` events + `getMarkers()` API), opt-in client-side glass-to-glass SLO sampler. Latest: 0.3.3. |
-| `lvqr` (Python) | `pip install lvqr` | Admin API client (`config_reload_status` / `trigger_config_reload`, `list_streamkeys` / `mint_streamkey` / `revoke_streamkey` / `rotate_streamkey`, plus health / stats / mesh / SLO / wasm-filter), `bearer_token` kwarg, dataclass returns. Latest: 0.3.3. |
+| `lvqr-core` (Rust) | `cargo add lvqr-core` | Shared types, `EventBus`, admin client. Latest: 1.0.0 (crates.io). |
+| `@lvqr/core` (TS) | `npm i @lvqr/core` | MoQ-Lite subscriber over WebTransport, WebSocket fMP4 fallback, full admin client (`configReload` / `triggerConfigReload` + `listStreamKeys` / `mintStreamKey` / `revokeStreamKey` / `rotateStreamKey` plus health / stats / mesh / SLO / wasm-filter), `MeshPeer` WebRTC DataChannel relay with `pushFrame` + `onChildOpen` + `parentPeerId` + `forwardedFrameCount` + `MeshConfig.capacity`. Latest: 1.0.0. |
+| `@lvqr/player` | `npm i @lvqr/player` | Drop-in `<lvqr-player>` web component with MSE fallback. Latest: 1.0.0. |
+| `@lvqr/dvr-player` | `npm i @lvqr/dvr-player` | Drop-in `<lvqr-dvr-player>` HLS DVR scrub component with custom seek bar, LIVE pill, Go Live, hover thumbnails, SCTE-35 ad-break marker rendering (`markers="visible/hidden"` + `lvqr-dvr-markers-changed` / `lvqr-dvr-marker-crossed` events + `getMarkers()` API), opt-in client-side glass-to-glass SLO sampler. Latest: 1.0.0. |
+| `@lvqr/admin-ui` | `npm i @lvqr/admin-ui` | Operator admin console -- Vue 3 SPA wired against every `/api/v1/*` route. Multi-relay connection profiles, themable via CSS custom properties, plugin plumbing via `window.__LVQR_ADMIN_PLUGINS__`. Static-deploy behind any host (nginx, Caddy, Digital Ocean App Platform). Latest: 1.0.0. |
+| `lvqr` (Python) | `pip install lvqr` | Admin API client (`config_reload_status` / `trigger_config_reload`, `list_streamkeys` / `mint_streamkey` / `revoke_streamkey` / `rotate_streamkey`, plus health / stats / mesh / SLO / wasm-filter), `bearer_token` kwarg, dataclass returns. Latest: 1.0.0. |
 
 Full TypeScript reference: [`docs/sdk/javascript.md`](docs/sdk/javascript.md).
 Python module: [`bindings/python/python/lvqr/`](bindings/python/python/lvqr/).

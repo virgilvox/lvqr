@@ -1,0 +1,71 @@
+/* =============================================================================
+ * Tallyboard design tokens
+ *
+ * Single source of truth for the admin console's visual contract. Every
+ * component reads from these custom properties; theming the UI is a matter of
+ * overriding tokens in a sibling stylesheet, not touching component CSS.
+ *
+ * Lifted verbatim from `mockups/tallyboard-storybook.html`. Keep in sync; if
+ * the storybook adds a new token, mirror it here.
+ * ========================================================================= */
+
+:root {
+  /* surfaces */
+  --bone: #f5f1e8;
+  --paper: #faf7f0;
+  --paper-hi: #fffcf4;
+  --chalk: #e9e2d2;
+  --chalk-hi: #d9cfba;
+  --chalk-lo: #efe9d9;
+
+  /* ink */
+  --ink: #14202e;
+  --ink-light: #2d3d54;
+  --ink-muted: #5a6b80;
+  --ink-faint: #8a98a8;
+  --ink-ghost: #b8c1cc;
+
+  /* primary - tally amber */
+  --tally: #e8751a;
+  --tally-deep: #c25d0d;
+  --tally-bright: #f59447;
+  --tally-glow: rgba(232, 117, 26, 0.18);
+  --tally-wash: rgba(232, 117, 26, 0.08);
+
+  /* secondary - wire cyan */
+  --wire: #0e7490;
+  --wire-bright: #06b6d4;
+  --wire-deep: #075561;
+  --wire-glow: rgba(14, 116, 144, 0.15);
+  --wire-wash: rgba(14, 116, 144, 0.06);
+
+  /* status */
+  --on-air: #dc2626;
+  --on-air-glow: rgba(220, 38, 38, 0.4);
+  --ready: #16a34a;
+  --warn: #d97706;
+  --idle: #8a98a8;
+
+  /* type */
+  --font-display: 'Instrument Serif', serif;
+  --font-body: 'Figtree', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  /* spacing */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+  --s-7: 48px;
+  --s-8: 64px;
+
+  /* layout */
+  --rail-w: 236px;
+  --topbar-h: 56px;
+  --statusbar-h: 28px;
+
+  /* breakpoints (consumed via @media; documented here for grep) */
+  /* sm: 640px, md: 768px, lg: 1024px, xl: 1280px */
+}
