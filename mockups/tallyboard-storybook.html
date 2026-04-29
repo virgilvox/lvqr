@@ -1,0 +1,2116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tallyboard · Design System</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Figtree:ital,wght@0,300..900;1,300..900&family=JetBrains+Mono:ital,wght@0,300..800;1,300..800&display=swap" rel="stylesheet">
+<style>
+/* ============================================================================
+   TALLYBOARD · Design System Storybook
+   The console aesthetic for LVQR. bone · ink · tally amber · wire cyan
+   ============================================================================ */
+:root {
+  /* surfaces */
+  --bone:#f5f1e8;
+  --paper:#faf7f0;
+  --paper-hi:#fffcf4;
+  --chalk:#e9e2d2;
+  --chalk-hi:#d9cfba;
+  --chalk-lo:#efe9d9;
+
+  /* ink */
+  --ink:#14202e;
+  --ink-light:#2d3d54;
+  --ink-muted:#5a6b80;
+  --ink-faint:#8a98a8;
+  --ink-ghost:#b8c1cc;
+
+  /* primary · tally amber */
+  --tally:#e8751a;
+  --tally-deep:#c25d0d;
+  --tally-bright:#f59447;
+  --tally-glow:rgba(232,117,26,0.18);
+  --tally-wash:rgba(232,117,26,0.08);
+
+  /* secondary · wire cyan */
+  --wire:#0e7490;
+  --wire-bright:#06b6d4;
+  --wire-deep:#075561;
+  --wire-glow:rgba(14,116,144,0.15);
+  --wire-wash:rgba(14,116,144,0.06);
+
+  /* status */
+  --on-air:#dc2626;
+  --on-air-glow:rgba(220,38,38,0.4);
+  --ready:#16a34a;
+  --warn:#d97706;
+  --idle:#8a98a8;
+
+  /* type */
+  --font-display:'Instrument Serif', serif;
+  --font-body:'Figtree', sans-serif;
+  --font-mono:'JetBrains Mono', monospace;
+
+  /* spacing */
+  --s-1:4px;
+  --s-2:8px;
+  --s-3:12px;
+  --s-4:16px;
+  --s-5:24px;
+  --s-6:32px;
+  --s-7:48px;
+  --s-8:64px;
+
+  --rail-w:240px;
+}
+
+*{margin:0;padding:0;box-sizing:border-box;}
+html{scroll-behavior:smooth;}
+body{
+  font-family:var(--font-body);
+  font-size:14px;
+  line-height:1.55;
+  color:var(--ink);
+  background:var(--bone);
+  -webkit-font-smoothing:antialiased;
+}
+a{color:inherit;text-decoration:none;}
+button{font-family:inherit;font-size:inherit;cursor:pointer;border:none;background:none;color:inherit;}
+input,textarea,select{font-family:inherit;font-size:inherit;color:inherit;}
+::selection{background:var(--tally);color:var(--paper);}
+
+/* paper-grain noise */
+body::before{
+  content:"";
+  position:fixed;
+  inset:0;
+  background-image:
+    radial-gradient(circle at 6% 0%, rgba(232,117,26,0.04) 0%, transparent 32%),
+    radial-gradient(circle at 94% 100%, rgba(14,116,144,0.04) 0%, transparent 32%);
+  pointer-events:none;
+  z-index:0;
+}
+
+/* ============================================================================
+   STORYBOOK SHELL
+   ============================================================================ */
+.sb-app{
+  display:grid;
+  grid-template-columns:var(--rail-w) 1fr;
+  min-height:100vh;
+  position:relative;
+  z-index:1;
+}
+
+/* sidebar */
+.sb-rail{
+  background:var(--paper);
+  border-right:1px solid var(--chalk-hi);
+  padding:var(--s-5) 0;
+  position:sticky;
+  top:0;
+  height:100vh;
+  overflow-y:auto;
+}
+.sb-rail::-webkit-scrollbar{width:6px;}
+.sb-rail::-webkit-scrollbar-thumb{background:var(--chalk-hi);}
+.sb-brand{
+  padding:0 var(--s-5) var(--s-4);
+  border-bottom:1px solid var(--chalk);
+  margin-bottom:var(--s-3);
+}
+.sb-brand-mark{
+  font-family:var(--font-display);
+  font-size:32px;
+  letter-spacing:-0.02em;
+  line-height:1;
+  color:var(--ink);
+}
+.sb-brand-mark em{
+  font-style:italic;
+  color:var(--tally-deep);
+}
+.sb-brand-mark .dot{
+  display:inline-block;
+  width:8px;height:8px;
+  background:var(--tally);
+  vertical-align:5px;
+  margin-left:2px;
+  box-shadow:0 0 12px var(--tally-glow);
+}
+.sb-brand-sub{
+  font-family:var(--font-mono);
+  font-size:10px;
+  letter-spacing:0.18em;
+  text-transform:uppercase;
+  color:var(--ink-faint);
+  margin-top:6px;
+}
+.sb-section{padding:var(--s-3) 0 var(--s-2);}
+.sb-section + .sb-section{border-top:1px solid var(--chalk);margin-top:6px;}
+.sb-label{
+  font-family:var(--font-mono);
+  font-size:9px;
+  font-weight:700;
+  letter-spacing:0.2em;
+  text-transform:uppercase;
+  color:var(--ink-faint);
+  padding:0 var(--s-5) var(--s-2);
+}
+.sb-nav{
+  display:block;
+  padding:6px var(--s-5);
+  font-size:13px;
+  color:var(--ink-light);
+  border-left:2px solid transparent;
+  transition:all 0.1s;
+  cursor:pointer;
+  font-weight:500;
+}
+.sb-nav:hover{background:var(--chalk-lo);color:var(--ink);}
+.sb-nav.active{
+  background:var(--tally-wash);
+  color:var(--ink);
+  border-left-color:var(--tally);
+  font-weight:600;
+}
+
+/* main content */
+.sb-main{
+  padding:var(--s-7) var(--s-7) var(--s-8);
+  max-width:1200px;
+}
+
+/* page-level title */
+.sb-h1{
+  font-family:var(--font-display);
+  font-size:64px;
+  font-weight:400;
+  line-height:1;
+  letter-spacing:-0.02em;
+  margin-bottom:var(--s-2);
+}
+.sb-h1 em{font-style:italic;color:var(--tally-deep);}
+.sb-h1 + p{
+  color:var(--ink-muted);
+  font-size:15px;
+  max-width:60ch;
+  margin-bottom:var(--s-7);
+  padding-bottom:var(--s-5);
+  border-bottom:1px solid var(--chalk-hi);
+}
+
+/* h2 (subsection title) */
+.sb-h2{
+  font-family:var(--font-display);
+  font-size:36px;
+  font-weight:400;
+  line-height:1.1;
+  letter-spacing:-0.01em;
+  margin:var(--s-6) 0 var(--s-3);
+  padding-top:var(--s-4);
+}
+.sb-h2 em{font-style:italic;color:var(--wire-deep);}
+.sb-h2:first-of-type{padding-top:0;margin-top:0;}
+
+/* h3 (group) */
+.sb-h3{
+  font-family:var(--font-mono);
+  font-size:11px;
+  font-weight:700;
+  letter-spacing:0.2em;
+  text-transform:uppercase;
+  color:var(--ink-faint);
+  margin:var(--s-5) 0 var(--s-3);
+  padding-bottom:8px;
+  border-bottom:1px solid var(--chalk);
+}
+
+/* prose */
+.sb-prose{color:var(--ink-light);max-width:60ch;line-height:1.65;margin-bottom:var(--s-4);}
+.sb-prose code{
+  font-family:var(--font-mono);
+  font-size:12px;
+  background:var(--chalk-lo);
+  border:1px solid var(--chalk-hi);
+  padding:1px 5px;
+}
+
+/* docblock — the "what is this and how do you use it" */
+.sb-doc{
+  background:var(--paper);
+  border-left:3px solid var(--tally);
+  padding:var(--s-3) var(--s-4);
+  margin:var(--s-3) 0 var(--s-4);
+  font-size:13px;
+  line-height:1.65;
+  color:var(--ink-light);
+  max-width:64ch;
+}
+.sb-doc strong{color:var(--ink);}
+.sb-doc.wire{border-left-color:var(--wire);}
+.sb-doc.warn{border-left-color:var(--warn);}
+
+/* page section */
+.sb-page{display:none;}
+.sb-page.active{display:block;}
+
+/* example block — wraps a live demo */
+.sb-eg{
+  background:var(--paper);
+  border:1px solid var(--chalk-hi);
+  margin-bottom:var(--s-3);
+  position:relative;
+}
+.sb-eg-head{
+  padding:8px var(--s-4);
+  border-bottom:1px solid var(--chalk);
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  background:var(--chalk-lo);
+  font-family:var(--font-mono);
+  font-size:10px;
+  letter-spacing:0.12em;
+  text-transform:uppercase;
+  color:var(--ink-faint);
+  font-weight:700;
+}
+.sb-eg-head span:last-child{color:var(--ink-muted);font-weight:400;letter-spacing:0.05em;text-transform:none;}
+.sb-eg-body{padding:var(--s-5);}
+.sb-eg-body.dark{background:var(--ink);}
+.sb-eg-body.osc{
+  position:relative;
+  background-image:
+    linear-gradient(rgba(20,32,46,0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(20,32,46,0.04) 1px, transparent 1px);
+  background-size:24px 24px;
+}
+.sb-eg-code{
+  background:var(--ink);
+  color:var(--paper);
+  font-family:var(--font-mono);
+  font-size:11px;
+  line-height:1.7;
+  padding:var(--s-3) var(--s-4);
+  overflow-x:auto;
+  border-top:1px solid var(--chalk);
+}
+.sb-eg-code .k{color:var(--tally-bright);}
+.sb-eg-code .s{color:#86efac;}
+.sb-eg-code .c{color:var(--ink-faint);font-style:italic;}
+.sb-eg-code .n{color:var(--wire-bright);}
+
+/* cluster — show several variants in a row */
+.sb-cluster{
+  display:flex;
+  flex-wrap:wrap;
+  gap:var(--s-3);
+  align-items:center;
+}
+.sb-cluster.spaced{gap:var(--s-4);}
+.sb-cluster.stacked{flex-direction:column;align-items:stretch;}
+.sb-cluster.tight{gap:var(--s-2);}
+
+/* token table */
+.sb-toktbl{
+  width:100%;
+  border-collapse:collapse;
+  background:var(--paper);
+  border:1px solid var(--chalk-hi);
+  font-family:var(--font-mono);
+  font-size:11px;
+}
+.sb-toktbl th{
+  text-align:left;
+  font-size:10px;
+  font-weight:700;
+  letter-spacing:0.15em;
+  text-transform:uppercase;
+  color:var(--ink-faint);
+  padding:8px 12px;
+  background:var(--chalk-lo);
+  border-bottom:1px solid var(--chalk-hi);
+}
+.sb-toktbl td{
+  padding:9px 12px;
+  border-bottom:1px solid var(--chalk);
+  vertical-align:middle;
+}
+.sb-toktbl tr:last-child td{border-bottom:none;}
+
+/* swatches */
+.sb-swatch-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill, minmax(160px, 1fr));
+  gap:var(--s-3);
+  margin-bottom:var(--s-4);
+}
+.sb-sw{
+  background:var(--paper);
+  border:1px solid var(--chalk-hi);
+  overflow:hidden;
+}
+.sb-sw-chip{
+  height:80px;
+  border-bottom:1px solid var(--chalk-hi);
+}
+.sb-sw-chip.bordered{border:1px solid var(--chalk-hi);border-bottom:1px solid var(--chalk-hi);}
+.sb-sw-meta{
+  padding:8px 10px;
+  font-family:var(--font-mono);
+  font-size:10px;
+  line-height:1.55;
+}
+.sb-sw-name{font-weight:700;color:var(--ink);}
+.sb-sw-var{color:var(--ink-muted);}
+.sb-sw-hex{color:var(--ink-faint);}
+
+/* type sample */
+.sb-type-sample{
+  background:var(--paper);
+  border:1px solid var(--chalk-hi);
+  padding:var(--s-5);
+  margin-bottom:var(--s-3);
+}
+.sb-type-meta{
+  font-family:var(--font-mono);
+  font-size:10px;
+  letter-spacing:0.15em;
+  text-transform:uppercase;
+  color:var(--ink-faint);
+  margin-bottom:var(--s-3);
+  padding-bottom:8px;
+  border-bottom:1px solid var(--chalk);
+}
+
+/* ============================================================================
+   PRODUCTION COMPONENTS — verbatim from the admin console
+   ============================================================================ */
+
+/* buttons */
+.btn{
+  display:inline-flex;align-items:center;gap:var(--s-2);
+  padding:7px 14px;
+  font-family:var(--font-mono);
+  font-size:11px;
+  font-weight:600;
+  letter-spacing:0.08em;
+  text-transform:uppercase;
+  border:1px solid var(--ink);
+  background:var(--paper);
+  color:var(--ink);
+  transition:all 0.1s;
+  cursor:pointer;
+}
+.btn:hover{background:var(--ink);color:var(--paper);}
+.btn-primary{background:var(--tally);border-color:var(--tally-deep);color:var(--paper);}
+.btn-primary:hover{background:var(--tally-deep);border-color:var(--ink);}
+.btn-wire{background:var(--wire);border-color:var(--wire-deep);color:var(--paper);}
+.btn-wire:hover{background:var(--wire-deep);}
+.btn-ghost{background:transparent;border-color:var(--ink-faint);color:var(--ink-muted);}
+.btn-ghost:hover{background:var(--ink);color:var(--paper);border-color:var(--ink);}
+.btn-danger{background:transparent;border-color:var(--on-air);color:var(--on-air);}
+.btn-danger:hover{background:var(--on-air);color:var(--paper);}
+.btn-sm{padding:4px 10px;font-size:10px;}
+.btn svg{width:12px;height:12px;}
+
+/* tally indicator (the signature element) */
+.tally{
+  display:inline-flex;align-items:center;gap:var(--s-2);
+  font-family:var(--font-mono);
+  font-size:10px;
+  font-weight:700;
+  letter-spacing:0.12em;
+  text-transform:uppercase;
+}
+.tally-dot{
+  width:8px;height:8px;border-radius:50%;
+  background:var(--idle);
+}
+@keyframes pulse{
+  0%,100%{opacity:1;}
+  50%{opacity:0.5;}
+}
+.tally.on-air .tally-dot{background:var(--on-air);box-shadow:0 0 10px var(--on-air-glow);animation:pulse 1.2s ease-in-out infinite;}
+.tally.on-air{color:var(--on-air);}
+.tally.live .tally-dot{background:var(--tally);box-shadow:0 0 10px var(--tally-glow);animation:pulse 1.5s ease-in-out infinite;}
+.tally.live{color:var(--tally-deep);}
+.tally.ready .tally-dot{background:var(--ready);box-shadow:0 0 8px rgba(22,163,74,0.5);}
+.tally.ready{color:var(--ready);}
+.tally.warn .tally-dot{background:var(--warn);}
+.tally.warn{color:var(--warn);}
+.tally.idle{color:var(--ink-faint);}
+
+/* pills */
+.pill{
+  display:inline-flex;align-items:center;gap:6px;
+  font-family:var(--font-mono);
+  font-size:10px;
+  font-weight:600;
+  letter-spacing:0.05em;
+  padding:3px 8px;
+  background:var(--chalk-lo);
+  color:var(--ink-muted);
+  border:1px solid var(--chalk-hi);
+  text-transform:uppercase;
+}
+.pill.tally{background:var(--tally-wash);color:var(--tally-deep);border-color:var(--tally);}
+.pill.wire{background:var(--wire-wash);color:var(--wire-deep);border-color:var(--wire);}
+.pill.air{background:rgba(220,38,38,0.08);color:var(--on-air);border-color:var(--on-air);}
+.pill.ready{background:rgba(22,163,74,0.08);color:var(--ready);border-color:var(--ready);}
+.pill.warn{background:rgba(217,119,6,0.08);color:var(--warn);border-color:var(--warn);}
+.pill.ink{background:var(--ink);color:var(--paper);border-color:var(--ink);}
+
+/* VU meter */
+.vu{
+  display:grid;
+  grid-template-columns:80px 1fr 70px;
+  gap:var(--s-3);
+  align-items:center;
+  margin-bottom:var(--s-2);
+  font-family:var(--font-mono);
+  font-size:11px;
+}
+.vu-label{color:var(--ink-muted);text-transform:uppercase;letter-spacing:0.08em;font-size:9px;font-weight:600;}
+.vu-track{
+  height:10px;
+  background:var(--chalk);
+  border:1px solid var(--chalk-hi);
+  position:relative;
+  overflow:hidden;
+}
+.vu-track::before{
+  content:"";
+  position:absolute;
+  inset:0;
+  background-image:repeating-linear-gradient(90deg,transparent 0,transparent 9px,rgba(20,32,46,0.08) 9px,rgba(20,32,46,0.08) 10px);
+  pointer-events:none;
+}
+.vu-fill{
+  height:100%;
+  background:linear-gradient(90deg, var(--ready) 0%, var(--ready) 60%, var(--warn) 75%, var(--warn) 88%, var(--on-air) 100%);
+}
+.vu-value{color:var(--ink);text-align:right;font-weight:600;}
+
+/* KPI tile */
+.kpi{
+  background:var(--paper);
+  border:1px solid var(--chalk-hi);
+  padding:var(--s-4) var(--s-5) var(--s-5);
+  position:relative;
+  overflow:hidden;
+}
+.kpi::before{
+  content:"";position:absolute;top:0;left:0;
+  width:32px;height:2px;background:var(--ink);
+}
+.kpi.tally::before{background:var(--tally);}
+.kpi.wire::before{background:var(--wire);}
+.kpi.air::before{background:var(--on-air);}
+.kpi-label{
+  font-family:var(--font-mono);
+  font-size:9px;
+  font-weight:700;
+  letter-spacing:0.18em;
+  color:var(--ink-faint);
+  text-transform:uppercase;
+  margin-bottom:var(--s-2);
+}
+.kpi-value{
+  font-family:var(--font-display);
+  font-size:48px;
+  line-height:1;
+  letter-spacing:-0.02em;
+  color:var(--ink);
+}
+.kpi-unit{
+  font-family:var(--font-mono);
+  font-size:13px;
+  color:var(--ink-muted);
+  margin-left:4px;
+  letter-spacing:0.05em;
+}
+.kpi-delta{
+  font-family:var(--font-mono);
+  font-size:11px;
+  margin-top:6px;
+}
+.kpi-delta.up{color:var(--ready);}
+.kpi-delta.down{color:var(--on-air);}
+.kpi-delta.flat{color:var(--ink-faint);}
+
+/* card */
+.card{
+  background:var(--paper);
+  border:1px solid var(--chalk-hi);
+  padding:var(--s-5);
+}
+.card-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:var(--s-3);
+  padding-bottom:var(--s-2);
+  border-bottom:1px solid var(--chalk);
+}
+.card-title{
+  font-family:var(--font-mono);
+  font-size:10px;
+  font-weight:700;
+  letter-spacing:0.15em;
+  text-transform:uppercase;
+  color:var(--ink);
+}
+
+/* rack */
+.rack{
+  display:grid;
+  grid-template-columns:64px 1fr auto;
+  align-items:stretch;
+  background:var(--paper);
+  border:1px solid var(--chalk-hi);
+  border-left:3px solid var(--ink);
+  margin-bottom:var(--s-3);
+}
+.rack.tally-rack{border-left-color:var(--tally);}
+.rack.wire-rack{border-left-color:var(--wire);}
+.rack.air-rack{border-left-color:var(--on-air);}
+.rack-id{
+  font-family:var(--font-mono);
+  font-size:9px;
+  text-align:center;
+  padding:var(--s-3) 0;
+  border-right:1px solid var(--chalk);
+  background:var(--chalk-lo);
+  display:flex;align-items:center;justify-content:center;
+  writing-mode:vertical-rl;
+  transform:rotate(180deg);
+  letter-spacing:0.2em;
+  text-transform:uppercase;
+  font-weight:700;
+  color:var(--ink-faint);
+}
+.rack-body{padding:var(--s-4) var(--s-5);min-width:0;}
+.rack-meta{
+  border-left:1px solid var(--chalk);
+  padding:var(--s-4) var(--s-5);
+  font-family:var(--font-mono);
+  font-size:10px;
+  color:var(--ink-muted);
+  display:flex;flex-direction:column;
+  gap:var(--s-1);
+  min-width:120px;
+}
+
+/* form bits */
+.field-input,.field-select,.field-textarea{
+  width:100%;
+  padding:8px 10px;
+  background:var(--paper-hi);
+  border:1px solid var(--chalk-hi);
+  font-family:var(--font-mono);
+  font-size:12px;
+  color:var(--ink);
+  outline:none;
+}
+.field-input:focus,.field-select:focus{border-color:var(--tally);}
+.field-label{
+  display:block;
+  font-family:var(--font-mono);
+  font-size:9px;
+  font-weight:700;
+  letter-spacing:0.15em;
+  text-transform:uppercase;
+  color:var(--ink-faint);
+  margin-bottom:4px;
+}
+
+/* toggle */
+.toggle{display:inline-flex;align-items:center;gap:var(--s-2);cursor:pointer;}
+.toggle-track{
+  width:32px;height:18px;
+  background:var(--chalk-hi);
+  border:1px solid var(--chalk-hi);
+  position:relative;
+  transition:background 0.15s;
+}
+.toggle-track::after{
+  content:"";
+  position:absolute;
+  top:1px;left:1px;
+  width:14px;height:14px;
+  background:var(--paper);
+  transition:transform 0.15s;
+}
+.toggle.on .toggle-track{background:var(--tally);border-color:var(--tally-deep);}
+.toggle.on .toggle-track::after{transform:translateX(14px);}
+.toggle-label{font-size:12px;color:var(--ink);}
+
+/* tabs */
+.tabs{display:flex;border-bottom:1px solid var(--chalk-hi);gap:0;}
+.tab{
+  padding:10px 18px;
+  font-family:var(--font-mono);
+  font-size:11px;
+  font-weight:600;
+  letter-spacing:0.1em;
+  text-transform:uppercase;
+  color:var(--ink-muted);
+  border-bottom:2px solid transparent;
+  margin-bottom:-1px;
+  cursor:pointer;
+}
+.tab:hover{color:var(--ink);}
+.tab.active{color:var(--ink);border-bottom-color:var(--tally);}
+.tab-count{
+  display:inline-block;margin-left:6px;padding:1px 5px;
+  background:var(--chalk);font-size:10px;font-weight:700;
+}
+.tab.active .tab-count{background:var(--tally);color:var(--paper);}
+
+/* dont-do */
+.dont{
+  background:var(--paper);
+  border:1px solid var(--chalk-hi);
+  border-left:3px solid var(--on-air);
+  padding:var(--s-3) var(--s-4);
+  margin:var(--s-2) 0;
+  font-size:13px;
+  color:var(--ink-light);
+  line-height:1.55;
+}
+.do{
+  border-left-color:var(--ready);
+}
+.dont strong, .do strong{font-family:var(--font-mono);font-size:10px;letter-spacing:0.15em;text-transform:uppercase;display:block;margin-bottom:4px;}
+.dont strong{color:var(--on-air);}
+.do strong{color:var(--ready);}
+
+/* responsive */
+@media (max-width: 1024px){
+  :root{--rail-w:72px;}
+  .sb-nav span,.sb-label,.sb-brand-sub{display:none;}
+  .sb-nav{justify-content:center;text-align:center;font-size:0;padding:8px;}
+  .sb-main{padding:var(--s-5) var(--s-5);}
+}
+</style>
+</head>
+<body>
+<div class="sb-app">
+
+  <!-- =========================================================================
+       SIDEBAR
+       ========================================================================= -->
+  <aside class="sb-rail">
+    <div class="sb-brand">
+      <div class="sb-brand-mark">Tally<em>board</em><span class="dot"></span></div>
+      <div class="sb-brand-sub">DESIGN SYSTEM · v1.0</div>
+    </div>
+
+    <div class="sb-section">
+      <div class="sb-label">Foundations</div>
+      <a class="sb-nav active" data-page="brand">Brand</a>
+      <a class="sb-nav" data-page="color">Color</a>
+      <a class="sb-nav" data-page="type">Typography</a>
+      <a class="sb-nav" data-page="spacing">Spacing &amp; Layout</a>
+      <a class="sb-nav" data-page="iconography">Iconography</a>
+      <a class="sb-nav" data-page="motion">Motion &amp; State</a>
+    </div>
+
+    <div class="sb-section">
+      <div class="sb-label">Components</div>
+      <a class="sb-nav" data-page="tally">Tally Indicators</a>
+      <a class="sb-nav" data-page="buttons">Buttons</a>
+      <a class="sb-nav" data-page="pills">Pills &amp; Chips</a>
+      <a class="sb-nav" data-page="meters">VU Meters &amp; Sparklines</a>
+      <a class="sb-nav" data-page="kpi">KPI Tiles</a>
+      <a class="sb-nav" data-page="cards">Cards</a>
+      <a class="sb-nav" data-page="rack">Rack Units</a>
+      <a class="sb-nav" data-page="tables">Tables</a>
+      <a class="sb-nav" data-page="forms">Form Fields</a>
+      <a class="sb-nav" data-page="tabs">Tabs &amp; Filter Bars</a>
+      <a class="sb-nav" data-page="code">Code &amp; Mono</a>
+    </div>
+
+    <div class="sb-section">
+      <div class="sb-label">Patterns</div>
+      <a class="sb-nav" data-page="topbar">Top Bar</a>
+      <a class="sb-nav" data-page="rail">Left Rail</a>
+      <a class="sb-nav" data-page="statusbar">Status Bar</a>
+      <a class="sb-nav" data-page="pageheader">Page Header</a>
+      <a class="sb-nav" data-page="osc">Oscilloscope Grid</a>
+    </div>
+
+    <div class="sb-section">
+      <div class="sb-label">Specialty</div>
+      <a class="sb-nav" data-page="chain">Filter Chain Canvas</a>
+      <a class="sb-nav" data-page="topology">Cluster Topology</a>
+      <a class="sb-nav" data-page="dvr">DVR Timeline</a>
+      <a class="sb-nav" data-page="histogram">Latency Histogram</a>
+      <a class="sb-nav" data-page="preview">Stream Preview</a>
+    </div>
+
+    <div class="sb-section">
+      <div class="sb-label">Voice</div>
+      <a class="sb-nav" data-page="voice">Writing &amp; Tone</a>
+    </div>
+  </aside>
+
+  <!-- =========================================================================
+       MAIN
+       ========================================================================= -->
+  <main class="sb-main">
+
+    <!-- ==================== BRAND ==================== -->
+    <section class="sb-page active" data-pg="brand">
+      <h1 class="sb-h1">Tally<em>board.</em></h1>
+      <p>The console aesthetic for LVQR. A live broadcast-room feel for software that lives next to OBS, ffmpeg, and the rack of NVENC GPUs in the corner. Built around four ideas: paper not pixels, ink not lines, an amber tally light, and a cyan signal wire.</p>
+
+      <h2 class="sb-h2">The four <em>signals.</em></h2>
+      <div class="sb-prose">Every screen in LVQR resolves to a combination of these four pigments. Pick the wrong one and the page reads wrong. Bone is the room you're standing in. Ink is what's printed on the wall. Tally amber is the on-air light. Wire cyan is the signal moving through the cables.</div>
+
+      <div class="sb-swatch-grid">
+        <div class="sb-sw">
+          <div class="sb-sw-chip" style="background:var(--bone);border:1px solid var(--chalk-hi);"></div>
+          <div class="sb-sw-meta">
+            <div class="sb-sw-name">bone</div>
+            <div class="sb-sw-var">--bone</div>
+            <div class="sb-sw-hex">#f5f1e8 · the room</div>
+          </div>
+        </div>
+        <div class="sb-sw">
+          <div class="sb-sw-chip" style="background:var(--ink);"></div>
+          <div class="sb-sw-meta">
+            <div class="sb-sw-name">ink</div>
+            <div class="sb-sw-var">--ink</div>
+            <div class="sb-sw-hex">#14202e · what's printed</div>
+          </div>
+        </div>
+        <div class="sb-sw">
+          <div class="sb-sw-chip" style="background:var(--tally);"></div>
+          <div class="sb-sw-meta">
+            <div class="sb-sw-name">tally amber</div>
+            <div class="sb-sw-var">--tally</div>
+            <div class="sb-sw-hex">#e8751a · on the air</div>
+          </div>
+        </div>
+        <div class="sb-sw">
+          <div class="sb-sw-chip" style="background:var(--wire);"></div>
+          <div class="sb-sw-meta">
+            <div class="sb-sw-name">wire cyan</div>
+            <div class="sb-sw-var">--wire</div>
+            <div class="sb-sw-hex">#0e7490 · the signal</div>
+          </div>
+        </div>
+      </div>
+
+      <h2 class="sb-h2">The <em>logo lockup.</em></h2>
+      <div class="sb-cluster spaced" style="margin-bottom:var(--s-4);">
+        <div class="card" style="padding:var(--s-7) var(--s-6);">
+          <div style="font-family:var(--font-display);font-size:64px;letter-spacing:-0.02em;line-height:1;">
+            LVQR<span style="display:inline-block;width:14px;height:14px;background:var(--tally);vertical-align:6px;margin-left:4px;box-shadow:0 0 16px var(--tally-glow);"></span>
+          </div>
+          <div style="font-family:var(--font-mono);font-size:10px;letter-spacing:0.18em;color:var(--ink-faint);margin-top:8px;">LIVE VIDEO QUIC RELAY</div>
+        </div>
+        <div class="card" style="padding:var(--s-6);background:var(--ink);">
+          <div style="font-family:var(--font-display);font-size:48px;letter-spacing:-0.02em;line-height:1;color:var(--paper);">
+            LVQR<span style="display:inline-block;width:10px;height:10px;background:var(--tally);vertical-align:5px;margin-left:3px;box-shadow:0 0 12px var(--tally);"></span>
+          </div>
+          <div style="font-family:var(--font-mono);font-size:9px;letter-spacing:0.18em;color:var(--ink-faint);margin-top:6px;">DARK SURFACE LOCKUP</div>
+        </div>
+      </div>
+
+      <div class="sb-doc">
+        <strong>Logo construction.</strong> The wordmark is set in Instrument Serif, weight 400, no kerning adjustments. The amber dot is exactly the cap-height divided by four, vertically aligned to baseline of the lowercase x-height. It always glows; the glow is <code>box-shadow: 0 0 12px var(--tally-glow)</code>. Never replace the wordmark with a logomark; never separate the dot from the wordmark; never tint the dot anything other than tally amber.
+      </div>
+
+      <h2 class="sb-h2">The room <em>vibe.</em></h2>
+      <div class="sb-prose">Tallyboard is meant to feel like the patch bay in a broadcast control room — 1U racks, vertical labels, color-coded signal paths, an on-air tally that's actually wired to something. Not skeumorphic. Just enough physical-world reference to make state legible at a glance from across the room.</div>
+
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:var(--s-3);">
+        <div class="card" style="text-align:center;padding:var(--s-5) var(--s-3);"><span class="tally on-air" style="font-size:14px;"><span class="tally-dot" style="width:14px;height:14px;"></span>ON AIR</span><div style="font-family:var(--font-mono);font-size:10px;color:var(--ink-faint);margin-top:8px;">visible from across the room</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-5) var(--s-3);"><div style="font-family:var(--font-mono);font-size:11px;letter-spacing:0.18em;color:var(--ink-faint);">12 / 50</div><div style="font-family:var(--font-display);font-size:36px;color:var(--ink);line-height:1;margin-top:4px;">channels</div><div style="font-family:var(--font-mono);font-size:10px;color:var(--ink-faint);margin-top:8px;">hard caps, real numbers</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-5) var(--s-3);"><div style="display:flex;justify-content:center;gap:6px;align-items:flex-end;height:32px;"><div style="width:6px;height:60%;background:var(--ready);"></div><div style="width:6px;height:80%;background:var(--ready);"></div><div style="width:6px;height:90%;background:var(--warn);"></div><div style="width:6px;height:100%;background:var(--on-air);"></div></div><div style="font-family:var(--font-mono);font-size:10px;color:var(--ink-faint);margin-top:8px;">VU meters not progress bars</div></div>
+      </div>
+
+      <h2 class="sb-h2">When to use <em>this system.</em></h2>
+      <div class="sb-prose">Tallyboard is the right system for dashboards, control surfaces, broadcast tooling, video infrastructure consoles, and any operator-facing UI where state legibility and density matter more than warmth. It is the wrong system for marketing pages, consumer products, blog posts, or anything aimed at end-viewers (audiences) rather than operators (engineers). For those, reach for hack.build punk zine or LumenCanvas paper-teal instead.</div>
+    </section>
+
+    <!-- ==================== COLOR ==================== -->
+    <section class="sb-page" data-pg="color">
+      <h1 class="sb-h1">Color.</h1>
+      <p>Every value is a CSS custom property. Never hardcode a hex. Never invent a shade. The full palette has fewer than two dozen values and that's the point.</p>
+
+      <h2 class="sb-h2">Surfaces.</h2>
+      <div class="sb-doc"><strong>Light surfaces only.</strong> Tallyboard is a paper-tone system. There is no "dark mode" — the ink panels in the topbar and statusbar are not "dark mode," they are dark <em>surfaces within the light document</em>, the way a printed black bar runs across a white page. If you find yourself reaching for a #1a1a1a global background, you are reaching for the wrong design system.</div>
+
+      <div class="sb-swatch-grid">
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--bone);border:1px solid var(--chalk-hi);"></div><div class="sb-sw-meta"><div class="sb-sw-name">bone</div><div class="sb-sw-var">--bone</div><div class="sb-sw-hex">#f5f1e8 · app bg</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--paper);border:1px solid var(--chalk-hi);"></div><div class="sb-sw-meta"><div class="sb-sw-name">paper</div><div class="sb-sw-var">--paper</div><div class="sb-sw-hex">#faf7f0 · cards</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--paper-hi);border:1px solid var(--chalk-hi);"></div><div class="sb-sw-meta"><div class="sb-sw-name">paper-hi</div><div class="sb-sw-var">--paper-hi</div><div class="sb-sw-hex">#fffcf4 · inputs</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--chalk);"></div><div class="sb-sw-meta"><div class="sb-sw-name">chalk</div><div class="sb-sw-var">--chalk</div><div class="sb-sw-hex">#e9e2d2 · borders</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--chalk-hi);"></div><div class="sb-sw-meta"><div class="sb-sw-name">chalk-hi</div><div class="sb-sw-var">--chalk-hi</div><div class="sb-sw-hex">#d9cfba · strong border</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--chalk-lo);border:1px solid var(--chalk-hi);"></div><div class="sb-sw-meta"><div class="sb-sw-name">chalk-lo</div><div class="sb-sw-var">--chalk-lo</div><div class="sb-sw-hex">#efe9d9 · table head</div></div></div>
+      </div>
+
+      <h2 class="sb-h2">Ink scale.</h2>
+      <div class="sb-prose">Five steps of grayscale, all warm-shifted to live happily on paper surfaces. Avoid black; <code>--ink</code> at <code>#14202e</code> is your darkest value.</div>
+      <div class="sb-swatch-grid">
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--ink);"></div><div class="sb-sw-meta"><div class="sb-sw-name">ink</div><div class="sb-sw-var">--ink</div><div class="sb-sw-hex">#14202e · headlines</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--ink-light);"></div><div class="sb-sw-meta"><div class="sb-sw-name">ink-light</div><div class="sb-sw-var">--ink-light</div><div class="sb-sw-hex">#2d3d54 · body</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--ink-muted);"></div><div class="sb-sw-meta"><div class="sb-sw-name">ink-muted</div><div class="sb-sw-var">--ink-muted</div><div class="sb-sw-hex">#5a6b80 · secondary</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--ink-faint);"></div><div class="sb-sw-meta"><div class="sb-sw-name">ink-faint</div><div class="sb-sw-var">--ink-faint</div><div class="sb-sw-hex">#8a98a8 · labels</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--ink-ghost);"></div><div class="sb-sw-meta"><div class="sb-sw-name">ink-ghost</div><div class="sb-sw-var">--ink-ghost</div><div class="sb-sw-hex">#b8c1cc · disabled</div></div></div>
+      </div>
+
+      <h2 class="sb-h2">Tally <em>amber.</em></h2>
+      <div class="sb-prose">The primary action color and the on-air signal. Reserved for: primary buttons, the on-air dot, active rail items, the "in motion" state of a live broadcast. If something needs the user's eye, it gets tally. If it doesn't, it doesn't.</div>
+      <div class="sb-swatch-grid">
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--tally-deep);"></div><div class="sb-sw-meta"><div class="sb-sw-name">tally-deep</div><div class="sb-sw-var">--tally-deep</div><div class="sb-sw-hex">#c25d0d · on-paper text</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--tally);"></div><div class="sb-sw-meta"><div class="sb-sw-name">tally</div><div class="sb-sw-var">--tally</div><div class="sb-sw-hex">#e8751a · primary</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--tally-bright);"></div><div class="sb-sw-meta"><div class="sb-sw-name">tally-bright</div><div class="sb-sw-var">--tally-bright</div><div class="sb-sw-hex">#f59447 · on-ink text</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--tally-wash);border:1px solid var(--chalk-hi);"></div><div class="sb-sw-meta"><div class="sb-sw-name">tally-wash</div><div class="sb-sw-var">--tally-wash</div><div class="sb-sw-hex">8% bg fill</div></div></div>
+      </div>
+
+      <h2 class="sb-h2">Wire <em>cyan.</em></h2>
+      <div class="sb-prose">The secondary action color and the data-in-flight signal. Used for: secondary buttons, federation links, sparklines that aren't tally, gossip and signal-routing elements. Tally is "this is what's happening," wire is "this is how it's getting there."</div>
+      <div class="sb-swatch-grid">
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--wire-deep);"></div><div class="sb-sw-meta"><div class="sb-sw-name">wire-deep</div><div class="sb-sw-var">--wire-deep</div><div class="sb-sw-hex">#075561 · on-paper text</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--wire);"></div><div class="sb-sw-meta"><div class="sb-sw-name">wire</div><div class="sb-sw-var">--wire</div><div class="sb-sw-hex">#0e7490 · primary</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--wire-bright);"></div><div class="sb-sw-meta"><div class="sb-sw-name">wire-bright</div><div class="sb-sw-var">--wire-bright</div><div class="sb-sw-hex">#06b6d4 · on-ink text</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--wire-wash);border:1px solid var(--chalk-hi);"></div><div class="sb-sw-meta"><div class="sb-sw-name">wire-wash</div><div class="sb-sw-var">--wire-wash</div><div class="sb-sw-hex">6% bg fill</div></div></div>
+      </div>
+
+      <h2 class="sb-h2">Status.</h2>
+      <div class="sb-prose">Four signals beyond the brand pair, each with one specific job. Don't tint anything red unless something is on-air or broken; don't tint anything green unless something is working. State colors are a contract.</div>
+      <div class="sb-swatch-grid">
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--on-air);"></div><div class="sb-sw-meta"><div class="sb-sw-name">on-air</div><div class="sb-sw-var">--on-air</div><div class="sb-sw-hex">#dc2626 · live broadcast</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--ready);"></div><div class="sb-sw-meta"><div class="sb-sw-name">ready</div><div class="sb-sw-var">--ready</div><div class="sb-sw-hex">#16a34a · healthy / ok</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--warn);"></div><div class="sb-sw-meta"><div class="sb-sw-name">warn</div><div class="sb-sw-var">--warn</div><div class="sb-sw-hex">#d97706 · capacity warn</div></div></div>
+        <div class="sb-sw"><div class="sb-sw-chip" style="background:var(--idle);"></div><div class="sb-sw-meta"><div class="sb-sw-name">idle</div><div class="sb-sw-var">--idle</div><div class="sb-sw-hex">#8a98a8 · no signal</div></div></div>
+      </div>
+
+      <div class="dont"><strong>Don't.</strong> Use red for danger that isn't on-air. Use green for "selected." Use blue (any blue) anywhere — that's wire's job. Combine tally and wire in the same gradient. Stack three colored pills next to each other on the same row.</div>
+      <div class="dont do"><strong>Do.</strong> Reserve on-air red for live signal and live signal only. Use chalk-lo as the "neutral idle" surface for a card that should not draw attention. Dim ink-faint or ink-ghost for any non-essential metadata. Treat tally amber as a budget — every screen gets one or two amber elements, not ten.</div>
+    </section>
+
+    <!-- ==================== TYPOGRAPHY ==================== -->
+    <section class="sb-page" data-pg="type">
+      <h1 class="sb-h1">Type.</h1>
+      <p>Three families. Instrument Serif for the editorial display voice. Figtree for the body. JetBrains Mono for everything that's a measurement, a label, or a piece of code. The mix is what makes the system feel like a console instead of a generic dashboard.</p>
+
+      <h2 class="sb-h2">Instrument <em>Serif.</em></h2>
+      <div class="sb-doc"><strong>Display only. Italic for emphasis.</strong> Used for page titles, KPI numerals, large card titles, brand wordmark. Never set body in this. Always pair an italic span (<code>&lt;em&gt;</code>) with the roman to anchor a head; the italic carries the editorial voice ("Tally<em>board.</em>"). Period at the end of every page title. No exceptions.</div>
+
+      <div class="sb-type-sample">
+        <div class="sb-type-meta">DISPLAY 64 · INSTRUMENT SERIF 400</div>
+        <div style="font-family:var(--font-display);font-size:64px;line-height:1;letter-spacing:-0.02em;color:var(--ink);">Tally<em style="color:var(--tally-deep);">board.</em></div>
+      </div>
+      <div class="sb-type-sample">
+        <div class="sb-type-meta">PAGE H1 · 48 · INSTRUMENT SERIF 400</div>
+        <div style="font-family:var(--font-display);font-size:48px;line-height:1;letter-spacing:-0.02em;color:var(--ink);">Filter <em style="color:var(--tally-deep);">chain.</em></div>
+      </div>
+      <div class="sb-type-sample">
+        <div class="sb-type-meta">SECTION H2 · 36 · INSTRUMENT SERIF 400</div>
+        <div style="font-family:var(--font-display);font-size:36px;line-height:1.1;letter-spacing:-0.01em;color:var(--ink);">On the rack <em style="color:var(--wire-deep);">right now.</em></div>
+      </div>
+      <div class="sb-type-sample">
+        <div class="sb-type-meta">KPI NUMERAL · 48 · INSTRUMENT SERIF 400</div>
+        <div style="font-family:var(--font-display);font-size:48px;line-height:1;letter-spacing:-0.02em;color:var(--ink);">8,432<span style="font-family:var(--font-mono);font-size:13px;color:var(--ink-muted);margin-left:6px;letter-spacing:0.05em;">viewers</span></div>
+      </div>
+
+      <h2 class="sb-h2">Figtree.</h2>
+      <div class="sb-doc"><strong>Body and prose.</strong> 14px is the default body size; 13px works inside cards; 15px for the lead paragraph under a page title. Use 400 for body, 600 for sub-emphasis, 700 sparingly. Never set anything in Figtree larger than 18px — at that size you should be in Instrument Serif instead.</div>
+
+      <div class="sb-type-sample">
+        <div class="sb-type-meta">LEAD · 15 / 1.55 · FIGTREE 400</div>
+        <div style="font-size:15px;line-height:1.55;color:var(--ink-muted);max-width:60ch;">Per-fragment WebAssembly filters running in a wasmtime sandbox between ingest and fan-out. Drop in a .wasm module, hot-reload it without dropping a frame, chain filters into a pipeline, attach the chain to a broadcast.</div>
+      </div>
+      <div class="sb-type-sample">
+        <div class="sb-type-meta">BODY · 14 / 1.55 · FIGTREE 400</div>
+        <div style="font-size:14px;line-height:1.55;color:var(--ink-light);max-width:60ch;">Subscribes to the audio track and publishes a <code style="font-family:var(--font-mono);font-size:12px;background:var(--chalk-lo);padding:1px 5px;">captions</code> side track at roughly 800ms latency. CMU dictionary plus a small custom vocabulary for HSL terms keeps the WER manageable.</div>
+      </div>
+      <div class="sb-type-sample">
+        <div class="sb-type-meta">CARD BODY · 13 / 1.55 · FIGTREE 400</div>
+        <div style="font-size:13px;line-height:1.55;color:var(--ink-muted);max-width:60ch;">Real-time English transcription with the whisper-small model running in process. No round trip, no API key.</div>
+      </div>
+
+      <h2 class="sb-h2">JetBrains <em>Mono.</em></h2>
+      <div class="sb-doc"><strong>Anything measured, named, or coded.</strong> Stream keys, IP addresses, byte counts, timestamps, port numbers, kbps values, file paths, log lines, code blocks. Also: every uppercase ALL-CAPS label in the system. Letter-spacing is your friend (0.08em–0.20em); the wider the spacing, the more "this is metadata" the text reads.</div>
+
+      <div class="sb-type-sample">
+        <div class="sb-type-meta">LABEL CAPS · 9 / 0.20em · JETBRAINS MONO 700</div>
+        <div style="font-family:var(--font-mono);font-size:9px;font-weight:700;letter-spacing:0.20em;text-transform:uppercase;color:var(--ink-faint);">CONCURRENT VIEWERS</div>
+      </div>
+      <div class="sb-type-sample">
+        <div class="sb-type-meta">CARD TITLE · 10 / 0.15em · JETBRAINS MONO 700</div>
+        <div style="font-family:var(--font-mono);font-size:10px;font-weight:700;letter-spacing:0.15em;text-transform:uppercase;color:var(--ink);">FILTER CHAIN · APPLIED</div>
+      </div>
+      <div class="sb-type-sample">
+        <div class="sb-type-meta">DATA · 11 · JETBRAINS MONO 400</div>
+        <div style="font-family:var(--font-mono);font-size:11px;color:var(--ink-light);line-height:1.7;">
+          sk_a8f2b3c4 · phx-01 · 70.95.18.42:54822<br>H.264 Baseline @L4.0 · 1080p60 · 6.2 Mb/s<br>uptime 04:18:22 · drift 0µs · drops 0
+        </div>
+      </div>
+      <div class="sb-type-sample">
+        <div class="sb-type-meta">CODE · 11 / 1.7 · JETBRAINS MONO 400 · ON INK</div>
+        <div style="background:var(--ink);color:var(--paper);font-family:var(--font-mono);font-size:11px;line-height:1.7;padding:var(--s-3) var(--s-4);">
+<span style="color:var(--ink-faint);font-style:italic;">// called per-fragment · budget 4ms hard cap</span><br>
+<span style="color:var(--tally-bright);">pub fn</span> <span style="color:var(--wire-bright);">on_fragment</span>(f: &amp;<span style="color:var(--tally-bright);">mut</span> Fragment) -&gt; Decision { ... }
+        </div>
+      </div>
+
+      <h2 class="sb-h2">Type <em>scale.</em></h2>
+      <table class="sb-toktbl">
+        <thead><tr><th>Token</th><th>Family</th><th>Size</th><th>Weight</th><th>Tracking</th><th>Used For</th></tr></thead>
+        <tbody>
+          <tr><td>display-xl</td><td>Instrument Serif</td><td>64px</td><td>400</td><td>-0.02em</td><td>Brand mark, big landings</td></tr>
+          <tr><td>display-lg</td><td>Instrument Serif</td><td>48px</td><td>400</td><td>-0.02em</td><td>Page H1</td></tr>
+          <tr><td>display-md</td><td>Instrument Serif</td><td>36px</td><td>400</td><td>-0.01em</td><td>Section heads</td></tr>
+          <tr><td>display-sm</td><td>Instrument Serif</td><td>28px</td><td>400</td><td>-0.01em</td><td>Minor section heads</td></tr>
+          <tr><td>kpi</td><td>Instrument Serif</td><td>48px</td><td>400</td><td>-0.02em</td><td>KPI numerals</td></tr>
+          <tr><td>lead</td><td>Figtree</td><td>15px</td><td>400</td><td>0</td><td>Page subtitle</td></tr>
+          <tr><td>body</td><td>Figtree</td><td>14px</td><td>400</td><td>0</td><td>Default prose</td></tr>
+          <tr><td>card-body</td><td>Figtree</td><td>13px</td><td>400</td><td>0</td><td>In-card prose</td></tr>
+          <tr><td>label-cap</td><td>JetBrains Mono</td><td>9px</td><td>700</td><td>0.20em</td><td>KPI labels, rail labels</td></tr>
+          <tr><td>card-title</td><td>JetBrains Mono</td><td>10px</td><td>700</td><td>0.15em</td><td>Card titles, status</td></tr>
+          <tr><td>tally</td><td>JetBrains Mono</td><td>10px</td><td>700</td><td>0.12em</td><td>Tally indicators, pills</td></tr>
+          <tr><td>data</td><td>JetBrains Mono</td><td>11px</td><td>400</td><td>0</td><td>Stream keys, IPs, bytes</td></tr>
+          <tr><td>code</td><td>JetBrains Mono</td><td>11px</td><td>400</td><td>0</td><td>Source on dark bg</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ==================== SPACING ==================== -->
+    <section class="sb-page" data-pg="spacing">
+      <h1 class="sb-h1">Spacing.</h1>
+      <p>An eight-step scale, used as CSS variables. Never invent a one-off value; if the spec says 18px, round to 16 or 24. Density beats whitespace in this system; a Tallyboard page should feel like a control surface, not a blog post.</p>
+
+      <h2 class="sb-h2">The <em>scale.</em></h2>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:var(--s-3);margin-bottom:var(--s-4);">
+        <div class="card"><div style="font-family:var(--font-mono);font-size:10px;color:var(--ink-faint);">--s-1</div><div style="font-family:var(--font-display);font-size:32px;line-height:1;color:var(--ink);">4<span style="font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">px</span></div><div style="height:4px;background:var(--tally);margin-top:8px;"></div></div>
+        <div class="card"><div style="font-family:var(--font-mono);font-size:10px;color:var(--ink-faint);">--s-2</div><div style="font-family:var(--font-display);font-size:32px;line-height:1;color:var(--ink);">8<span style="font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">px</span></div><div style="height:8px;background:var(--tally);margin-top:8px;"></div></div>
+        <div class="card"><div style="font-family:var(--font-mono);font-size:10px;color:var(--ink-faint);">--s-3</div><div style="font-family:var(--font-display);font-size:32px;line-height:1;color:var(--ink);">12<span style="font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">px</span></div><div style="height:12px;background:var(--tally);margin-top:8px;"></div></div>
+        <div class="card"><div style="font-family:var(--font-mono);font-size:10px;color:var(--ink-faint);">--s-4</div><div style="font-family:var(--font-display);font-size:32px;line-height:1;color:var(--ink);">16<span style="font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">px</span></div><div style="height:16px;background:var(--tally);margin-top:8px;"></div></div>
+        <div class="card"><div style="font-family:var(--font-mono);font-size:10px;color:var(--ink-faint);">--s-5</div><div style="font-family:var(--font-display);font-size:32px;line-height:1;color:var(--ink);">24<span style="font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">px</span></div><div style="height:24px;background:var(--tally);margin-top:8px;"></div></div>
+        <div class="card"><div style="font-family:var(--font-mono);font-size:10px;color:var(--ink-faint);">--s-6</div><div style="font-family:var(--font-display);font-size:32px;line-height:1;color:var(--ink);">32<span style="font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">px</span></div><div style="height:32px;background:var(--tally);margin-top:8px;"></div></div>
+        <div class="card"><div style="font-family:var(--font-mono);font-size:10px;color:var(--ink-faint);">--s-7</div><div style="font-family:var(--font-display);font-size:32px;line-height:1;color:var(--ink);">48<span style="font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">px</span></div><div style="height:48px;background:var(--tally);margin-top:8px;"></div></div>
+        <div class="card"><div style="font-family:var(--font-mono);font-size:10px;color:var(--ink-faint);">--s-8</div><div style="font-family:var(--font-display);font-size:32px;line-height:1;color:var(--ink);">64<span style="font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">px</span></div><div style="height:64px;background:var(--tally);margin-top:8px;"></div></div>
+      </div>
+
+      <h2 class="sb-h2">Layout <em>rules.</em></h2>
+      <table class="sb-toktbl">
+        <thead><tr><th>Token / Rule</th><th>Value</th><th>Used For</th></tr></thead>
+        <tbody>
+          <tr><td>page padding</td><td>32px 48px</td><td>Outer .page, breathable but dense</td></tr>
+          <tr><td>card padding</td><td>24px (--s-5)</td><td>Default .card padding</td></tr>
+          <tr><td>card-head margin</td><td>12px bottom</td><td>Spacing between title and body</td></tr>
+          <tr><td>card gap</td><td>12px (--s-3)</td><td>Default gap between cards in grid</td></tr>
+          <tr><td>section gap</td><td>32px (--s-6)</td><td>Between major sections on a page</td></tr>
+          <tr><td>rail width</td><td>240px desktop / 72px mobile</td><td>Left navigation</td></tr>
+          <tr><td>topbar height</td><td>56px</td><td>Top control surface</td></tr>
+          <tr><td>statusbar height</td><td>28px</td><td>Footer status strip</td></tr>
+          <tr><td>max content</td><td>1600px (page) / 1200px (storybook)</td><td>Cap on page width</td></tr>
+        </tbody>
+      </table>
+
+      <h2 class="sb-h2">Borders &amp; <em>corners.</em></h2>
+      <div class="sb-prose">Square corners, always. Border-radius is zero across the entire system — there is no exception. Borders are 1px, almost always <code>--chalk-hi</code>, sometimes <code>--ink</code> for high-contrast emphasis. Cards use a 1px border, never a shadow. The shadow vocabulary is reserved for the rack-on-hover state and for the on-air glow.</div>
+      <div class="sb-cluster">
+        <div style="background:var(--paper);border:1px solid var(--chalk-hi);padding:var(--s-3) var(--s-4);">1px chalk-hi (default)</div>
+        <div style="background:var(--paper);border:1px solid var(--ink);padding:var(--s-3) var(--s-4);">1px ink (emphasis)</div>
+        <div style="background:var(--paper);border:1px dashed var(--chalk-hi);padding:var(--s-3) var(--s-4);">1px dashed (placeholder)</div>
+        <div style="background:var(--paper);border:1px solid var(--chalk-hi);border-left:3px solid var(--tally);padding:var(--s-3) var(--s-4);">3px tally accent (rack)</div>
+      </div>
+    </section>
+
+    <!-- ==================== ICONOGRAPHY ==================== -->
+    <section class="sb-page" data-pg="iconography">
+      <h1 class="sb-h1">Iconography.</h1>
+      <p>Inline SVG only. 1.5px stroke. No fills (line icons), no two-tone, no emoji, no icon font. The icon style is engineering schematic — every icon should look like it could appear next to a switch on the back of a piece of broadcast gear.</p>
+
+      <h2 class="sb-h2">Style <em>rules.</em></h2>
+      <table class="sb-toktbl">
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>viewBox</td><td>0 0 24 24</td></tr>
+          <tr><td>stroke-width</td><td>1.5</td></tr>
+          <tr><td>stroke</td><td>currentColor</td></tr>
+          <tr><td>fill</td><td>none</td></tr>
+          <tr><td>stroke-linecap</td><td>round (default svg)</td></tr>
+          <tr><td>stroke-linejoin</td><td>round (default svg)</td></tr>
+          <tr><td>default size</td><td>14px in rail, 16px in topbar, 12px in btn</td></tr>
+        </tbody>
+      </table>
+
+      <h2 class="sb-h2">The <em>set.</em></h2>
+      <div class="sb-prose">A small canon of icons used across the admin console. Use these or stay in the same family (Lucide / Phosphor regular weight); never mix in Material or filled icons.</div>
+      <div style="display:grid;grid-template-columns:repeat(8,1fr);gap:var(--s-3);">
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">DASHBOARD</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><circle cx="12" cy="12" r="3"/><path d="M5.07 19A9 9 0 1 0 19 19"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">STREAM</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">RECORD</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><polygon points="5 3 19 12 5 21 5 3"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">PLAY</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="18" r="3"/><path d="M9 6h6M9 18h6M6 9v6M18 9v6"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">FILTERS</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><circle cx="12" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="18" r="3"/><path d="M12 9v3l-6 3M12 12l6 3"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">CLUSTER</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><rect x="5" y="11" width="14" height="10" rx="1"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">AUTH</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><path d="M3 12h3l3-9 6 18 3-9h3"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">METRICS</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><rect x="4" y="4" width="16" height="16" rx="1"/><path d="M8 9h8M8 13h8M8 17h5"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">LOGS</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><path d="M12 2 4 6v6c0 5 4 9 8 10 4-1 8-5 8-10V6l-8-4z"/><path d="m9 12 2 2 4-4"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">PROVENANCE</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">SETTINGS</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><circle cx="7" cy="7" r="5"/><path d="m11 11 3 3"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">SEARCH</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">PLUS</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15A9 9 0 1 1 5.64 5.64L23 10"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">RELOAD</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">DOWNLOAD</div></div>
+        <div class="card" style="text-align:center;padding:var(--s-4) var(--s-2);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:24px;height:24px;color:var(--ink);"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:6px;letter-spacing:0.1em;">UPLOAD</div></div>
+      </div>
+
+      <div class="dont"><strong>Don't.</strong> Use emoji. Use filled / two-tone icons. Use a different stroke weight than 1.5. Mix icon families on the same page.</div>
+    </section>
+
+    <!-- ==================== MOTION ==================== -->
+    <section class="sb-page" data-pg="motion">
+      <h1 class="sb-h1">Motion.</h1>
+      <p>Almost nothing moves. The exceptions exist because they encode state — pulses are wired to actual real-world signals (live broadcast, healthy heartbeat) and need to feel like an analog tally bulb, not a CSS transition.</p>
+
+      <h2 class="sb-h2">Pulse <em>vocabulary.</em></h2>
+      <table class="sb-toktbl">
+        <thead><tr><th>Element</th><th>Animation</th><th>Means</th></tr></thead>
+        <tbody>
+          <tr><td>on-air dot</td><td>pulse 1.2s ease-in-out infinite</td><td>Live broadcast in progress</td></tr>
+          <tr><td>live (tally) dot</td><td>pulse 1.5s ease-in-out infinite</td><td>Live data flow, not necessarily on-air</td></tr>
+          <tr><td>cluster heartbeat</td><td>pulse 2s ease-in-out infinite</td><td>Cluster gossip is converging</td></tr>
+          <tr><td>caption typing cursor</td><td>blink 1s step-end infinite</td><td>Live transcription writing</td></tr>
+        </tbody>
+      </table>
+
+      <h2 class="sb-h2">Live <em>examples.</em></h2>
+      <div class="sb-cluster spaced">
+        <div class="card" style="padding:var(--s-5);text-align:center;"><span class="tally on-air"><span class="tally-dot"></span>ON AIR</span><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:8px;letter-spacing:0.1em;">PULSE 1.2s</div></div>
+        <div class="card" style="padding:var(--s-5);text-align:center;"><span class="tally live"><span class="tally-dot"></span>LIVE FEED</span><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:8px;letter-spacing:0.1em;">PULSE 1.5s</div></div>
+        <div class="card" style="padding:var(--s-5);text-align:center;"><span class="tally ready"><span class="tally-dot"></span>HEALTHY</span><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:8px;letter-spacing:0.1em;">STATIC</div></div>
+        <div class="card" style="padding:var(--s-5);text-align:center;"><span class="tally warn"><span class="tally-dot"></span>WARN</span><div style="font-family:var(--font-mono);font-size:9px;color:var(--ink-faint);margin-top:8px;letter-spacing:0.1em;">STATIC</div></div>
+      </div>
+
+      <h2 class="sb-h2">Transitions.</h2>
+      <table class="sb-toktbl">
+        <thead><tr><th>Use</th><th>Duration</th><th>Easing</th></tr></thead>
+        <tbody>
+          <tr><td>Hover state on rail / button</td><td>100ms</td><td>linear</td></tr>
+          <tr><td>Toggle switch</td><td>150ms</td><td>linear</td></tr>
+          <tr><td>VU fill update</td><td>300ms</td><td>linear</td></tr>
+          <tr><td>Tab indicator slide</td><td>0ms</td><td>none — instant</td></tr>
+          <tr><td>Page route change</td><td>0ms</td><td>none — instant</td></tr>
+        </tbody>
+      </table>
+      <div class="sb-doc warn"><strong>No fade-ins.</strong> No entrance animations. No stagger reveals. Pages snap. Hovers are 100ms or less. The system feels responsive because nothing is animated — it just appears.</div>
+    </section>
+
+    <!-- ==================== TALLY ==================== -->
+    <section class="sb-page" data-pg="tally">
+      <h1 class="sb-h1">Tally <em>indicators.</em></h1>
+      <p>The signature element of the system. A pulsing colored dot plus a JetBrains Mono caps label. The vocabulary of state in Tallyboard is taught entirely through these.</p>
+
+      <h2 class="sb-h2">All <em>states.</em></h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>states</span><span>.tally + state class</span></div>
+        <div class="sb-eg-body">
+          <div class="sb-cluster spaced">
+            <span class="tally on-air"><span class="tally-dot"></span>ON AIR</span>
+            <span class="tally live"><span class="tally-dot"></span>LIVE FEED</span>
+            <span class="tally ready"><span class="tally-dot"></span>HEALTHY</span>
+            <span class="tally warn"><span class="tally-dot"></span>WARN</span>
+            <span class="tally idle"><span class="tally-dot"></span>IDLE</span>
+          </div>
+        </div>
+        <div class="sb-eg-code"><span class="c">&lt;!-- HTML --&gt;</span>
+&lt;span class=<span class="s">"tally on-air"</span>&gt;&lt;span class=<span class="s">"tally-dot"</span>&gt;&lt;/span&gt;ON AIR&lt;/span&gt;</div>
+      </div>
+
+      <h2 class="sb-h2">Semantic <em>contract.</em></h2>
+      <table class="sb-toktbl">
+        <thead><tr><th>State</th><th>Color</th><th>Animation</th><th>Means exactly</th></tr></thead>
+        <tbody>
+          <tr><td>on-air</td><td>--on-air red</td><td>pulse 1.2s</td><td>Broadcast is currently transmitting to viewers</td></tr>
+          <tr><td>live</td><td>--tally amber</td><td>pulse 1.5s</td><td>Data is flowing but not necessarily on-air (preview, contribution)</td></tr>
+          <tr><td>ready</td><td>--ready green</td><td>static</td><td>Component is up and healthy</td></tr>
+          <tr><td>warn</td><td>--warn amber</td><td>static</td><td>Threshold breached but not failing</td></tr>
+          <tr><td>idle</td><td>--idle gray</td><td>static</td><td>Configured but not active</td></tr>
+        </tbody>
+      </table>
+
+      <h2 class="sb-h2">Sizing.</h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>sizes</span><span>default 10px · large 14px · in-rack 10px</span></div>
+        <div class="sb-eg-body">
+          <div class="sb-cluster spaced">
+            <span class="tally on-air"><span class="tally-dot"></span>DEFAULT</span>
+            <span class="tally on-air" style="font-size:14px;"><span class="tally-dot" style="width:14px;height:14px;"></span>LARGE</span>
+            <span class="tally on-air" style="font-size:9px;"><span class="tally-dot" style="width:6px;height:6px;"></span>SMALL</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="sb-doc"><strong>The on-air pulse is sacred.</strong> It is the only animation in the system that exists for emotional reasons — it's the bulb in the studio that tells the talent "you are being seen right now." Don't reuse this animation for anything that isn't actually live to viewers. Putting an on-air pulse on a save button or a notification badge would be a costume.</div>
+    </section>
+
+    <!-- ==================== BUTTONS ==================== -->
+    <section class="sb-page" data-pg="buttons">
+      <h1 class="sb-h1">Buttons.</h1>
+      <p>Five variants. JetBrains Mono uppercase, square corners, 1px border, no shadow, no radius. Hover inverts the surface — primary becomes deeper amber, ghost becomes solid ink. The mono cap-styling is what makes a button read as a control rather than a CTA.</p>
+
+      <h2 class="sb-h2">Variants.</h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>btn variants</span><span>primary · wire · default · ghost · danger</span></div>
+        <div class="sb-eg-body">
+          <div class="sb-cluster">
+            <button class="btn btn-primary">Deploy Chain</button>
+            <button class="btn btn-wire">Probe Cluster</button>
+            <button class="btn">Save Draft</button>
+            <button class="btn btn-ghost">Cancel</button>
+            <button class="btn btn-danger">Cut Feed</button>
+          </div>
+        </div>
+        <div class="sb-eg-code">&lt;button class=<span class="s">"btn btn-primary"</span>&gt;<span class="s">Deploy Chain</span>&lt;/button&gt;
+&lt;button class=<span class="s">"btn btn-wire"</span>&gt;<span class="s">Probe Cluster</span>&lt;/button&gt;
+&lt;button class=<span class="s">"btn"</span>&gt;<span class="s">Save Draft</span>&lt;/button&gt;
+&lt;button class=<span class="s">"btn btn-ghost"</span>&gt;<span class="s">Cancel</span>&lt;/button&gt;
+&lt;button class=<span class="s">"btn btn-danger"</span>&gt;<span class="s">Cut Feed</span>&lt;/button&gt;</div>
+      </div>
+
+      <h2 class="sb-h2">Sizes.</h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>btn-sm + default</span><span>row controls · header actions</span></div>
+        <div class="sb-eg-body">
+          <div class="sb-cluster">
+            <button class="btn btn-primary btn-sm">Deploy</button>
+            <button class="btn btn-sm">Edit</button>
+            <button class="btn btn-ghost btn-sm">Cancel</button>
+            <button class="btn btn-danger btn-sm">Revoke</button>
+          </div>
+        </div>
+      </div>
+
+      <h2 class="sb-h2">With <em>icons.</em></h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>icon + label</span><span>icon left · 12px · 8px gap</span></div>
+        <div class="sb-eg-body">
+          <div class="sb-cluster">
+            <button class="btn btn-primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> New Stream Key</button>
+            <button class="btn btn-ghost"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15A9 9 0 1 1 5.64 5.64L23 10"/></svg> Reload</button>
+            <button class="btn btn-ghost"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Download Last 60s</button>
+          </div>
+        </div>
+      </div>
+
+      <h2 class="sb-h2">When to use <em>which.</em></h2>
+      <table class="sb-toktbl">
+        <thead><tr><th>Variant</th><th>Use For</th><th>Per Page Limit</th></tr></thead>
+        <tbody>
+          <tr><td>primary</td><td>The single most important action</td><td>1, ideally; 2 max</td></tr>
+          <tr><td>wire</td><td>Important secondary action with cyan semantics</td><td>1</td></tr>
+          <tr><td>default (ink)</td><td>Standard actions</td><td>unlimited</td></tr>
+          <tr><td>ghost</td><td>Tertiary, dismissive, or low-priority</td><td>unlimited</td></tr>
+          <tr><td>danger</td><td>Destructive (revoke, cut feed, delete)</td><td>1 in scope</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ==================== PILLS ==================== -->
+    <section class="sb-page" data-pg="pills">
+      <h1 class="sb-h1">Pills &amp; <em>chips.</em></h1>
+      <p>Compact uppercase JetBrains Mono labels. Used for protocols, statuses, counts, tags. Three pixels vertical padding, eight horizontal. Border + matching wash background — unlike pills in most systems, these are bordered, never solid-on-tinted-bg, because density beats brightness.</p>
+
+      <h2 class="sb-h2">Variants.</h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>pill variants</span><span>default · tally · wire · air · ready · warn · ink</span></div>
+        <div class="sb-eg-body">
+          <div class="sb-cluster">
+            <span class="pill">DEFAULT</span>
+            <span class="pill tally">TALLY</span>
+            <span class="pill wire">WIRE</span>
+            <span class="pill air">AIR</span>
+            <span class="pill ready">READY</span>
+            <span class="pill warn">WARN</span>
+            <span class="pill ink">INK</span>
+          </div>
+        </div>
+        <div class="sb-eg-code">&lt;span class=<span class="s">"pill ready"</span>&gt;<span class="s">healthy</span>&lt;/span&gt;
+&lt;span class=<span class="s">"pill ink"</span>&gt;<span class="s">RTMP</span>&lt;/span&gt;</div>
+      </div>
+
+      <h2 class="sb-h2">In context.</h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>row of metadata pills</span><span>protocol + filters + dvr + status</span></div>
+        <div class="sb-eg-body">
+          <div class="sb-cluster tight">
+            <span class="tally on-air"><span class="tally-dot"></span>ON AIR · 04:18:22</span>
+            <span class="pill ink">RTMP / OBS 31</span>
+            <span class="pill wire">3 filters</span>
+            <span class="pill ready">DVR 4h</span>
+            <span class="pill" style="padding:1px 6px;">owner: moheeb@hsl</span>
+          </div>
+        </div>
+      </div>
+
+      <h2 class="sb-h2">Pill <em>semantic map.</em></h2>
+      <table class="sb-toktbl">
+        <thead><tr><th>Variant</th><th>Use</th><th>Examples</th></tr></thead>
+        <tbody>
+          <tr><td>ink</td><td>Protocol or hard identifier</td><td>RTMP, WHIP, SRT, MoQ</td></tr>
+          <tr><td>tally</td><td>"This is the active flow"</td><td>publish scope, primary tag</td></tr>
+          <tr><td>wire</td><td>"This is data routing or transport"</td><td>subscribe scope, S3 sync, federation</td></tr>
+          <tr><td>air</td><td>Live broadcast metadata</td><td>"AIR" labels on thumbs</td></tr>
+          <tr><td>ready</td><td>OK / signed / passing</td><td>healthy, signed, in sync</td></tr>
+          <tr><td>warn</td><td>Threshold breach</td><td>capacity warn, 1 pub</td></tr>
+          <tr><td>default</td><td>Neutral metadata</td><td>v2.4.1, version, count</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ==================== METERS ==================== -->
+    <section class="sb-page" data-pg="meters">
+      <h1 class="sb-h1">VU meters &amp; <em>sparklines.</em></h1>
+      <p>The replacement for progress bars. A VU meter has a hatched background and a green-warn-red gradient fill that mirrors how broadcast levels actually look on equipment. Use VU for any continuously varying measurement; never use it for a percentage that has a fixed end-state ("file uploaded 60%").</p>
+
+      <h2 class="sb-h2">VU <em>meter.</em></h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>vu meter rows</span><span>label · track · value</span></div>
+        <div class="sb-eg-body">
+          <div class="vu"><span class="vu-label">Viewers</span><span class="vu-track"><span class="vu-fill" style="width:72%"></span></span><span class="vu-value">3,612</span></div>
+          <div class="vu"><span class="vu-label">Fan-out</span><span class="vu-track"><span class="vu-fill" style="width:54%"></span></span><span class="vu-value">2.1 Gb/s</span></div>
+          <div class="vu"><span class="vu-label">CPU</span><span class="vu-track"><span class="vu-fill" style="width:38%"></span></span><span class="vu-value">38%</span></div>
+          <div class="vu"><span class="vu-label">Capacity</span><span class="vu-track"><span class="vu-fill" style="width:84%"></span></span><span class="vu-value">84%</span></div>
+        </div>
+        <div class="sb-eg-code">&lt;div class=<span class="s">"vu"</span>&gt;
+  &lt;span class=<span class="s">"vu-label"</span>&gt;<span class="s">Viewers</span>&lt;/span&gt;
+  &lt;span class=<span class="s">"vu-track"</span>&gt;&lt;span class=<span class="s">"vu-fill"</span> style=<span class="s">"width:72%"</span>&gt;&lt;/span&gt;&lt;/span&gt;
+  &lt;span class=<span class="s">"vu-value"</span>&gt;<span class="s">3,612</span>&lt;/span&gt;
+&lt;/div&gt;</div>
+      </div>
+
+      <h2 class="sb-h2">Sparklines.</h2>
+      <div class="sb-prose">A 32px-tall single-stroke line with a 10% area fill underneath. Use inside a KPI tile to show the trend. Tally amber by default, switch to wire cyan with the <code>.wire</code> modifier when the sparkline tracks data flow rather than a count.</div>
+
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>sparkline · tally and wire variants</span><span>32px tall</span></div>
+        <div class="sb-eg-body">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--s-3);">
+            <div class="card" style="padding:var(--s-3) var(--s-4);">
+              <div class="kpi-label">Concurrent Viewers</div>
+              <div style="font-family:var(--font-display);font-size:32px;line-height:1;">8,432</div>
+              <svg viewBox="0 0 100 32" preserveAspectRatio="none" style="height:32px;width:100%;display:block;margin-top:6px;">
+                <path d="M0,24 L10,22 L20,20 L30,18 L40,16 L50,12 L60,10 L70,14 L80,8 L90,6 L100,4 L100,32 L0,32 Z" fill="var(--tally)" opacity="0.1"/>
+                <path d="M0,24 L10,22 L20,20 L30,18 L40,16 L50,12 L60,10 L70,14 L80,8 L90,6 L100,4" fill="none" stroke="var(--tally)" stroke-width="1.5"/>
+              </svg>
+            </div>
+            <div class="card" style="padding:var(--s-3) var(--s-4);">
+              <div class="kpi-label">Fan-out Throughput</div>
+              <div style="font-family:var(--font-display);font-size:32px;line-height:1;">4.2<span style="font-family:var(--font-mono);font-size:13px;color:var(--ink-muted);">Gb/s</span></div>
+              <svg viewBox="0 0 100 32" preserveAspectRatio="none" style="height:32px;width:100%;display:block;margin-top:6px;">
+                <path d="M0,16 L10,14 L20,18 L30,12 L40,16 L50,14 L60,12 L70,16 L80,14 L90,12 L100,14 L100,32 L0,32 Z" fill="var(--wire)" opacity="0.1"/>
+                <path d="M0,16 L10,14 L20,18 L30,12 L40,16 L50,14 L60,12 L70,16 L80,14 L90,12 L100,14" fill="none" stroke="var(--wire)" stroke-width="1.5"/>
+              </svg>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== KPI ==================== -->
+    <section class="sb-page" data-pg="kpi">
+      <h1 class="sb-h1">KPI <em>tiles.</em></h1>
+      <p>The headline data block. Numbers in Instrument Serif at 48px, mono cap label above, mono delta below, optional sparkline, a 32×2px accent stripe in the top-left corner indicating semantic. Always grid in fours; KPI tiles in a row of three look starved.</p>
+
+      <h2 class="sb-h2">All <em>variants.</em></h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>kpi variants</span><span>default · tally · wire · air</span></div>
+        <div class="sb-eg-body">
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:var(--s-3);">
+            <div class="kpi air">
+              <div class="kpi-label">On-Air Broadcasts</div>
+              <div class="kpi-value">12<span class="kpi-unit">/ 50 cap</span></div>
+              <div class="kpi-delta up">↑ 2 since 1h ago</div>
+            </div>
+            <div class="kpi tally">
+              <div class="kpi-label">Concurrent Viewers</div>
+              <div class="kpi-value">8,432</div>
+              <div class="kpi-delta up">↑ 14% vs. 24h avg</div>
+            </div>
+            <div class="kpi wire">
+              <div class="kpi-label">Fan-out Throughput</div>
+              <div class="kpi-value">4.2<span class="kpi-unit">Gb/s</span></div>
+              <div class="kpi-delta flat">→ steady · 67% of cap</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">Cluster Uptime · 30d</div>
+              <div class="kpi-value">99.94<span class="kpi-unit">%</span></div>
+              <div class="kpi-delta up">SLO 99.9 · 26 min budget</div>
+            </div>
+          </div>
+        </div>
+        <div class="sb-eg-code">&lt;div class=<span class="s">"kpi tally"</span>&gt;
+  &lt;div class=<span class="s">"kpi-label"</span>&gt;<span class="s">Concurrent Viewers</span>&lt;/div&gt;
+  &lt;div class=<span class="s">"kpi-value"</span>&gt;<span class="s">8,432</span>&lt;/div&gt;
+  &lt;div class=<span class="s">"kpi-delta up"</span>&gt;<span class="s">↑ 14% vs. 24h avg</span>&lt;/div&gt;
+&lt;/div&gt;</div>
+      </div>
+
+      <h2 class="sb-h2">Delta <em>directions.</em></h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>delta tones</span><span>up · down · flat</span></div>
+        <div class="sb-eg-body">
+          <div class="sb-cluster spaced">
+            <div class="kpi-delta up">↑ 14% vs. 24h avg</div>
+            <div class="kpi-delta down">↓ 0.4% pass rate</div>
+            <div class="kpi-delta flat">→ steady · within range</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sb-doc"><strong>Up isn't always good.</strong> The arrow direction is literal — "the metric went up" — not semantic. Use up-green only when the metric going up is desirable. A latency p95 going up should be displayed as <code>kpi-delta down</code> (red) with a "↑ 12ms" label — the metric rose, but the meaning is bad. Confusing? Yes. Better than the alternative.</div>
+    </section>
+
+    <!-- ==================== CARDS ==================== -->
+    <section class="sb-page" data-pg="cards">
+      <h1 class="sb-h1">Cards.</h1>
+      <p>The default container. Paper background, 1px chalk-hi border, 24px padding. A card-head row separates a JetBrains Mono caps title from a right-aligned status pill or button. No shadow, no radius. Cards are bricks; stack them.</p>
+
+      <h2 class="sb-h2">Standard.</h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>.card</span><span>+ .card-head + .card-title</span></div>
+        <div class="sb-eg-body">
+          <div class="card">
+            <div class="card-head">
+              <div class="card-title">Egress Latency · p95</div>
+              <span class="pill" style="padding:1px 6px;font-size:9px;">last 60min</span>
+            </div>
+            <div style="font-family:var(--font-mono);font-size:11px;line-height:2;">
+              <div style="display:flex;justify-content:space-between;"><span>MoQ / WT</span><strong style="color:var(--tally-deep);">142 ms</strong></div>
+              <div style="display:flex;justify-content:space-between;"><span>WHEP</span><strong>198 ms</strong></div>
+              <div style="display:flex;justify-content:space-between;"><span>WS fMP4</span><strong>312 ms</strong></div>
+              <div style="display:flex;justify-content:space-between;"><span>LL-HLS</span><strong>1.8 s</strong></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <h2 class="sb-h2">With osc <em>grid.</em></h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>.card.osc-bg</span><span>data-heavy cards (charts, timelines)</span></div>
+        <div class="sb-eg-body">
+          <div class="card" style="background-image:linear-gradient(rgba(20,32,46,0.04) 1px, transparent 1px),linear-gradient(90deg, rgba(20,32,46,0.04) 1px, transparent 1px);background-size:24px 24px;">
+            <div class="card-head">
+              <div class="card-title">Viewers · 4 hour window</div>
+              <span class="pill tally">peak 3,847</span>
+            </div>
+            <svg viewBox="0 0 600 100" preserveAspectRatio="none" style="width:100%;height:100px;display:block;">
+              <path d="M 0,80 L 50,76 L 100,68 L 150,56 L 200,44 L 250,32 L 300,24 L 350,30 L 400,22 L 450,28 L 500,20 L 550,18 L 600,14" fill="none" stroke="var(--tally)" stroke-width="1.5"/>
+              <path d="M 0,80 L 50,76 L 100,68 L 150,56 L 200,44 L 250,32 L 300,24 L 350,30 L 400,22 L 450,28 L 500,20 L 550,18 L 600,14 L 600,100 L 0,100 Z" fill="var(--tally)" opacity="0.12"/>
+            </svg>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== RACK ==================== -->
+    <section class="sb-page" data-pg="rack">
+      <h1 class="sb-h1">Rack <em>units.</em></h1>
+      <p>The signature pattern. A horizontal three-column card with a vertical-text ID strip on the left, body in the middle, mono metadata on the right. Designed to evoke a 1U server in a broadcast rack. Use rack units for live broadcasts, AI agents, and other "running things." Don't use them for static records.</p>
+
+      <h2 class="sb-h2">Variants.</h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>.rack with state modifiers</span><span>tally-rack · wire-rack · air-rack</span></div>
+        <div class="sb-eg-body">
+          <div class="rack air-rack">
+            <div class="rack-id">SK · 01</div>
+            <div class="rack-body">
+              <div style="display:flex;align-items:center;gap:var(--s-3);margin-bottom:6px;">
+                <span class="tally on-air"><span class="tally-dot"></span>ON AIR</span>
+                <span style="font-family:var(--font-mono);font-size:13px;font-weight:600;">heatsync-mainstage</span>
+                <span class="pill ink">RTMP / OBS 31</span>
+                <span class="pill wire">+3 filters</span>
+              </div>
+              <div style="font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">
+                H.264 Baseline · 1080p60 · 6.2 Mb/s · 47ms glass-to-glass · 70.95.18.42
+              </div>
+              <div style="margin-top:var(--s-3);">
+                <div class="vu"><span class="vu-label">Viewers</span><span class="vu-track"><span class="vu-fill" style="width:72%"></span></span><span class="vu-value">3,612</span></div>
+                <div class="vu"><span class="vu-label">Fan-out</span><span class="vu-track"><span class="vu-fill" style="width:54%"></span></span><span class="vu-value">2.1 Gb/s</span></div>
+              </div>
+            </div>
+            <div class="rack-meta">
+              <div>UPTIME 04:18:22</div>
+              <div>DVR 4h kept</div>
+              <div>4 egress active</div>
+              <div style="color:var(--tally-deep);">3 children peers</div>
+            </div>
+          </div>
+
+          <div class="rack tally-rack">
+            <div class="rack-id">AGT · 01</div>
+            <div class="rack-body">
+              <div style="display:flex;align-items:center;gap:var(--s-3);margin-bottom:6px;">
+                <span class="tally on-air"><span class="tally-dot"></span>RUNNING</span>
+                <span style="font-family:var(--font-mono);font-size:13px;font-weight:600;">whisper-en</span>
+                <span class="pill ink">whisper.cpp</span>
+              </div>
+              <div style="font-size:13px;color:var(--ink-muted);line-height:1.5;">Real-time English transcription. Subscribes to audio track, publishes captions side track at ~800ms latency.</div>
+            </div>
+            <div class="rack-meta">
+              <div>BROADCASTS 2</div>
+              <div>UPTIME 14d</div>
+              <div>WER ~6.4%</div>
+              <div style="color:var(--ready);">CAPS ON</div>
+            </div>
+          </div>
+
+          <div class="rack wire-rack">
+            <div class="rack-id">FED · 01</div>
+            <div class="rack-body">
+              <div style="display:flex;align-items:center;gap:var(--s-3);margin-bottom:6px;">
+                <span class="tally ready"><span class="tally-dot"></span>UP</span>
+                <span style="font-family:var(--font-mono);font-size:13px;font-weight:600;">atl-prod-01</span>
+                <span class="pill wire">PUSH</span>
+              </div>
+              <div style="font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">
+                https://atl.lvqr.hack.build · 2 streams · 4.2 Mb/s · 142ms RTT
+              </div>
+            </div>
+            <div class="rack-meta">
+              <div>SINCE 2026-03-10</div>
+              <div>0 dropouts 24h</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sb-doc"><strong>Anatomy.</strong> Left strip is 64px wide, vertical-rl text rotated 180°, chalk-lo background, mono caps. Body is 16px/24px padding, free-form content. Right strip is 24px padding, mono 10px metadata stacked vertically. Border-left is 3px and color-coded by what's running: amber for "in motion," cyan for "data path," red for "on-air."</div>
+    </section>
+
+    <!-- ==================== TABLES ==================== -->
+    <section class="sb-page" data-pg="tables">
+      <h1 class="sb-h1">Tables.</h1>
+      <p>Dense data display. Mono caps headers in chalk-lo, mono cells, hover state lights up the row in chalk-lo. Two types: <code>.tbl</code> for full-bleed lists, and a "no border" variant nested inside cards. Tallyboard tables are not Material — they are spreadsheet tables, deliberately.</p>
+
+      <h2 class="sb-h2">Standard.</h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>.tbl</span><span>full-width data table</span></div>
+        <div class="sb-eg-body">
+          <table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--chalk-hi);">
+            <thead>
+              <tr>
+                <th style="text-align:left;font-family:var(--font-mono);font-size:10px;font-weight:700;letter-spacing:0.15em;text-transform:uppercase;color:var(--ink-faint);padding:10px 14px;border-bottom:1px solid var(--chalk-hi);background:var(--chalk-lo);">Broadcast</th>
+                <th style="text-align:left;font-family:var(--font-mono);font-size:10px;font-weight:700;letter-spacing:0.15em;text-transform:uppercase;color:var(--ink-faint);padding:10px 14px;border-bottom:1px solid var(--chalk-hi);background:var(--chalk-lo);">Ingest</th>
+                <th style="text-align:left;font-family:var(--font-mono);font-size:10px;font-weight:700;letter-spacing:0.15em;text-transform:uppercase;color:var(--ink-faint);padding:10px 14px;border-bottom:1px solid var(--chalk-hi);background:var(--chalk-lo);">Bitrate</th>
+                <th style="text-align:left;font-family:var(--font-mono);font-size:10px;font-weight:700;letter-spacing:0.15em;text-transform:uppercase;color:var(--ink-faint);padding:10px 14px;border-bottom:1px solid var(--chalk-hi);background:var(--chalk-lo);">Viewers</th>
+                <th style="text-align:left;font-family:var(--font-mono);font-size:10px;font-weight:700;letter-spacing:0.15em;text-transform:uppercase;color:var(--ink-faint);padding:10px 14px;border-bottom:1px solid var(--chalk-hi);background:var(--chalk-lo);">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td style="padding:12px 14px;border-bottom:1px solid var(--chalk);font-size:13px;"><strong>heatsync-mainstage</strong><div style="font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">sk_a8f2b3c4 · phx-01</div></td><td style="padding:12px 14px;border-bottom:1px solid var(--chalk);"><span class="pill ink">RTMP</span></td><td style="padding:12px 14px;border-bottom:1px solid var(--chalk);font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">6.2 Mb/s</td><td style="padding:12px 14px;border-bottom:1px solid var(--chalk);font-size:13px;"><strong>3,612</strong></td><td style="padding:12px 14px;border-bottom:1px solid var(--chalk);"><span class="tally on-air"><span class="tally-dot"></span>AIR</span></td></tr>
+              <tr><td style="padding:12px 14px;border-bottom:1px solid var(--chalk);font-size:13px;"><strong>deveco-podcast-live</strong><div style="font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">sk_e9d4f1a7 · phx-02</div></td><td style="padding:12px 14px;border-bottom:1px solid var(--chalk);"><span class="pill ink">WHIP</span></td><td style="padding:12px 14px;border-bottom:1px solid var(--chalk);font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">2.1 Mb/s</td><td style="padding:12px 14px;border-bottom:1px solid var(--chalk);font-size:13px;"><strong>1,892</strong></td><td style="padding:12px 14px;border-bottom:1px solid var(--chalk);"><span class="tally on-air"><span class="tally-dot"></span>AIR</span></td></tr>
+              <tr><td style="padding:12px 14px;font-size:13px;"><strong>camera-frontdoor</strong><div style="font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">sk_c2b8e6f9 · phx-03</div></td><td style="padding:12px 14px;"><span class="pill ink">RTSP</span></td><td style="padding:12px 14px;font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);">1.8 Mb/s</td><td style="padding:12px 14px;font-size:13px;">14</td><td style="padding:12px 14px;"><span class="tally ready"><span class="tally-dot"></span>OK</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <h2 class="sb-h2">Row <em>conventions.</em></h2>
+      <table class="sb-toktbl">
+        <thead><tr><th>Column type</th><th>Treatment</th></tr></thead>
+        <tbody>
+          <tr><td>Primary identifier</td><td>Strong + dimmed mono key on second line</td></tr>
+          <tr><td>Protocol / type</td><td>Pill, ink variant for hard identity</td></tr>
+          <tr><td>Numeric / measurement</td><td>JetBrains Mono 11px, ink-muted</td></tr>
+          <tr><td>Count or hero number</td><td>Strong (Figtree 600), 13px</td></tr>
+          <tr><td>Status</td><td>Tally indicator with pulsing dot</td></tr>
+          <tr><td>Action column</td><td>btn-ghost btn-sm or two stacked</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ==================== FORMS ==================== -->
+    <section class="sb-page" data-pg="forms">
+      <h1 class="sb-h1">Forms.</h1>
+      <p>Compact mono fields. Paper-hi background, chalk-hi border. Labels are mono 9px caps in ink-faint. Focus state shifts the border to tally amber. Nothing about a form should feel like Material; everything should feel like configuration text typed into a TOML file.</p>
+
+      <h2 class="sb-h2">Inputs.</h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>field with label</span><span>mono cap label · paper-hi input</span></div>
+        <div class="sb-eg-body">
+          <div style="max-width:360px;display:flex;flex-direction:column;gap:var(--s-3);">
+            <div>
+              <label class="field-label">Stream Name</label>
+              <input class="field-input" value="heatsync-mainstage"/>
+            </div>
+            <div>
+              <label class="field-label">Ingest Protocol</label>
+              <select class="field-select"><option>RTMP</option><option>WHIP</option><option>SRT</option><option>RTSP</option></select>
+            </div>
+            <div>
+              <label class="field-label">Notes</label>
+              <textarea class="field-input" rows="3" style="resize:vertical;line-height:1.6;">main stage broadcast for HSL events. always-on RTMP key.</textarea>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <h2 class="sb-h2">Toggle.</h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>.toggle</span><span>tally-amber on-state</span></div>
+        <div class="sb-eg-body">
+          <div class="sb-cluster spaced">
+            <label class="toggle on"><span class="toggle-track"></span><span class="toggle-label">Hot reload</span></label>
+            <label class="toggle"><span class="toggle-track"></span><span class="toggle-label">io_uring</span></label>
+            <label class="toggle on"><span class="toggle-track"></span><span class="toggle-label">C2PA signing</span></label>
+            <label class="toggle"><span class="toggle-track"></span><span class="toggle-label">Demo mode</span></label>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== TABS ==================== -->
+    <section class="sb-page" data-pg="tabs">
+      <h1 class="sb-h1">Tabs &amp; <em>filter bars.</em></h1>
+      <p>Two patterns for slicing data: tabs for hard partitions of the same data, filter bars for soft narrowing. Tabs use mono caps with a tally underline; filter bars are a single horizontal strip with a search field plus selects.</p>
+
+      <h2 class="sb-h2">Tabs.</h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>.tabs + .tab</span><span>active tab gets tally underline</span></div>
+        <div class="sb-eg-body">
+          <div class="tabs">
+            <div class="tab active">All<span class="tab-count">847</span></div>
+            <div class="tab">Recording Now<span class="tab-count">8</span></div>
+            <div class="tab">Archived<span class="tab-count">775</span></div>
+            <div class="tab">Glacier<span class="tab-count">60</span></div>
+            <div class="tab">Failed<span class="tab-count">4</span></div>
+          </div>
+        </div>
+      </div>
+
+      <h2 class="sb-h2">Filter <em>bar.</em></h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>filter bar</span><span>search + protocol + codec + clear</span></div>
+        <div class="sb-eg-body">
+          <div style="display:flex;align-items:center;gap:var(--s-3);background:var(--paper);border:1px solid var(--chalk-hi);padding:var(--s-2) var(--s-3);">
+            <div style="flex:1;display:flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--chalk-hi);background:var(--paper-hi);">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" style="width:11px;height:11px;color:var(--ink-faint)"><circle cx="7" cy="7" r="5"/><path d="m11 11 3 3"/></svg>
+              <input type="text" placeholder="search by name, key, publisher IP, or codec…" style="background:none;border:none;outline:none;flex:1;font-size:12px;font-family:var(--font-mono);">
+            </div>
+            <select class="field-select" style="width:auto;padding:5px 10px;"><option>All ingest protocols</option></select>
+            <select class="field-select" style="width:auto;padding:5px 10px;"><option>All codecs</option></select>
+            <button class="btn btn-ghost btn-sm">Clear</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== CODE ==================== -->
+    <section class="sb-page" data-pg="code">
+      <h1 class="sb-h1">Code &amp; <em>mono.</em></h1>
+      <p>Code blocks live on ink. Three colors plus the paper foreground: tally amber for keywords, a soft green for strings, ink-faint italic for comments, wire bright for identifiers. The result is monochrome enough to read like a terminal, colored enough to be legible at a glance.</p>
+
+      <h2 class="sb-h2">Code <em>block.</em></h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>code block</span><span>ink bg · tally accent strip</span></div>
+        <div class="sb-eg-body" style="background:var(--ink);padding:0;">
+          <div style="background:var(--ink);color:var(--paper);font-family:var(--font-mono);font-size:11px;line-height:1.7;padding:var(--s-4);border-left:3px solid var(--tally);">
+<span style="color:var(--ink-faint);font-style:italic;">// redact-pii v2.4.1 — face/license-plate blur</span><br>
+<span style="color:var(--tally-bright);">use</span> lvqr_filter_sdk::{Fragment, Decision, host};<br>
+<br>
+<span style="color:var(--ink-faint);font-style:italic;">// called per-fragment · budget 4ms hard cap</span><br>
+<span style="color:var(--tally-bright);">#[no_mangle]</span><br>
+<span style="color:var(--tally-bright);">pub fn</span> <span style="color:var(--wire-bright);">on_fragment</span>(f: &amp;<span style="color:var(--tally-bright);">mut</span> Fragment) -&gt; Decision {<br>
+&nbsp;&nbsp;<span style="color:var(--tally-bright);">if</span> !f.flags.contains(KEYFRAME) { <span style="color:var(--tally-bright);">return</span> Decision::Pass; }<br>
+&nbsp;&nbsp;<span style="color:var(--tally-bright);">let</span> img = f.payload.as_yuv()?;<br>
+&nbsp;&nbsp;<span style="color:var(--tally-bright);">let</span> boxes = MODEL.detect(&amp;img)?;<br>
+&nbsp;&nbsp;host::log(<span style="color:#86efac;">"detected " + boxes.len()</span>);<br>
+&nbsp;&nbsp;Decision::Pass<br>
+}
+          </div>
+        </div>
+      </div>
+
+      <h2 class="sb-h2">Inline <em>mono.</em></h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>code in prose</span><span>chalk-lo bg · subtle</span></div>
+        <div class="sb-eg-body">
+          <div style="font-size:14px;line-height:1.65;color:var(--ink-light);max-width:60ch;">
+            Mount the listener on <code style="font-family:var(--font-mono);font-size:12px;background:var(--chalk-lo);border:1px solid var(--chalk-hi);padding:1px 5px;">0.0.0.0:1935</code> and publish with <code style="font-family:var(--font-mono);font-size:12px;background:var(--chalk-lo);border:1px solid var(--chalk-hi);padding:1px 5px;">rtmp://lvqr.hack.build/live/{stream_key}</code>. Auth is JWT-bearer or static key, configurable per app.
+          </div>
+        </div>
+      </div>
+
+      <h2 class="sb-h2">Log <em>tail.</em></h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>log tail rows</span><span>time · level pill · component · message</span></div>
+        <div class="sb-eg-body">
+          <div style="font-family:var(--font-mono);font-size:11px;line-height:1.7;background:var(--paper);">
+            <div style="display:grid;grid-template-columns:74px 38px 90px 1fr;gap:8px;padding:5px var(--s-4);border-bottom:1px solid var(--chalk);"><span style="color:var(--ink-faint);">14:23:08</span><span class="pill ready" style="padding:0 4px;font-size:9px;">INFO</span><span style="color:var(--wire-deep);">lvqr-ingest</span><span style="color:var(--ink-light);">RTMP publish accepted broadcast=heatsync-mainstage</span></div>
+            <div style="display:grid;grid-template-columns:74px 38px 90px 1fr;gap:8px;padding:5px var(--s-4);border-bottom:1px solid var(--chalk);"><span style="color:var(--ink-faint);">14:23:12</span><span class="pill warn" style="padding:0 4px;font-size:9px;">WARN</span><span style="color:var(--warn);">lvqr-cluster</span><span style="color:var(--ink-light);">node phx-03 capacity 84% threshold=80</span></div>
+            <div style="display:grid;grid-template-columns:74px 38px 90px 1fr;gap:8px;padding:5px var(--s-4);"><span style="color:var(--ink-faint);">14:23:13</span><span class="pill ready" style="padding:0 4px;font-size:9px;">INFO</span><span style="color:var(--wire-deep);">lvqr-filter</span><span style="color:var(--ink-light);">wasm chain executed total=1.7ms</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== TOPBAR ==================== -->
+    <section class="sb-page" data-pg="topbar">
+      <h1 class="sb-h1">Top bar.</h1>
+      <p>The fixed-height ink-surface header. Brand left, cluster identity middle-left, on-air indicator center-right, search and user controls right. The 56px height is sacred; resist the urge to make it taller.</p>
+
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>full topbar</span><span>56px · ink bg · scanline texture</span></div>
+        <div class="sb-eg-body" style="padding:0;background:var(--ink);">
+          <header style="background:var(--ink);color:var(--paper);height:56px;display:flex;align-items:center;padding:0 var(--s-5);gap:var(--s-5);position:relative;background-image:repeating-linear-gradient(0deg, transparent 0, transparent 23px, rgba(255,255,255,0.025) 23px, rgba(255,255,255,0.025) 24px);">
+            <div style="display:flex;align-items:center;gap:var(--s-3);">
+              <span style="font-family:var(--font-display);font-size:24px;letter-spacing:-0.02em;color:var(--paper);">LVQR<span style="display:inline-block;width:8px;height:8px;background:var(--tally);margin-left:2px;vertical-align:1px;box-shadow:0 0 12px var(--tally-glow);"></span></span>
+              <span style="font-family:var(--font-mono);font-size:10px;color:var(--ink-faint);padding:2px 6px;border:1px solid var(--ink-light);letter-spacing:0.05em;">v1.0.0-rc.3</span>
+            </div>
+            <div style="width:1px;height:24px;background:var(--ink-light);"></div>
+            <div style="display:flex;align-items:center;gap:var(--s-2);font-family:var(--font-mono);font-size:11px;color:var(--ink-ghost);">
+              <span style="width:6px;height:6px;border-radius:50%;background:var(--ready);box-shadow:0 0 8px rgba(22,163,74,0.5);"></span>
+              <span>cluster: <strong style="color:var(--paper)">phx-prod-01</strong></span>
+              <span style="color:var(--ink-faint);">·</span>
+              <span>3 nodes</span>
+            </div>
+            <div style="flex:1;"></div>
+            <div style="display:flex;align-items:center;gap:var(--s-2);font-family:var(--font-mono);font-size:10px;font-weight:700;letter-spacing:0.15em;color:var(--paper);padding:6px 10px;background:rgba(220,38,38,0.15);border:1px solid var(--on-air);">
+              <span style="width:8px;height:8px;border-radius:50%;background:var(--on-air);box-shadow:0 0 12px var(--on-air-glow);"></span>
+              <span>ON AIR</span>
+              <span style="color:var(--ink-ghost);font-weight:400;letter-spacing:normal;">12 / 50</span>
+            </div>
+            <div style="display:flex;align-items:center;background:rgba(255,255,255,0.06);border:1px solid var(--ink-light);padding:0 var(--s-3);height:32px;width:240px;">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" style="width:12px;height:12px;color:var(--ink-faint);margin-right:8px;"><circle cx="7" cy="7" r="5"/><path d="m11 11 3 3"/></svg>
+              <input type="text" placeholder="search streams, keys, nodes…" style="background:none;border:none;outline:none;color:var(--paper);font-size:12px;width:100%;font-family:var(--font-mono);">
+            </div>
+            <div style="display:flex;align-items:center;gap:var(--s-2);padding:4px 10px 4px 4px;border:1px solid var(--ink-light);">
+              <div style="width:24px;height:24px;background:var(--tally);color:var(--ink);font-family:var(--font-mono);font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;">MZ</div>
+              <span style="font-family:var(--font-mono);font-size:11px;color:var(--paper);">moheeb@hsl</span>
+            </div>
+          </header>
+        </div>
+      </div>
+
+      <div class="sb-doc"><strong>The on-air block.</strong> Always visible if any broadcast is on-air. Cap-letterspaced "ON AIR" plus the count over the cluster cap (12 / 50). Pulsing red dot. This is the single most important indicator in the system — it tells the operator at a glance how loaded the system is. If you remove or hide this, the system fails its primary job.</div>
+    </section>
+
+    <!-- ==================== RAIL ==================== -->
+    <section class="sb-page" data-pg="rail">
+      <h1 class="sb-h1">Left rail.</h1>
+      <p>Sectioned navigation. Mono caps section labels in ink-faint, list items in Figtree 13px ink-light, active item gets a tally amber left border and tally-wash background. Sections are separated by hairline rules. Badge counts live right-aligned on the row.</p>
+
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>rail · sectioned</span><span>240px · paper bg</span></div>
+        <div class="sb-eg-body" style="padding:0;">
+          <nav style="background:var(--paper);border:1px solid var(--chalk-hi);width:240px;">
+            <div style="padding:var(--s-4) 0 var(--s-2);">
+              <div style="font-family:var(--font-mono);font-size:9px;font-weight:700;letter-spacing:0.2em;color:var(--ink-faint);padding:0 var(--s-5) var(--s-2);text-transform:uppercase;">Operations</div>
+              <a style="display:flex;align-items:center;gap:var(--s-3);padding:7px var(--s-5);font-size:13px;color:var(--ink);background:var(--tally-wash);border-left:2px solid var(--tally);font-weight:600;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:14px;height:14px;color:var(--tally-deep);"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
+                <span>Dashboard</span>
+              </a>
+              <a style="display:flex;align-items:center;gap:var(--s-3);padding:7px var(--s-5);font-size:13px;color:var(--ink-light);border-left:2px solid transparent;font-weight:500;cursor:pointer;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:14px;height:14px;color:var(--ink-muted);"><circle cx="12" cy="12" r="3"/><path d="M5.07 19A9 9 0 1 0 19 19"/></svg>
+                <span>Live Streams</span>
+                <span style="margin-left:auto;font-family:var(--font-mono);font-size:10px;padding:1px 6px;background:var(--on-air);color:var(--paper);font-weight:600;">12</span>
+              </a>
+              <a style="display:flex;align-items:center;gap:var(--s-3);padding:7px var(--s-5);font-size:13px;color:var(--ink-light);border-left:2px solid transparent;font-weight:500;cursor:pointer;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:14px;height:14px;color:var(--ink-muted);"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>
+                <span>Recordings</span>
+                <span style="margin-left:auto;font-family:var(--font-mono);font-size:10px;padding:1px 6px;background:var(--chalk);color:var(--ink-muted);font-weight:600;">847</span>
+              </a>
+            </div>
+            <div style="padding:var(--s-4) 0 var(--s-2);border-top:1px solid var(--chalk);">
+              <div style="font-family:var(--font-mono);font-size:9px;font-weight:700;letter-spacing:0.2em;color:var(--ink-faint);padding:0 var(--s-5) var(--s-2);text-transform:uppercase;">Pipeline</div>
+              <a style="display:flex;align-items:center;gap:var(--s-3);padding:7px var(--s-5);font-size:13px;color:var(--ink-light);border-left:2px solid transparent;font-weight:500;cursor:pointer;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:14px;height:14px;color:var(--ink-muted);"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="18" r="3"/><path d="M9 6h6M9 18h6M6 9v6M18 9v6"/></svg>
+                <span>WASM Filters</span>
+                <span style="margin-left:auto;font-family:var(--font-mono);font-size:10px;padding:1px 6px;background:var(--chalk);color:var(--ink-muted);font-weight:600;">28</span>
+              </a>
+            </div>
+          </nav>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== STATUSBAR ==================== -->
+    <section class="sb-page" data-pg="statusbar">
+      <h1 class="sb-h1">Status bar.</h1>
+      <p>The 28px-tall ink-surface footer. Listening port states with colored dots, on-air count center, machine stats right. The control-room equivalent of a Vim status line. Always visible, always live.</p>
+
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>statusbar</span><span>28px · ink bg · mono 10px</span></div>
+        <div class="sb-eg-body" style="padding:0;">
+          <footer style="background:var(--ink);color:var(--ink-ghost);height:28px;display:flex;align-items:center;padding:0 var(--s-5);gap:var(--s-5);font-family:var(--font-mono);font-size:10px;letter-spacing:0.05em;">
+            <div style="display:flex;align-items:center;gap:var(--s-2);"><span style="width:6px;height:6px;border-radius:50%;background:var(--ready);box-shadow:0 0 6px rgba(22,163,74,0.5);"></span>RELAY OK</div>
+            <div style="display:flex;align-items:center;gap:var(--s-2);padding-left:var(--s-5);border-left:1px solid var(--ink-light);"><span style="width:6px;height:6px;border-radius:50%;background:var(--ready);"></span>RTMP :1935</div>
+            <div style="display:flex;align-items:center;gap:var(--s-2);padding-left:var(--s-5);border-left:1px solid var(--ink-light);"><span style="width:6px;height:6px;border-radius:50%;background:var(--ready);"></span>QUIC :4443</div>
+            <div style="display:flex;align-items:center;gap:var(--s-2);padding-left:var(--s-5);border-left:1px solid var(--ink-light);"><span style="width:6px;height:6px;border-radius:50%;background:var(--warn);"></span>SRT :8890 (1)</div>
+            <div style="display:flex;align-items:center;gap:var(--s-2);padding-left:var(--s-5);border-left:1px solid var(--ink-light);"><span style="width:6px;height:6px;border-radius:50%;background:var(--on-air);box-shadow:0 0 6px var(--on-air-glow);"></span>12 ON AIR</div>
+            <div style="flex:1;"></div>
+            <div style="display:flex;align-items:center;gap:var(--s-2);padding-left:var(--s-5);border-left:1px solid var(--ink-light);">CPU 38%</div>
+            <div style="display:flex;align-items:center;gap:var(--s-2);padding-left:var(--s-5);border-left:1px solid var(--ink-light);">MEM 4.2/16 GB</div>
+            <div style="display:flex;align-items:center;gap:var(--s-2);padding-left:var(--s-5);border-left:1px solid var(--ink-light);">UPTIME 18d 06:14:22</div>
+            <div style="display:flex;align-items:center;gap:var(--s-2);padding-left:var(--s-5);border-left:1px solid var(--ink-light);color:var(--tally-bright);">TALLY //</div>
+          </footer>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== PAGE HEADER ==================== -->
+    <section class="sb-page" data-pg="pageheader">
+      <h1 class="sb-h1">Page header.</h1>
+      <p>The shape every page opens with. A breadcrumb in mono caps, a 48px Instrument Serif title with one italic word, a 60-character lead paragraph, and right-aligned action buttons. Always ends with a hairline border. Always.</p>
+
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>page header</span><span>crumb + title + lead + actions</span></div>
+        <div class="sb-eg-body">
+          <div style="display:flex;align-items:flex-end;justify-content:space-between;padding-bottom:var(--s-4);border-bottom:1px solid var(--chalk-hi);gap:var(--s-5);">
+            <div>
+              <div style="font-family:var(--font-mono);font-size:10px;letter-spacing:0.15em;color:var(--ink-faint);text-transform:uppercase;margin-bottom:6px;">CONSOLE / PIPELINE / <span style="color:var(--ink-muted);">WASM Filters</span></div>
+              <h1 style="font-family:var(--font-display);font-size:48px;font-weight:400;line-height:1;letter-spacing:-0.02em;color:var(--ink);">Filter <em style="color:var(--tally-deep);">chain.</em></h1>
+              <p style="margin-top:var(--s-2);color:var(--ink-muted);font-size:14px;max-width:60ch;">Per-fragment WebAssembly filters running in a wasmtime sandbox between ingest and fan-out. Hot-reload modules without dropping a frame. Chain them, attach them to broadcasts.</p>
+            </div>
+            <div style="display:flex;gap:var(--s-2);align-items:center;">
+              <button class="btn btn-ghost">Upload .wasm</button>
+              <button class="btn btn-wire">Marketplace</button>
+              <button class="btn btn-primary">+ New Chain</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sb-doc"><strong>The italic word matters.</strong> Pick the one word in the title that carries the metaphor. "Filter <em>chain</em>" — the chain is the verb. "Stream <em>detail</em>" — the detail is the focus. "Tally<em>board</em> overview" — the board is the object. The italic anchors the page emotionally; without it, headlines feel mechanical.</div>
+    </section>
+
+    <!-- ==================== OSC ==================== -->
+    <section class="sb-page" data-pg="osc">
+      <h1 class="sb-h1">Oscilloscope grid.</h1>
+      <p>A 24×24px subtle grid background, applied to cards or sections that contain charts, timelines, or technical diagrams. Implies "this is a measurement surface." Don't apply it to general content cards; the visual cost is too high if the contents aren't actually measured.</p>
+
+      <h2 class="sb-h2">Standalone.</h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>.osc-bg</span><span>24px grid · 4% ink lines</span></div>
+        <div class="sb-eg-body osc">
+          <div style="height:140px;display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-size:11px;letter-spacing:0.15em;color:var(--ink-muted);text-transform:uppercase;">measurement surface</div>
+        </div>
+      </div>
+
+      <h2 class="sb-h2">In context.</h2>
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>card.osc-bg</span><span>chart with grid</span></div>
+        <div class="sb-eg-body">
+          <div class="card" style="background-image:linear-gradient(rgba(20,32,46,0.04) 1px, transparent 1px),linear-gradient(90deg, rgba(20,32,46,0.04) 1px, transparent 1px);background-size:24px 24px;">
+            <div class="card-head">
+              <div class="card-title">Latency Histogram · MoQ p50/95/99</div>
+              <span class="pill" style="padding:1px 6px;font-size:9px;">last 60min</span>
+            </div>
+            <svg viewBox="0 0 480 140" style="width:100%;display:block;">
+              <line x1="0" y1="40" x2="480" y2="40" stroke="rgba(20,32,46,0.08)" stroke-dasharray="2,3"/>
+              <line x1="0" y1="80" x2="480" y2="80" stroke="rgba(20,32,46,0.08)" stroke-dasharray="2,3"/>
+              <g fill="var(--tally)" opacity="0.7">
+                <rect x="40" y="108" width="14" height="22"/><rect x="58" y="98" width="14" height="32"/>
+                <rect x="76" y="84" width="14" height="46"/><rect x="94" y="68" width="14" height="62"/>
+                <rect x="112" y="48" width="14" height="82"/><rect x="130" y="32" width="14" height="98"/>
+                <rect x="148" y="24" width="14" height="106"/><rect x="166" y="40" width="14" height="90"/>
+                <rect x="184" y="58" width="14" height="72"/><rect x="202" y="76" width="14" height="54"/>
+                <rect x="220" y="90" width="14" height="40"/><rect x="238" y="102" width="14" height="28"/>
+              </g>
+              <line x1="143" y1="0" x2="143" y2="130" stroke="var(--ink)" stroke-dasharray="2,2"/>
+              <text x="146" y="11" font-family="JetBrains Mono" font-size="9" font-weight="700" fill="var(--ink)">p50 112ms</text>
+            </svg>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== CHAIN ==================== -->
+    <section class="sb-page" data-pg="chain">
+      <h1 class="sb-h1">Filter chain <em>canvas.</em></h1>
+      <p>The signature specialty component. A node graph showing fragments flowing through the filter pipeline. Square boxes, hard-cornered, color-coded by signal type (tally for video, wire for audio). The drawing language is broadcast schematic, not flowchart.</p>
+
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>filter chain</span><span>ingest → filters → fan-out</span></div>
+        <div class="sb-eg-body osc">
+          <svg viewBox="0 0 880 220" style="width:100%;display:block;">
+            <defs>
+              <marker id="sb-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--ink)"/>
+              </marker>
+              <marker id="sb-arrow-tally" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--tally)"/>
+              </marker>
+            </defs>
+            <!-- ingest -->
+            <rect x="20" y="80" width="120" height="60" fill="var(--ink)"/>
+            <text x="80" y="102" text-anchor="middle" font-family="JetBrains Mono" font-size="9" font-weight="700" fill="var(--ink-faint)" letter-spacing="2">INGEST</text>
+            <text x="80" y="124" text-anchor="middle" font-family="Instrument Serif" font-size="20" fill="var(--paper)">RTMP</text>
+            <circle cx="140" cy="110" r="5" fill="var(--tally)" stroke="var(--paper)" stroke-width="2"/>
+
+            <path d="M 145 110 L 220 110" stroke="var(--ink)" stroke-width="1.5" fill="none" marker-end="url(#sb-arrow)"/>
+
+            <!-- f1 -->
+            <rect x="220" y="80" width="160" height="60" fill="var(--paper)" stroke="var(--tally)" stroke-width="2"/>
+            <rect x="220" y="80" width="160" height="14" fill="var(--tally-wash)"/>
+            <text x="230" y="91" font-family="JetBrains Mono" font-size="9" font-weight="700" fill="var(--tally-deep)" letter-spacing="2">FILTER 1</text>
+            <text x="230" y="114" font-family="Instrument Serif" font-size="18" fill="var(--ink)">redact-pii</text>
+            <text x="230" y="130" font-family="JetBrains Mono" font-size="9" fill="var(--ready)">1.2ms · 99.99%</text>
+            <circle cx="220" cy="110" r="5" fill="var(--ink)" stroke="var(--paper)" stroke-width="2"/>
+            <circle cx="380" cy="110" r="5" fill="var(--tally)" stroke="var(--paper)" stroke-width="2"/>
+
+            <path d="M 385 110 L 440 110" stroke="var(--ink)" stroke-width="1.5" fill="none" marker-end="url(#sb-arrow)"/>
+
+            <!-- f2 -->
+            <rect x="440" y="80" width="160" height="60" fill="var(--paper)" stroke="var(--tally)" stroke-width="2"/>
+            <rect x="440" y="80" width="160" height="14" fill="var(--tally-wash)"/>
+            <text x="450" y="91" font-family="JetBrains Mono" font-size="9" font-weight="700" fill="var(--tally-deep)" letter-spacing="2">FILTER 2</text>
+            <text x="450" y="114" font-family="Instrument Serif" font-size="18" fill="var(--ink)">watermark</text>
+            <text x="450" y="130" font-family="JetBrains Mono" font-size="9" fill="var(--ready)">0.4ms · 100%</text>
+            <circle cx="440" cy="110" r="5" fill="var(--ink)" stroke="var(--paper)" stroke-width="2"/>
+            <circle cx="600" cy="110" r="5" fill="var(--tally)" stroke="var(--paper)" stroke-width="2"/>
+
+            <path d="M 605 110 L 700 110" stroke="var(--tally)" stroke-width="2" fill="none" marker-end="url(#sb-arrow-tally)"/>
+
+            <!-- fan -->
+            <rect x="700" y="80" width="160" height="60" fill="var(--tally)" stroke="var(--tally-deep)" stroke-width="2"/>
+            <text x="780" y="102" text-anchor="middle" font-family="JetBrains Mono" font-size="9" font-weight="700" fill="var(--paper)" letter-spacing="2">FAN-OUT</text>
+            <text x="780" y="126" text-anchor="middle" font-family="Instrument Serif" font-size="18" fill="var(--paper)">to all egress</text>
+          </svg>
+        </div>
+      </div>
+
+      <h2 class="sb-h2">Anatomy.</h2>
+      <table class="sb-toktbl">
+        <thead><tr><th>Element</th><th>Treatment</th></tr></thead>
+        <tbody>
+          <tr><td>Ingest source node</td><td>Solid ink fill, paper text. 120×60.</td></tr>
+          <tr><td>Filter node (video)</td><td>Paper bg, 2px tally border, tally-wash header strip. 160×60.</td></tr>
+          <tr><td>Filter node (audio)</td><td>Paper bg, 2px wire border, wire-wash header strip. 160×60.</td></tr>
+          <tr><td>Selected filter</td><td>Same as base + 2px dashed tally-deep outer ring</td></tr>
+          <tr><td>Egress / fan-out</td><td>Solid tally fill, paper text. 160×60.</td></tr>
+          <tr><td>Connection (default)</td><td>1.5px ink with arrow marker</td></tr>
+          <tr><td>Connection (audio branch)</td><td>1.5px ink dashed (4,2)</td></tr>
+          <tr><td>Connection (to fan-out)</td><td>1.5px tally with tally arrow</td></tr>
+          <tr><td>Port (input)</td><td>5px ink filled circle, paper border</td></tr>
+          <tr><td>Port (output)</td><td>5px tally or wire filled circle, paper border</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ==================== TOPOLOGY ==================== -->
+    <section class="sb-page" data-pg="topology">
+      <h1 class="sb-h1">Cluster <em>topology.</em></h1>
+      <p>Node graph for cluster, federation, and peer mesh views. Nodes are bordered rectangles or filled circles depending on weight. Edges are 1.5–2px lines, dashed when gossip-only, solid when carrying actual traffic.</p>
+
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>cluster topology</span><span>3-node + edge labels</span></div>
+        <div class="sb-eg-body osc">
+          <svg viewBox="0 0 600 240" style="width:100%;display:block;">
+            <!-- mesh edges -->
+            <path d="M 130 80 L 470 80" stroke="var(--wire)" stroke-width="2"/>
+            <path d="M 130 80 L 300 200" stroke="var(--wire)" stroke-width="2"/>
+            <path d="M 470 80 L 300 200" stroke="var(--wire)" stroke-width="2"/>
+            <text x="300" y="74" text-anchor="middle" font-family="JetBrains Mono" font-size="9" fill="var(--wire-deep)" font-weight="700">chitchat gossip · 142 fragments/s</text>
+
+            <!-- N1 -->
+            <rect x="50" y="40" width="160" height="80" fill="var(--paper)" stroke="var(--ink)" stroke-width="2"/>
+            <rect x="50" y="40" width="160" height="18" fill="var(--ink)"/>
+            <text x="60" y="53" font-family="JetBrains Mono" font-size="9" font-weight="700" fill="var(--paper)" letter-spacing="2">NODE · LEADER</text>
+            <text x="60" y="80" font-family="Instrument Serif" font-size="20" fill="var(--ink)">phx-01</text>
+            <text x="60" y="98" font-family="JetBrains Mono" font-size="9" fill="var(--ink-muted)">5 broadcasts · CPU 38%</text>
+            <text x="60" y="112" font-family="JetBrains Mono" font-size="9" fill="var(--ready)">healthy</text>
+
+            <!-- N2 -->
+            <rect x="390" y="40" width="160" height="80" fill="var(--paper)" stroke="var(--ink)" stroke-width="2"/>
+            <rect x="390" y="40" width="160" height="18" fill="var(--ink)"/>
+            <text x="400" y="53" font-family="JetBrains Mono" font-size="9" font-weight="700" fill="var(--paper)" letter-spacing="2">NODE</text>
+            <text x="400" y="80" font-family="Instrument Serif" font-size="20" fill="var(--ink)">phx-02</text>
+            <text x="400" y="98" font-family="JetBrains Mono" font-size="9" fill="var(--ink-muted)">4 broadcasts · CPU 42%</text>
+            <text x="400" y="112" font-family="JetBrains Mono" font-size="9" fill="var(--ready)">healthy</text>
+
+            <!-- N3 -->
+            <rect x="220" y="160" width="160" height="80" fill="var(--paper)" stroke="var(--warn)" stroke-width="2"/>
+            <rect x="220" y="160" width="160" height="18" fill="var(--warn)"/>
+            <text x="230" y="173" font-family="JetBrains Mono" font-size="9" font-weight="700" fill="var(--paper)" letter-spacing="2">NODE · 84% CAP</text>
+            <text x="230" y="200" font-family="Instrument Serif" font-size="20" fill="var(--ink)">phx-03</text>
+            <text x="230" y="218" font-family="JetBrains Mono" font-size="9" fill="var(--ink-muted)">3 broadcasts · CPU 78%</text>
+            <text x="230" y="232" font-family="JetBrains Mono" font-size="9" fill="var(--warn)">capacity warning</text>
+          </svg>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== DVR ==================== -->
+    <section class="sb-page" data-pg="dvr">
+      <h1 class="sb-h1">DVR <em>timeline.</em></h1>
+      <p>Multi-track timeline for archived live content. Ruler ticks on top, then video fragment lane (with keyframe markers as dense vertical bars), audio lane, captions lane, plus event markers (SCTE-35 triangles). Playhead is a 2px tally vertical line with a triangle cap and a timecode label below.</p>
+
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>DVR scrubber</span><span>video · audio · captions · scte · playhead</span></div>
+        <div class="sb-eg-body">
+          <svg viewBox="0 0 1000 120" style="width:100%;display:block;">
+            <!-- ruler -->
+            <line x1="0" y1="20" x2="1000" y2="20" stroke="var(--chalk-hi)"/>
+            <g font-family="JetBrains Mono" font-size="9" fill="var(--ink-faint)">
+              <line x1="0" y1="20" x2="0" y2="14" stroke="var(--ink-faint)"/><text x="2" y="11">10:05</text>
+              <line x1="200" y1="20" x2="200" y2="14" stroke="var(--ink-faint)"/><text x="202" y="11">11:00</text>
+              <line x1="400" y1="20" x2="400" y2="14" stroke="var(--ink-faint)"/><text x="402" y="11">12:00</text>
+              <line x1="600" y1="20" x2="600" y2="14" stroke="var(--ink-faint)"/><text x="602" y="11">13:00</text>
+              <line x1="800" y1="20" x2="800" y2="14" stroke="var(--ink-faint)"/><text x="802" y="11">14:00</text>
+            </g>
+            <!-- video lane -->
+            <rect x="0" y="26" width="1000" height="14" fill="var(--chalk-lo)" stroke="var(--chalk-hi)"/>
+            <g fill="var(--wire)" opacity="0.6">
+              <rect x="0" y="26" width="2" height="14"/><rect x="40" y="26" width="2" height="14"/><rect x="80" y="26" width="2" height="14"/>
+              <rect x="120" y="26" width="2" height="14"/><rect x="160" y="26" width="2" height="14"/><rect x="200" y="26" width="2" height="14"/>
+              <rect x="280" y="26" width="2" height="14"/><rect x="360" y="26" width="2" height="14"/><rect x="440" y="26" width="2" height="14"/>
+              <rect x="520" y="26" width="2" height="14"/><rect x="600" y="26" width="2" height="14"/><rect x="680" y="26" width="2" height="14"/>
+              <rect x="760" y="26" width="2" height="14"/><rect x="840" y="26" width="2" height="14"/><rect x="920" y="26" width="2" height="14"/>
+            </g>
+            <!-- audio -->
+            <rect x="0" y="46" width="1000" height="10" fill="var(--chalk-lo)" stroke="var(--chalk-hi)"/>
+            <rect x="0" y="46" width="1000" height="10" fill="var(--tally)" opacity="0.4"/>
+            <!-- captions -->
+            <rect x="0" y="62" width="1000" height="8" fill="var(--chalk-lo)" stroke="var(--chalk-hi)"/>
+            <g fill="var(--ready)" opacity="0.7">
+              <rect x="50" y="62" width="80" height="8"/><rect x="180" y="62" width="40" height="8"/>
+              <rect x="280" y="62" width="120" height="8"/><rect x="450" y="62" width="60" height="8"/>
+              <rect x="580" y="62" width="100" height="8"/><rect x="720" y="62" width="180" height="8"/>
+            </g>
+            <!-- scte markers -->
+            <g fill="var(--on-air)">
+              <polygon points="345,75 350,82 340,82"/>
+              <polygon points="612,75 617,82 607,82"/>
+            </g>
+            <!-- playhead -->
+            <line x1="540" y1="0" x2="540" y2="80" stroke="var(--tally)" stroke-width="2"/>
+            <polygon points="535,0 545,0 540,8" fill="var(--tally)"/>
+            <text x="540" y="98" text-anchor="middle" font-family="JetBrains Mono" font-size="9" font-weight="700" fill="var(--tally-deep)">12:42:18</text>
+          </svg>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== HISTOGRAM ==================== -->
+    <section class="sb-page" data-pg="histogram">
+      <h1 class="sb-h1">Latency <em>histogram.</em></h1>
+      <p>Bar histogram with p50, p95, and p99 markers as ink-colored vertical lines. Use for latency distributions, fragment size distributions, anything where the shape of the distribution matters.</p>
+
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>histogram + percentiles</span><span>p50 ink · p95 wire · p99 air</span></div>
+        <div class="sb-eg-body osc">
+          <svg viewBox="0 0 480 180" style="width:100%;display:block;">
+            <line x1="0" y1="60" x2="480" y2="60" stroke="rgba(20,32,46,0.08)" stroke-dasharray="2,3"/>
+            <line x1="0" y1="120" x2="480" y2="120" stroke="rgba(20,32,46,0.08)" stroke-dasharray="2,3"/>
+            <text x="0" y="58" font-family="JetBrains Mono" font-size="9" fill="var(--ink-faint)">200ms</text>
+            <text x="0" y="118" font-family="JetBrains Mono" font-size="9" fill="var(--ink-faint)">100ms</text>
+            <g fill="var(--tally)" opacity="0.7">
+              <rect x="32" y="148" width="14" height="22"/><rect x="50" y="138" width="14" height="32"/>
+              <rect x="68" y="124" width="14" height="46"/><rect x="86" y="108" width="14" height="62"/>
+              <rect x="104" y="88" width="14" height="82"/><rect x="122" y="72" width="14" height="98"/>
+              <rect x="140" y="64" width="14" height="106"/><rect x="158" y="80" width="14" height="90"/>
+              <rect x="176" y="98" width="14" height="72"/><rect x="194" y="116" width="14" height="54"/>
+              <rect x="212" y="130" width="14" height="40"/><rect x="230" y="142" width="14" height="28"/>
+              <rect x="248" y="152" width="14" height="18"/><rect x="266" y="158" width="14" height="12"/>
+              <rect x="284" y="161" width="14" height="9"/><rect x="302" y="164" width="14" height="6"/>
+              <rect x="320" y="166" width="14" height="4"/><rect x="338" y="167" width="14" height="3"/>
+            </g>
+            <line x1="135" y1="40" x2="135" y2="170" stroke="var(--ink)" stroke-dasharray="2,2"/>
+            <text x="138" y="50" font-family="JetBrains Mono" font-size="9" font-weight="700" fill="var(--ink)">p50 112ms</text>
+            <line x1="195" y1="40" x2="195" y2="170" stroke="var(--wire-deep)" stroke-dasharray="2,2"/>
+            <text x="198" y="50" font-family="JetBrains Mono" font-size="9" font-weight="700" fill="var(--wire-deep)">p95 142ms</text>
+            <line x1="248" y1="40" x2="248" y2="170" stroke="var(--on-air)" stroke-dasharray="2,2"/>
+            <text x="251" y="50" font-family="JetBrains Mono" font-size="9" font-weight="700" fill="var(--on-air)">p99 178ms</text>
+          </svg>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== PREVIEW ==================== -->
+    <section class="sb-page" data-pg="preview">
+      <h1 class="sb-h1">Stream <em>preview.</em></h1>
+      <p>The video pane, when no actual video is rendering. SMPTE color bars overlaid on a tinted ink panel, scanline texture, mono labels in each corner: tally indicator top-left, codec / resolution top-right, PTS bottom-left, "TALLYBOARD PREVIEW" bottom-right. Always 16:9.</p>
+
+      <div class="sb-eg">
+        <div class="sb-eg-head"><span>preview pane</span><span>color bars · scanlines · corner labels</span></div>
+        <div class="sb-eg-body" style="padding:0;">
+          <div style="background:var(--ink);aspect-ratio:16/9;position:relative;border:1px solid var(--ink-light);overflow:hidden;">
+            <div style="position:absolute;inset:0;background-image:linear-gradient(135deg, rgba(232,117,26,0.18) 0%, rgba(14,116,144,0.18) 100%);"></div>
+            <div style="position:absolute;inset:0;background-image:repeating-linear-gradient(90deg,transparent 0,transparent 4px,rgba(255,255,255,0.04) 4px,rgba(255,255,255,0.04) 5px);"></div>
+            <div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:60%;height:50%;display:flex;">
+              <div style="flex:1;background:#c0c0c0;"></div><div style="flex:1;background:#c0c000;"></div><div style="flex:1;background:#00c0c0;"></div><div style="flex:1;background:#00c000;"></div><div style="flex:1;background:#c000c0;"></div><div style="flex:1;background:#c00000;"></div><div style="flex:1;background:#0000c0;"></div>
+            </div>
+            <div style="position:absolute;top:8px;left:8px;background:var(--on-air);color:var(--paper);padding:2px 8px;font-family:var(--font-mono);font-size:10px;font-weight:700;letter-spacing:0.1em;">● LIVE</div>
+            <div style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,0.6);color:var(--paper);padding:2px 8px;font-family:var(--font-mono);font-size:10px;">1080p60 · H.264 · 6.2 Mb/s</div>
+            <div style="position:absolute;bottom:8px;left:8px;background:rgba(0,0,0,0.6);color:var(--paper);padding:2px 8px;font-family:var(--font-mono);font-size:10px;">PTS 14:23:08.642 · DRIFT 0ms</div>
+            <div style="position:absolute;bottom:8px;right:8px;background:rgba(0,0,0,0.6);color:var(--tally-bright);padding:2px 8px;font-family:var(--font-mono);font-size:10px;">TALLYBOARD PREVIEW</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== VOICE ==================== -->
+    <section class="sb-page" data-pg="voice">
+      <h1 class="sb-h1">Voice &amp; <em>tone.</em></h1>
+      <p>Tallyboard sounds like an operator who has already done this a thousand times and assumes you have too. Direct, technical, comfortable with jargon, occasionally dry. Not warm, not chatty, not "delightful." This is software for engineers running broadcast infrastructure.</p>
+
+      <h2 class="sb-h2">Page <em>titles.</em></h2>
+      <div class="do"><strong>do.</strong> "Filter <em>chain.</em>" · "Tally<em>board</em> overview." · "DVR <em>scrubber.</em>" · "Cross-cluster <em>federation.</em>" · "Egress <em>endpoints.</em>"</div>
+      <div class="dont"><strong>don't.</strong> "Welcome to your filters!" · "Manage Recordings" · "View Cluster Details" · "Streams Dashboard" · titles without periods.</div>
+
+      <div class="sb-doc"><strong>The pattern.</strong> One or two words, ending in a period, with the second word italicized. Reads like a chapter heading in a manual. The italic anchors the metaphor; the period closes the thought. Avoid verb-led titles ("Manage X," "View Y") — those are CMS chrome, not console chrome.</div>
+
+      <h2 class="sb-h2">Lead <em>paragraphs.</em></h2>
+      <div class="do"><strong>do.</strong> "Per-fragment WebAssembly filters running in a wasmtime sandbox between ingest and fan-out. Drop in a .wasm module, hot-reload it without dropping a frame, chain filters into a pipeline."</div>
+      <div class="dont"><strong>don't.</strong> "Welcome! Filters let you customize your stream by adding effects and transformations. Get started by clicking the New Filter button below to upload your first filter."</div>
+
+      <div class="sb-doc"><strong>Address the operator, not the new user.</strong> Lead paragraphs explain what the system does, not how to use it. They use the actual technical names of things (wasmtime, fragment, fan-out) instead of metaphors. They refer to specific implementations the operator can reason about. They never welcome anyone.</div>
+
+      <h2 class="sb-h2">Microcopy.</h2>
+      <table class="sb-toktbl">
+        <thead><tr><th>Use</th><th>Tone</th><th>Examples</th></tr></thead>
+        <tbody>
+          <tr><td>Buttons</td><td>Verb + object, mono caps</td><td>NEW STREAM KEY · ROTATE · CUT FEED · DEPLOY CHAIN</td></tr>
+          <tr><td>Status pills</td><td>Cap nouns or terse adjectives</td><td>RTMP · SIGNED · WHIP / Browser · stable · beta</td></tr>
+          <tr><td>Tally labels</td><td>2-3 words max, all caps</td><td>ON AIR · LIVE FEED · HEALTHY · WARN · IDLE</td></tr>
+          <tr><td>Empty states</td><td>Statement of fact, never apology</td><td>"No filters in this chain. Drag from the library." (not "Looks like nothing's here yet!")</td></tr>
+          <tr><td>Errors</td><td>What broke, in plain language</td><td>"Node phx-03 capacity 84%. Consider draining or scaling." (not "Oops! Something went wrong.")</td></tr>
+        </tbody>
+      </table>
+
+      <h2 class="sb-h2">House <em>rules.</em></h2>
+      <div class="dont"><strong>never.</strong> Em-dashes (—) anywhere in any output. Em-dashes are an LLM tic. Use a colon, semicolon, period, or just two sentences instead.</div>
+      <div class="dont"><strong>never.</strong> Emojis anywhere. Inline SVG icons only.</div>
+      <div class="dont"><strong>never.</strong> "Not just X, it's Y." "Whether you're A or B…" Other AI-tinged framing patterns. They're cliches and they erode the operator voice.</div>
+      <div class="do"><strong>always.</strong> Use mono for any measurement, identifier, or piece of code, even inline. Use specific numbers ("142ms p95") rather than vague ones ("low latency"). Use "broadcast" instead of "stream" when referring to a logical channel; "stream" refers to the actual data flow.</div>
+
+      <h2 class="sb-h2">Side-by-<em>side.</em></h2>
+      <div class="do"><strong>do.</strong> "Federation forwards broadcasts across LVQR clusters over a single authenticated QUIC link. Push or pull, config-driven, with broadcast-name patterns and ACL."</div>
+      <div class="dont"><strong>don't.</strong> "Federation is a powerful feature that lets you connect multiple LVQR servers together — whether you're scaling globally or partnering with another cluster, federation has you covered."</div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+function navTo(name){
+  document.querySelectorAll('.sb-page').forEach(p => p.classList.toggle('active', p.dataset.pg === name));
+  document.querySelectorAll('.sb-nav').forEach(n => n.classList.toggle('active', n.dataset.page === name));
+  document.querySelector('.sb-main').scrollTop = 0;
+  window.scrollTo({top: 0, behavior:'instant'});
+}
+document.querySelectorAll('[data-page]').forEach(el => {
+  el.addEventListener('click', e => {
+    e.preventDefault();
+    navTo(el.dataset.page);
+  });
+});
+</script>
+</body>
+</html>

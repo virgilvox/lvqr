@@ -14,11 +14,17 @@ Three npm packages for browser integration:
   [`../dvr-scrub.md`](../dvr-scrub.md) for the operator embedding
   recipe.
 
-`@lvqr/core` and `@lvqr/player` ship at `0.3.2`; `@lvqr/dvr-player`
-ships at `0.3.3` (session 154 added the SCTE-35 marker layer; the
-two other packages stayed at 0.3.2). Features added on `main`
-after the last publish (listed below under **Timeouts + reconnect**
-and **Admin API**) land for consumers at the next release cycle.
+`@lvqr/core` ships at `0.3.3`, `@lvqr/dvr-player` at `0.3.3`,
+`@lvqr/player` at `0.3.2`. The 0.3.3 cycle (session 162) brought
+`@lvqr/core` admin-client parity with the v0.4.2 server surface
+(`configReload` / `triggerConfigReload` for hot config reload;
+`listStreamKeys` / `mintStreamKey` / `revokeStreamKey` /
+`rotateStreamKey` for runtime stream-key CRUD) and dropped the
+dead `./wasm` subpath export. `@lvqr/dvr-player` 0.3.3 added the
+SCTE-35 marker layer (session 154) and the opt-in client-side
+glass-to-glass SLO sampler (session 156 follow-up). `@lvqr/player`
+stays at 0.3.2 because no public-surface change has landed against
+that package since.
 
 ## Install
 

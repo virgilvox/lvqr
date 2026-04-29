@@ -94,6 +94,72 @@ entirely. Cloudflare, Fastly, and other CDNs do not currently
 proxy WebTransport; most deploys give the MoQ listener its own
 subdomain (`moq.relay.example.com`).
 
+## Hardware encoder prerequisites
+
+LVQR ships four hardware encoder backends, each behind a Cargo
+feature on `lvqr-cli` + `lvqr-transcode`. The build pulls the
+`gstreamer-rs` bindings; the runtime needs the matching
+GStreamer plugin + vendor driver installed on the host.
+
+```bash
+# macOS VideoToolbox (Apple Silicon + Intel)
+brew install gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav
+# vtenc_h264_hw ships with applemedia in gst-plugins-bad
+
+# Ubuntu / Debian + Nvidia NVENC
+sudo apt-get install -y \
+  gstreamer1.0-tools gstreamer1.0-plugins-base \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+  gstreamer1.0-libav \
+  nvidia-cuda-toolkit
+# Plus a working Nvidia driver (proprietary or open). Verify:
+gst-inspect-1.0 nvh264enc | head -8
+
+# Ubuntu / Debian + Intel VA-API (iGPU + Arc)
+sudo apt-get install -y \
+  gstreamer1.0-tools gstreamer1.0-plugins-base \
+  gstreamer1.0-plugins-bad gstreamer1.0-libav \
+  intel-media-va-driver-non-free
+# Or for AMD: replace the va-driver line with `mesa-va-drivers`.
+# Verify libva sees a device + the encoder element loads:
+vainfo
+gst-inspect-1.0 vah264enc | head -8
+
+# Ubuntu / Debian + Intel Quick Sync (oneVPL / legacy MFX)
+sudo apt-get install -y \
+  gstreamer1.0-plugins-bad libmfx1
+# qsvh264enc selects oneVPL on Tiger Lake+ and MFX on older
+# Skylake-Coffee Lake automatically. Verify:
+gst-inspect-1.0 qsvh264enc | head -8
+
+# Rocky / RHEL 8+ + Nvidia
+sudo dnf install -y \
+  gstreamer1-plugins-bad-free gstreamer1-libav \
+  cuda-toolkit
+```
+
+Each backend's `is_available()` probes for its required GStreamer
+elements at factory construction and emits a `warn!` log naming
+the missing element if the host can't drive the requested
+encoder. `build()` then opts out of every stream cleanly --
+**no silent fallback to software**. This is deliberate: an
+operator who builds with `--features hw-nvenc` and selects
+`--transcode-encoder nvenc` should hard-fail (visibly) on a host
+without an Nvidia driver rather than burn CPU silently.
+
+Build-time selection (one feature per binary):
+
+```bash
+cargo build --release --features hw-videotoolbox -p lvqr-cli  # macOS
+cargo build --release --features hw-nvenc        -p lvqr-cli  # Linux + Nvidia
+cargo build --release --features hw-vaapi        -p lvqr-cli  # Linux + Intel iGPU / AMD
+cargo build --release --features hw-qsv          -p lvqr-cli  # Linux + Intel QSV
+```
+
+Multiple features may compile together, but a binary's runtime
+selection is via the `--transcode-encoder
+software|videotoolbox|nvenc|vaapi|qsv` flag.
+
 ## systemd
 
 ```ini

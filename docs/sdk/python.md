@@ -1,9 +1,11 @@
 # Python SDK
 
 The `lvqr` Python package provides a synchronous admin client
-for LVQR relay servers. Ships at `0.3.2` on PyPI (released 2026-04-24); the 9-method
-admin surface documented below lands for consumers at the next
-release cycle.
+for LVQR relay servers. Ships at `0.3.3` on PyPI (released
+2026-04-28). Covers the full admin surface: stats / streams /
+mesh / SLO / cluster (4 routes) / wasm-filter / config-reload
+(hot reload status + trigger) / streamkeys (list / mint / revoke
+/ rotate). All methods documented below.
 
 ## Install
 

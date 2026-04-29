@@ -162,6 +162,37 @@ credential as live subscribe. Unauthenticated servers serve
 playback with `CorsLayer::permissive()`; tighten before
 exposing publicly.
 
+## Hardware encoders (optional)
+
+Build with one of the per-backend Cargo features and select via
+`--transcode-encoder`:
+
+```bash
+# macOS VideoToolbox
+cargo build --release --features hw-videotoolbox -p lvqr-cli
+lvqr serve --transcode-rendition 720p,480p,240p --transcode-encoder videotoolbox
+
+# Linux + Nvidia (NVENC)
+cargo build --release --features hw-nvenc -p lvqr-cli
+lvqr serve --transcode-rendition 720p,480p,240p --transcode-encoder nvenc
+
+# Linux + Intel iGPU / AMD (VA-API)
+cargo build --release --features hw-vaapi -p lvqr-cli
+lvqr serve --transcode-rendition 720p,480p,240p --transcode-encoder vaapi
+
+# Linux + Intel Quick Sync
+cargo build --release --features hw-qsv -p lvqr-cli
+lvqr serve --transcode-rendition 720p,480p,240p --transcode-encoder qsv
+```
+
+Each backend probes its required GStreamer encoder element at
+factory construction; if the runtime hardware is missing
+`build()` opts out cleanly with a warn log rather than silently
+falling back to software (a deliberate "operator-pickable
+hardware tier" design choice). System-package prerequisites per
+host are documented in
+[`docs/deployment.md#hardware-encoder-prerequisites`](deployment.md#hardware-encoder-prerequisites).
+
 ## Monitor
 
 ```bash
