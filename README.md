@@ -842,6 +842,13 @@ Python module: [`bindings/python/python/lvqr/`](bindings/python/python/lvqr/).
 The workspace is 29 Rust crates organised around the unified data
 plane: one segmenter, every protocol is a projection.
 
+![LVQR unified data-plane flow](docs/images/architecture-data-plane-flow.png)
+
+*Fig. 01 -- every ingest protocol (RTMP, WHIP, SRT, RTSP, WS fMP4)
+funnels through `lvqr-cmaf` into the `FragmentBroadcasterRegistry`;
+every egress is a projection. Sibling tracks (`captions`, `scte35`,
+`0.timing`, `.catalog`) ride the same registry.*
+
 ```
 Data model + fanout
   lvqr-core           StreamId, TrackName, EventBus, RelayStats
@@ -889,10 +896,27 @@ Infrastructure
   lvqr-soak           long-run soak driver
 ```
 
-### Three load-bearing decisions
+![LVQR three planes at a glance: data plane, cluster plane, observability](docs/images/architecture-three-planes.png)
 
-Every contributor needs to internalise these before touching cross-
-crate boundaries:
+*Three planes at a glance. The **data plane** (ingest -> CMAF
+segmenter -> `FragmentBroadcasterRegistry` -> observer taps) keeps
+concrete dispatch on the hot path, no `dyn` per fragment. The
+**cluster plane** (chitchat gossip carrying membership + ownership
+pointers + capacity + config; never per-frame state) routes
+subscribers to the owning node via a 302 redirect. **Observability**
+fans tracing spans + metrics counters out to Prometheus and OTLP gRPC
+through `FanoutBuilder`; lifecycle events ride
+`tokio::sync::broadcast`, per-byte counters never share a channel.*
+
+### Load-bearing decisions
+
+![Ten load-bearing architectural decisions](docs/images/architecture-load-bearing-decisions.png)
+
+*Ten architectural decisions that load-bear every protocol crate.
+Full prose narrative lives in
+[`tracking/ROADMAP.md`](tracking/ROADMAP.md). The three expanded
+below are the ones every contributor needs to internalise before
+touching cross-crate boundaries:*
 
 - **Unified Fragment Model.** Every track is a sequence of
   `Fragment { track_id, group_id, object_id, priority, dts, pts,
