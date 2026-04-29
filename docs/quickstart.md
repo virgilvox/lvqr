@@ -43,15 +43,17 @@ non-zero port:
 ```bash
 lvqr serve \
   --dash-port 8889 \
-  --whep-port 8443 \
   --whip-port 8443 \
+  --whep-port 8444 \
   --rtsp-port 8554 \
   --srt-port 8890
 ```
 
-Note that WHIP and WHEP can share the same HTTPS port when
-supplied with the same `--tls-*` pair; the routers are disjoint
-paths (`/whip/*` vs `/whep/*`).
+WHIP and WHEP need distinct ports so a single process can publish
+and preview at the same time. The relay's str0m ingest answerer
+(WHIP) and egress offerer (WHEP) each bind their own UDP socket;
+sharing 8443 between them was the WHIP/WHEP collision the admin
+console fixed in commit 1e36d1a.
 
 ## Publish a test stream
 
@@ -97,7 +99,7 @@ WebSocket fMP4.
 - **MPEG-DASH** (dash.js):
   `http://localhost:8889/dash/live/demo/manifest.mpd`
 - **WHEP** (WebRTC player):
-  `https://localhost:8443/whep/live/demo`
+  `https://localhost:8444/whep/live/demo`
 - **MoQ** (Chrome / Edge 107+ with WebTransport, using
   `@lvqr/player`):
   `https://localhost:4443/live/demo`

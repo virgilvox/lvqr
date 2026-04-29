@@ -30,7 +30,8 @@ single-node deploy.
 | 8888/tcp | LL-HLS | `--hls-port` | inbound | Subscribers + hls.js |
 | 8080/tcp | Admin + WS | `--admin-port` | inbound | Restrict `/api/v1/*` |
 | 8889/tcp | DASH | `--dash-port` | inbound | Optional |
-| 8443/tcp | WHEP / WHIP | `--whep-port` / `--whip-port` | inbound | HTTPS required |
+| 8443/tcp | WHIP | `--whip-port` | inbound | HTTPS required; ingest-side WebRTC |
+| 8444/tcp | WHEP | `--whep-port` | inbound | HTTPS required; egress-side WebRTC, distinct from WHIP so a single relay can publish + preview simultaneously |
 | 8554/tcp | RTSP | `--rtsp-port` | inbound | Optional |
 | 8890/udp | SRT | `--srt-port` | inbound | UDP; cannot proxy |
 | 10007/udp | chitchat gossip | `--cluster-listen` | intra-cluster | Between nodes only |
@@ -43,6 +44,7 @@ ufw allow 1935/tcp
 ufw allow 8888/tcp
 ufw allow 8889/tcp
 ufw allow 8443/tcp
+ufw allow 8444/tcp
 ufw allow from 10.0.0.0/8 to any port 8080  # admin internal only
 
 # Cluster nodes: allow chitchat between LVQR nodes only
@@ -82,8 +84,8 @@ relay.example.com {
     reverse_proxy /healthz     localhost:8080
     reverse_proxy /readyz      localhost:8080
     reverse_proxy /metrics     localhost:8080
-    reverse_proxy /whep/*      localhost:8443
     reverse_proxy /whip/*      localhost:8443
+    reverse_proxy /whep/*      localhost:8444
     # /ws/* terminates at admin port; Caddy proxies WS automatically.
     reverse_proxy /ws/*        localhost:8080
 }
@@ -206,7 +208,7 @@ RUST_LOG=lvqr=info,warn
 # Optional protocols
 LVQR_DASH_PORT=8889
 LVQR_WHIP_PORT=8443
-LVQR_WHEP_PORT=8443
+LVQR_WHEP_PORT=8444
 LVQR_RTSP_PORT=8554
 LVQR_SRT_PORT=8890
 

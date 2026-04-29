@@ -142,15 +142,16 @@ function save() {
               {{ showAdvanced ? '-' : '+' }} Advanced -- per-protocol ports
             </summary>
             <p class="advanced-hint">
-              Leave empty to use the LVQR defaults (RTMP 1935, WHIP/WHEP 8443,
-              HLS 8888, DASH 8889, SRT 9000, RTSP 8554, MoQ 4443). Override
-              when your relay binds non-default ports (e.g. running multiple
-              instances on one host).
+              Leave empty to use the LVQR defaults (RTMP 1935, WHIP 8443,
+              WHEP 8444, HLS 8888, DASH 8889, SRT 9000, RTSP 8554, MoQ 4443).
+              WHIP and WHEP get separate ports so a single relay can publish
+              and preview at the same time. Override when your relay binds
+              non-default ports (e.g. running multiple instances on one host).
             </p>
             <div class="port-grid">
               <label><span>RTMP</span><input v-model.number="draftPorts.rtmp" type="number" min="1" max="65535" placeholder="1935" /></label>
               <label><span>WHIP</span><input v-model.number="draftPorts.whip" type="number" min="1" max="65535" placeholder="8443" /></label>
-              <label><span>WHEP</span><input v-model.number="draftPorts.whep" type="number" min="1" max="65535" placeholder="8443" /></label>
+              <label><span>WHEP</span><input v-model.number="draftPorts.whep" type="number" min="1" max="65535" placeholder="8444" /></label>
               <label><span>LL-HLS</span><input v-model.number="draftPorts.hls" type="number" min="1" max="65535" placeholder="8888" /></label>
               <label><span>DASH</span><input v-model.number="draftPorts.dash" type="number" min="1" max="65535" placeholder="8889" /></label>
               <label><span>SRT</span><input v-model.number="draftPorts.srt" type="number" min="1" max="65535" placeholder="9000" /></label>

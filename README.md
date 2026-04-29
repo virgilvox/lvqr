@@ -403,7 +403,8 @@ see [`docs/scte35.md`](docs/scte35.md).
 - **LL-HLS**: `http://localhost:8888/hls/live/demo/playlist.m3u8`
 - **DASH**: `http://localhost:8889/dash/live/demo/manifest.mpd`
 - **WHEP**: browser WebRTC player at
-  `https://localhost:8443/whep/live/demo`
+  `https://localhost:8444/whep/live/demo` (distinct from WHIP's
+  8443 so a single relay can publish + preview at once)
 - **MoQ**: Chrome / Edge 107+ via the `@lvqr/player` web component
   (`npm i @lvqr/player`)
 - **DVR scrub**: `<lvqr-dvr-player>` web component
