@@ -177,9 +177,21 @@ impl HlsServer {
     pub async fn push_init(&self, bytes: Bytes) {
         let video = detect_video_codec_string(&bytes);
         let audio = detect_audio_codec_string(&bytes);
+        // RFC 8216bis §4.4.4.4: a publisher reconnect (or any
+        // mid-stream codec / encoder change) is exactly what
+        // EXT-X-DISCONTINUITY signals. The CLI's HLS bridge calls
+        // `push_init` once at stream start AND every time it observes
+        // new init bytes from the broadcaster (e.g. the publisher
+        // dropped + re-published on the same broadcast slot). The
+        // first call must NOT mark a discontinuity (it is the start
+        // of the stream); every subsequent call MUST.
+        let was_initialized = self.state.init_segment.read().await.is_some();
         *self.state.video_codec_string.write().await = video;
         *self.state.audio_codec_string.write().await = audio;
         *self.state.init_segment.write().await = Some(bytes);
+        if was_initialized {
+            self.state.builder.write().await.mark_discontinuity_pending();
+        }
         self.state.notify.notify_waiters();
     }
 
@@ -1342,6 +1354,40 @@ mod tests {
             cache.values().any(|v| v.as_ref() == b"seg0part0"),
             "cache: {:?}",
             cache.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn second_push_init_marks_next_segment_discontinuity() {
+        // First push_init is the start of stream and must NOT mark a
+        // discontinuity; the second push_init (publisher reconnect on
+        // the same broadcast slot, RFC 8216bis §4.4.4.4 trigger) must.
+        let server = HlsServer::new(PlaylistBuilderConfig::default());
+        // Initial init: first segment renders without discontinuity.
+        server.push_init(Bytes::from_static(b"init-v1")).await;
+        let seg0 = mk_chunk(0, 90_000, CmafChunkKind::Segment);
+        server
+            .push_chunk_bytes(&seg0, Bytes::from_static(b"seg0"))
+            .await
+            .unwrap();
+        server.state.builder.write().await.close_pending_segment();
+        let m1 = server.state.builder.read().await.manifest().render();
+        assert!(
+            !m1.contains("#EXT-X-DISCONTINUITY"),
+            "first segment must not be a discontinuity boundary; got:\n{m1}"
+        );
+        // Replacement init -> next-closed segment must carry the tag.
+        server.push_init(Bytes::from_static(b"init-v2")).await;
+        let seg1 = mk_chunk(90_000, 90_000, CmafChunkKind::Segment);
+        server
+            .push_chunk_bytes(&seg1, Bytes::from_static(b"seg1"))
+            .await
+            .unwrap();
+        server.state.builder.write().await.close_pending_segment();
+        let m2 = server.state.builder.read().await.manifest().render();
+        assert!(
+            m2.contains("#EXT-X-DISCONTINUITY"),
+            "replacement init must mark next-closed segment as discontinuity; got:\n{m2}"
         );
     }
 

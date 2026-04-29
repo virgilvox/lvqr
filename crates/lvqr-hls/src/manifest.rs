@@ -55,6 +55,17 @@ pub struct Segment {
     /// `#EXT-X-PART` line. RFC 8216bis requires this tag on every
     /// segment when `CAN-SKIP-UNTIL` is advertised.
     pub program_date_time_millis: Option<u64>,
+    /// `true` when this segment marks a codec / init-segment / encoder
+    /// boundary. Set by [`PlaylistBuilder::mark_discontinuity_pending`]
+    /// (called by the HLS server when a publisher reconnects with new
+    /// init bytes) and consumed by the renderer, which emits
+    /// `#EXT-X-DISCONTINUITY` immediately before this segment's first
+    /// `#EXT-X-PROGRAM-DATE-TIME` / `#EXT-X-PART` / `#EXTINF` lines.
+    /// RFC 8216bis §4.4.4.4 requires this tag on the first segment that
+    /// follows any change in codec, file format, or timestamp sequence;
+    /// strict players (hls.js, Shaka) glitch or fail playback on the
+    /// boundary when it is missing.
+    pub discontinuity: bool,
 }
 
 /// One partial segment (LL-HLS `#EXT-X-PART` entry).
@@ -323,6 +334,16 @@ impl Manifest {
             let _ = writeln!(out, ",{}={}", dr.kind.attribute_name(), dr.scte35_hex);
         }
         for seg in &self.segments[skip_count..] {
+            // RFC 8216bis §4.4.4.4: the discontinuity tag appears
+            // BEFORE the segment's PDT / PART / EXTINF lines. Strict
+            // players (hls.js, Shaka) use it to drop the audio /
+            // video timestamp continuity check across the boundary,
+            // which is exactly what a publisher reconnect with new
+            // init bytes needs. The first segment never carries it
+            // (see `pending_discontinuity` semantics in the builder).
+            if seg.discontinuity {
+                let _ = writeln!(out, "#EXT-X-DISCONTINUITY");
+            }
             if let Some(millis) = seg.program_date_time_millis {
                 let _ = writeln!(out, "#EXT-X-PROGRAM-DATE-TIME:{}", format_program_date_time(millis));
             }
@@ -522,6 +543,13 @@ pub struct PlaylistBuilder {
     /// offset from the config base. Only meaningful when
     /// `config.program_date_time_base` is `Some`.
     cumulative_duration_millis: u64,
+    /// Latch flag consumed by `close_pending_segment`. Set to `true`
+    /// by [`Self::mark_discontinuity_pending`] (called by
+    /// [`crate::HlsServer::push_init`] on every replacement init,
+    /// i.e. publisher reconnect with new codec params), cleared after
+    /// the next segment closes carrying the flag. The first init push
+    /// of a stream does NOT set this; only subsequent re-pushes do.
+    pending_discontinuity: bool,
 }
 
 impl PlaylistBuilder {
@@ -555,7 +583,25 @@ impl PlaylistBuilder {
             part_index: 0,
             evicted_uris: Vec::new(),
             cumulative_duration_millis: 0,
+            pending_discontinuity: false,
         }
+    }
+
+    /// Mark the next-to-close segment as a discontinuity boundary.
+    /// Called by [`crate::HlsServer::push_init`] when a publisher
+    /// reconnects with new init bytes (different codec, different
+    /// encoding parameters, different timestamp sequence). RFC
+    /// 8216bis §4.4.4.4 requires the playlist to emit
+    /// `#EXT-X-DISCONTINUITY` before the first Media Segment that
+    /// follows the change; without it, hls.js + Shaka glitch
+    /// playback at the boundary.
+    ///
+    /// Idempotent. Multiple calls before the next segment closes
+    /// collapse to a single discontinuity. Cleared by
+    /// [`Self::close_pending_segment`] after stamping it on the
+    /// newly closed segment.
+    pub fn mark_discontinuity_pending(&mut self) {
+        self.pending_discontinuity = true;
     }
 
     /// Push one chunk. Returns the updated manifest view on every
@@ -639,12 +685,14 @@ impl PlaylistBuilder {
         } else {
             0
         };
+        let discontinuity = std::mem::take(&mut self.pending_discontinuity);
         let seg = Segment {
             sequence,
             uri,
             duration_ticks: self.pending_duration_ticks,
             parts: std::mem::take(&mut self.pending_parts),
             program_date_time_millis: pdt_millis,
+            discontinuity,
         };
         self.manifest.segments.push(seg);
         self.cumulative_duration_millis += duration_millis;
@@ -956,6 +1004,52 @@ mod tests {
     }
 
     #[test]
+    fn render_emits_discontinuity_only_on_segment_after_mark() {
+        // RFC 8216bis §4.4.4.4: EXT-X-DISCONTINUITY appears before the
+        // first Media Segment that follows any change in codec, file
+        // format, or timestamp sequence. The flag is latched by
+        // PlaylistBuilder::mark_discontinuity_pending and consumed
+        // exactly once on the next close. Subsequent segments without
+        // a fresh mark do NOT repeat the tag.
+        let mut b = PlaylistBuilder::new(PlaylistBuilderConfig::default());
+        // Segment 0: pre-discontinuity, must render without the tag.
+        b.push(&mk_chunk(0, 90_000, CmafChunkKind::Segment)).unwrap();
+        b.close_pending_segment();
+        let text0 = b.manifest().render();
+        assert!(
+            !text0.contains("#EXT-X-DISCONTINUITY"),
+            "first segment must not be a discontinuity boundary; got:\n{text0}"
+        );
+        // Operator (or HlsServer::push_init on reconnect) marks
+        // discontinuity; the next closed segment carries it.
+        b.mark_discontinuity_pending();
+        b.push(&mk_chunk(90_000, 90_000, CmafChunkKind::Segment)).unwrap();
+        b.close_pending_segment();
+        let text1 = b.manifest().render();
+        assert!(
+            text1.contains("#EXT-X-DISCONTINUITY"),
+            "second segment must mark discontinuity; got:\n{text1}"
+        );
+        // The tag must precede the second segment's URI line, not
+        // the first. Locate the discontinuity marker and seg-0 +
+        // seg-1; assert seg-0 < discontinuity < seg-1.
+        let disc = text1.find("#EXT-X-DISCONTINUITY").expect("discontinuity present");
+        let s0 = text1.find("seg-0.m4s").expect("seg-0 present");
+        let s1 = text1.find("seg-1.m4s").expect("seg-1 present");
+        assert!(s0 < disc && disc < s1, "discontinuity must sit between seg-0 and seg-1");
+        // Push a third segment WITHOUT another mark; the tag must
+        // not repeat (the latch cleared after the first consumption).
+        b.push(&mk_chunk(180_000, 90_000, CmafChunkKind::Segment)).unwrap();
+        b.close_pending_segment();
+        let text2 = b.manifest().render();
+        assert_eq!(
+            text2.matches("#EXT-X-DISCONTINUITY").count(),
+            1,
+            "discontinuity must not repeat on subsequent segments; got:\n{text2}"
+        );
+    }
+
+    #[test]
     fn render_target_duration_ceils_observed_segment_when_over_configured() {
         // Configured target is 2 s but the encoder closes a segment at
         // 2.1 s (189_000 ticks at the default 90 kHz timescale). RFC
@@ -1101,6 +1195,7 @@ mod tests {
                 duration_ticks: 180_000,
                 parts: Vec::new(),
                 program_date_time_millis: None,
+                discontinuity: false,
             })
             .collect();
         let m = Manifest {
