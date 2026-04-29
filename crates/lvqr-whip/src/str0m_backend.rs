@@ -84,21 +84,40 @@ impl SdpAnswerer for Str0mIngestAnswerer {
         let offer = SdpOffer::from_sdp_string(offer_text)
             .map_err(|e| WhipError::MalformedOffer(format!("sdp parse failed: {e}")))?;
 
-        // One UDP socket per session. Same pattern as
-        // `lvqr_whep::Str0mAnswerer::create_session`: bind with
-        // `std::net::UdpSocket`, flip to nonblocking, hand to tokio
-        // via `from_std`. Host IP comes from the answerer config so
-        // deployments with a bridged network interface can advertise
-        // the reachable address rather than 127.0.0.1.
-        let bind_addr = SocketAddr::new(self.config.host_ip, 0);
+        // One UDP socket per session. Bind on the WILDCARD address so
+        // the OS can route outbound packets through any local
+        // interface (loopback, LAN, public). The ICE host candidate
+        // we ADVERTISE to the browser is `host_ip:port` -- a real
+        // routable address that the peer can reach us at.
+        //
+        // Why these are different concerns: the bind address governs
+        // which interfaces the socket can SEND from. A loopback
+        // (`127.0.0.1`) bind can only send to/from 127.0.0.1. When
+        // the browser's ICE agent enumerates srflx candidates (its
+        // STUN-discovered public IP, e.g. `68.3.214.53`), str0m
+        // tries to send STUN keepalives back to those endpoints via
+        // the bound socket; on a loopback socket the kernel rejects
+        // the send with `Can't assign requested address` (errno 49)
+        // and the session goes silent after the first sample.
+        //
+        // Wildcard bind + loopback candidate side-steps that: the
+        // browser's nominated pair is `127.0.0.1:port` (which it
+        // can reach via the host candidate), and ICE keepalives to
+        // other pairs flow out via the regular routing table.
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         let std_socket = std::net::UdpSocket::bind(bind_addr)
             .map_err(|e| WhipError::AnswererFailed(format!("udp bind {bind_addr} failed: {e}")))?;
         std_socket
             .set_nonblocking(true)
             .map_err(|e| WhipError::AnswererFailed(format!("set_nonblocking failed: {e}")))?;
-        let local_addr = std_socket
+        let bound = std_socket
             .local_addr()
             .map_err(|e| WhipError::AnswererFailed(format!("local_addr failed: {e}")))?;
+        // The candidate advertises `host_ip` (the operator-configured
+        // reachable address) on the OS-assigned port. local_addr.ip()
+        // would be `0.0.0.0` here -- which str0m correctly rejects.
+        let candidate_addr = SocketAddr::new(self.config.host_ip, bound.port());
+        let local_addr = bound;
         let socket = UdpSocket::from_std(std_socket)
             .map_err(|e| WhipError::AnswererFailed(format!("tokio from_std failed: {e}")))?;
 
@@ -108,7 +127,7 @@ impl SdpAnswerer for Str0mIngestAnswerer {
             .enable_opus(true)
             .build(Instant::now());
 
-        let candidate = Candidate::host(local_addr, Protocol::Udp)
+        let candidate = Candidate::host(candidate_addr, Protocol::Udp)
             .map_err(|e| WhipError::AnswererFailed(format!("host candidate failed: {e}")))?;
         rtc.add_local_candidate(candidate);
 

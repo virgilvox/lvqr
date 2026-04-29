@@ -188,15 +188,23 @@ impl SdpAnswerer for Str0mAnswerer {
         // nonblocking mode before handing the FD to tokio via
         // `tokio::net::UdpSocket::from_std`, which is tokio's
         // required conversion contract.
-        let bind_addr = SocketAddr::new(self.config.host_ip, 0);
+        // Wildcard bind so the OS can route outbound packets through
+        // any local interface; the ICE host candidate we ADVERTISE is
+        // `host_ip:port` (a routable address). Mirrors the WHIP-side
+        // fix: a loopback bind cannot send to non-loopback ICE-pair
+        // destinations, which fails with `Can't assign requested
+        // address` once the browser nominates an srflx candidate.
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         let std_socket = std::net::UdpSocket::bind(bind_addr)
             .map_err(|e| WhepError::AnswererFailed(format!("udp bind {bind_addr} failed: {e}")))?;
         std_socket
             .set_nonblocking(true)
             .map_err(|e| WhepError::AnswererFailed(format!("set_nonblocking failed: {e}")))?;
-        let local_addr = std_socket
+        let bound = std_socket
             .local_addr()
             .map_err(|e| WhepError::AnswererFailed(format!("local_addr failed: {e}")))?;
+        let candidate_addr = SocketAddr::new(self.config.host_ip, bound.port());
+        let local_addr = bound;
         let socket = UdpSocket::from_std(std_socket)
             .map_err(|e| WhepError::AnswererFailed(format!("tokio from_std failed: {e}")))?;
 
@@ -206,7 +214,7 @@ impl SdpAnswerer for Str0mAnswerer {
             .enable_opus(true)
             .build(Instant::now());
 
-        let candidate = Candidate::host(local_addr, Protocol::Udp)
+        let candidate = Candidate::host(candidate_addr, Protocol::Udp)
             .map_err(|e| WhepError::AnswererFailed(format!("host candidate failed: {e}")))?;
         rtc.add_local_candidate(candidate);
 

@@ -913,17 +913,29 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         });
     }
 
-    // Admin HTTP state and router.
+    // Admin HTTP state and router. The `/api/v1/stats` + `/api/v1/streams`
+    // callbacks query the FragmentBroadcasterRegistry rather than the
+    // RTMP-only bridge so WHIP / SRT / RTSP / WS-fMP4 publishes show up
+    // alongside RTMP. The bridge is still useful for RTMP-specific paths
+    // (recorder subscribed to BroadcastStarted/Stopped) but as a "what's
+    // currently publishing" source it's incomplete.
     let metrics_state = relay.metrics().clone();
-    let bridge_for_stats = bridge.clone();
-    let bridge_for_streams = bridge.clone();
+    let registry_for_stats = shared_registry.clone();
+    let registry_for_streams = shared_registry.clone();
 
     let admin_state = lvqr_admin::AdminState::new(
         move || {
-            let active = bridge_for_stats.active_stream_count() as u64;
+            let keys = registry_for_stats.keys();
+            // Unique broadcast count = publishers; total track count =
+            // unique (broadcast, track) pairs.
+            let mut broadcasts: Vec<&String> = keys.iter().map(|(b, _)| b).collect();
+            broadcasts.sort();
+            broadcasts.dedup();
+            let publishers = broadcasts.len() as u64;
+            let tracks = keys.len() as u64;
             lvqr_core::RelayStats {
-                publishers: active,
-                tracks: active * 2,
+                publishers,
+                tracks,
                 subscribers: metrics_state.connections_active.load(Ordering::Relaxed),
                 bytes_received: 0,
                 bytes_sent: 0,
@@ -931,8 +943,14 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             }
         },
         move || {
-            bridge_for_streams
-                .stream_names()
+            let mut names: Vec<String> = registry_for_streams
+                .keys()
+                .into_iter()
+                .map(|(broadcast, _track)| broadcast)
+                .collect();
+            names.sort();
+            names.dedup();
+            names
                 .into_iter()
                 .map(|name| lvqr_admin::StreamInfo { name, subscribers: 0 })
                 .collect()
