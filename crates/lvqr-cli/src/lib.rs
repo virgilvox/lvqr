@@ -61,9 +61,35 @@ use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
 #[cfg(feature = "c2pa")]
 use crate::archive::verify_router;
 use crate::archive::{BroadcasterArchiveIndexer, playback_router};
+
+/// Pick the IP address to advertise as a WebRTC ICE host candidate when
+/// LVQR is binding the WHIP / WHEP listener on a given socket address.
+///
+/// The bind address is what we LISTEN on (e.g. `0.0.0.0:8443` to accept
+/// from every interface). The ICE host candidate is what the WebRTC
+/// peer tries to REACH us at -- and `0.0.0.0` / `::` are not valid
+/// destinations. str0m correctly refuses to add an unspecified IP as a
+/// candidate (`"ICE bad candidate: invalid ip 0.0.0.0"`), so a wildcard
+/// listener silently breaks every WHIP / WHEP session.
+///
+/// Substitute loopback when the bind is wildcard so the localhost demo
+/// case works out of the box; production deployments running across
+/// multiple interfaces should bind explicitly (e.g. `--whip-port` with
+/// the host narrowed via the future `--whip-public-host` flag) or run
+/// the relay on a specific interface address.
+fn ice_host_ip_for_bind(bind: SocketAddr) -> IpAddr {
+    let ip = bind.ip();
+    if ip.is_unspecified() {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else {
+        ip
+    }
+}
 use crate::auth_middleware::{
     LivePlaybackAuthState, SignalAuthState, live_playback_auth_middleware, signal_auth_middleware,
 };
@@ -667,7 +693,9 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // a POST on the router is immediately visible to the raw-sample
     // fanout path.
     let whep_server = if let Some(addr) = config.whep_addr {
-        let str0m_cfg = lvqr_whep::Str0mConfig { host_ip: addr.ip() };
+        let str0m_cfg = lvqr_whep::Str0mConfig {
+            host_ip: ice_host_ip_for_bind(addr),
+        };
         // Tier 4 item 4.7 session 110 B: thread the shared
         // LatencyTracker into the str0m answerer so every spawned
         // session's poll loop records one sample per successful
@@ -707,7 +735,9 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         }
         let whip_bridge_arc = Arc::new(whip_bridge);
         let sink = whip_bridge_arc.clone() as Arc<dyn lvqr_whip::IngestSampleSink>;
-        let str0m_cfg = lvqr_whip::Str0mIngestConfig { host_ip: addr.ip() };
+        let str0m_cfg = lvqr_whip::Str0mIngestConfig {
+            host_ip: ice_host_ip_for_bind(addr),
+        };
         let answerer =
             Arc::new(lvqr_whip::Str0mIngestAnswerer::new(str0m_cfg, sink)) as Arc<dyn lvqr_whip::SdpAnswerer>;
         let server = lvqr_whip::WhipServer::with_auth_provider(answerer, auth.clone());
