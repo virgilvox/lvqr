@@ -117,7 +117,16 @@ impl SdpAnswerer for Str0mIngestAnswerer {
         // reachable address) on the OS-assigned port. local_addr.ip()
         // would be `0.0.0.0` here -- which str0m correctly rejects.
         let candidate_addr = SocketAddr::new(self.config.host_ip, bound.port());
-        let local_addr = bound;
+        // The session loop passes `local_addr` to str0m as the
+        // `destination` on every Receive datagram. str0m's ICE matcher
+        // compares that destination against its advertised local
+        // candidates -- so it must equal `candidate_addr`, NOT `bound`.
+        // Using `bound` (= 0.0.0.0:port) means no candidate ever
+        // matches, ICE pair selection fails, and the session
+        // disconnects without ever coming up. (See the Receive {
+        // destination, ... } construction in `run_session_loop_inner`
+        // below.)
+        let local_addr = candidate_addr;
         let socket = UdpSocket::from_std(std_socket)
             .map_err(|e| WhipError::AnswererFailed(format!("tokio from_std failed: {e}")))?;
 

@@ -204,7 +204,11 @@ impl SdpAnswerer for Str0mAnswerer {
             .local_addr()
             .map_err(|e| WhepError::AnswererFailed(format!("local_addr failed: {e}")))?;
         let candidate_addr = SocketAddr::new(self.config.host_ip, bound.port());
-        let local_addr = bound;
+        // The session loop hands `local_addr` to str0m as the
+        // `destination` on every received datagram for ICE pair
+        // matching. It must equal the advertised candidate address,
+        // not the wildcard bind. Mirrors the WHIP-side fix.
+        let local_addr = candidate_addr;
         let socket = UdpSocket::from_std(std_socket)
             .map_err(|e| WhepError::AnswererFailed(format!("tokio from_std failed: {e}")))?;
 
