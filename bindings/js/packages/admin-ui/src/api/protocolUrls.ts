@@ -8,7 +8,11 @@ import type { ConnectionProfile } from '@/stores/connection';
 export const DEFAULT_PROTOCOL_PORTS = {
   rtmp: 1935,
   whip: 8443,
-  whep: 8443,
+  // WHEP gets its own axum listener (separate from WHIP) so it cannot
+  // share 8443 with WHIP. 8444 is the adjacent-port convention and what
+  // the lvqr-cli composition root uses in its examples + the unit-test
+  // suite asserts whip != whep so this cannot silently regress.
+  whep: 8444,
   hls: 8888,
   dash: 8889,
   srt: 9000,

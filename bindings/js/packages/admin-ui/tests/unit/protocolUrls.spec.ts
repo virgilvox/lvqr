@@ -41,8 +41,13 @@ describe('broadcastUrls', () => {
     const urls = broadcastUrls(profile(), 'live/demo');
     expect(urls.publish.rtmp).toBe(`rtmp://relay.example.com:${DEFAULT_PROTOCOL_PORTS.rtmp}/live/live/demo`);
     expect(urls.publish.whip).toBe(`http://relay.example.com:${DEFAULT_PROTOCOL_PORTS.whip}/whip/live/demo`);
+    expect(urls.subscribe.whep).toBe(`http://relay.example.com:${DEFAULT_PROTOCOL_PORTS.whep}/whep/live/demo`);
     expect(urls.subscribe.hls).toBe(`http://relay.example.com:${DEFAULT_PROTOCOL_PORTS.hls}/hls/live/demo/master.m3u8`);
     expect(urls.subscribe.dash).toBe(`http://relay.example.com:${DEFAULT_PROTOCOL_PORTS.dash}/dash/live/demo/manifest.mpd`);
+    // WHIP and WHEP must bind on different ports because LVQR runs them on
+    // separate axum listeners (per `crates/lvqr-cli/src/lib.rs`). Two
+    // listeners can't share a port; the default-set must encode that.
+    expect(DEFAULT_PROTOCOL_PORTS.whip).not.toBe(DEFAULT_PROTOCOL_PORTS.whep);
   });
 
   it('honors per-protocol port overrides on the profile', () => {
