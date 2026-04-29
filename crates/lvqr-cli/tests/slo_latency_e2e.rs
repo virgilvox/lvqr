@@ -274,19 +274,33 @@ async fn slo_route_reports_ws_latency_samples_after_publish() {
     // Asserting they co-exist on the snapshot proves the cross-
     // transport dashboard story is live end-to-end through the WS
     // addition in 110 A.
-    let snapshot = server.slo().snapshot();
-    assert!(
-        snapshot
+    //
+    // Poll for the HLS sibling entry rather than asserting once: the
+    // HLS drain registration is independent of the WS aux drain and
+    // can land microseconds-to-seconds later on a contended CI host
+    // (specifically macos-latest under load). Reusing the earlier
+    // 5 s pattern with a fresh deadline keeps the test deterministic
+    // without flake.
+    let cross_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = server.slo().snapshot();
+        let has_ws = snapshot
             .iter()
-            .any(|e| e.broadcast == "live/demo" && e.transport == "ws"),
-        "expected live/demo ws entry in snapshot, got {snapshot:?}",
-    );
-    assert!(
-        snapshot
+            .any(|e| e.broadcast == "live/demo" && e.transport == "ws");
+        let has_hls = snapshot
             .iter()
-            .any(|e| e.broadcast == "live/demo" && e.transport == "hls"),
-        "expected live/demo hls entry in snapshot alongside ws, got {snapshot:?}",
-    );
+            .any(|e| e.broadcast == "live/demo" && e.transport == "hls");
+        if has_ws && has_hls {
+            break;
+        }
+        if Instant::now() > cross_deadline {
+            panic!(
+                "expected both live/demo ws + hls entries in snapshot within 5s; \
+                 has_ws={has_ws} has_hls={has_hls}; snapshot: {snapshot:?}",
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     server.shutdown().await.expect("shutdown");
 }

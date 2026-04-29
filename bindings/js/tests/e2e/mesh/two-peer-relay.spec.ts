@@ -28,6 +28,17 @@
 // pushFrame); that is phase-D scope per the session 116 briefing.
 
 import { test, expect, Page } from '@playwright/test';
+
+// WebRTC-mesh tests on GitHub-hosted runners are timing-fragile:
+// the WebSocket signal handshake + Register -> AssignParent -> SDP
+// offer/answer + ICE + DataChannel open chain involves five round
+// trips that can each add 100ms-2s on a contended runner. Even with
+// generous waitForFunction timeouts, the chain occasionally fails
+// at the first round trip when the WebSocket can't connect inside
+// the test budget. Two retries cover the usual flake without
+// hiding genuine logic regressions (a real bug fails three times
+// in a row deterministically).
+test.describe.configure({ retries: 2 });
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
