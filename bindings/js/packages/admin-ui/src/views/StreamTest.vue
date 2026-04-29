@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import PageHeader from '@/components/ui/PageHeader.vue';
 import Card from '@/components/ui/Card.vue';
@@ -54,9 +54,37 @@ const defaultWhipUrl = computed(() => {
   return `${scheme}://${host}:${port}/whip/${broadcast.value}`;
 });
 
-// What we actually post against. The override wins; otherwise we fall
-// back to the URL derived from the connection profile.
+// Track whether the user has manually edited the field. Until they do,
+// we keep the override in sync with the derived default so changing the
+// broadcast / profile reflects in the input. As soon as they type, they
+// own the value -- typical "managed default" pattern.
+const whipUserEdited = ref(false);
 const whipUrl = computed(() => whipOverride.value.trim() || defaultWhipUrl.value);
+
+onMounted(() => {
+  if (!whipOverride.value && defaultWhipUrl.value) {
+    whipOverride.value = defaultWhipUrl.value;
+  }
+});
+
+watch(
+  [broadcast, defaultWhipUrl],
+  ([, next]) => {
+    if (!whipUserEdited.value && next) {
+      whipOverride.value = next;
+    }
+  },
+);
+
+function onWhipInput(e: Event) {
+  whipUserEdited.value = true;
+  whipOverride.value = (e.target as HTMLInputElement).value;
+}
+
+function resetWhipToDerived() {
+  whipUserEdited.value = false;
+  whipOverride.value = defaultWhipUrl.value;
+}
 
 // True when the override is empty AND the default URL points at the LVQR
 // default WHIP port (8443) while the admin URL is on a non-default port.
@@ -298,17 +326,31 @@ const urls = computed(() =>
             <div class="endpoint">
               <label>
                 <span>WHIP endpoint</span>
-                <input
-                  v-model="whipOverride"
-                  :placeholder="defaultWhipUrl"
-                  :disabled="publisher.isPublishing.value"
-                />
+                <div class="endpoint-row">
+                  <input
+                    :value="whipOverride"
+                    @input="onWhipInput"
+                    :placeholder="defaultWhipUrl"
+                    :disabled="publisher.isPublishing.value"
+                    spellcheck="false"
+                    autocomplete="off"
+                  />
+                  <button
+                    type="button"
+                    class="endpoint-reset"
+                    :disabled="publisher.isPublishing.value || whipOverride === defaultWhipUrl"
+                    @click="resetWhipToDerived"
+                    title="Reset to URL derived from the connection profile"
+                  >
+                    reset
+                  </button>
+                </div>
               </label>
-              <p class="endpoint-effective" v-if="whipOverride.trim()">
-                using override; default would be <code>{{ defaultWhipUrl }}</code>
+              <p class="endpoint-effective" v-if="whipUserEdited && whipOverride !== defaultWhipUrl">
+                edited; click <strong>reset</strong> to restore <code>{{ defaultWhipUrl }}</code>
               </p>
               <p class="endpoint-effective" v-else>
-                derived from connection profile; will POST to <code>{{ defaultWhipUrl }}</code>
+                derived from connection profile; edit inline to override
               </p>
               <p v-if="portMismatchHint" class="warn-hint">
                 {{ portMismatchHint }}
@@ -541,6 +583,33 @@ export default { components: { Icon } };
   padding: 5px 8px;
   font-size: 11px;
   font-family: var(--font-mono);
+  flex: 1;
+  min-width: 0;
+}
+.endpoint-row {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+.endpoint-reset {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 4px 10px;
+  border: 1px solid var(--chalk-hi);
+  background: var(--paper);
+  color: var(--ink-muted);
+  cursor: pointer;
+}
+.endpoint-reset:hover:not(:disabled) {
+  background: var(--ink);
+  color: var(--paper);
+  border-color: var(--ink);
+}
+.endpoint-reset:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 .endpoint-effective {
   font-family: var(--font-mono);
