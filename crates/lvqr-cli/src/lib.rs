@@ -59,7 +59,6 @@ use lvqr_hls::{MultiHlsServer, PlaylistBuilderConfig};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
-use tower_http::cors::CorsLayer;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Instant;
@@ -90,6 +89,31 @@ fn ice_host_ip_for_bind(bind: SocketAddr) -> IpAddr {
     } else {
         ip
     }
+}
+
+/// Build the CORS layer LVQR mounts on every browser-facing router.
+///
+/// `tower_http::cors::CorsLayer::permissive()` (the previous default)
+/// allows the request side (any origin / method / header) but exposes
+/// ZERO response headers. That means a browser-side WHIP/WHEP client
+/// cannot read the `Location` header off the 201 Created response,
+/// which the WHIP draft (`draft-ietf-wish-whip` §4.1) and the WHEP
+/// draft both require for PATCH (trickle ICE) and DELETE (terminate).
+/// Without a readable Location, browser publishers cannot end a
+/// session cleanly or feed mid-session ICE candidates after a
+/// network change.
+///
+/// Expose `Location` (WHIP/WHEP session URL), `Content-Type` (so
+/// browser SDP parsing can branch on `application/sdp`), and `ETag`
+/// (the WHIP draft suggests `If-Match` for SDP renegotiation).
+fn lvqr_cors_layer() -> tower_http::cors::CorsLayer {
+    use axum::http::header;
+    use tower_http::cors::{Any, CorsLayer};
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .expose_headers([header::LOCATION, header::CONTENT_TYPE, header::ETAG])
 }
 use crate::auth_middleware::{
     LivePlaybackAuthState, SignalAuthState, live_playback_auth_middleware, signal_auth_middleware,
@@ -1420,7 +1444,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         };
         combined
     }
-    .layer(CorsLayer::permissive());
+    .layer(lvqr_cors_layer());
 
     // Spawn a single background task that joins relay + RTMP + admin and
     // signals the shared shutdown token if any subsystem exits early.
@@ -1510,7 +1534,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                 };
                 router = router.layer(from_fn_with_state(state, live_playback_auth_middleware));
             }
-            let router = router.layer(CorsLayer::permissive());
+            let router = router.layer(lvqr_cors_layer());
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move { hls_shutdown.cancelled().await })
                 .await;
@@ -1538,7 +1562,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
                 };
                 router = router.layer(from_fn_with_state(state, live_playback_auth_middleware));
             }
-            let router = router.layer(CorsLayer::permissive());
+            let router = router.layer(lvqr_cors_layer());
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move { dash_shutdown.cancelled().await })
                 .await;
@@ -1558,7 +1582,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             // the live HLS / DASH / admin posture; without this an
             // OPTIONS preflight returns 405 and every browser blocks
             // the actual POST.
-            let router = lvqr_whep::router_for(server).layer(CorsLayer::permissive());
+            let router = lvqr_whep::router_for(server).layer(lvqr_cors_layer());
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move { whep_shutdown.cancelled().await })
                 .await;
@@ -1578,7 +1602,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             // capture apps) can POST the SDP offer cross-origin. Without
             // this an OPTIONS preflight returns 405 and the browser
             // blocks the publish.
-            let router = lvqr_whip::router_for(server).layer(CorsLayer::permissive());
+            let router = lvqr_whip::router_for(server).layer(lvqr_cors_layer());
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move { whip_shutdown.cancelled().await })
                 .await;
