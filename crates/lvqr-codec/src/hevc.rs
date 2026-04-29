@@ -113,6 +113,17 @@ impl HevcSps {
     ///   hev1.<profile>.<compat-reversed>.L<level>.<constraint>
     /// ```
     ///
+    /// `general_profile_compatibility_flags` are emitted with bit
+    /// order reversed (the spec's flag[0] becomes bit 0 of the
+    /// encoded value) per ISO/IEC 14496-15 annex E. Trailing zero
+    /// hex digits are stripped naturally by `format!("{:X}", n)`,
+    /// matching Apple's HLS authoring spec examples like
+    /// `"hev1.1.6.L93.B0"` for Main-compatible profiles. Without
+    /// the reversal Shaka Player + dash.js reject the string with
+    /// `CODEC_NOT_SUPPORTED`; iOS Safari is more forgiving because
+    /// it leans on the `hvc1` sample-entry tag rather than parsing
+    /// the codec string.
+    ///
     /// LVQR always emits `hev1` (byte-stream compatible) rather than
     /// `hvc1` (length-prefixed parameter-set compatible). The constraint
     /// flags are not currently captured so the trailing `.B0` reflects
@@ -128,7 +139,7 @@ impl HevcSps {
                 _ => String::new(),
             },
             self.general_profile_idc,
-            self.general_profile_compatibility_flags,
+            self.general_profile_compatibility_flags.reverse_bits(),
             self.general_level_idc,
         )
     }
@@ -465,7 +476,7 @@ mod tests {
         assert_eq!(sps.chroma_format_idc, 1);
         assert_eq!(sps.pic_width_in_luma_samples, 1920);
         assert_eq!(sps.pic_height_in_luma_samples, 1080);
-        assert_eq!(sps.codec_string(), "hev1.1.60000000.L93.B0");
+        assert_eq!(sps.codec_string(), "hev1.1.6.L93.B0");
     }
 
     #[test]
@@ -524,7 +535,7 @@ mod tests {
         assert_eq!(sps.chroma_format_idc, 1); // 4:2:0
         assert_eq!(sps.pic_width_in_luma_samples, 320);
         assert_eq!(sps.pic_height_in_luma_samples, 240);
-        assert_eq!(sps.codec_string(), "hev1.1.60000000.L60.B0");
+        assert_eq!(sps.codec_string(), "hev1.1.6.L60.B0");
     }
 
     #[test]
@@ -539,7 +550,31 @@ mod tests {
             pic_width_in_luma_samples: 1920,
             pic_height_in_luma_samples: 1080,
         };
-        // profile 1 (Main), compat flags 0x60000000, level 93 (level 3.1).
-        assert_eq!(sps.codec_string(), "hev1.1.60000000.L93.B0");
+        // profile 1 (Main), compat flags 0x60000000 (Main + Main10
+        // compatible), level 93 (level 3.1). The reverse-bit-ordered
+        // hex of 0x60000000 is 0x6, so the third field is "6".
+        assert_eq!(sps.codec_string(), "hev1.1.6.L93.B0");
+    }
+
+    #[test]
+    fn codec_string_reverses_compat_flag_bit_order() {
+        // Lock the bit-reversal explicitly so a future refactor that
+        // drops the `.reverse_bits()` call regresses with a named
+        // expectation rather than via the indirect Main-compat
+        // assertion. flag[0..=3] all set in the spec's MSB-first
+        // ordering reads as 0xF0000000 from `read_bits(32)`; reversed
+        // those flags land in bits 0..=3 of the encoded value, so
+        // the codec string carries 0xF.
+        let sps = HevcSps {
+            general_profile_space: 0,
+            general_tier_flag: false,
+            general_profile_idc: 4,
+            general_profile_compatibility_flags: 0xF000_0000,
+            general_level_idc: 120,
+            chroma_format_idc: 1,
+            pic_width_in_luma_samples: 1920,
+            pic_height_in_luma_samples: 1080,
+        };
+        assert_eq!(sps.codec_string(), "hev1.4.F.L120.B0");
     }
 }

@@ -72,7 +72,7 @@ pub mod codec {
     /// do not assert on them.
     #[derive(Debug, Clone, Deserialize)]
     pub struct CodecFixtureMeta {
-        /// Human-readable codec string, e.g. `"hev1.1.60000000.L93.B0"`.
+        /// Human-readable codec string, e.g. `"hev1.1.6.L93.B0"`.
         pub codec: String,
         /// Expected decoded values for an HEVC SPS fixture. Present
         /// iff the fixture is an HEVC SPS byte blob.
