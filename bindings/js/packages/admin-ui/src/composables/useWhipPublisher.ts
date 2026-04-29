@@ -171,8 +171,42 @@ export function useWhipPublisher() {
       pc = new RTCPeerConnection({
         iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
       });
-      for (const track of stream.getTracks()) {
-        pc.addTrack(track, stream);
+
+      // Add transceivers explicitly so we can pin codec preferences
+      // BEFORE the offer is created. LVQR's WHIP bridge only knows
+      // how to build init segments for H264 / HEVC video; Chrome's
+      // WebRTC default of VP8 leaves the bridge unable to publish
+      // anything to the FragmentBroadcasterRegistry, so the
+      // broadcast never appears in /api/v1/streams or any other
+      // admin view. Pinning H264 (or HEVC if the system has it)
+      // up-front keeps the entire egress + admin surface coherent.
+      const videoTrack = stream.getVideoTracks()[0];
+      const audioTrack = stream.getAudioTracks()[0];
+      if (videoTrack) {
+        const tx = pc.addTransceiver(videoTrack, { direction: 'sendonly', streams: [stream] });
+        try {
+          const caps = (RTCRtpSender as unknown as {
+            getCapabilities?: (kind: string) => RTCRtpCapabilities | null;
+          }).getCapabilities?.('video');
+          if (caps) {
+            const preferred = caps.codecs.filter((c) => /\/h26[45]$/i.test(c.mimeType));
+            if (preferred.length && 'setCodecPreferences' in tx) {
+              (tx as unknown as {
+                setCodecPreferences: (cs: RTCRtpCodec[]) => void;
+              }).setCodecPreferences(preferred);
+            }
+          }
+        } catch {
+          // setCodecPreferences is best-effort; if it throws (older
+          // Safari, niche WebRTC stacks) the negotiation falls back
+          // to the browser's default codec list and the WHIP bridge
+          // may not pick up the broadcast. Surface this in the UI
+          // when we detect VP8 in the stats panel rather than
+          // failing here.
+        }
+      }
+      if (audioTrack) {
+        pc.addTransceiver(audioTrack, { direction: 'sendonly', streams: [stream] });
       }
 
       // Stop the publisher when the peer connection drops.

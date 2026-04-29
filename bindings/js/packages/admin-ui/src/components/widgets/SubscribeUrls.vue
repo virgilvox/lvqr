@@ -18,6 +18,14 @@ const urls = computed(() => {
 
 <template>
   <div class="subs" v-if="urls">
+    <p class="hint">
+      <strong>LL-HLS</strong> + <strong>DASH</strong> open directly in a
+      browser tab (LL-HLS via Safari natively, or VLC / hls.js for the
+      others). <strong>MoQ</strong> + <strong>WHEP</strong> +
+      <strong>WS fMP4</strong> are programmatic protocols -- pasting
+      them into the address bar will fail; use the embed snippets below
+      or the <code>@lvqr/core</code> / <code>@lvqr/player</code> SDKs.
+    </p>
     <CopyableUrl label="MoQ" accent="wire" :value="urls.subscribe.moq" />
     <CopyableUrl label="WHEP" accent="wire" :value="urls.subscribe.whep" />
     <CopyableUrl label="LL-HLS" accent="wire" :value="urls.subscribe.hls" />
