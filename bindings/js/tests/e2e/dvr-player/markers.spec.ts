@@ -554,15 +554,35 @@ test.describe('@lvqr/dvr-player live RTMP publish (closes session 153 deferred)'
       // does not emit Access-Control-Allow-Origin so a direct
       // cross-port hls.js fetch is blocked at the browser. See the
       // strengthened live-pill test above for context.
+      //
+      // Two-stage try/catch so the route is fulfilled exactly once.
+      // The previous shape called fulfill in the catch block too,
+      // which raised "Route is already handled!" when the inner
+      // fulfill threw mid-flight (e.g., the underlying socket
+      // closed between fetch resolution and fulfill completion --
+      // the route was marked handled before the error propagated).
       await page.route('**/127.0.0.1:18190/hls/**', async (route: Route) => {
+        let resp: Awaited<ReturnType<typeof route.fetch>>;
         try {
-          const resp = await route.fetch();
+          resp = await route.fetch();
+        } catch {
+          // Network fetch failed entirely -- surface a 502 so
+          // hls.js's retry path runs cleanly. Swallow a secondary
+          // error in case the route somehow reached the handled
+          // state already.
+          try {
+            await route.fulfill({ status: 502, body: 'proxy fetch failed' });
+          } catch {
+            // Already handled; nothing to do.
+          }
+          return;
+        }
+        try {
           await route.fulfill({ response: resp });
         } catch {
-          // hls.js retries on transient fetch errors; surface a 502
-          // response rather than aborting the route handler so the
-          // retry path runs cleanly.
-          await route.fulfill({ status: 502, body: 'proxy fetch failed' });
+          // Route already in a handled state (e.g., the test
+          // tore down mid-fulfill). The outcome is determined
+          // either way; do not double-fulfill.
         }
       });
 

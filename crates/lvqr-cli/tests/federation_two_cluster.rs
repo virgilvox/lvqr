@@ -36,7 +36,15 @@ use lvqr_test_utils::{TestServer, TestServerConfig};
 use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(10);
+// The propagation deadline absorbs the gap between
+// FederationRunner reaching Connected and the per-track
+// `forward_track` task actually serving subscribers on the
+// downstream relay. Linux CI + local macOS dev complete this in
+// 1-3 seconds; macos-latest GitHub-hosted runners under contended
+// load have been observed taking >10s for the per-track forwarder
+// to start. 30 s buys enough headroom that the deadline fires
+// only on a genuine forward-loop hang, not on contended runners.
+const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 // Known to fail on the macos-latest GitHub-hosted CI runner: the
 // per-track forward_track task in `lvqr-cluster::federation` never

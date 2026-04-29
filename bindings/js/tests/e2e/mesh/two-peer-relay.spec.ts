@@ -103,10 +103,14 @@ test('two-peer DataChannel mesh relays a root-pushed frame to the child', async 
   );
 
   // Give peer_1 a moment to register and receive AssignParent.
+  // 30 s timeout absorbs CI runner WebSocket-handshake jitter; the
+  // happy-path latency is sub-second locally + on Linux CI but the
+  // ubuntu-latest runner under load has been observed to take
+  // 10-20 s to complete the signal-protocol exchange.
   await pageA.waitForFunction(
     () => (window as unknown as { __peer?: { peerRole: string } }).__peer?.peerRole === 'Root',
     null,
-    { timeout: 10_000 },
+    { timeout: 30_000 },
   );
 
   // --- peer_2 (relay child) ---
@@ -125,7 +129,7 @@ test('two-peer DataChannel mesh relays a root-pushed frame to the child', async 
   await pageB.waitForFunction(
     () => (window as unknown as { __peer?: { peerRole: string } }).__peer?.peerRole === 'Relay',
     null,
-    { timeout: 10_000 },
+    { timeout: 30_000 },
   );
 
   // MeshPeer.children is populated on `pc.ondatachannel` with a
