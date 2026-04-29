@@ -5,7 +5,10 @@ import PageHeader from '@/components/ui/PageHeader.vue';
 import KpiTile from '@/components/ui/KpiTile.vue';
 import Card from '@/components/ui/Card.vue';
 import Button from '@/components/ui/Button.vue';
+import Icon from '@/components/ui/Icon.vue';
 import SloEntryCard from '@/components/widgets/SloEntryCard.vue';
+import PublishRecipes from '@/components/widgets/PublishRecipes.vue';
+import SubscribeUrls from '@/components/widgets/SubscribeUrls.vue';
 import { useStreamsStore } from '@/stores/streams';
 import { useSloStore } from '@/stores/slo';
 import { useMeshStore } from '@/stores/mesh';
@@ -32,6 +35,9 @@ const sloRows = computed(() =>
     <PageHeader :crumb="`STREAMS / ${broadcastName}`">
       <template #title>{{ broadcastName }}</template>
       <template #actions>
+        <RouterLink :to="{ path: '/stream-test', query: { broadcast: broadcastName } }">
+          <Button variant="primary"><Icon name="rec" :size="12" /> Test this stream</Button>
+        </RouterLink>
         <RouterLink to="/streams">
           <Button variant="ghost">Back</Button>
         </RouterLink>
@@ -57,6 +63,15 @@ const sloRows = computed(() =>
         </p>
       </div>
     </Card>
+
+    <div class="dual">
+      <Card kicker="PUBLISH" title="Publisher URLs" wire>
+        <PublishRecipes :broadcast="broadcastName" />
+      </Card>
+      <Card kicker="SUBSCRIBE" title="Subscriber URLs">
+        <SubscribeUrls :broadcast="broadcastName" />
+      </Card>
+    </div>
 
     <!-- LVQR v1.x backlog: per-broadcast stop / kick-subscriber controls.
          The current /api/v1/streams route is read-only; mutating shape would
@@ -88,6 +103,16 @@ const sloRows = computed(() =>
   display: flex;
   flex-direction: column;
   gap: var(--s-2);
+}
+.dual {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--s-4);
+}
+@media (max-width: 1023px) {
+  .dual {
+    grid-template-columns: 1fr;
+  }
 }
 .empty {
   font-family: var(--font-mono);

@@ -6,15 +6,34 @@ import Icon from '@/components/ui/Icon.vue';
 import Badge from '@/components/ui/Badge.vue';
 import { useConfigReloadStore } from '@/stores/configReload';
 import { useConnectionStore } from '@/stores/connection';
+import { useStatsStore } from '@/stores/stats';
+import { useMeshStore } from '@/stores/mesh';
+import { useClusterStore } from '@/stores/cluster';
+import { useWasmFilterStore } from '@/stores/wasmFilter';
+import { useStreamKeysStore } from '@/stores/streamkeys';
 import { useToast } from '@/composables/useToast';
 import { usePolling } from '@/composables/usePolling';
 import { formatRelativeTime } from '@/api/url';
+import ServerFlagsMirror from '@/components/widgets/ServerFlagsMirror.vue';
+import TomlConfigBuilder from '@/components/widgets/TomlConfigBuilder.vue';
 
 const cfg = useConfigReloadStore();
 const conn = useConnectionStore();
+const stats = useStatsStore();
+const mesh = useMeshStore();
+const cluster = useClusterStore();
+const wasm = useWasmFilterStore();
+const sk = useStreamKeysStore();
 const { push } = useToast();
 
 usePolling(() => cfg.fetch(), { intervalMs: 30_000 });
+// Keep the runtime-state stores fresh so the ServerFlagsMirror reflects
+// reality without the operator having to navigate to other views first.
+usePolling(() => stats.fetch(), { intervalMs: 15_000 });
+usePolling(() => mesh.fetch(), { intervalMs: 15_000 });
+usePolling(() => cluster.fetch(), { intervalMs: 15_000 });
+usePolling(() => wasm.fetch(), { intervalMs: 15_000 });
+usePolling(() => sk.fetch(), { intervalMs: 30_000 });
 
 async function trigger() {
   try {
@@ -66,6 +85,14 @@ async function trigger() {
       </Button>
     </Card>
 
+    <Card kicker="SERVER FLAGS" title="lvqr serve template" wire>
+      <ServerFlagsMirror />
+    </Card>
+
+    <Card kicker="CONFIG TEMPLATE" title="Build a TOML --config">
+      <TomlConfigBuilder />
+    </Card>
+
     <Card kicker="CONNECTIONS" title="Active connection">
       <p v-if="conn.activeProfile">
         <strong>{{ conn.activeProfile.label }}</strong>
@@ -79,11 +106,15 @@ async function trigger() {
     </Card>
 
     <!-- LVQR v1.x backlog: full GET / PUT of the parsed --config file shape. -->
-    <Card kicker="V1.X BACKLOG" title="Full config GET/PUT">
+    <Card kicker="V1.X BACKLOG" title="Full config GET/PUT + writable feature toggles">
       <p class="hint">
-        Reading the resolved <code>--config</code> file via the admin API, or pushing a
-        full-file replacement, is on the v1.x backlog. Today operators edit the file directly
-        + trigger a reload.
+        Reading the resolved <code>--config</code> file via the admin API, pushing a
+        full-file replacement, and toggling process-startup features (port bindings,
+        archive directory, transcode ladder, WASM chain, mesh / cluster enablement,
+        whisper agent) at runtime are on the v1.x backlog. Until then, the
+        <strong>TOML config builder</strong> above lets you draft the runtime-reloadable
+        subset (auth, mesh ICE, HMAC, JWKS, webhook URLs); process-startup-only
+        knobs are documented in the <strong>Server flags</strong> card.
       </p>
     </Card>
   </div>

@@ -2,6 +2,8 @@
 import { computed } from 'vue';
 import PageHeader from '@/components/ui/PageHeader.vue';
 import Card from '@/components/ui/Card.vue';
+import Button from '@/components/ui/Button.vue';
+import Icon from '@/components/ui/Icon.vue';
 import StreamRow from '@/components/widgets/StreamRow.vue';
 import { useStreamsStore } from '@/stores/streams';
 import { useConnectionStore } from '@/stores/connection';
@@ -34,6 +36,9 @@ const recipes = computed(() => [
     <PageHeader crumb="CONSOLE / PIPELINE / INGEST">
       <template #title>Ingest <em>endpoints.</em></template>
       <template #actions>
+        <RouterLink to="/stream-test">
+          <Button variant="primary"><Icon name="rec" :size="12" /> Test stream from browser</Button>
+        </RouterLink>
         <span class="hint">configured via <code>lvqr serve</code></span>
       </template>
     </PageHeader>

@@ -1401,7 +1401,12 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             let Some((listener, server)) = whep_router_pair else {
                 return;
             };
-            let router = lvqr_whep::router_for(server);
+            // CORS-permissive on WHEP so browser clients can subscribe
+            // cross-origin (admin UI, third-party players, etc.). Mirrors
+            // the live HLS / DASH / admin posture; without this an
+            // OPTIONS preflight returns 405 and every browser blocks
+            // the actual POST.
+            let router = lvqr_whep::router_for(server).layer(CorsLayer::permissive());
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move { whep_shutdown.cancelled().await })
                 .await;
@@ -1416,7 +1421,12 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             let Some((listener, server)) = whip_router_pair else {
                 return;
             };
-            let router = lvqr_whip::router_for(server);
+            // CORS-permissive so browser-based publishers (the admin UI's
+            // in-browser WHIP demo, OBS-WHIP-via-web, third-party
+            // capture apps) can POST the SDP offer cross-origin. Without
+            // this an OPTIONS preflight returns 405 and the browser
+            // blocks the publish.
+            let router = lvqr_whip::router_for(server).layer(CorsLayer::permissive());
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move { whip_shutdown.cancelled().await })
                 .await;

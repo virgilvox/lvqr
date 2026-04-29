@@ -45,6 +45,12 @@ const routes: RouteRecordRaw[] = [
     meta: { rail: 'pipeline', label: 'Ingest', icon: 'ingest' },
   },
   {
+    path: '/stream-test',
+    name: 'stream-test',
+    component: () => import('@/views/StreamTest.vue'),
+    meta: { rail: 'pipeline', label: 'Test stream', icon: 'rec' },
+  },
+  {
     path: '/filters',
     name: 'filters',
     component: () => import('@/views/Filters.vue'),

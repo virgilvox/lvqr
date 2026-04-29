@@ -14,12 +14,16 @@ defineEmits<{ close: [] }>();
 const draftLabel = ref('');
 const draftUrl = ref('');
 const draftToken = ref('');
+const draftPorts = ref<{ rtmp?: number; whip?: number; whep?: number; hls?: number; dash?: number; srt?: number; rtsp?: number; moq?: number }>({});
+const showAdvanced = ref(false);
 const editingId = ref<string | null>(null);
 
 function reset() {
   draftLabel.value = '';
   draftUrl.value = '';
   draftToken.value = '';
+  draftPorts.value = {};
+  showAdvanced.value = false;
   editingId.value = null;
 }
 
@@ -27,16 +31,38 @@ function startEdit(p: ConnectionProfile) {
   draftLabel.value = p.label;
   draftUrl.value = p.baseUrl;
   draftToken.value = p.bearerToken ?? '';
+  draftPorts.value = {
+    rtmp: p.rtmpPort,
+    whip: p.whipPort,
+    whep: p.whepPort,
+    hls: p.hlsPort,
+    dash: p.dashPort,
+    srt: p.srtPort,
+    rtsp: p.rtspPort,
+    moq: p.moqPort,
+  };
+  showAdvanced.value = Object.values(draftPorts.value).some((v) => v != null);
   editingId.value = p.id;
 }
 
 function save() {
   try {
+    const portPatch = {
+      rtmpPort: draftPorts.value.rtmp,
+      whipPort: draftPorts.value.whip,
+      whepPort: draftPorts.value.whep,
+      hlsPort: draftPorts.value.hls,
+      dashPort: draftPorts.value.dash,
+      srtPort: draftPorts.value.srt,
+      rtspPort: draftPorts.value.rtsp,
+      moqPort: draftPorts.value.moq,
+    };
     if (editingId.value) {
       conn.updateProfile(editingId.value, {
         label: draftLabel.value,
         baseUrl: draftUrl.value,
         bearerToken: draftToken.value,
+        ...portPatch,
       });
       push('success', 'profile updated');
     } else {
@@ -44,6 +70,7 @@ function save() {
         label: draftLabel.value || draftUrl.value,
         baseUrl: draftUrl.value,
         bearerToken: draftToken.value,
+        ...portPatch,
       });
       push('success', 'profile added');
     }
@@ -109,6 +136,29 @@ function save() {
             <span>Bearer token (optional)</span>
             <input v-model="draftToken" type="password" autocomplete="off" />
           </label>
+
+          <details class="advanced" :open="showAdvanced">
+            <summary @click.prevent="showAdvanced = !showAdvanced">
+              {{ showAdvanced ? '-' : '+' }} Advanced -- per-protocol ports
+            </summary>
+            <p class="advanced-hint">
+              Leave empty to use the LVQR defaults (RTMP 1935, WHIP/WHEP 8443,
+              HLS 8888, DASH 8889, SRT 9000, RTSP 8554, MoQ 4443). Override
+              when your relay binds non-default ports (e.g. running multiple
+              instances on one host).
+            </p>
+            <div class="port-grid">
+              <label><span>RTMP</span><input v-model.number="draftPorts.rtmp" type="number" min="1" max="65535" placeholder="1935" /></label>
+              <label><span>WHIP</span><input v-model.number="draftPorts.whip" type="number" min="1" max="65535" placeholder="8443" /></label>
+              <label><span>WHEP</span><input v-model.number="draftPorts.whep" type="number" min="1" max="65535" placeholder="8443" /></label>
+              <label><span>LL-HLS</span><input v-model.number="draftPorts.hls" type="number" min="1" max="65535" placeholder="8888" /></label>
+              <label><span>DASH</span><input v-model.number="draftPorts.dash" type="number" min="1" max="65535" placeholder="8889" /></label>
+              <label><span>SRT</span><input v-model.number="draftPorts.srt" type="number" min="1" max="65535" placeholder="9000" /></label>
+              <label><span>RTSP</span><input v-model.number="draftPorts.rtsp" type="number" min="1" max="65535" placeholder="8554" /></label>
+              <label><span>MoQ</span><input v-model.number="draftPorts.moq" type="number" min="1" max="65535" placeholder="4443" /></label>
+            </div>
+          </details>
+
           <div class="form-actions">
             <Button v-if="editingId" variant="ghost" @click="reset" type="button">Cancel</Button>
             <Button variant="primary" type="submit">{{ editingId ? 'Save changes' : 'Add relay' }}</Button>
@@ -272,6 +322,52 @@ function save() {
   border: 1px solid var(--warn);
   font-size: 12px;
   color: var(--ink-light);
+}
+.advanced summary {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  color: var(--ink-muted);
+  cursor: pointer;
+  padding: 4px 0;
+  list-style: none;
+  user-select: none;
+}
+.advanced summary:hover {
+  color: var(--ink);
+}
+.advanced summary::-webkit-details-marker {
+  display: none;
+}
+.advanced-hint {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+  line-height: 1.6;
+  margin: 4px 0 var(--s-2);
+}
+.port-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--s-2);
+}
+.port-grid label {
+  flex-direction: column;
+  gap: 2px;
+}
+.port-grid span {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.port-grid input {
+  border: 1px solid var(--chalk-hi);
+  background: var(--paper-hi);
+  padding: 5px 8px;
+  font-size: 12px;
+  font-family: var(--font-mono);
 }
 
 .drawer-enter-active,

@@ -10,6 +10,17 @@ export interface ConnectionProfile {
   label: string;
   baseUrl: string;
   bearerToken?: string;
+  // Optional per-protocol port overrides. `undefined` falls back to the
+  // documented defaults in `src/api/protocolUrls.ts::DEFAULT_PROTOCOL_PORTS`.
+  // Operators set these when their relay binds non-default ports.
+  rtmpPort?: number;
+  whipPort?: number;
+  whepPort?: number;
+  hlsPort?: number;
+  dashPort?: number;
+  srtPort?: number;
+  rtspPort?: number;
+  moqPort?: number;
 }
 
 interface PersistedState {
@@ -73,6 +84,14 @@ export const useConnectionStore = defineStore('connection', () => {
       label: input.label.trim() || 'untitled',
       baseUrl: normalizeRelayUrl(input.baseUrl),
       bearerToken: input.bearerToken?.trim() || undefined,
+      rtmpPort: input.rtmpPort,
+      whipPort: input.whipPort,
+      whepPort: input.whepPort,
+      hlsPort: input.hlsPort,
+      dashPort: input.dashPort,
+      srtPort: input.srtPort,
+      rtspPort: input.rtspPort,
+      moqPort: input.moqPort,
     };
     profiles.value.push(profile);
     if (!activeId.value) activeId.value = profile.id;

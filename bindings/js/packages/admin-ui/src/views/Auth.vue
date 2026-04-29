@@ -6,6 +6,7 @@ import Button from '@/components/ui/Button.vue';
 import Icon from '@/components/ui/Icon.vue';
 import Badge from '@/components/ui/Badge.vue';
 import StreamKeyTable from '@/components/widgets/StreamKeyTable.vue';
+import SignedUrlGenerator from '@/components/widgets/SignedUrlGenerator.vue';
 import { useStreamKeysStore } from '@/stores/streamkeys';
 import { useConfigReloadStore } from '@/stores/configReload';
 import { useToast } from '@/composables/useToast';
@@ -87,6 +88,10 @@ async function revoke(id: string) {
         @revoke="revoke"
         @copy-token="push('success', 'token copied')"
       />
+    </Card>
+
+    <Card kicker="SIGNED URLS" title="HMAC playback / live URL generator" wire>
+      <SignedUrlGenerator />
     </Card>
 
     <Card kicker="PROVIDERS" title="Authentication providers (read-only)">
