@@ -181,6 +181,15 @@ pub struct AdminState {
     /// Optional `POST /api/v1/config-reload` trigger closure
     /// (session 147). `None` -> the POST returns 503.
     config_reload_trigger: Option<crate::config_reload_routes::ConfigReloadTriggerFn>,
+    /// Optional snapshot closure backing `GET /api/v1/server-info`
+    /// (session 164). lvqr-cli's composition root passes a closure
+    /// that reads the parsed `ServeConfig` + every listener's bound
+    /// address + the cargo crate version + `Instant::now()` for
+    /// uptime. `None` -> the route returns the stub
+    /// `default_server_info()` (just `CARGO_PKG_VERSION` + empty
+    /// bound + features) so dashboards can pre-bake the response
+    /// shape before the CLI is wired.
+    server_info: Option<crate::server_info_routes::ServerInfoFn>,
 }
 
 impl AdminState {
@@ -213,6 +222,7 @@ impl AdminState {
             streamkey_store: None,
             config_reload_status: None,
             config_reload_trigger: None,
+            server_info: None,
         }
     }
 
@@ -336,6 +346,26 @@ impl AdminState {
     pub(crate) fn config_reload_trigger(&self) -> Option<&crate::config_reload_routes::ConfigReloadTriggerFn> {
         self.config_reload_trigger.as_ref()
     }
+
+    /// Wire a `GET /api/v1/server-info` snapshot closure (session 164).
+    /// lvqr-cli's composition root calls this with a closure built via
+    /// [`crate::server_info_routes::server_info_fn_with_uptime`] over
+    /// the parsed `ServeConfig` + bound listener addresses.
+    pub fn with_server_info(mut self, f: crate::server_info_routes::ServerInfoFn) -> Self {
+        self.server_info = Some(f);
+        self
+    }
+
+    /// Snapshot the wired server-info closure, or return the stub
+    /// `default_server_info()` when none is wired. Always returns a
+    /// `ServerInfo` (never `None`) so the route handler can stay
+    /// trivially infallible.
+    pub(crate) fn server_info(&self) -> crate::server_info_routes::ServerInfo {
+        match self.server_info.as_ref() {
+            Some(f) => f(),
+            None => crate::server_info_routes::default_server_info(),
+        }
+    }
 }
 
 /// Structured error responses for the admin API.
@@ -393,7 +423,8 @@ pub fn build_router(state: AdminState) -> Router {
             "/api/v1/config-reload",
             get(crate::config_reload_routes::get_config_reload)
                 .post(crate::config_reload_routes::trigger_config_reload),
-        );
+        )
+        .route("/api/v1/server-info", get(crate::server_info_routes::get_server_info));
 
     #[cfg(feature = "cluster")]
     {

@@ -62,6 +62,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Instant;
 
 #[cfg(feature = "c2pa")]
 use crate::archive::verify_router;
@@ -104,6 +105,12 @@ use crate::ws::{WsRelayState, spawn_recordings, ws_ingest_handler, ws_relay_hand
 /// and admin subsystems under a shared cancellation token. Use
 /// [`ServerHandle::shutdown`] for deterministic teardown.
 pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
+    // Captured up-front so `GET /api/v1/server-info` can report
+    // process uptime relative to the `start()` entry point. Anchoring
+    // on `Instant::now()` here matches the dashboard's "since the
+    // serve binary started" notion better than a per-request clock.
+    let server_start_instant = Instant::now();
+
     tracing::info!(
         relay = %config.relay_addr,
         rtmp = %config.rtmp_addr,
@@ -1057,6 +1064,103 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         }
         None => admin_state,
     };
+
+    // Session 164 follow-up: wire `GET /api/v1/server-info` so the
+    // admin UI can auto-populate connection-profile per-protocol
+    // ports and render accurate Server Settings views without the
+    // operator hand-typing the relay's bind layout. The closure
+    // captures a static `ServerInfo` (cargo version + bound addrs +
+    // feature snapshot derived from the parsed `ServeConfig`); the
+    // `server_info_fn_with_uptime` helper re-stamps `uptime_secs`
+    // from `server_start_instant` per call.
+    //
+    // `auth_mode` is a coarse classifier: `ServeConfig.auth` is a
+    // pre-built `SharedAuth` (Arc<dyn AuthProvider>) and we cannot
+    // ask the trait object what shape it has without a downcast.
+    // The admin UI can pick up finer detail off
+    // `/api/v1/config-reload` (which threads the boot defaults +
+    // diff state) for now; if we later want a precise label we can
+    // either grow `AuthProvider::kind()` or thread the boot
+    // classifier through `ServeConfig` directly.
+    let auth_mode = if config.auth.is_some() { "configured" } else { "noop" };
+    let mut build_features: Vec<String> = Vec::new();
+    if cfg!(feature = "cluster") {
+        build_features.push("cluster".to_string());
+    }
+    if cfg!(feature = "c2pa") {
+        build_features.push("c2pa".to_string());
+    }
+    if cfg!(feature = "transcode") {
+        build_features.push("transcode".to_string());
+    }
+    if cfg!(feature = "whisper") {
+        build_features.push("whisper".to_string());
+    }
+    if cfg!(feature = "jwks") {
+        build_features.push("jwks".to_string());
+    }
+    if cfg!(feature = "webhook") {
+        build_features.push("webhook".to_string());
+    }
+    if cfg!(feature = "hw-videotoolbox") {
+        build_features.push("hw-videotoolbox".to_string());
+    }
+    if cfg!(feature = "hw-nvenc") {
+        build_features.push("hw-nvenc".to_string());
+    }
+    if cfg!(feature = "hw-vaapi") {
+        build_features.push("hw-vaapi".to_string());
+    }
+    if cfg!(feature = "hw-qsv") {
+        build_features.push("hw-qsv".to_string());
+    }
+    let cluster_enabled = {
+        #[cfg(feature = "cluster")]
+        {
+            cluster.is_some()
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            false
+        }
+    };
+    let server_info_base = lvqr_admin::ServerInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build_features,
+        uptime_secs: 0,
+        bound: lvqr_admin::BoundAddresses {
+            admin: Some(admin_bound.to_string()),
+            rtmp: Some(rtmp_bound.to_string()),
+            whip: whip_bound.map(|a| a.to_string()),
+            whep: whep_bound.map(|a| a.to_string()),
+            hls: hls_bound.map(|a| a.to_string()),
+            dash: dash_bound.map(|a| a.to_string()),
+            srt: srt_bound.map(|a| a.to_string()),
+            rtsp: rtsp_bound.map(|a| a.to_string()),
+            moq: Some(relay_bound.to_string()),
+            signal: if config.mesh_enabled {
+                Some(admin_bound.to_string())
+            } else {
+                None
+            },
+        },
+        features: lvqr_admin::RuntimeFeatures {
+            mesh_enabled: config.mesh_enabled,
+            cluster_enabled,
+            archive_dir: config.archive_dir.as_ref().map(|p| p.display().to_string()),
+            record_dir: config.record_dir.as_ref().map(|p| p.display().to_string()),
+            wasm_filter_chain_length: config.wasm_filter.len(),
+            auth_mode: auth_mode.to_string(),
+            hmac_playback_secret_configured: config.hmac_playback_secret.is_some(),
+            stream_keys_enabled: streamkey_store.is_some(),
+        },
+        config_path: None,
+        wasm_filter_paths: config.wasm_filter.iter().map(|p| p.display().to_string()).collect(),
+    };
+    let admin_state = admin_state.with_server_info(lvqr_admin::server_info_fn_with_uptime(
+        server_start_instant,
+        server_info_base,
+    ));
 
     // Session 111-B1: hoist `MeshCoordinator` construction out of
     // the admin-router block so it can be stored on `ServerHandle`

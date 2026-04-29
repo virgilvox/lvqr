@@ -30,6 +30,7 @@
 
 pub mod config_reload_routes;
 pub mod routes;
+pub mod server_info_routes;
 pub mod slo;
 pub mod streamkey_routes;
 
@@ -40,6 +41,9 @@ pub use config_reload_routes::{ConfigReloadFuture, ConfigReloadStatus, ConfigRel
 pub use routes::{
     AdminError, AdminState, MeshPeerStats, MeshState, MetricsRender, StreamInfo, WasmFilterBroadcastStats,
     WasmFilterSlotStats, WasmFilterState, build_router,
+};
+pub use server_info_routes::{
+    BoundAddresses, RuntimeFeatures, ServerInfo, ServerInfoFn, default_server_info, server_info_fn_with_uptime,
 };
 pub use slo::{LatencyTracker, SloEntry};
 pub use streamkey_routes::StreamKeyList;
