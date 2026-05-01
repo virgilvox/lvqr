@@ -1098,15 +1098,43 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // `server_info_fn_with_uptime` helper re-stamps `uptime_secs`
     // from `server_start_instant` per call.
     //
-    // `auth_mode` is a coarse classifier: `ServeConfig.auth` is a
-    // pre-built `SharedAuth` (Arc<dyn AuthProvider>) and we cannot
-    // ask the trait object what shape it has without a downcast.
-    // The admin UI can pick up finer detail off
-    // `/api/v1/config-reload` (which threads the boot defaults +
-    // diff state) for now; if we later want a precise label we can
-    // either grow `AuthProvider::kind()` or thread the boot
-    // classifier through `ServeConfig` directly.
-    let auth_mode = if config.auth.is_some() { "configured" } else { "noop" };
+    // `auth_mode` is the spec'd label set per the
+    // `RuntimeFeatures::auth_mode` doc-string:
+    //   `"noop" | "static" | "jwt" | "jwks" | "webhook" | "multi" | "configured"`.
+    // `ServeConfig.auth` is a pre-built `SharedAuth` (Arc<dyn
+    // AuthProvider>) and we cannot ask the trait object what shape
+    // it has without a downcast, but `config.config_reload` carries
+    // the boot defaults that built it (when `--config` was passed
+    // OR when main.rs threaded the seed through). Classify off
+    // those fields in priority order: webhook beats jwks beats jwt
+    // beats static. The classification leaks no token literals --
+    // it only inspects which boot bucket is `Some(_)`. Falls back
+    // to the binary `configured`/`noop` shape for CLI-only
+    // invocations that did not populate `config_reload` (the wider
+    // refactor to always populate the seed lives behind B-6's
+    // follow-up note in the audit).
+    let auth_mode: &'static str = if let Some(seed) = config.config_reload.as_ref() {
+        if seed.webhook_boot.is_some() {
+            "webhook"
+        } else if seed.jwks_boot.is_some() {
+            "jwks"
+        } else if seed.auth_boot_defaults.jwt_secret.is_some() {
+            "jwt"
+        } else if seed.auth_boot_defaults.admin_token.is_some()
+            || seed.auth_boot_defaults.publish_key.is_some()
+            || seed.auth_boot_defaults.subscribe_token.is_some()
+        {
+            "static"
+        } else if config.auth.is_some() {
+            "configured"
+        } else {
+            "noop"
+        }
+    } else if config.auth.is_some() {
+        "configured"
+    } else {
+        "noop"
+    };
     let mut build_features: Vec<String> = Vec::new();
     if cfg!(feature = "cluster") {
         build_features.push("cluster".to_string());
@@ -1178,7 +1206,12 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             hmac_playback_secret_configured: config.hmac_playback_secret.is_some(),
             stream_keys_enabled: streamkey_store.is_some(),
         },
-        config_path: None,
+        // Surfaced from the config-reload seed when `--config <path>`
+        // was passed. Lets the admin UI's Server Settings view decide
+        // whether `/api/v1/config-reload` is a working POST without an
+        // extra round-trip (the same view already polls server-info on
+        // load). `None` for CLI-only invocations.
+        config_path: config.config_reload.as_ref().map(|s| s.path.display().to_string()),
         wasm_filter_paths: config.wasm_filter.iter().map(|p| p.display().to_string()).collect(),
     };
     let admin_state = admin_state.with_server_info(lvqr_admin::server_info_fn_with_uptime(
