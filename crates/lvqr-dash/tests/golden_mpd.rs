@@ -23,6 +23,18 @@ fn video_only_live() -> Mpd {
         profiles: "urn:mpeg:dash:profile:isoff-live:2011".into(),
         min_buffer_time: "PT2.0S".into(),
         minimum_update_period: "PT2.0S".into(),
+        // Session-165 C-3: the live profile gained four optional
+        // timing attributes; the golden fixture keeps them all
+        // unset so the byte-for-byte assertion below still
+        // documents the pre-C-3 attribute layout. Production
+        // callers (DashServer::render_manifest) populate these
+        // from the captured wall-clock anchor + system clock; the
+        // server-level test in `lvqr-dash::server::tests` covers
+        // the populated path.
+        availability_start_time_millis: None,
+        publish_time_millis: None,
+        time_shift_buffer_depth_secs: None,
+        utc_timing_value_millis: None,
         periods: vec![Period {
             id: "0".into(),
             start: "PT0S".into(),

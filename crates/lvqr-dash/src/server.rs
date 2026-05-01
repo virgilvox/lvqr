@@ -31,6 +31,20 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Read the system clock as milliseconds since the UNIX epoch.
+/// Centralised so test code that needs to mock the clock has one
+/// override point; production callers see SystemTime::now. Returns
+/// 0 (the "not set" sentinel for `availabilityStartTime`) when the
+/// system clock is unavailable, which can only happen on hosts
+/// where the clock pre-dates the UNIX epoch -- effectively never.
+fn unix_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 use axum::{
     Router,
@@ -149,6 +163,17 @@ struct DashState {
     /// `MpdType::Static` and omit `minimumUpdatePeriod` so DASH
     /// clients stop polling for new segments.
     finalized: std::sync::atomic::AtomicBool,
+    /// Wall-clock anchor for the dynamic MPD's `availabilityStartTime`
+    /// (ISO/IEC 23009-1 §5.3.1.2). Captured ONCE -- on the first
+    /// `push_*_init` or `push_*_segment` call after construction --
+    /// then read verbatim on every render. `0` is the sentinel for
+    /// "not yet captured"; production code calls
+    /// `mark_started` before the first MPD render so the value is
+    /// stable. DASH clients use this to compute segment availability
+    /// (`availabilityStartTime + N * (duration / timescale)`); a
+    /// constant anchor is the spec contract, so reading `now()` per
+    /// render would shift the segment timeline backwards every poll.
+    availability_start_millis: std::sync::atomic::AtomicU64,
 }
 
 /// Per-broadcast DASH server. Cheap to clone; internally one `Arc`.
@@ -174,7 +199,34 @@ impl DashServer {
                 audio: Mutex::new(TrackState::new()),
                 event_streams: Mutex::new(Vec::new()),
                 finalized: std::sync::atomic::AtomicBool::new(false),
+                availability_start_millis: std::sync::atomic::AtomicU64::new(0),
             }),
+        }
+    }
+
+    /// Lazy-capture the `availabilityStartTime` anchor. Called from
+    /// every producer entry point (`push_*_init`, `push_*_segment`).
+    /// `compare_exchange` ensures only the first caller wins; later
+    /// pushes are no-ops, which keeps the anchor stable for the
+    /// lifetime of the broadcast (a strict requirement of ISO/IEC
+    /// 23009-1 §5.3.1.2). Returns the captured anchor.
+    fn ensure_started(&self) -> u64 {
+        let cur = self
+            .state
+            .availability_start_millis
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if cur != 0 {
+            return cur;
+        }
+        let now = unix_millis_now();
+        match self.state.availability_start_millis.compare_exchange(
+            0,
+            now,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => now,
+            Err(actual) => actual,
         }
     }
 
@@ -212,6 +264,7 @@ impl DashServer {
     /// through [`detect_video_codec_string`] so the rendered MPD
     /// picks up a real codec attribute for H.264 / HEVC publishers.
     pub fn push_video_init(&self, bytes: Bytes) {
+        self.ensure_started();
         let codec = detect_video_codec_string(&bytes);
         let mut v = self.state.video.lock().expect("dash video lock poisoned");
         v.codec = codec;
@@ -222,6 +275,7 @@ impl DashServer {
     /// [`detect_audio_codec_string`] to pick up `mp4a.40.2` for AAC
     /// or `opus` for Opus publishers.
     pub fn push_audio_init(&self, bytes: Bytes) {
+        self.ensure_started();
         let codec = detect_audio_codec_string(&bytes);
         let mut a = self.state.audio.lock().expect("dash audio lock poisoned");
         a.codec = codec;
@@ -230,6 +284,7 @@ impl DashServer {
 
     /// Store one video segment under the given `$Number$` key.
     pub fn push_video_segment(&self, seq: u64, bytes: Bytes) {
+        self.ensure_started();
         let mut v = self.state.video.lock().expect("dash video lock poisoned");
         if !v.any_segment || seq > v.latest_seq {
             v.latest_seq = seq;
@@ -240,6 +295,7 @@ impl DashServer {
 
     /// Store one audio segment under the given `$Number$` key.
     pub fn push_audio_segment(&self, seq: u64, bytes: Bytes) {
+        self.ensure_started();
         let mut a = self.state.audio.lock().expect("dash audio lock poisoned");
         if !a.any_segment || seq > a.latest_seq {
             a.latest_seq = seq;
@@ -349,6 +405,26 @@ impl DashServer {
         }
 
         let finalized = self.state.finalized.load(std::sync::atomic::Ordering::Relaxed);
+        // Live (dynamic) MPDs require availabilityStartTime per
+        // ISO/IEC 23009-1 §5.3.1.2 -- the constant captured by
+        // `ensure_started` on the first producer push. Static (VOD)
+        // MPDs do not carry it; the timeline is fully described by
+        // each segment's duration. publishTime stamps the moment the
+        // doc was generated; UTCTiming(direct) inlines the same
+        // timestamp so dash.js / Shaka clock-sync without an
+        // external probe.
+        let availability_start_time_millis = if finalized {
+            None
+        } else {
+            let v = self
+                .state
+                .availability_start_millis
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if v == 0 { None } else { Some(v) }
+        };
+        let now_millis = unix_millis_now();
+        let publish_time_millis = if finalized { None } else { Some(now_millis) };
+        let utc_timing_value_millis = if finalized { None } else { Some(now_millis) };
         let mpd = Mpd {
             mpd_type: if finalized { MpdType::Static } else { MpdType::Dynamic },
             profiles: if finalized {
@@ -362,6 +438,10 @@ impl DashServer {
             } else {
                 cfg.minimum_update_period.clone()
             },
+            availability_start_time_millis,
+            publish_time_millis,
+            time_shift_buffer_depth_secs: None,
+            utc_timing_value_millis,
             periods: vec![Period {
                 id: "0".into(),
                 start: "PT0S".into(),
@@ -675,6 +755,65 @@ mod tests {
         assert!(xml.contains("<AdaptationSet id=\"0\""));
         assert!(!xml.contains("<AdaptationSet id=\"1\""));
         assert!(xml.contains("seg-video-$Number$.m4s"));
+    }
+
+    #[test]
+    fn render_manifest_emits_availability_start_time_and_publish_time() {
+        // ISO/IEC 23009-1 §5.3.1.2: a dynamic MPD must carry
+        // availabilityStartTime + (SHOULD) publishTime; without
+        // them dash.js + Shaka cannot anchor the segment timeline.
+        // The dash server captures the wall-clock anchor lazily on
+        // the first producer push (`ensure_started`), which means
+        // `availabilityStartTime` is non-zero on the first
+        // render-after-push.
+        let server = DashServer::new(DashConfig::default());
+        server.push_video_init(Bytes::from_static(b"\x00init-bytes"));
+        let xml = server.render_manifest().expect("video manifest renders");
+        assert!(
+            xml.contains("availabilityStartTime=\""),
+            "expected AST attribute; got:\n{xml}"
+        );
+        assert!(
+            xml.contains("publishTime=\""),
+            "expected publishTime attribute; got:\n{xml}"
+        );
+        assert!(
+            xml.contains(r#"<UTCTiming schemeIdUri="urn:mpeg:dash:utc:direct:2014""#),
+            "expected UTCTiming(direct) descriptor; got:\n{xml}"
+        );
+    }
+
+    #[test]
+    fn render_manifest_keeps_availability_start_time_constant_across_renders() {
+        // ISO/IEC 23009-1 §5.3.1.2 makes availabilityStartTime a
+        // STREAM-LIFETIME anchor: a dash.js client computes
+        // segment availability as `AST + N * (duration / timescale)`,
+        // so a server that re-stamps AST per render shifts the
+        // segment timeline backwards every poll. Verify the captured
+        // anchor stays identical across two back-to-back renders.
+        let server = DashServer::new(DashConfig::default());
+        server.push_video_init(Bytes::from_static(b"\x00init-bytes"));
+        let xml1 = server.render_manifest().expect("first render");
+        // Sleep is undesirable in unit tests; instead, use the
+        // observation that the anchor was captured once and
+        // re-rendering does not call `ensure_started` again. The
+        // simplest test is structural: extract AST from both
+        // renders and compare.
+        let ast1 = extract_attribute(&xml1, "availabilityStartTime");
+        let xml2 = server.render_manifest().expect("second render");
+        let ast2 = extract_attribute(&xml2, "availabilityStartTime");
+        assert_eq!(ast1, ast2, "AST must remain constant across renders");
+    }
+
+    /// Test helper: pull the value of a `name="..."` attribute from
+    /// the rendered XML. Used by the AST-stability test to compare
+    /// the anchor across two renders without depending on the
+    /// system clock.
+    fn extract_attribute<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+        let needle = format!("{name}=\"");
+        let start = xml.find(&needle)? + needle.len();
+        let end = start + xml[start..].find('"')?;
+        Some(&xml[start..end])
     }
 
     #[test]

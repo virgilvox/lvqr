@@ -95,6 +95,15 @@ fn arb_mpd() -> impl Strategy<Value = Mpd> {
         profiles: "urn:mpeg:dash:profile:isoff-live:2011".into(),
         min_buffer_time: "PT2.0S".into(),
         minimum_update_period: "PT2.0S".into(),
+        // Session-165 C-3: leave the new timing attributes unset
+        // in proptest so the renderer's existing well-formedness
+        // properties (no panic, valid XML, period count > 0) keep
+        // exercising the pre-C-3 attribute surface. Populated-path
+        // coverage lives in the unit tests.
+        availability_start_time_millis: None,
+        publish_time_millis: None,
+        time_shift_buffer_depth_secs: None,
+        utc_timing_value_millis: None,
         periods,
     })
 }

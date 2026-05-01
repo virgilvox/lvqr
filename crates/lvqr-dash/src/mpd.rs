@@ -429,6 +429,38 @@ pub struct Mpd {
     /// LL-DASH profile can be ratcheted down once chunked-transfer
     /// segment writing lands.
     pub minimum_update_period: String,
+    /// `availabilityStartTime` attribute as milliseconds since the
+    /// UNIX epoch. ISO/IEC 23009-1 §5.3.1.2 makes this REQUIRED on
+    /// dynamic MPDs because the live segment timeline is anchored
+    /// to it: a client computes "segment N is available at
+    /// `availabilityStartTime + N * (duration/timescale)`". A
+    /// dynamic MPD without this attribute is rejected by dash.js
+    /// and Shaka with a clock-sync error. Captured ONCE at the
+    /// moment the per-broadcast state first observed media (so the
+    /// anchor stays constant across MPD re-renders within a
+    /// session); `None` skips the attribute, which is appropriate
+    /// for static (VOD) MPDs.
+    pub availability_start_time_millis: Option<u64>,
+    /// `publishTime` attribute as milliseconds since the UNIX
+    /// epoch. ISO/IEC 23009-1 §5.3.1.2 says this SHOULD be set on
+    /// dynamic MPDs to the wall-clock moment the MPD doc was
+    /// generated. Updated on every render so a client can detect
+    /// when the manifest has been re-published.
+    pub publish_time_millis: Option<u64>,
+    /// `timeShiftBufferDepth` attribute as DVR seconds. Matches
+    /// the LL-HLS DVR window depth so a DASH client knows how far
+    /// back into the live stream it is allowed to seek. `None`
+    /// omits the attribute entirely, which the spec treats as
+    /// "the publisher does not advertise a DVR window".
+    pub time_shift_buffer_depth_secs: Option<u32>,
+    /// `<UTCTiming>` descriptor. ISO/IEC 23009-1 §5.3.1.5 lets
+    /// the server inline its current wall-clock via the
+    /// `urn:mpeg:dash:utc:direct:2014` scheme so dash.js / Shaka
+    /// can clock-sync without an external HTTP/NTP probe. The
+    /// value is the same milliseconds-since-epoch the server
+    /// stamps on `publishTime` (effectively "trust the server's
+    /// clock"). `None` skips the descriptor.
+    pub utc_timing_value_millis: Option<u64>,
     /// One or more Periods.
     pub periods: Vec<Period>,
 }
@@ -451,20 +483,80 @@ impl Mpd {
         } else {
             format!(r#" minimumUpdatePeriod="{}""#, esc(&self.minimum_update_period))
         };
+        let ast_attr = self
+            .availability_start_time_millis
+            .map(|m| format!(r#" availabilityStartTime="{}""#, format_iso8601_utc(m)))
+            .unwrap_or_default();
+        let pt_attr = self
+            .publish_time_millis
+            .map(|m| format!(r#" publishTime="{}""#, format_iso8601_utc(m)))
+            .unwrap_or_default();
+        let tsbd_attr = self
+            .time_shift_buffer_depth_secs
+            .map(|s| format!(r#" timeShiftBufferDepth="PT{s}.000S""#))
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="{ty}" profiles="{profiles}" minBufferTime="{mbt}"{mup}>"#,
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="{ty}" profiles="{profiles}" minBufferTime="{mbt}"{mup}{ast}{pt}{tsbd}>"#,
             ty = self.mpd_type.as_str(),
             profiles = esc(&self.profiles),
             mbt = esc(&self.min_buffer_time),
             mup = mup_attr,
+            ast = ast_attr,
+            pt = pt_attr,
+            tsbd = tsbd_attr,
         );
         for period in &self.periods {
             period.write(&mut out, 1)?;
         }
+        // ISO/IEC 23009-1 §5.3.1.2 child-element ordering puts
+        // `<UTCTiming>` AFTER the Period(s). Use the
+        // `urn:mpeg:dash:utc:direct:2014` scheme to inline the
+        // server's clock so a freshly-fetched MPD is
+        // self-clocking; players that prefer an external HTTP/NTP
+        // probe simply ignore the `direct` scheme and keep their
+        // own time source.
+        if let Some(value_ms) = self.utc_timing_value_millis {
+            let _ = writeln!(
+                out,
+                r#"  <UTCTiming schemeIdUri="urn:mpeg:dash:utc:direct:2014" value="{}"/>"#,
+                format_iso8601_utc(value_ms),
+            );
+        }
         out.push_str("</MPD>\n");
         Ok(out)
     }
+}
+
+/// Format milliseconds since the UNIX epoch as an ISO 8601 UTC
+/// datetime (e.g. `"2026-04-30T12:34:56.789Z"`). DASH requires this
+/// exact shape on `availabilityStartTime`, `publishTime`, and the
+/// `urn:mpeg:dash:utc:direct:2014` UTCTiming value. Implemented
+/// against Howard Hinnant's civil_from_days algorithm so lvqr-dash
+/// stays free of a chrono / time crate dependency. Mirrors the
+/// `format_program_date_time` helper inside `lvqr-hls::manifest`;
+/// kept as a private helper here rather than factored into a shared
+/// crate because the two callsites are self-contained and the
+/// algorithm is small enough that a shared module would not pull
+/// its weight.
+fn format_iso8601_utc(epoch_millis: u64) -> String {
+    let total_secs = (epoch_millis / 1000) as i64;
+    let millis = epoch_millis % 1000;
+    let day_secs = total_secs.rem_euclid(86400) as u32;
+    let h = day_secs / 3600;
+    let min = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    let z = total_secs.div_euclid(86400) + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}.{millis:03}Z")
 }
 
 /// Free-standing version of [`Mpd::render`] mirroring the pattern
@@ -484,6 +576,10 @@ mod tests {
             profiles: "urn:mpeg:dash:profile:isoff-live:2011".into(),
             min_buffer_time: "PT2.0S".into(),
             minimum_update_period: "PT2.0S".into(),
+            availability_start_time_millis: None,
+            publish_time_millis: None,
+            time_shift_buffer_depth_secs: None,
+            utc_timing_value_millis: None,
             periods: vec![Period {
                 id: "0".into(),
                 start: "PT0S".into(),
@@ -592,6 +688,10 @@ mod tests {
             profiles: "urn:mpeg:dash:profile:isoff-live:2011".into(),
             min_buffer_time: "PT2.0S".into(),
             minimum_update_period: "PT2.0S".into(),
+            availability_start_time_millis: None,
+            publish_time_millis: None,
+            time_shift_buffer_depth_secs: None,
+            utc_timing_value_millis: None,
             periods: vec![Period {
                 id: "0".into(),
                 start: "PT0S".into(),
@@ -609,9 +709,97 @@ mod tests {
             profiles: "urn:mpeg:dash:profile:isoff-live:2011".into(),
             min_buffer_time: "PT2.0S".into(),
             minimum_update_period: "PT2.0S".into(),
+            availability_start_time_millis: None,
+            publish_time_millis: None,
+            time_shift_buffer_depth_secs: None,
+            utc_timing_value_millis: None,
             periods: Vec::new(),
         };
         assert!(matches!(mpd.render(), Err(DashError::EmptyPeriod)));
+    }
+
+    #[test]
+    fn render_emits_availability_start_time_publish_time_and_utc_timing() {
+        // ISO/IEC 23009-1 §5.3.1.2 + §5.3.1.5: a dynamic MPD with
+        // availabilityStartTime + publishTime + a UTCTiming(direct)
+        // descriptor renders all three in the canonical
+        // ISO 8601 UTC-millis-Z form. dash.js + Shaka rely on these
+        // for clock sync; the timeShiftBufferDepth attribute is the
+        // DVR-window equivalent of LL-HLS `EXT-X-TARGETDURATION *
+        // max_segments` and tells the player how far back into the
+        // live stream a seek is allowed to go.
+        //
+        // The expected ISO 8601 strings are derived by re-running
+        // the same `format_iso8601_utc` helper the renderer uses,
+        // so the test stays decoupled from any specific calendar
+        // arithmetic and survives a future leap-day fix without a
+        // brittle hand-computed assertion.
+        let mut mpd = live_mpd_with_video();
+        let ast = 1_777_983_296_789u64;
+        let pub_t = ast + 1_500;
+        mpd.availability_start_time_millis = Some(ast);
+        mpd.publish_time_millis = Some(pub_t);
+        mpd.time_shift_buffer_depth_secs = Some(60);
+        mpd.utc_timing_value_millis = Some(pub_t);
+        let xml = mpd.render().expect("render dynamic mpd with timing");
+        let ast_iso = format_iso8601_utc(ast);
+        let pub_iso = format_iso8601_utc(pub_t);
+        assert!(
+            xml.contains(&format!(r#"availabilityStartTime="{ast_iso}""#)),
+            "expected ISO 8601 availabilityStartTime; got:\n{xml}"
+        );
+        assert!(
+            xml.contains(&format!(r#"publishTime="{pub_iso}""#)),
+            "expected ISO 8601 publishTime; got:\n{xml}"
+        );
+        assert!(
+            xml.contains(r#"timeShiftBufferDepth="PT60.000S""#),
+            "expected DVR window attribute; got:\n{xml}"
+        );
+        assert!(
+            xml.contains(&format!(
+                r#"<UTCTiming schemeIdUri="urn:mpeg:dash:utc:direct:2014" value="{pub_iso}"/>"#
+            )),
+            "expected UTCTiming(direct) descriptor; got:\n{xml}"
+        );
+        // §5.3.1 child-element ordering: UTCTiming sits AFTER the
+        // Period element.
+        let period_close = xml.find("</Period>").expect("period close");
+        let utc_timing = xml.find("<UTCTiming").expect("utc timing present");
+        assert!(period_close < utc_timing, "UTCTiming must appear after Period");
+    }
+
+    #[test]
+    fn render_omits_timing_attrs_when_unset() {
+        // Backwards-compat: the four new fields default to None and
+        // produce no attributes / descriptors so existing tests +
+        // any embedder that builds an Mpd by hand against the
+        // pre-C-3 shape keeps the same output (no spurious
+        // attributes that break literal-XML diff tests).
+        let mpd = live_mpd_with_video();
+        let xml = mpd.render().expect("render");
+        assert!(!xml.contains("availabilityStartTime"));
+        assert!(!xml.contains("publishTime"));
+        assert!(!xml.contains("timeShiftBufferDepth"));
+        assert!(!xml.contains("UTCTiming"));
+    }
+
+    #[test]
+    fn format_iso8601_utc_known_epoch() {
+        // UNIX epoch + millisecond precision baseline. A regression
+        // in the civil_from_days arithmetic would silently shift
+        // every live MPD's anchor by a day or month, which dash.js
+        // would surface as "segment timeline drifted" warnings; the
+        // baseline assertions below pin the algorithm against
+        // Hinnant's original test vectors.
+        assert_eq!(format_iso8601_utc(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(format_iso8601_utc(1_234), "1970-01-01T00:00:01.234Z");
+        // 2024-01-01T00:00:00.000Z = 1704067200000 ms (the most
+        // recent leap-year boundary at the time of writing). The
+        // civil-from-days implementation handles 2024 as a leap
+        // year correctly: Jan 1 has YOY day-of-year 0, so the result
+        // is 2024-01-01 not 2024-01-02.
+        assert_eq!(format_iso8601_utc(1_704_067_200_000), "2024-01-01T00:00:00.000Z");
     }
 
     #[test]
