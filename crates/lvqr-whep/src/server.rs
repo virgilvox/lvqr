@@ -115,6 +115,24 @@ pub enum WhepError {
     /// [`AuthProvider`]: lvqr_auth::AuthProvider
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+
+    /// The publisher's audio codec is one this WHEP answerer cannot
+    /// serve. Maps to 422 Unprocessable Entity (the offer itself is
+    /// well-formed; the resource is unprocessable because the
+    /// upstream publisher is incompatible). Today this fires
+    /// precisely on a non-transcode-feature LVQR build whose
+    /// upstream publisher is AAC: without an `aac-opus` factory the
+    /// session would otherwise accept the SDP offer + silently
+    /// drop every audio sample. The session-start gate gives the
+    /// subscriber a clear up-front error instead of a video-only
+    /// stream that "just looks broken".
+    ///
+    /// Best-effort: when the publisher has not yet emitted a
+    /// codec config the cache is empty and the gate falls through.
+    /// In that case the existing per-sample warn-once + Prometheus
+    /// counter (audit I-7) covers the runtime drop visibility.
+    #[error("publisher audio codec is not serveable on this surface: {0}")]
+    AudioCodecUnavailable(String),
 }
 
 impl IntoResponse for WhepError {
@@ -125,6 +143,7 @@ impl IntoResponse for WhepError {
             WhepError::SessionNotFound => StatusCode::NOT_FOUND,
             WhepError::AnswererFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             WhepError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            WhepError::AudioCodecUnavailable(_) => StatusCode::UNPROCESSABLE_ENTITY,
         };
         let body = self.to_string();
         (status, body).into_response()
@@ -197,6 +216,21 @@ pub trait SdpAnswerer: Send + Sync + 'static {
     /// when the offer itself is unparseable and
     /// [`WhepError::AnswererFailed`] for any other internal error.
     fn create_session(&self, broadcast: &str, offer: &[u8]) -> Result<(Box<dyn SessionHandle>, Bytes), WhepError>;
+
+    /// Return `true` when this answerer can serve the given audio
+    /// codec into a WHEP subscriber session. The router's
+    /// session-start gate uses this to short-circuit a session
+    /// whose upstream publisher is sending a codec the answerer
+    /// would have to silently drop. Default: `Opus` only -- WebRTC
+    /// audio is canonically Opus and a fresh implementation should
+    /// not have to think about transcoding shapes.
+    /// [`crate::str0m_backend::Str0mAnswerer`] overrides this to
+    /// also accept `Aac` when an `AacToOpusEncoderFactory` was
+    /// wired via [`crate::Str0mAnswerer::with_aac_to_opus_factory`].
+    /// PLAN audit C-9.
+    fn supports_audio_codec(&self, codec: MediaCodec) -> bool {
+        matches!(codec, MediaCodec::Opus)
+    }
 }
 
 /// Internal entry stored in the session registry.

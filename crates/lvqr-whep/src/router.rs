@@ -114,6 +114,42 @@ async fn handle_offer(
         return Err(WhepError::Unauthorized(reason));
     }
 
+    // Audit C-9: if the upstream publisher has already sent an
+    // audio codec config and the answerer cannot serve it (today:
+    // an AAC publisher reaching a non-transcode-feature build),
+    // return 422 upfront instead of accepting the session +
+    // silently dropping every audio sample. Best-effort: when no
+    // audio config has arrived yet (publisher not yet started, or
+    // video-only broadcast), the cache is empty and the gate
+    // falls through. The session-runtime per-sample
+    // `lvqr_whep_codec_mismatch_drops_total` counter (audit I-7)
+    // remains the canonical source of truth for drops the
+    // up-front gate could not catch.
+    if let Some(snapshot) = server.cached_audio_config(&broadcast)
+        && !server.state.answerer.supports_audio_codec(snapshot.codec)
+    {
+        let codec_label = match snapshot.codec {
+            lvqr_ingest::MediaCodec::Aac => "aac",
+            lvqr_ingest::MediaCodec::Opus => "opus",
+            lvqr_ingest::MediaCodec::H264 => "h264",
+            lvqr_ingest::MediaCodec::H265 => "h265",
+        };
+        tracing::warn!(
+            %broadcast,
+            codec = codec_label,
+            "WHEP offer rejected: publisher audio codec not serveable on this surface"
+        );
+        metrics::counter!(
+            "lvqr_whep_audio_codec_unavailable_total",
+            "broadcast" => broadcast.clone(),
+            "codec" => codec_label,
+        )
+        .increment(1);
+        return Err(WhepError::AudioCodecUnavailable(format!(
+            "publisher audio codec is {codec_label}; this WHEP server cannot serve it (no transcoder wired)"
+        )));
+    }
+
     let (handle, answer) = server.state.answerer.create_session(&broadcast, &body)?;
 
     // Session 113: if the upstream publisher has already broadcast

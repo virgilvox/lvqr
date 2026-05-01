@@ -248,6 +248,65 @@ async fn post_offer_without_bearer_returns_401_when_subscribe_token_required() {
 }
 
 #[tokio::test]
+async fn post_offer_returns_422_when_publisher_aac_and_no_transcoder() {
+    // Audit C-9: a publisher that has already announced its audio
+    // codec as AAC + an answerer that cannot serve AAC (the
+    // default trait shape, which mirrors a non-aac-opus build)
+    // must reject the WHEP POST upfront with 422 instead of
+    // accepting the session and silently dropping every audio
+    // sample at runtime. Wire an audio config snapshot into the
+    // cache via the public RawSampleObserver hook + drive a
+    // POST; assert 422.
+    let (answerer, _, _) = StubAnswerer::new();
+    let server = WhepServer::new(Arc::new(answerer));
+    // Inject a publisher audio config the way the bridge would.
+    // StubAnswerer inherits the default `supports_audio_codec`
+    // which returns true only for Opus, so AAC fails the gate.
+    server.on_audio_config("live/test", "1.mp4", MediaCodec::Aac, b"ASC payload");
+
+    let router = lvqr_whep::router_for(server.clone());
+    let response = router.oneshot(sdp_offer("live/test")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(server.session_count(), 0, "rejected POST must not register a session");
+    let body = body_bytes(response.into_body()).await;
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        text.contains("aac"),
+        "error body must name the rejected codec; got {text}"
+    );
+}
+
+#[tokio::test]
+async fn post_offer_passes_when_publisher_audio_is_opus() {
+    // Companion to the AAC-deny test: the same default answerer
+    // accepts an Opus publisher because Opus is the default
+    // serveable codec.
+    let (answerer, _, _) = StubAnswerer::new();
+    let server = WhepServer::new(Arc::new(answerer));
+    server.on_audio_config("live/test", "1.mp4", MediaCodec::Opus, b"OpusHead-ish");
+
+    let router = lvqr_whep::router_for(server.clone());
+    let response = router.oneshot(sdp_offer("live/test")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(server.session_count(), 1);
+}
+
+#[tokio::test]
+async fn post_offer_falls_through_when_no_audio_config_published_yet() {
+    // Best-effort: when the publisher has not yet announced any
+    // audio codec config (cache empty), the C-9 gate falls
+    // through. The runtime per-sample
+    // lvqr_whep_codec_mismatch_drops_total counter (audit I-7) is
+    // the canonical source of truth in that case.
+    let (answerer, _, _) = StubAnswerer::new();
+    let server = WhepServer::new(Arc::new(answerer));
+    let router = lvqr_whep::router_for(server.clone());
+    let response = router.oneshot(sdp_offer("live/test")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(server.session_count(), 1);
+}
+
+#[tokio::test]
 async fn post_offer_with_correct_bearer_passes_auth_gate() {
     // Companion to the deny test above. The same strict provider
     // accepts a request that carries the right Bearer token.

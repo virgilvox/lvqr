@@ -275,6 +275,24 @@ impl SdpAnswerer for Str0mAnswerer {
         });
         Ok((handle, answer_bytes))
     }
+
+    /// Override the trait default to also accept `Aac` when the
+    /// answerer was wired with an `AacToOpusEncoderFactory`. The
+    /// router gate (audit C-9) reads this at session-start time
+    /// to surface a 422 instead of accepting a session whose
+    /// audio path would silently drop on a non-transcode build.
+    /// The `aac_opus_factory` field is feature-gated on
+    /// `aac-opus`, so the AAC arm is only reachable when the
+    /// crate was built with the feature; otherwise AAC falls
+    /// through to the `false` default.
+    fn supports_audio_codec(&self, codec: MediaCodec) -> bool {
+        match codec {
+            MediaCodec::Opus => true,
+            #[cfg(feature = "aac-opus")]
+            MediaCodec::Aac => self.aac_opus_factory.is_some(),
+            _ => false,
+        }
+    }
 }
 
 /// Opus frames flowing from the AAC-to-Opus encoder worker back
