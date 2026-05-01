@@ -94,10 +94,11 @@ pub enum DashError {
 /// live stream (`dynamic`) from a VOD stream (`static`). Live is
 /// the only mode LVQR ships today; VOD lands alongside the LL-HLS
 /// DVR scrub story.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MpdType {
     /// `type="dynamic"`. Live stream; the client polls the MPD for
     /// updates and follows the SegmentTemplate to the live edge.
+    #[default]
     Dynamic,
     /// `type="static"`. VOD stream; the MPD is immutable and the
     /// client sees the full duration up front.
@@ -141,6 +142,23 @@ pub struct SegmentTemplate {
     /// Matches the track's native timescale (90 000 for 90 kHz
     /// video, 48 000 for Opus audio, 44 100 for 44.1 kHz AAC).
     pub timescale: u32,
+}
+
+/// `Default` exists so external embedders can absorb future
+/// optional-field additions via the `..Default::default()` spread
+/// pattern. The default values render syntactically-valid XML but
+/// are placeholders: callers that want a usable template MUST set
+/// `initialization`, `media`, `duration`, and `timescale`.
+impl Default for SegmentTemplate {
+    fn default() -> Self {
+        Self {
+            initialization: String::new(),
+            media: String::new(),
+            start_number: 1,
+            duration: 0,
+            timescale: 0,
+        }
+    }
 }
 
 impl SegmentTemplate {
@@ -188,6 +206,23 @@ pub struct Representation {
     /// `audioSamplingRate` attribute for audio Representations.
     /// `None` for video.
     pub audio_sampling_rate: Option<u32>,
+}
+
+/// Same `Default`-spread rationale as [`SegmentTemplate`]. Callers
+/// that intend to render the result must set `id`, `codecs`, and
+/// `bandwidth_bps` plus the dimensional / sampling-rate fields
+/// appropriate for their track type.
+impl Default for Representation {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            codecs: String::new(),
+            bandwidth_bps: 0,
+            width: None,
+            height: None,
+            audio_sampling_rate: None,
+        }
+    }
 }
 
 impl Representation {
@@ -243,6 +278,23 @@ pub struct AdaptationSet {
     /// puts it on the set because every Representation in a given
     /// set shares the same segment duration + timescale.
     pub segment_template: SegmentTemplate,
+}
+
+/// Same `Default`-spread rationale. The defaults shape a video
+/// `AdaptationSet` because that is the dominant LVQR case;
+/// embedders adding an audio set should override `mime_type`,
+/// `content_type`, and supply a `lang`.
+impl Default for AdaptationSet {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            mime_type: "video/mp4".into(),
+            content_type: "video".into(),
+            lang: None,
+            representations: Vec::new(),
+            segment_template: SegmentTemplate::default(),
+        }
+    }
 }
 
 impl AdaptationSet {
@@ -385,6 +437,19 @@ pub struct Period {
     pub adaptation_sets: Vec<AdaptationSet>,
 }
 
+/// Same `Default`-spread rationale. `start="PT0S"` is the
+/// almost-universal first-Period offset for live LVQR streams.
+impl Default for Period {
+    fn default() -> Self {
+        Self {
+            id: "0".into(),
+            start: "PT0S".into(),
+            event_streams: Vec::new(),
+            adaptation_sets: Vec::new(),
+        }
+    }
+}
+
 impl Period {
     fn write(&self, out: &mut String, indent: usize) -> Result<(), DashError> {
         if self.adaptation_sets.is_empty() {
@@ -463,6 +528,30 @@ pub struct Mpd {
     pub utc_timing_value_millis: Option<u64>,
     /// One or more Periods.
     pub periods: Vec<Period>,
+}
+
+/// `Default` lets external embedders absorb the four optional
+/// timing fields (`availability_start_time_millis`,
+/// `publish_time_millis`, `time_shift_buffer_depth_secs`,
+/// `utc_timing_value_millis`) added in the C-3 fix via the
+/// `..Default::default()` spread pattern, instead of every
+/// downstream struct-literal site needing to be updated each time
+/// a new optional field appears. The non-optional fields default
+/// to LVQR's in-tree live-profile values.
+impl Default for Mpd {
+    fn default() -> Self {
+        Self {
+            mpd_type: MpdType::Dynamic,
+            profiles: "urn:mpeg:dash:profile:isoff-live:2011".into(),
+            min_buffer_time: "PT2.0S".into(),
+            minimum_update_period: "PT2.0S".into(),
+            availability_start_time_millis: None,
+            publish_time_millis: None,
+            time_shift_buffer_depth_secs: None,
+            utc_timing_value_millis: None,
+            periods: Vec::new(),
+        }
+    }
 }
 
 impl Mpd {
@@ -925,5 +1014,57 @@ mod tests {
         let xml = mpd.render().expect("render");
         assert!(xml.contains(r#"type="static""#));
         assert!(!xml.contains(r#"type="dynamic""#));
+    }
+
+    /// Locks the `..Default::default()` spread pattern external
+    /// embedders use after the C-3 fix added four optional timing
+    /// fields. A 1.0.0 consumer can express the pre-C-3 shape as
+    /// `Mpd { periods, ..Default::default() }` and stay forwards-
+    /// compatible with future optional-field additions without
+    /// every struct-literal site having to be updated each time.
+    #[test]
+    fn default_spread_lets_embedder_supply_only_meaningful_fields() {
+        let segment_template = SegmentTemplate {
+            initialization: "init-video.m4s".into(),
+            media: "seg-video-$Number$.m4s".into(),
+            duration: 180_000,
+            timescale: 90_000,
+            ..Default::default()
+        };
+        let representation = Representation {
+            id: "video".into(),
+            codecs: "avc1.42001F".into(),
+            bandwidth_bps: 2_500_000,
+            width: Some(1280),
+            height: Some(720),
+            ..Default::default()
+        };
+        let adaptation_set = AdaptationSet {
+            representations: vec![representation],
+            segment_template,
+            ..Default::default()
+        };
+        let period = Period {
+            adaptation_sets: vec![adaptation_set],
+            ..Default::default()
+        };
+        let mpd = Mpd {
+            periods: vec![period],
+            ..Default::default()
+        };
+        let xml = mpd.render().expect("default-spread mpd should render");
+        assert!(xml.contains(r#"type="dynamic""#));
+        assert!(xml.contains(r#"profiles="urn:mpeg:dash:profile:isoff-live:2011""#));
+        assert!(xml.contains(r#"minBufferTime="PT2.0S""#));
+        assert!(xml.contains(r#"<Period id="0" start="PT0S">"#));
+        assert!(xml.contains(r#"<AdaptationSet id="0" mimeType="video/mp4""#));
+        assert!(xml.contains(r#"<Representation id="video" codecs="avc1.42001F""#));
+        // The four optional timing fields default to None and stay
+        // off the wire so a Default-spread MPD matches the pre-C-3
+        // shape byte-for-byte.
+        assert!(!xml.contains("availabilityStartTime"));
+        assert!(!xml.contains("publishTime"));
+        assert!(!xml.contains("timeShiftBufferDepth"));
+        assert!(!xml.contains("UTCTiming"));
     }
 }
