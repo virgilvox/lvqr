@@ -24,6 +24,7 @@ axum = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 lvqr-admin = { workspace = true }
+lvqr-auth = { workspace = true }
 lvqr-cmaf = { workspace = true }
 lvqr-core = { workspace = true }
 lvqr-ingest = { workspace = true }

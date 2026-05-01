@@ -743,7 +743,15 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         let answerer_builder =
             answerer_builder.with_aac_to_opus_factory(Arc::new(lvqr_transcode::AacToOpusEncoderFactory::new()));
         let answerer = Arc::new(answerer_builder) as Arc<dyn lvqr_whep::SdpAnswerer>;
-        let server = lvqr_whep::WhepServer::new(answerer);
+        // Subscribe-auth gating. Threading the workspace
+        // `SharedAuth` here makes WHEP enforce `--subscribe-token`
+        // / `--jwt-secret` / `--jwks-url` / `--webhook-auth-url`
+        // identically to live HLS / DASH / WS-fMP4. Pre-fix WHEP
+        // was open by default because `lvqr_whep::WhepServer::new`
+        // wired a `NoopAuthProvider`; that constructor still
+        // exists for embedders that want open WHEP, but the CLI's
+        // composition root always picks the auth-aware builder.
+        let server = lvqr_whep::WhepServer::with_auth_provider(answerer, auth.clone());
         let observer: lvqr_ingest::SharedRawSampleObserver = Arc::new(server.clone());
         bridge_builder = bridge_builder.with_raw_sample_observer(observer);
         Some(server)

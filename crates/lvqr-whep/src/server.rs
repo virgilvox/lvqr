@@ -19,6 +19,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use dashmap::DashMap;
+use lvqr_auth::{NoopAuthProvider, SharedAuth};
 use lvqr_cmaf::RawSample;
 use lvqr_ingest::{MediaCodec, RawSampleObserver};
 use rand::RngCore;
@@ -100,6 +101,20 @@ pub enum WhepError {
     /// bind, internal state error). Maps to 500.
     #[error("answerer internal error: {0}")]
     AnswererFailed(String),
+
+    /// The configured [`AuthProvider`] denied the subscriber. Maps to
+    /// 401. Carries the provider's reason string so operators
+    /// running `RUST_LOG=debug` can see why without exposing token
+    /// details in the response body. Parallel to
+    /// [`crate::WhipError::Unauthorized`] -- the WHEP egress was
+    /// previously unprotected because the router did not consult
+    /// any provider, so deployments running with `--subscribe-token`
+    /// silently exposed every broadcast over WHEP regardless of
+    /// what the operator configured.
+    ///
+    /// [`AuthProvider`]: lvqr_auth::AuthProvider
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
 }
 
 impl IntoResponse for WhepError {
@@ -109,6 +124,7 @@ impl IntoResponse for WhepError {
             WhepError::MalformedOffer(_) => StatusCode::BAD_REQUEST,
             WhepError::SessionNotFound => StatusCode::NOT_FOUND,
             WhepError::AnswererFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            WhepError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
         };
         let body = self.to_string();
         (status, body).into_response()
@@ -202,6 +218,12 @@ pub(crate) struct WhepState {
     /// the publisher's first sequence header still sees the config.
     /// Session 113.
     pub audio_configs: DashMap<String, AudioConfigSnapshot>,
+    /// Authentication provider consulted on the POST /whep/{broadcast}
+    /// offer. `NoopAuthProvider` by default (open access);
+    /// overridden via [`WhepServer::with_auth_provider`]. Mirrors the
+    /// WHIP-side wiring so deployments that set `--subscribe-token`
+    /// gate every subscribe protocol identically.
+    pub auth: SharedAuth,
 }
 
 /// Cheaply cloneable handle to the WHEP server.
@@ -219,14 +241,34 @@ pub struct WhepServer {
 
 impl WhepServer {
     /// Build a new server backed by a concrete SDP answerer.
+    /// Defaults to `NoopAuthProvider` (open WHEP); call
+    /// [`Self::with_auth_provider`] to gate subscribe POSTs through
+    /// the operator's configured provider.
     pub fn new(answerer: Arc<dyn SdpAnswerer>) -> Self {
+        Self::with_auth_provider(answerer, Arc::new(NoopAuthProvider))
+    }
+
+    /// Build a new server backed by a concrete SDP answerer + a
+    /// concrete `SharedAuth`. The CLI composition root passes the
+    /// shared workspace auth provider so a `--subscribe-token`
+    /// configured at boot gates WHEP identically to live HLS / DASH
+    /// / WS-fMP4. Backwards-compat: callers that used `WhepServer::new`
+    /// continue to compile + run open (NoopAuthProvider).
+    pub fn with_auth_provider(answerer: Arc<dyn SdpAnswerer>, auth: SharedAuth) -> Self {
         Self {
             state: Arc::new(WhepState {
                 answerer,
                 sessions: DashMap::new(),
                 audio_configs: DashMap::new(),
+                auth,
             }),
         }
+    }
+
+    /// Borrow the configured auth provider. Used by the router's
+    /// `handle_offer` to gate the POST.
+    pub(crate) fn auth(&self) -> &SharedAuth {
+        &self.state.auth
     }
 
     /// Look up the cached audio codec config for `broadcast`, if

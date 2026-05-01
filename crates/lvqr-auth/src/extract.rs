@@ -132,6 +132,22 @@ pub fn extract_rtsp(broadcast: &str, authorization: Option<&str>) -> AuthContext
     }
 }
 
+/// Build an [`AuthContext::Subscribe`] for a WHEP POST /whep/{broadcast}.
+///
+/// WHEP is the egress (subscriber) counterpart to WHIP and gates on
+/// the operator's `SubscribeAuth` bucket -- not `Publish`. The token
+/// comes off the request's `Authorization` header. The broadcast is
+/// the path segment from the URI (e.g. `live/cam1`). Returns
+/// `Subscribe { token: None, broadcast }` when the header is missing
+/// or malformed so a `NoopAuthProvider` deployment still admits the
+/// session and a strict provider can deny with a clear reason.
+pub fn extract_whep(broadcast: &str, authorization: Option<&str>) -> AuthContext {
+    AuthContext::Subscribe {
+        token: parse_bearer(authorization),
+        broadcast: broadcast.to_string(),
+    }
+}
+
 /// Build an [`AuthContext::Publish`] for a WebSocket ingest upgrade.
 ///
 /// The caller has already resolved the bearer token (typically via the
@@ -150,6 +166,36 @@ pub fn extract_ws_ingest(resolved_token: Option<&str>, broadcast: &str) -> AuthC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_whep_builds_subscribe_context_with_bearer() {
+        // The WHEP egress gates on Subscribe scope; if the helper
+        // ever regressed to Publish, every operator using a
+        // permission-tiered AuthProvider would silently downgrade
+        // WHEP from "viewer-token grants" to "publisher-token only"
+        // (or worse: open if the provider treats unknown scopes as
+        // allow). Lock the Subscribe variant + token round-trip.
+        let ctx = extract_whep("live/cam1", Some("Bearer view.token"));
+        match ctx {
+            AuthContext::Subscribe { token, broadcast } => {
+                assert_eq!(token.as_deref(), Some("view.token"));
+                assert_eq!(broadcast, "live/cam1");
+            }
+            other => panic!("expected Subscribe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_whep_missing_header_yields_subscribe_without_token() {
+        let ctx = extract_whep("live/cam1", None);
+        match ctx {
+            AuthContext::Subscribe { token, broadcast } => {
+                assert!(token.is_none(), "absent header => no token claim");
+                assert_eq!(broadcast, "live/cam1");
+            }
+            other => panic!("expected Subscribe, got {other:?}"),
+        }
+    }
 
     #[test]
     fn parse_bearer_strips_scheme_case_insensitively() {

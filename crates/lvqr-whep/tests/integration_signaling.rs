@@ -227,6 +227,53 @@ async fn post_offer_accepts_content_type_with_parameters() {
 }
 
 #[tokio::test]
+async fn post_offer_without_bearer_returns_401_when_subscribe_token_required() {
+    // C-10: pre-fix the WHEP router did not consult any auth
+    // provider; a deployment with `--subscribe-token=viewer`
+    // configured silently exposed every broadcast over WHEP. Wire
+    // the strict provider via with_auth_provider and assert the
+    // POST without a bearer is rejected with 401 -- not 201.
+    let (answerer, _, _) = StubAnswerer::new();
+    let provider = lvqr_auth::StaticAuthProvider::new(lvqr_auth::StaticAuthConfig {
+        admin_token: None,
+        publish_key: None,
+        subscribe_token: Some("viewer".into()),
+    });
+    let server = WhepServer::with_auth_provider(Arc::new(answerer), Arc::new(provider));
+    let router = lvqr_whep::router_for(server.clone());
+
+    let response = router.oneshot(sdp_offer("live/test")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(server.session_count(), 0, "denied POST must not register a session");
+}
+
+#[tokio::test]
+async fn post_offer_with_correct_bearer_passes_auth_gate() {
+    // Companion to the deny test above. The same strict provider
+    // accepts a request that carries the right Bearer token.
+    let (answerer, _, _) = StubAnswerer::new();
+    let provider = lvqr_auth::StaticAuthProvider::new(lvqr_auth::StaticAuthConfig {
+        admin_token: None,
+        publish_key: None,
+        subscribe_token: Some("viewer".into()),
+    });
+    let server = WhepServer::with_auth_provider(Arc::new(answerer), Arc::new(provider));
+    let router = lvqr_whep::router_for(server.clone());
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/whep/live/test")
+        .header(header::CONTENT_TYPE, "application/sdp")
+        .header(header::AUTHORIZATION, "Bearer viewer")
+        .body(Body::from("v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n"))
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(server.session_count(), 1);
+}
+
+#[tokio::test]
 async fn post_offer_with_empty_body_returns_400() {
     let (answerer, _, _) = StubAnswerer::new();
     let server = WhepServer::new(Arc::new(answerer));

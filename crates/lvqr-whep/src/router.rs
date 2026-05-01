@@ -24,6 +24,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Router, body::Bytes};
+use lvqr_auth::{AuthDecision, extract};
 
 /// Build the axum router wired to the given [`WhepServer`]. The
 /// router is ready to mount under `lvqr-cli`'s axum binding (or
@@ -96,6 +97,23 @@ async fn handle_offer(
     // session id and appends it to the path when building the
     // `Location` header.
     let broadcast = path;
+
+    // Subscribe-side auth gate. WHEP is the egress (subscriber)
+    // counterpart to WHIP and consults the operator's
+    // `SubscribeAuth` bucket. Pre-fix the WHEP router did not
+    // import lvqr-auth at all, so a deployment with
+    // `--subscribe-token` configured silently exposed every
+    // broadcast over WHEP. The check matches the pattern WHIP's
+    // handle_offer + the live HLS / DASH `live_playback_auth_middleware`
+    // already use: build the per-protocol AuthContext, ask the
+    // shared provider, return 401 + the provider's reason on deny.
+    let auth_header = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+    let ctx = extract::extract_whep(&broadcast, auth_header);
+    if let AuthDecision::Deny { reason } = server.auth().check(&ctx) {
+        tracing::warn!(broadcast = %broadcast, reason = %reason, "WHEP offer denied");
+        return Err(WhepError::Unauthorized(reason));
+    }
+
     let (handle, answer) = server.state.answerer.create_session(&broadcast, &body)?;
 
     // Session 113: if the upstream publisher has already broadcast
