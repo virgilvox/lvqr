@@ -4,6 +4,125 @@
 
 **Last Updated**: 2026-04-29 (session 164 post-publish wave -- 12 commits on top of v1.0.0: README architecture diagrams hoisted to the top, in-browser WHIP demo streamer + signed-URL generator + protocol-URL recipes + TOML config builder added to the admin-ui, 7 follow-up WebRTC fixes (CORS / ICE-host-candidate / wildcard bind / FragmentBroadcasterRegistry-as-source / `local_addr = candidate_addr` / H264 codec pinning / WHEP default port flip), in-tree WIP for `GET /api/v1/server-info` route + DVR HLS-port fix. v1.0.0 release verified still LIVE on every channel: `gh release view v1.0.0` shows not-draft / not-prerelease + 4 binary assets uploaded with sha256 digests; crates.io / npm / PyPI / ghcr.io publishes from session 163 stand unchanged. CI on the head commit `d14b726` has 7/9 workflows green + 1 cancelled (LL-HLS routine cancel-in-progress) + 1 red (CI workflow); the red workflow has 2 pre-existing flakes -- `Test (macOS, informational)` is `continue-on-error: true` so not a merge gate, `Test (Linux)` flakes on `federation_link_propagates_broadcast_between_two_clusters` which is the same flake we already skip on `macos-latest` via commit e7277cb. Neither flake is a regression from this session's work. previous session 163 close (2026-04-28) + publish wave: **v1.0.0 PUBLISHED** on crates.io (all 26 crates) + npm (`@lvqr/{core, dvr-player, player, admin-ui}`) + PyPI (`lvqr 1.0.0`); tags `v1.0.0` + `python-v1.0.0` pushed to `origin`; commit `2ee3c9f`. **Pre-publish ultrathink audit** added 21 more Vitest tests on the admin-ui (52 total: 20 url + 7 connection + 4 plugins + 10 stores + 11 components), fixed a real bug (`bindings/python/python/lvqr/__init__.py` `__version__` had drifted to `0.3.2` across the prior 0.3.3 + 1.0.0 bumps; corrected to `1.0.0` + locked behind a pytest guard), wired a 401/403 toast on App.vue bootstrap so a wrong bearer token does not silently render an empty dashboard, verified CORS posture (line 1271 of `crates/lvqr-cli/src/lib.rs` wraps the combined admin router in `CorsLayer::permissive()` -- `OPTIONS` preflight returns `access-control-allow-origin: *` + `access-control-allow-methods: *` + `access-control-allow-headers: *`; the SPA works cross-origin from any deployment host out of the box), audited XSS surface (no `v-html` / `innerHTML` anywhere in admin-ui src), audited per-crate Cargo.toml inheritance (no 0.4.2 stragglers; every internal dep uses `version.workspace = true`), audited Cargo.lock (lvqr-* crates all flipped to `1.0.0`), end-to-end smoked the dev server (vite serves index.html + main.ts module + admin endpoints respond cross-origin with the configured wasm-filter chain). Final audit gate: cargo fmt + clippy + cargo build --workspace --release green; `npm run build` clean across all four JS packages; `npm run test:admin-ui` 52/52; `npm run test:sdk` 89/89 against a locally booted lvqr serve; `pytest` 39/39 (was 38; +1 version-guard test). Pre-publish state was: v1.0.0 STAGED on `main` -- workspace `Cargo.toml` 0.4.2 -> 1.0.0; `@lvqr/{core, dvr-player, player}` 0.3.3 / 0.3.3 / 0.3.2 -> 1.0.0; Python `lvqr` 0.3.3 -> 1.0.0; new `@lvqr/admin-ui 1.0.0` package shipped with 19 routes wired against `/api/v1/*` + design tokens from the storybook + 31 Vitest unit tests + a mobile-first responsive shell. Audit gate: cargo fmt + clippy + workspace test green; `npm run build` clean across all four JS packages + admin-ui dist; `npm run test:sdk` 89/89 against a local `lvqr serve --admin-port 18090 --mesh-enabled --cluster-listen 127.0.0.1:18093 --no-auth-signal --wasm-filter ...`; `pytest` 38/38; `npm run test:admin-ui` 31/31. Operator-gated steps remaining: `cargo publish` (Tier 0 -> Tier 6 per CLAUDE.md), `npm publish --access public` x 4 (core -> dvr-player -> player -> admin-ui), `python -m twine upload`, `git tag v1.0.0 python-v1.0.0 && git push`. previous session 162 close: SDK 0.3.3 release wave staged on `main`. `@lvqr/core` package.json bumped 0.3.2 -> 0.3.3 + CHANGELOG `## Unreleased (post-0.3.2)` block promoted to `## [0.3.3] - 2026-04-28` with `### Removed` subsection for the dead `./wasm` subpath drop; `@lvqr/dvr-player` package.json already at 0.3.3 from session 154 + new CHANGELOG.md created (first publish to npm); `bindings/python/pyproject.toml` 0.3.2 -> 0.3.3 + CHANGELOG promoted; workspace README "Client libraries" table refreshed including the stale-before-this-session Rust 0.4.1 -> 0.4.2 row catch-up. `npm run build` clean; `npm run test:sdk` 76/0; `pytest` 38/0; `npm pack --dry-run` clean for `@lvqr/core 0.3.3` and `@lvqr/dvr-player 0.3.3`; `python -m build` produces `lvqr-0.3.3.tar.gz` + `lvqr-0.3.3-py3-none-any.whl`. `npm publish` + `twine upload` + `git tag python-v0.3.3` are operator-gated and run externally; previous session 161 close: v0.4.2 PUBLISHED on crates.io with all 26 publishable crates uploaded in topological dependency order, git tag `v0.4.2` pushed to origin).
 
+## Session 170 (2026-04-30) -- real-wire reproduction of the audit fixes + lvqr-dash Default impls
+
+First operator-driven real-wire pass against the post-audit binary
+(commit `c832d92` head). Five of the new counters and three of the
+recently-landed protocol fixes were exercised against a live
+`./target/release/lvqr serve` running with every protocol bound. The
+session-170 status section at the top of `tracking/AUDIT-2026-04-29.md`
+captures the full counter snapshot, evidence-directory layout, and
+honest enumeration of which matrix cells could NOT be wire-tested
+on this host (no OBS, mpv, VLC, mediastreamvalidator, MP4Box,
+moq-rs, libsrt-enabled ffmpeg, no browser-driver harness for the
+Chrome / hls.js / Shaka / dash.js cells, no iOS device).
+
+### What got wire-tested green this session
+
+- **C-3 dynamic MPD** -- live ffmpeg RTMP publisher at `live/dynamic-mpd`,
+  curl against `http://127.0.0.1:8889/dash/<bcast>/manifest.mpd`
+  rendered the spec-mandated trio: `availabilityStartTime` +
+  `publishTime` + `<UTCTiming schemeIdUri="urn:mpeg:dash:utc:direct:2014">`
+  in the canonical ISO 8601 ms-Z form, `<UTCTiming>` placed AFTER
+  the Period element per ISO/IEC 23009-1 §5.3.1.2, `type="dynamic"`
+  with the live profile, `minimumUpdatePeriod="PT2.0S"`. Post-finalize
+  the same MPD correctly switches to `type="static"` with the
+  on-demand profile and OMITS the four timing attributes.
+- **C-4 LL-HLS playlist shape** -- VERSION 9, INDEPENDENT-SEGMENTS,
+  TARGETDURATION:2, PART-TARGET=0.200, EXT-X-PROGRAM-DATE-TIME
+  anchored within 9 ms of the DASH availabilityStartTime,
+  per-part durations all 33-34 ms (well under PART-TARGET).
+- **C-6 WHIP 415 on incompatible-codec offer** -- VP9, VP8, AV1
+  hand-crafted SDP offers all returned HTTP 415 with bodies
+  citing the rejected codec list. Counter
+  `lvqr_whip_unsupported_codec_total{broadcast=<slug>}` increments
+  per request (4+1+1 across `vp9-test` + `vp8-test` + `av1-test`).
+- **C-9 WHEP 422 on AAC publisher (non-transcode build)** --
+  ffmpeg RTMP publisher pushing AAC to `live/aac-test`, curl-driven
+  WHEP offer to `/whep/live/aac-test` with a minimal Opus + H.264
+  recvonly answer returned HTTP 422 with body
+  `publisher audio codec is aac; this WHEP server cannot serve it
+  (no transcoder wired)`. Counter
+  `lvqr_whep_audio_codec_unavailable_total{broadcast="live/aac-test",codec="aac"}=1`.
+- **I-5 RTMP non-AVC video** -- `ffmpeg -c:v flv1` (Sorenson H.263,
+  FLV codec_id=2) push produced the warn log + counter
+  `lvqr_rtmp_unsupported_codec_total{kind="video",codec_id="2"}=1`.
+- **In-tree e2e wire-tests** (real TCP, real protocol clients, real
+  HTTP playlist read): whip_hls_e2e 1/1, rtmp_hls_e2e 3/3,
+  rtmp_dash_e2e 2/2, rtsp_hls_e2e 1/1, srt_hls_e2e 2/2 (incl. HEVC),
+  srt_dash_e2e 1/1, scte35_hls_dash_e2e 3/3.
+
+### What did NOT get wire-tested + why
+
+- (d) `lvqr_srt_unknown_stream_type_drops_total` -- homebrew
+  `ffmpeg 8.1` here lacks `--enable-libsrt` (only `srtp` for
+  Secure RTP, not the `srt://` protocol). Push could not be
+  issued. Counter is unit-tested in `lvqr-srt::ingest`.
+- (c) `lvqr_whep_codec_mismatch_drops_total` -- the C-6 + C-9
+  upstream gates now pre-empt every scenario this per-sample
+  drop counter was originally meant to observe. Reaching the
+  per-sample drop point requires non-WebRTC ingest delivering
+  unsupported video codecs (e.g. SRT-AV1) which this host
+  cannot generate without libsrt-ffmpeg.
+- All browser cells, iOS Safari, OBS ingest, mpv / VLC subscribe,
+  MoQ moq-rs cell -- tooling not on this host.
+
+### CI signal on `c832d92`
+
+- `dash-conformance.yml`: `success` on `c832d92`. MP4Box
+  `-dash-check` + ffmpeg pull both green.
+- `hls-conformance.yml`: marked `failure` on `c832d92` but log
+  inspection shows the workflow content steps all PASSED
+  (`ffmpeg pull exit: 0; ffprobe exit: 0`); the `failure` came
+  from `actions/upload-artifact@v4` retrying 5x against
+  `/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact`
+  with `Request timeout` -- a GitHub Actions service-side
+  artifact-upload outage, not a content regression.
+  `mediastreamvalidator` itself is soft-skipped on macos-latest
+  GitHub runners (Apple's tools are not on the runner image).
+
+### Operator finding (informational)
+
+`/api/v1/server-info` on a relay booted without any auth flags
+returns `auth_mode: "configured"` while the boot log says
+`auth: open access (no tokens configured)`. The default
+`--no-streamkeys`-off path wraps the configured provider in
+`MultiKeyAuthProvider` which appears to flip the session-167
+classifier off the "configured" boot bucket. Worth a follow-up
+classifier pass that detects the wrap-only-for-streamkeys case
+and reports the inner provider's mode.
+
+### Lvqr-dash 1.0.0 SemVer ergonomics fix landed
+
+The session-168 deferral on the C-3 struct-literal break is closed.
+`Default` impls land on `Mpd` / `Period` / `AdaptationSet` /
+`Representation` / `SegmentTemplate` / `MpdType` so external
+embedders can write `Mpd { periods, ..Default::default() }` and
+stay forwards-compatible. Defaults match LVQR's in-tree live-
+profile values; the four post-C-3 timing fields default to `None`
+so the wire shape matches the pre-C-3 shape byte-for-byte. New
+unit test `default_spread_lets_embedder_supply_only_meaningful_fields`
+locks the spread pattern in. 38 lvqr-dash lib tests pass; fmt
+clean; clippy clean.
+
+### Remaining open after session 170 (priority order, unchanged)
+
+- C-2 WHEP PLI / FIR -- large cross-crate.
+- I-1 WHIP trickle ICE PATCH -- medium.
+- I-5b RTMP `onStatus(error)` hard-reject -- companion to I-5.
+- I-6 WHEP `rtcp-fb` consumer -- tied to C-2.
+- B-5 CMAF `styp` at chunk-serving layer -- small but cross-crate.
+
+### What the next session should do
+
+The audit's missing piece -- real-wire reproduction across the
+full matrix -- is now half-done; the host-tooling-tractable
+slice is wire-tested green on `c832d92`. The browser / iOS / OBS
+/ mpv / VLC / MoQ / libsrt cells need either a host with those
+tools installed or a Playwright / Puppeteer harness for the
+browser cells. Apple HLS Tools require a self-hosted macOS
+runner (the GitHub macos-latest image does not ship them).
+
 ## Session 165 (2026-04-29 -> 2026-04-30) -- end-to-end audit cycle + 22 commits
 
 End-to-end audit pass kicked off by the user noting that v1.0.0 was published
