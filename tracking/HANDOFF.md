@@ -81,22 +81,35 @@ Chrome / hls.js / Shaka / dash.js cells, no iOS device).
   `mediastreamvalidator` itself is soft-skipped on macos-latest
   GitHub runners (Apple's tools are not on the runner image).
 
-### Operator finding closed in this session (session-170 follow-up to B-6)
+### Operator finding partially closed in this session (session-170 follow-up to B-6)
 
 `/api/v1/server-info` on a relay booted without any auth flags
 was reporting `auth_mode: "configured"` while the boot log said
 `auth: open access`. Root cause: main.rs's `build_auth` always
 returned `Arc::new(NoopAuthProvider)` for the no-flags fallback
 and the caller wrapped it as `Some(auth)`, contradicting the
-documented `ServeConfig.auth = None` sentinel for open access.
-The classifier's `config.auth.is_some()` fallback then fired
-"configured" for every CLI invocation. Fix: `build_auth` returns
-`Option<SharedAuth>` and threads `None` through the no-flags
-case; `start()` already substitutes Noop for `None` so downstream
-auth decisions are unchanged. The classifier was extracted as
-a pure function with 11 unit tests covering every branch + the
-documented `webhook > jwks > jwt > static > configured > noop`
-precedence. 61 lvqr-cli lib tests pass; clippy + fmt clean.
+documented `ServeConfig.auth = None` sentinel. Fix (commit
+`0b2d6eb`): `build_auth` returns `Option<SharedAuth>` and threads
+`None` through the no-flags case; `start()` already substitutes
+Noop for `None` so downstream auth decisions are unchanged. The
+classifier was extracted as a pure function with 11 unit tests
+covering every label + the documented `webhook > jwks > jwt >
+static > configured > noop` precedence. Live-wire confirmed:
+no-flags relay reports `auth_mode: "noop"`. 61 lvqr-cli lib tests
+pass; clippy + fmt clean.
+
+**Still deferred** (same session-167 follow-up note): CLI-only
+invocations with `--publish-key` / `--jwt-secret` / etc. but no
+`--config` still report `"configured"` rather than the granular
+`"static"` / `"jwt"` label. The promotion ladder gates on
+`config_reload_seed.is_some()` which today requires `--config
+<path>` because the seed type carries a required `path: PathBuf`.
+The fix needs `ConfigReloadSeed.path: Option<PathBuf>` plus a
+reload-handle shape that no-ops the file-apply when `path` is
+`None`. Bigger refactor than the open-auth fix above; left for
+a future session where the reload pipeline is open for other
+reasons. The classifier extraction makes the eventual change a
+one-line ladder edit.
 
 ### Lvqr-dash 1.0.0 SemVer ergonomics fix landed
 
