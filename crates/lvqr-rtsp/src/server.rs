@@ -954,8 +954,10 @@ fn handle_play(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) -> R
     // Pick the video drain variant that matches the broadcaster's
     // codec. Try HEVC first (its extractor returns None on an AVC
     // init) so an HEVC publisher gets the HEVC drain; fall back to
-    // H.264 otherwise. If neither matches, default to H.264; the
-    // drain will itself notice the absent broadcaster and exit.
+    // H.264 otherwise. If neither matches, return RTSP 415 below
+    // -- the previous behavior was to silently spawn play_drain_h264
+    // with garbage init bytes, which produced empty RTP that the
+    // client interpreted as "PLAY started but stream is silent".
     let video_init = conn
         .registry
         .get(&broadcast, "0.mp4")
@@ -963,6 +965,9 @@ fn handle_play(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) -> R
     let is_hevc = video_init
         .as_ref()
         .is_some_and(|bytes| lvqr_cmaf::extract_hevc_parameter_sets(bytes).is_some());
+    let is_h264 = video_init
+        .as_ref()
+        .is_some_and(|bytes| lvqr_cmaf::extract_avc_parameter_sets(bytes).is_some());
 
     // Dispatch the audio drain the same way: Opus first (its
     // extractor returns None on an AAC init), fall through to AAC.
@@ -975,6 +980,30 @@ fn handle_play(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) -> R
     let is_opus = audio_init
         .as_ref()
         .is_some_and(|bytes| lvqr_cmaf::extract_opus_config(bytes).is_some());
+    let is_aac = audio_init
+        .as_ref()
+        .is_some_and(|bytes| lvqr_cmaf::extract_aac_config(bytes).is_some());
+
+    // Codec-conformance gate. RFC 2326 §11.3.16 lists 415
+    // Unsupported Media Type as the right response when the
+    // server cannot serve the requested representation. Reach
+    // this branch when the publisher is something the RTSP egress
+    // does not depacketize (AV1, VP9, anything outside the
+    // H.264/HEVC + AAC/Opus matrix) AND the client requested that
+    // track via SETUP. A client that SETUPped only the track we
+    // CAN serve gets through normally.
+    if video_channels.is_some() && video_init.is_some() && !is_hevc && !is_h264 {
+        warn!(%broadcast, "RTSP PLAY rejected: video codec not H.264 or HEVC");
+        return Response::unsupported_media_type()
+            .with_cseq(cseq)
+            .with_header("Session", &session_id_owned);
+    }
+    if audio_channels.is_some() && audio_init.is_some() && !is_opus && !is_aac {
+        warn!(%broadcast, "RTSP PLAY rejected: audio codec not AAC or Opus");
+        return Response::unsupported_media_type()
+            .with_cseq(cseq)
+            .with_header("Session", &session_id_owned);
+    }
 
     let registry = conn.registry.clone();
     let cancel = conn.conn_cancel.clone();

@@ -169,6 +169,19 @@ impl Response {
         Self::new(401, "Unauthorized")
     }
 
+    /// RTSP/1.0 `415 Unsupported Media Type`. Returned by PLAY (and
+    /// other request handlers in the future) when the broadcaster's
+    /// codec is one we cannot serve over RTSP -- e.g. an AV1 / VP9
+    /// publisher reaching the RTSP egress, which only depacketizes
+    /// H.264 + HEVC video and AAC + Opus audio. Without this
+    /// distinct status the previous behavior was to silently fall
+    /// back to the H.264 drain, which spawned the wrong
+    /// depacketizer and produced empty / malformed RTP. RFC 2326
+    /// §11.3.16 lists 415 as a valid response.
+    pub fn unsupported_media_type() -> Self {
+        Self::new(415, "Unsupported Media Type")
+    }
+
     /// RTSP/1.0 `302 Moved Temporarily` with a `Location:` header.
     /// Used by the cluster redirect-to-owner path when a DESCRIBE
     /// or PLAY for a broadcast this node does not host resolves to
