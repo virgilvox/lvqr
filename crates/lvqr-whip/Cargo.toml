@@ -22,6 +22,7 @@ lvqr-core = { workspace = true }
 lvqr-fragment = { workspace = true }
 lvqr-ingest = { workspace = true }
 lvqr-moq = { workspace = true }
+metrics = { workspace = true }
 rand = { workspace = true }
 str0m = "0.18"
 thiserror = { workspace = true }

@@ -86,6 +86,18 @@ pub enum WhipError {
     /// [`AuthProvider`]: lvqr_auth::AuthProvider
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+
+    /// The offer carried at least one `m=video` section but none of
+    /// them advertised a codec the str0m bridge can consume (today:
+    /// H264 + HEVC). Without this gate, str0m happily accepts the
+    /// offer + answers with `a=inactive` on the video media section,
+    /// the publisher sees ICE connect, and no `MediaData` ever reaches
+    /// the bridge -- the silent-drop class of bug the in-browser
+    /// VP8 case famously hit. Per WHIP draft §3.1 + RFC 9359
+    /// 415 Unsupported Media Type is the right shape for "the
+    /// session cannot be negotiated as offered".
+    #[error("unsupported video codec: {0}")]
+    UnsupportedCodec(String),
 }
 
 impl IntoResponse for WhipError {
@@ -96,6 +108,7 @@ impl IntoResponse for WhipError {
             WhipError::SessionNotFound => StatusCode::NOT_FOUND,
             WhipError::AnswererFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             WhipError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            WhipError::UnsupportedCodec(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
         };
         let body = self.to_string();
         (status, body).into_response()
