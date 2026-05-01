@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 #[cfg(feature = "jwks")]
 use lvqr_auth::{JwksAuthConfig, JwksAuthProvider};
-use lvqr_auth::{JwtAuthConfig, JwtAuthProvider, NoopAuthProvider, SharedAuth, StaticAuthConfig, StaticAuthProvider};
+use lvqr_auth::{JwtAuthConfig, JwtAuthProvider, SharedAuth, StaticAuthConfig, StaticAuthProvider};
 #[cfg(feature = "webhook")]
 use lvqr_auth::{WebhookAuthConfig, WebhookAuthProvider};
 #[cfg(feature = "transcode")]
@@ -646,7 +646,7 @@ async fn serve_from_args(
     // `--jwks-url`, `--webhook-auth-url`, and `--jwt-secret` are mutually
     // exclusive: each picks a different signing or decision strategy, and a
     // silent pick between them would hide a misconfiguration.
-    let auth: SharedAuth = build_auth(&args).await?;
+    let auth: Option<SharedAuth> = build_auth(&args).await?;
 
     let hls_addr = if args.hls_port == 0 {
         None
@@ -706,7 +706,7 @@ async fn serve_from_args(
         dash_addr,
         mesh_enabled: args.mesh_enabled,
         max_peers: args.max_peers,
-        auth: Some(auth),
+        auth,
         record_dir: args.record_dir,
         archive_dir: args.archive_dir,
         hmac_playback_secret: args.hmac_playback_secret,
@@ -762,7 +762,15 @@ async fn serve_from_args(
 /// Resolve the full auth-provider cascade, applying the precedence documented
 /// at the call site in `serve_from_args`. Factored out so each feature-gated
 /// branch stays local to one `#[cfg]` block without littering the caller.
-async fn build_auth(args: &ServeArgs) -> Result<SharedAuth> {
+///
+/// Returns `Ok(None)` when no auth flags are set; `Ok(Some(provider))` for any
+/// configured strategy (JWKS, webhook, JWT, static-token). Honouring the
+/// documented `ServeConfig.auth = None` sentinel for the open-access case is
+/// load-bearing for the `auth_mode` classifier on `/api/v1/server-info` --
+/// otherwise the streamkey wrap inside `start()` flips an open-auth relay's
+/// classifier off `noop` and back to the catch-all `configured` bucket
+/// (session-170 follow-up to the session-167 B-6 fix).
+async fn build_auth(args: &ServeArgs) -> Result<Option<SharedAuth>> {
     check_auth_flag_combinations(args)?;
 
     #[cfg(feature = "jwks")]
@@ -785,7 +793,7 @@ async fn build_auth(args: &ServeArgs) -> Result<SharedAuth> {
         let provider = JwksAuthProvider::new(cfg)
             .await
             .map_err(|e| anyhow::anyhow!("failed to init JWKS auth provider: {e}"))?;
-        return Ok(Arc::new(provider) as SharedAuth);
+        return Ok(Some(Arc::new(provider) as SharedAuth));
     }
 
     #[cfg(feature = "webhook")]
@@ -807,7 +815,7 @@ async fn build_auth(args: &ServeArgs) -> Result<SharedAuth> {
         let provider = WebhookAuthProvider::new(cfg)
             .await
             .map_err(|e| anyhow::anyhow!("failed to init webhook auth provider: {e}"))?;
-        return Ok(Arc::new(provider) as SharedAuth);
+        return Ok(Some(Arc::new(provider) as SharedAuth));
     }
 
     build_static_or_jwt_auth(args)
@@ -870,7 +878,13 @@ fn parse_mesh_ice_servers(raw: Option<&str>) -> Result<Vec<lvqr_signal::IceServe
 /// individual token is configured, otherwise open access. Factored out so
 /// the JWKS branch in `serve_from_args` can fall through to the same
 /// resolution when `--jwks-url` is unset.
-fn build_static_or_jwt_auth(args: &ServeArgs) -> Result<SharedAuth> {
+///
+/// Returns `Ok(None)` when no JWT or static-token flags are set so the
+/// caller can pass `ServeConfig.auth = None` (the documented sentinel for
+/// open access). `start()` substitutes a `NoopAuthProvider` for the `None`
+/// branch, which keeps the auth-mode classifier on `/api/v1/server-info`
+/// honest about which deployments are actually open vs configured.
+fn build_static_or_jwt_auth(args: &ServeArgs) -> Result<Option<SharedAuth>> {
     if let Some(secret) = args.jwt_secret.clone() {
         tracing::info!(
             issuer = args.jwt_issuer.is_some(),
@@ -883,7 +897,7 @@ fn build_static_or_jwt_auth(args: &ServeArgs) -> Result<SharedAuth> {
             audience: args.jwt_audience.clone(),
         })
         .map_err(|e| anyhow::anyhow!("failed to init JWT auth provider: {e}"))?;
-        return Ok(Arc::new(provider) as SharedAuth);
+        return Ok(Some(Arc::new(provider) as SharedAuth));
     }
     let auth_config = StaticAuthConfig {
         admin_token: args.admin_token.clone(),
@@ -897,10 +911,10 @@ fn build_static_or_jwt_auth(args: &ServeArgs) -> Result<SharedAuth> {
             subscribe = auth_config.subscribe_token.is_some(),
             "auth: static-token provider enabled"
         );
-        Ok(Arc::new(StaticAuthProvider::new(auth_config)) as SharedAuth)
+        Ok(Some(Arc::new(StaticAuthProvider::new(auth_config)) as SharedAuth))
     } else {
         tracing::info!("auth: open access (no tokens configured)");
-        Ok(Arc::new(NoopAuthProvider) as SharedAuth)
+        Ok(None)
     }
 }
 
