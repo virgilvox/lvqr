@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Configuration for the RTMP ingest server.
 #[derive(Debug, Clone)]
@@ -390,6 +390,65 @@ async fn handle_rtmp_session(
                             audio_codec_id = ?metadata.audio_codec_id,
                             "stream metadata received"
                         );
+                        // FLV codec_id 7 = AVC/H.264, the only video
+                        // codec the lvqr-ingest pipeline depacketizes.
+                        // Other values (1=jpeg, 2=Sorenson H.263,
+                        // 4=VP6, 5=VP6 alpha, 6=screen video) ride
+                        // through the existing FLV-tag path with the
+                        // wrong byte structure and corrupt downstream
+                        // CMAF; the operator never sees a clear error.
+                        // Publishers using enhanced RTMP (HEVC / AV1
+                        // via fourCC) leave `video_codec_id` unset
+                        // because the metadata field expects a
+                        // standard numeric codec_id, so `None` is the
+                        // "not classified" branch -- treat it as an
+                        // unsupported-codec warning until the deeper
+                        // enhanced-RTMP fourCC parser lands.
+                        //
+                        // Hard-reject via `onStatus(error)` is the
+                        // right long-term shape but requires
+                        // additional `rml_rtmp` surgery to call
+                        // `session.publish_rejected` mid-stream;
+                        // documented as still-open in the audit.
+                        // This commit closes the operator-visibility
+                        // gap (warn + counter) so unsupported
+                        // publishes are no longer silent at info.
+                        if let Some(id) = metadata.video_codec_id
+                            && id != 7
+                        {
+                            warn!(
+                                app = %app_name,
+                                key = %stream_key,
+                                video_codec_id = id,
+                                "RTMP publisher advertises non-H.264 video codec; downstream depacketization will corrupt"
+                            );
+                            metrics::counter!(
+                                "lvqr_rtmp_unsupported_codec_total",
+                                "kind" => "video",
+                                "codec_id" => id.to_string(),
+                            )
+                            .increment(1);
+                        }
+                        // FLV audio codec_id 10 = AAC. Other values
+                        // (0=Linear PCM, 1=ADPCM, 2=MP3, 4-6=Nellymoser,
+                        // 7=G.711 A-law, 8=G.711 mu-law, 11=Speex,
+                        // 14=MP3 8kHz) are not depacketized.
+                        if let Some(id) = metadata.audio_codec_id
+                            && id != 10
+                        {
+                            warn!(
+                                app = %app_name,
+                                key = %stream_key,
+                                audio_codec_id = id,
+                                "RTMP publisher advertises non-AAC audio codec; downstream depacketization will corrupt"
+                            );
+                            metrics::counter!(
+                                "lvqr_rtmp_unsupported_codec_total",
+                                "kind" => "audio",
+                                "codec_id" => id.to_string(),
+                            )
+                            .increment(1);
+                        }
                     }
                     ServerSessionEvent::Amf0DataReceived {
                         app_name,
