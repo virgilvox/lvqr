@@ -70,11 +70,21 @@ async fn body_bytes(body: Body) -> Bytes {
 }
 
 fn sdp_offer(broadcast: &str) -> Request<Body> {
+    // RFC 4566 §6 says payload types in the dynamic range
+    // (96-127) MUST be defined by an `a=rtpmap`. Session 167's
+    // C-6 codec gate now rejects an offer that advertises
+    // m=video but no rtpmap line, which is the exact shape this
+    // helper used to ship. Including a=rtpmap:96 H264/90000
+    // makes the offer compliant + a no-op for the gate (H264 is
+    // in the supported set so the gate passes through to the
+    // stub answerer).
     Request::builder()
         .method("POST")
         .uri(format!("/whip/{broadcast}"))
         .header(header::CONTENT_TYPE, "application/sdp")
-        .body(Body::from("v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n"))
+        .body(Body::from(
+            "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\n",
+        ))
         .expect("build post")
 }
 
@@ -352,7 +362,9 @@ async fn post_offer_with_valid_bearer_returns_201() {
         .uri("/whip/live/test")
         .header(header::CONTENT_TYPE, "application/sdp")
         .header(header::AUTHORIZATION, "Bearer good")
-        .body(Body::from("v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n"))
+        .body(Body::from(
+            "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\n",
+        ))
         .unwrap();
 
     let response = lvqr_whip::router_for(server.clone()).oneshot(request).await.unwrap();
