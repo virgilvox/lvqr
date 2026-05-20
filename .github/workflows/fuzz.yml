@@ -10,6 +10,15 @@ name: Fuzz
 #   - crates/lvqr-whip/fuzz: Annex B -> AVCC depack (the first
 #     byte a WHIP bridge runs over str0m `Event::MediaData`
 #     payloads). Added in session 31.
+#   - crates/lvqr-cmaf/fuzz: init-segment codec-string detectors
+#     (publisher-reachable input side of `detect_video_codec_string`
+#     and `detect_audio_codec_string`). Wired in session 172 to
+#     close the CI gap surfaced by the post-B-5 audit.
+#   - crates/lvqr-hls/fuzz: `PlaylistBuilder` state machine,
+#     including the session-33 closed-segment coalesce path and the
+#     session-34 sliding-window eviction path. Wired in session 172
+#     because the B-5 styp prepend at `HlsServer::push_chunk_bytes`
+#     widens the byte-shape surface this target already exercises.
 #
 # Two cadences:
 #
@@ -38,6 +47,10 @@ on:
       - "crates/lvqr-whep/fuzz/**"
       - "crates/lvqr-whip/src/**"
       - "crates/lvqr-whip/fuzz/**"
+      - "crates/lvqr-cmaf/src/**"
+      - "crates/lvqr-cmaf/fuzz/**"
+      - "crates/lvqr-hls/src/**"
+      - "crates/lvqr-hls/fuzz/**"
       - ".github/workflows/fuzz.yml"
   schedule:
     # 07:00 UTC daily. Low-contention window for Linux runners.
@@ -73,6 +86,10 @@ jobs:
             fuzz_dir: crates/lvqr-whep/fuzz
           - target: parse_annex_b
             fuzz_dir: crates/lvqr-whip/fuzz
+          - target: detect_codec_strings
+            fuzz_dir: crates/lvqr-cmaf/fuzz
+          - target: playlist_builder
+            fuzz_dir: crates/lvqr-hls/fuzz
     steps:
       - uses: actions/checkout@v4
 
