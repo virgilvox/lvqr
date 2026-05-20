@@ -135,7 +135,8 @@ async fn http_get(addr: SocketAddr, path: &str) -> HttpResponse {
 /// `/dash/srt/default/manifest.mpd` endpoint renders a syntactically
 /// plausible live-profile MPD, `/init-video.m4s` serves the init
 /// segment with the expected `ftyp` prefix, and at least one numbered
-/// `seg-video-1.m4s` URI resolves to a non-empty `moof`-prefixed body.
+/// `seg-video-1.m4s` URI resolves to a non-empty `styp+moof`-prefixed
+/// body (audit finding B-5; ISO/IEC 23000-19 §7.4 CMAF chunk shape).
 #[tokio::test]
 async fn srt_publish_reaches_dash_router() {
     let _ = tracing_subscriber::fmt()
@@ -220,15 +221,23 @@ async fn srt_publish_reaches_dash_router() {
         "seg-video-1 GET status for SRT broadcast (body bytes: {})",
         seg.body.len()
     );
+    // Audit finding B-5: DASH segments carry a 24-byte CMAF chunk-
+    // format `styp` prefix (ISO/IEC 23000-19 §7.4) followed by the
+    // `moof + mdat` body.
     assert!(
-        seg.body.len() >= 8,
-        "seg-video-1 body too short: {} bytes",
+        seg.body.len() >= 32,
+        "seg-video-1 body too short for styp+moof: {} bytes",
         seg.body.len()
     );
     assert_eq!(
         &seg.body[4..8],
+        b"styp",
+        "expected seg-video-1 to start with a styp box",
+    );
+    assert_eq!(
+        &seg.body[28..32],
         b"moof",
-        "expected seg-video-1 to start with a moof box",
+        "expected seg-video-1's body after styp to start with a moof box",
     );
 
     // Negative: unknown broadcast returns 404 off the DASH router.

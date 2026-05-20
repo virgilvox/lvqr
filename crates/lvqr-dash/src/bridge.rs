@@ -210,9 +210,12 @@ mod tests {
         let_drain_run().await;
 
         let server = multi.get("live/test").expect("broadcast ensured");
-        assert_eq!(server.video_segment(1).unwrap(), Bytes::from_static(b"seg1"));
-        assert_eq!(server.video_segment(2).unwrap(), Bytes::from_static(b"seg2"));
-        assert_eq!(server.video_segment(3).unwrap(), Bytes::from_static(b"seg3"));
+        // Audit finding B-5: each cached segment carries a 24-byte
+        // CMAF chunk-format `styp` prefix; the producer's bytes
+        // follow.
+        assert_segment_body(server.video_segment(1).as_deref(), b"seg1");
+        assert_segment_body(server.video_segment(2).as_deref(), b"seg2");
+        assert_segment_body(server.video_segment(3).as_deref(), b"seg3");
         assert!(server.video_segment(4).is_none());
     }
 
@@ -234,10 +237,10 @@ mod tests {
         let_drain_run().await;
 
         let server = multi.get("live/av").expect("broadcast ensured");
-        assert_eq!(server.video_segment(1).unwrap(), Bytes::from_static(b"v1"));
-        assert_eq!(server.video_segment(2).unwrap(), Bytes::from_static(b"v2"));
-        assert_eq!(server.audio_segment(1).unwrap(), Bytes::from_static(b"a1"));
-        assert_eq!(server.audio_segment(2).unwrap(), Bytes::from_static(b"a2"));
+        assert_segment_body(server.video_segment(1).as_deref(), b"v1");
+        assert_segment_body(server.video_segment(2).as_deref(), b"v2");
+        assert_segment_body(server.audio_segment(1).as_deref(), b"a1");
+        assert_segment_body(server.audio_segment(2).as_deref(), b"a2");
     }
 
     #[tokio::test]
@@ -262,7 +265,27 @@ mod tests {
         let_drain_run().await;
 
         let server = multi.get("live/rc").expect("broadcast ensured");
-        assert_eq!(server.video_segment(1).unwrap(), Bytes::from_static(b"b1"));
+        assert_segment_body(server.video_segment(1).as_deref(), b"b1");
+    }
+
+    /// Shared assertion helper: every cached segment carries the
+    /// 24-byte CMAF chunk-format `styp` prefix (audit finding B-5)
+    /// followed by the producer's body bytes.
+    #[track_caller]
+    fn assert_segment_body(seg: Option<&[u8]>, expected_body: &[u8]) {
+        let seg = seg.expect("segment cached");
+        assert!(
+            seg.len() >= 24,
+            "cached segment is too short for styp prefix: {}",
+            seg.len()
+        );
+        assert_eq!(
+            &seg[..24],
+            &lvqr_cmaf::CMAF_CHUNK_STYP_BYTES[..],
+            "missing styp prefix; got: {:?}",
+            &seg[..seg.len().min(24)]
+        );
+        assert_eq!(&seg[24..], expected_body);
     }
 
     #[tokio::test]

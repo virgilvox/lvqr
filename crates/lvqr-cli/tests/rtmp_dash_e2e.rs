@@ -138,15 +138,23 @@ async fn rtmp_publish_reaches_dash_router() {
 
     let seg = http_get(dash_addr, "/dash/live/test/seg-video-1.m4s").await;
     assert_eq!(seg.status, 200, "seg-video-1 GET status");
+    // Audit finding B-5: DASH segments carry a 24-byte CMAF chunk-
+    // format `styp` prefix (ISO/IEC 23000-19 §7.4) followed by the
+    // `moof + mdat` body.
     assert!(
-        seg.body.len() >= 8,
-        "seg-video-1 body too short: {} bytes",
+        seg.body.len() >= 32,
+        "seg-video-1 body too short for styp+moof: {} bytes",
         seg.body.len()
     );
     assert_eq!(
         &seg.body[4..8],
+        b"styp",
+        "expected seg-video-1 to start with a styp box"
+    );
+    assert_eq!(
+        &seg.body[28..32],
         b"moof",
-        "expected seg-video-1 to start with a moof box"
+        "expected seg-video-1's body after styp to start with a moof box"
     );
 
     let unknown = http_get(dash_addr, "/dash/live/ghost/manifest.mpd").await;

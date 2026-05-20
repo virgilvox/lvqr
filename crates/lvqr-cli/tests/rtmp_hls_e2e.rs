@@ -231,28 +231,42 @@ async fn rtmp_publish_reaches_multi_broadcast_hls_router() {
 
     let part_one_resp = http_get(hls_addr, &part_one_path).await;
     assert_eq!(part_one_resp.status, 200, "part GET status for {part_one_path}");
+    // Audit finding B-5: HLS partials carry a 24-byte CMAF chunk-
+    // format `styp` prefix (ISO/IEC 23000-19 §7.4) followed by the
+    // `moof + mdat` body, so the chunk is a standalone CMAF
+    // deliverable.
     assert!(
-        part_one_resp.body.len() >= 8,
-        "part one body too short: {} bytes",
+        part_one_resp.body.len() >= 32,
+        "part one body too short for styp+moof: {} bytes",
         part_one_resp.body.len()
     );
     assert_eq!(
         &part_one_resp.body[4..8],
+        b"styp",
+        "expected part one to start with a `styp` box"
+    );
+    assert_eq!(
+        &part_one_resp.body[28..32],
         b"moof",
-        "expected part one to start with a `moof` box"
+        "expected part one's body after styp to start with a `moof` box"
     );
 
     let part_two_resp = http_get(hls_addr, &part_two_path).await;
     assert_eq!(part_two_resp.status, 200, "part GET status for {part_two_path}");
     assert!(
-        part_two_resp.body.len() >= 8,
-        "part two body too short: {} bytes",
+        part_two_resp.body.len() >= 32,
+        "part two body too short for styp+moof: {} bytes",
         part_two_resp.body.len()
     );
     assert_eq!(
         &part_two_resp.body[4..8],
+        b"styp",
+        "expected part two to start with a `styp` box"
+    );
+    assert_eq!(
+        &part_two_resp.body[28..32],
         b"moof",
-        "expected part two to start with a `moof` box"
+        "expected part two's body after styp to start with a `moof` box"
     );
 
     // --- init segments must be served per broadcast too. ---

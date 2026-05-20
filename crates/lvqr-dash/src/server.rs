@@ -54,7 +54,7 @@ use axum::{
     routing::get,
 };
 use bytes::Bytes;
-use lvqr_cmaf::{detect_audio_codec_string, detect_video_codec_string};
+use lvqr_cmaf::{detect_audio_codec_string, detect_video_codec_string, prepend_cmaf_chunk_styp};
 
 use crate::mpd::{
     AdaptationSet, DashEvent, EventStream, Mpd, MpdType, Period, Representation, SCTE35_SCHEME_ID, SegmentTemplate,
@@ -283,25 +283,36 @@ impl DashServer {
     }
 
     /// Store one video segment under the given `$Number$` key.
+    ///
+    /// Stamps a CMAF chunk-format `styp` prefix on the body before
+    /// insertion (audit finding B-5; ISO/IEC 23000-19 §7.4). The MPEG-
+    /// DASH live profile delivers each segment as a standalone
+    /// downloadable, so the `styp` belongs on every segment the
+    /// `$Number$` template addresses. Init segments (`init-video.m4s`)
+    /// are not touched: they carry `ftyp + moov`, not chunk media.
     pub fn push_video_segment(&self, seq: u64, bytes: Bytes) {
         self.ensure_started();
+        let stamped = prepend_cmaf_chunk_styp(&bytes);
         let mut v = self.state.video.lock().expect("dash video lock poisoned");
         if !v.any_segment || seq > v.latest_seq {
             v.latest_seq = seq;
         }
         v.any_segment = true;
-        v.segments.insert(seq, bytes);
+        v.segments.insert(seq, stamped);
     }
 
-    /// Store one audio segment under the given `$Number$` key.
+    /// Store one audio segment under the given `$Number$` key. Stamps
+    /// the same CMAF chunk-format `styp` prefix as
+    /// [`push_video_segment`] for the same reason.
     pub fn push_audio_segment(&self, seq: u64, bytes: Bytes) {
         self.ensure_started();
+        let stamped = prepend_cmaf_chunk_styp(&bytes);
         let mut a = self.state.audio.lock().expect("dash audio lock poisoned");
         if !a.any_segment || seq > a.latest_seq {
             a.latest_seq = seq;
         }
         a.any_segment = true;
-        a.segments.insert(seq, bytes);
+        a.segments.insert(seq, stamped);
     }
 
     pub(crate) fn video_init(&self) -> Option<Bytes> {
@@ -829,13 +840,31 @@ mod tests {
 
     #[test]
     fn push_and_read_back_video_segment_bytes() {
+        // Audit finding B-5: video segments are stamped with a CMAF
+        // chunk-format `styp` prefix on cache-insert, so a readback
+        // returns the prefix followed by the producer's body.
         let server = DashServer::new(DashConfig::default());
         server.push_video_init(Bytes::from_static(b"\x00init"));
         server.push_video_segment(1, Bytes::from_static(b"seg1-body"));
         server.push_video_segment(2, Bytes::from_static(b"seg2-body"));
-        assert_eq!(server.video_segment(1).unwrap(), Bytes::from_static(b"seg1-body"));
-        assert_eq!(server.video_segment(2).unwrap(), Bytes::from_static(b"seg2-body"));
+        let seg1 = server.video_segment(1).expect("seg1 cached");
+        let seg2 = server.video_segment(2).expect("seg2 cached");
+        assert_eq!(&seg1[..24], &lvqr_cmaf::CMAF_CHUNK_STYP_BYTES[..]);
+        assert_eq!(&seg1[24..], b"seg1-body");
+        assert_eq!(&seg2[..24], &lvqr_cmaf::CMAF_CHUNK_STYP_BYTES[..]);
+        assert_eq!(&seg2[24..], b"seg2-body");
         assert!(server.video_segment(3).is_none());
+    }
+
+    #[test]
+    fn push_audio_segment_also_stamps_styp_prefix() {
+        let server = DashServer::new(DashConfig::default());
+        server.push_audio_init(Bytes::from_static(b"\x00init"));
+        server.push_audio_segment(1, Bytes::from_static(b"audio-body"));
+        let seg1 = server.audio_segment(1).expect("audio seg1 cached");
+        assert_eq!(&seg1[..24], &lvqr_cmaf::CMAF_CHUNK_STYP_BYTES[..]);
+        assert_eq!(&seg1[4..8], b"styp");
+        assert_eq!(&seg1[24..], b"audio-body");
     }
 
     #[test]

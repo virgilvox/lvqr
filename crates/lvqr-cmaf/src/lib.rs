@@ -57,6 +57,7 @@ pub mod init;
 pub mod policy;
 pub mod sample;
 pub mod segmenter;
+pub mod styp;
 
 pub use chunk::{CmafChunk, CmafChunkKind};
 pub use coalescer::{CmafSampleSegmenter, TrackCoalescer, build_moof_mdat};
@@ -69,3 +70,4 @@ pub use init::{
 pub use policy::{CmafPolicy, CmafPolicyState, PolicyDecision};
 pub use sample::{RawSample, SampleStream};
 pub use segmenter::{CmafSegmenter, SegmenterError};
+pub use styp::{CMAF_CHUNK_STYP_BYTES, cmaf_chunk_styp, prepend_cmaf_chunk_styp};

@@ -77,7 +77,7 @@ use axum::{
     routing::get,
 };
 use bytes::Bytes;
-use lvqr_cmaf::{CmafChunk, detect_audio_codec_string, detect_video_codec_string};
+use lvqr_cmaf::{CmafChunk, detect_audio_codec_string, detect_video_codec_string, prepend_cmaf_chunk_styp};
 use tokio::sync::{Notify, RwLock};
 
 use crate::manifest::{HlsError, PlaylistBuilder, PlaylistBuilderConfig};
@@ -262,6 +262,17 @@ impl HlsServer {
     /// partial URIs, which made `GET /seg-<n>.m4s` a 404; the Apple
     /// `mediastreamvalidator` soft-skip workflow surfaced this via
     /// its ffmpeg client-side compliance pass.
+    ///
+    /// Each cached body is stamped with a CMAF chunk-format `styp`
+    /// prefix via [`prepend_cmaf_chunk_styp`] before insertion (audit
+    /// finding B-5; ISO/IEC 23000-19 §7.4 says every CMAF Chunk SHALL
+    /// begin with a `styp` box). Coalesced closed-segment bytes
+    /// inherit one `styp` per constituent partial, which is exactly
+    /// the layout the spec specifies for multi-chunk CMAF Segments.
+    /// The fragment-broadcaster payload, archive-recorder writes, and
+    /// `/playback/*` DVR replay path are deliberately untouched: the
+    /// disk archive layout and direct-fragment consumers stay byte-
+    /// identical.
     pub async fn push_chunk_bytes(&self, chunk: &CmafChunk, body: Bytes) -> Result<(), HlsError> {
         let mut builder = self.state.builder.write().await;
         let prev_last_seq = builder.manifest().segments.last().map(|s| s.sequence);
@@ -280,7 +291,8 @@ impl HlsServer {
         let evicted = builder.drain_evicted_uris();
         drop(builder);
         if !uri.is_empty() {
-            self.state.cache.write().await.insert(uri, body);
+            let stamped = prepend_cmaf_chunk_styp(&body);
+            self.state.cache.write().await.insert(uri, stamped);
         }
         coalesce_closed_segments(&self.state, coalesce_work).await;
         purge_evicted_uris(&self.state, evicted).await;
@@ -1345,16 +1357,46 @@ mod tests {
             .await
             .unwrap();
 
+        // The init segment is stored verbatim: HLS `/init.mp4` serves
+        // `ftyp + moov` bytes the producer hands in.
         assert_eq!(
             server.state.init_segment.read().await.as_deref(),
             Some(b"init".as_ref())
         );
+        // The chunk cache stamps a CMAF chunk-format `styp` prefix
+        // onto each body so HTTP responses are wire-ready CMAF chunks
+        // per ISO/IEC 23000-19 §7.4 (audit finding B-5). The body
+        // payload follows the 24-byte prefix.
         let cache = server.state.cache.read().await;
+        let expected = {
+            let mut v = Vec::with_capacity(24 + 9);
+            v.extend_from_slice(&lvqr_cmaf::CMAF_CHUNK_STYP_BYTES);
+            v.extend_from_slice(b"seg0part0");
+            v
+        };
         assert!(
-            cache.values().any(|v| v.as_ref() == b"seg0part0"),
+            cache.values().any(|v| v.as_ref() == expected.as_slice()),
             "cache: {:?}",
             cache.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn cached_chunk_body_begins_with_styp_box() {
+        // Direct check that the styp prefix is in place. Independent
+        // assertion shape from the test above so a regression on the
+        // styp stamp surfaces with a focused failure message.
+        let server = HlsServer::new(PlaylistBuilderConfig::default());
+        let chunk = mk_chunk(0, 180_000, CmafChunkKind::Segment);
+        server
+            .push_chunk_bytes(&chunk, Bytes::from_static(b"\x00\x00\x00\x10moof....data...."))
+            .await
+            .unwrap();
+        let cache = server.state.cache.read().await;
+        let (_uri, body) = cache.iter().next().expect("one cached chunk");
+        assert!(body.len() >= 24, "body too short for styp prefix: {}", body.len());
+        assert_eq!(&body[..24], &lvqr_cmaf::CMAF_CHUNK_STYP_BYTES[..]);
+        assert_eq!(&body[4..8], b"styp");
     }
 
     #[tokio::test]

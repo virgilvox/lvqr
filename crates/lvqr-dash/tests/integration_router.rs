@@ -59,14 +59,17 @@ async fn single_broadcast_av_round_trip_through_router() {
     assert_eq!(ct, "audio/mp4");
     assert_eq!(body, b"\x00audio-init");
 
+    // Audit finding B-5: segment bodies are stamped with a 24-byte
+    // CMAF chunk-format `styp` prefix on the cache-insert path; the
+    // router serves the cached bytes verbatim.
     let (status, ct, body) = get(server.router(), "/seg-video-1.m4s").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(ct, "video/iso.segment");
-    assert_eq!(body, b"v-seg-1");
+    assert_styp_then_body(&body, b"v-seg-1");
 
     let (status, _, body) = get(server.router(), "/seg-audio-2.m4s").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, b"a-seg-2");
+    assert_styp_then_body(&body, b"a-seg-2");
 }
 
 #[tokio::test]
@@ -113,12 +116,30 @@ async fn multi_broadcast_router_dispatches_per_broadcast() {
 
     let (status, _, body) = get(multi.router(), "/dash/live/one/seg-video-1.m4s").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, b"a-seg-1");
+    assert_styp_then_body(&body, b"a-seg-1");
     let (status, _, body) = get(multi.router(), "/dash/live/two/seg-video-1.m4s").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, b"b-seg-1");
+    assert_styp_then_body(&body, b"b-seg-1");
 
     // Unknown broadcast is a 404, not an empty 200.
     let (status, _, _) = get(multi.router(), "/dash/live/ghost/manifest.mpd").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Shared assertion: a router-served DASH segment body starts with
+/// the canonical 24-byte CMAF chunk-format `styp` prefix and the
+/// expected producer payload follows.
+#[track_caller]
+fn assert_styp_then_body(body: &[u8], expected: &[u8]) {
+    assert!(
+        body.len() >= 24,
+        "segment body too short for styp prefix: {}",
+        body.len()
+    );
+    assert_eq!(
+        &body[..24],
+        &lvqr_cmaf::CMAF_CHUNK_STYP_BYTES[..],
+        "missing CMAF styp prefix"
+    );
+    assert_eq!(&body[24..], expected, "post-styp body mismatch");
 }

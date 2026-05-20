@@ -125,7 +125,22 @@ async fn playlist_init_and_segment_round_trip() {
         let (status, ct, body) = get_body(&server, &format!("/{uri}")).await;
         assert_eq!(status, StatusCode::OK, "fetching {uri}");
         assert_eq!(ct, "video/iso.segment");
-        assert!(body.starts_with(b"part-") || body == b"seg1-part0");
+        // Audit finding B-5: each HLS partial is a wire-ready CMAF
+        // chunk, so the body begins with the 24-byte `styp` prefix
+        // followed by the producer's bytes (the `part-N` body the
+        // synthetic chunk pushed for this URI, or `seg1-part0` for
+        // the trailing Segment-kind push that closed segment 1).
+        assert!(
+            body.len() > 24 && body[..24] == lvqr_cmaf::CMAF_CHUNK_STYP_BYTES,
+            "expected styp prefix on partial {uri}; got len={}",
+            body.len()
+        );
+        let after_styp = &body[24..];
+        assert!(
+            after_styp.starts_with(b"part-") || after_styp == b"seg1-part0",
+            "post-styp body for {uri} did not match expected synthetic shape: {:?}",
+            std::str::from_utf8(after_styp).unwrap_or("<non-utf8>")
+        );
     }
 }
 
@@ -147,6 +162,13 @@ async fn closed_segment_uri_serves_coalesced_bytes() {
 
     let part_dur = 18_000u64;
     let mut dts = 0u64;
+    // Audit finding B-5: each cached partial is now `styp + body`,
+    // so the coalesced closed-segment bytes are
+    // `(styp + part-0-body) || (styp + part-1-body) || ... ||
+    // (styp + part-9-body)`. Per ISO/IEC 23000-19 §7.4, a CMAF
+    // Segment composed of multiple CMAF Chunks naturally carries
+    // one `styp` per chunk boundary, which is what this concat
+    // produces.
     let mut expected_seg0: Vec<u8> = Vec::new();
     for i in 0..10 {
         let kind = if i == 0 {
@@ -155,6 +177,7 @@ async fn closed_segment_uri_serves_coalesced_bytes() {
             CmafChunkKind::Partial
         };
         let body_bytes = format!("part-{i}-body").into_bytes();
+        expected_seg0.extend_from_slice(&lvqr_cmaf::CMAF_CHUNK_STYP_BYTES);
         expected_seg0.extend_from_slice(&body_bytes);
         server
             .push_chunk_bytes(&chunk(dts, part_dur, kind), Bytes::from(body_bytes))
