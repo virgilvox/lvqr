@@ -413,6 +413,7 @@ impl TestServer {
                 jwks_boot: None,
                 webhook_boot: None,
             }),
+            auth_boot: lvqr_cli::AuthBootSummary::default(),
         };
         let handle = start(serve_config).await?;
         Ok(Self { handle })

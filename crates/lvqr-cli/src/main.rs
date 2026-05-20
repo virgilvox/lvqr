@@ -625,6 +625,17 @@ async fn serve_from_args(
     #[cfg(not(feature = "webhook"))]
     let webhook_boot: Option<lvqr_cli::WebhookBootDefaults> = None;
 
+    // Boot auth strategy summary for the server-info `auth_mode`
+    // classifier. Built from the CLI flags regardless of `--config`
+    // (the reload seed below only exists with `--config`), so a
+    // CLI-only invocation reports its real strategy. Built before the
+    // seed because the seed moves `auth_boot_defaults`.
+    let auth_boot = lvqr_cli::AuthBootSummary {
+        defaults: auth_boot_defaults.clone(),
+        jwks: jwks_boot.is_some(),
+        webhook: webhook_boot.is_some(),
+    };
+
     let config_reload_seed = args.config.clone().map(|path| {
         tracing::info!(
             path = %path.display(),
@@ -746,6 +757,7 @@ async fn serve_from_args(
         mesh_ice_servers,
         streamkeys_enabled: !args.no_streamkeys,
         config_reload: config_reload_seed,
+        auth_boot,
     };
 
     let handle = start(config).await?;

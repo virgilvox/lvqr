@@ -316,6 +316,33 @@ pub struct ServeConfig {
     /// `None` means no `--config` flag was set; SIGHUP is a
     /// no-op and the admin POST returns 503.
     pub config_reload: Option<ConfigReloadSeed>,
+    /// Boot-time auth strategy summary for the `/api/v1/server-info`
+    /// `auth_mode` classifier. Populated from the CLI auth flags
+    /// REGARDLESS of `--config` (unlike [`config_reload`], which is
+    /// `None` without a config file), so a CLI-only invocation
+    /// reports its real strategy (`static` / `jwt` / `jwks` /
+    /// `webhook`) instead of the catch-all `configured`. Decoupled
+    /// from the reload seed on purpose: the classifier only needs the
+    /// boot strategy, not the file-reload machinery.
+    ///
+    /// [`config_reload`]: ServeConfig::config_reload
+    pub auth_boot: AuthBootSummary,
+}
+
+/// Boot-time auth strategy summary consumed by the `auth_mode`
+/// classifier (see [`ServeConfig::auth_boot`]). Mirrors the strategy
+/// buckets the reload seed carries, but is always populated so the
+/// classifier works for CLI-only (no `--config`) invocations.
+#[derive(Debug, Clone, Default)]
+pub struct AuthBootSummary {
+    /// Static-token / HS256-JWT boot defaults (admin/publish/subscribe
+    /// tokens, jwt secret). `jwt_secret.is_some()` -> `jwt`; any of the
+    /// tokens -> `static`.
+    pub defaults: AuthBootDefaults,
+    /// `--jwks-url` was set at boot (feature `jwks`).
+    pub jwks: bool,
+    /// `--webhook-auth-url` was set at boot (feature `webhook`).
+    pub webhook: bool,
 }
 
 /// Seed passed from the CLI parser into `start()` so the
@@ -395,6 +422,7 @@ impl ServeConfig {
             mesh_ice_servers: Vec::new(),
             streamkeys_enabled: true,
             config_reload: None,
+            auth_boot: AuthBootSummary::default(),
         }
     }
 }
