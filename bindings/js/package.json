@@ -4,7 +4,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm --workspaces --if-present run build",
+    "build": "npm run build -w @lvqr/core && npm run build -w @lvqr/player && npm run build -w @lvqr/dvr-player && npm run build -w @lvqr/admin-ui",
     "test:e2e": "playwright test",
     "test:sdk": "vitest run",
     "test:admin-ui": "npm --workspace @lvqr/admin-ui run test:unit"
