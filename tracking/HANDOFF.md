@@ -200,13 +200,40 @@ has no decoder) -- candidate for the planned Playwright E2E suite.
 ### Committed + PR'd (session 173 close)
 
 All session-173 work is on branch `audit/whep-webrtc-correctness`,
-commit `0dab367` (one commit, no Claude attribution per CLAUDE.md),
 pushed to `origin`. PR https://github.com/virgilvox/lvqr/pull/1
 ("WebRTC egress/ingress correctness: close audit C-2/I-6/I-9/I-1") is
-open against `main` with CI running. The audit's only remaining item
-is the cosmetic `auth_mode` server-info label ladder (deferred; the
-fix would rework the hot-reload pipeline, which reads a required
-config-file path, for no functional gain).
+open against `main` (no Claude attribution per CLAUDE.md). The audit's
+only remaining item is the cosmetic `auth_mode` server-info label
+ladder (deferred; the fix would rework the hot-reload pipeline, which
+reads a required config-file path, for no functional gain).
+
+### Pre-existing CI debt fixed on the same branch (first-PR exposure)
+
+PR #1 is the repo's first-ever PR, so `pull_request`-gated lanes
+(Playwright, Vitest, the PR fuzz matrix, LL-HLS) ran for the first time
+and surfaced pre-existing breakage unrelated to the WebRTC diff. Fixed
+in-branch:
+- `baaffc0` fix(fuzz): every `crates/*/fuzz` manifest now declares an
+  empty `[workspace]` table. They are in the root `exclude` list, so a
+  recent nightly cargo errored "current package believes it's in a
+  workspace when it's not" and all 9 fuzz targets failed to build.
+- `c497653` fix(js): root `bindings/js` build now runs in dependency
+  order (`core -> player -> dvr-player -> admin-ui`) instead of npm's
+  alphabetical `--workspaces` order, which built admin-ui before the
+  `@lvqr/core` + `@lvqr/dvr-player` it imports. On a fresh checkout
+  that failed vue-tsc ("Cannot find module '@lvqr/core'" + a cascade of
+  d3 `Node` type errors) and vite ("Failed to resolve @lvqr/dvr-player").
+  Local builds had passed only on stale `dist/`.
+- `dc68ebf` ci(hls-conformance): 3-minute step `timeout-minutes` on the
+  ffmpeg RTMP fixture push, which hung the macOS lane to its 30m job
+  timeout. The RTMP->HLS path itself is green (Test (Linux)
+  rtmp_hls_e2e), so the hang is a runner flake; the cap fails it fast.
+- macOS hw-videotoolbox lane is already `continue-on-error: true`
+  (ci.yml), so its known panic-isolation flake does not gate.
+
+Authoritative LL-HLS conformance still needs a self-hosted macOS runner
+with Apple HLS Tools (`mediastreamvalidator` is not on GH-hosted
+runners) -- a long-documented, user-bound gap, not code-bound.
 
 ## Session 172 (2026-05-19) -- audit finding B-5 CMAF `styp` at HLS partial + DASH segment HTTP cache
 
