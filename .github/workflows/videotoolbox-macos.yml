@@ -11,9 +11,16 @@ name: VideoToolbox HW encode (macos)
 # scope re-runs to the transcode + cli crates that actually exercise
 # the encoder; unrelated workspace edits do not retrigger.
 #
-# Posture: `continue-on-error: true` for the first weeks while we
-# learn what variance looks like on the GitHub-hosted Apple Silicon
-# runner. Promote to a required check after a green-run streak.
+# Posture: `continue-on-error: true`. GitHub-hosted (virtualised) Apple
+# Silicon runners cannot initialise the HW-only `vtenc_h264_hw` encoder,
+# so the probe step records `hw_available=false` and the build + HW test
+# steps are skipped (the job stays green, the skip is logged loudly via
+# a workflow warning + step summary). When/if this runs on a runner with
+# a real HW encoder, the probe succeeds and the full suite executes.
+#
+# Do NOT promote this lane to a required check on the strength of green
+# runs until the probe actually succeeds on the chosen runner: a green
+# produced by a skip validates nothing. See the GUARD note on the probe.
 
 on:
   pull_request:
@@ -70,10 +77,24 @@ jobs:
       # spending compile time. A surprise plugin packaging change on
       # Homebrew's side surfaces here as a fast-fail rather than as a
       # confusing "factory opted out" log buried in the test output.
+      # The round-trip smoke below is also the HW-availability gate. On
+      # GitHub-hosted (virtualised) Apple Silicon runners the HW-only
+      # vtenc_h264_hw cannot initialise -- the pipeline fails to preroll
+      # with `not-negotiated (-4)`. That is an environmental limitation
+      # of the hosted runner, not a code regression, so on probe failure
+      # we record hw_available=false and SKIP the build + HW test steps
+      # (the job stays green) instead of failing the lane on every run.
+      #
+      # GUARD: a skipped run is NOT a pass. Do NOT promote this lane to a
+      # required check on the strength of green runs until the probe here
+      # actually succeeds on the chosen runner (e.g. a self-hosted Apple
+      # Silicon box with a real HW encoder). A green from a skip validates
+      # nothing -- the warning + step summary below make the skip loud.
       - name: Probe vtenc_h264_hw availability
+        id: probe
         run: |
           gst-inspect-1.0 --version
-          gst-inspect-1.0 vtenc_h264_hw | head -8
+          gst-inspect-1.0 vtenc_h264_hw | head -8 || true
           echo "---"
           # Round-trip smoke: encode 30 frames of testsrc through
           # vtenc_h264_hw to confirm HW initialisation works on this
@@ -87,7 +108,7 @@ jobs:
           # production pipeline in lvqr_transcode::videotoolbox so the
           # smoke and production paths agree on the encoder's input
           # format contract.
-          gst-launch-1.0 -e \
+          if gst-launch-1.0 -e \
             videotestsrc num-buffers=30 \
             ! 'video/x-raw,format=I420,width=320,height=180,framerate=30/1' \
             ! videoconvert \
@@ -95,13 +116,21 @@ jobs:
             ! vtenc_h264_hw bitrate=500 realtime=true allow-frame-reordering=false \
             ! h264parse \
             ! mp4mux \
-            ! filesink location=/tmp/vt_smoke.mp4
-          ls -la /tmp/vt_smoke.mp4
+            ! filesink location=/tmp/vt_smoke.mp4 && [ -s /tmp/vt_smoke.mp4 ]; then
+            echo "hw_available=true" >> "$GITHUB_OUTPUT"
+            ls -la /tmp/vt_smoke.mp4
+            echo "VideoToolbox HW encode is functional on this runner; running HW tests." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "hw_available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=VideoToolbox HW unavailable::vtenc_h264_hw could not initialise on this runner (HW-only encoder on a virtualised host -- not-negotiated). HW build + test steps are SKIPPED and NOT validated. A skipped run is not a pass; do not promote this lane to required until it runs on real HW."
+            echo "VideoToolbox HW encode is NOT functional on this runner (HW-only encoder, virtualised host). HW build + test steps SKIPPED and NOT validated -- this is not a pass." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
       # Build the feature-on slice of the workspace. Restricted to
       # the two crates the integration test transitively pulls so the
       # macos-runner doesn't pay the full workspace compile.
       - name: Build lvqr-transcode + tests (hw-videotoolbox)
+        if: steps.probe.outputs.hw_available == 'true'
         run: |
           cargo build -p lvqr-transcode --features hw-videotoolbox --tests
 
@@ -109,6 +138,7 @@ jobs:
       # 360p conformance fixture through the HW pipeline + assert
       # three rendition outputs land non-empty + 720p > 240p bytes.
       - name: Run videotoolbox_ladder integration test
+        if: steps.probe.outputs.hw_available == 'true'
         run: |
           cargo test -p lvqr-transcode \
             --test videotoolbox_ladder \
@@ -119,6 +149,7 @@ jobs:
       # tests (factory-build / opt-out / naming / metric label /
       # suffix-skip / pipeline string) ride here too.
       - name: Run videotoolbox unit tests
+        if: steps.probe.outputs.hw_available == 'true'
         run: |
           cargo test -p lvqr-transcode --lib \
             --features hw-videotoolbox \
