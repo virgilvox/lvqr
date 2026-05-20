@@ -25,7 +25,7 @@ mod scte35_bridge;
 mod signed_url;
 mod ws;
 
-pub use config::ConfigReloadSeed;
+pub use config::{AuthBootSummary, ConfigReloadSeed};
 pub use config_file::{AuthSection, ServeConfigFile};
 pub use config_reload::{
     AuthBootDefaults, ConfigReloadHandle, JwksBootDefaults, SharedReloadHandle, WebhookBootDefaults,
@@ -142,27 +142,29 @@ use crate::ws::{WsRelayState, spawn_recordings, ws_ingest_handler, ws_relay_hand
 /// the classifier stays honest even after the streamkey-CRUD wrap inside
 /// `start()` replaces the inner provider with a `MultiKeyAuthProvider`.
 fn classify_auth_mode(config: &ServeConfig) -> &'static str {
-    classify_auth_mode_inner(config.auth.is_some(), config.config_reload.as_ref())
+    classify_auth_mode_inner(config.auth.is_some(), &config.auth_boot)
 }
 
-fn classify_auth_mode_inner(auth_configured: bool, seed: Option<&ConfigReloadSeed>) -> &'static str {
-    if let Some(seed) = seed {
-        if seed.webhook_boot.is_some() {
-            "webhook"
-        } else if seed.jwks_boot.is_some() {
-            "jwks"
-        } else if seed.auth_boot_defaults.jwt_secret.is_some() {
-            "jwt"
-        } else if seed.auth_boot_defaults.admin_token.is_some()
-            || seed.auth_boot_defaults.publish_key.is_some()
-            || seed.auth_boot_defaults.subscribe_token.is_some()
-        {
-            "static"
-        } else if auth_configured {
-            "configured"
-        } else {
-            "noop"
-        }
+/// Map the boot auth strategy to the `auth_mode` label, in precedence
+/// order `webhook > jwks > jwt > static > configured > noop`. Reads the
+/// always-populated [`AuthBootSummary`] (not the `--config`-only reload
+/// seed), so CLI-only invocations report their real strategy instead
+/// of the catch-all `configured`. `auth_configured` is `true` when a
+/// provider was installed but no recognized boot strategy is set
+/// (e.g. a file-only or future provider), which falls through to
+/// `configured`.
+fn classify_auth_mode_inner(auth_configured: bool, boot: &AuthBootSummary) -> &'static str {
+    if boot.webhook {
+        "webhook"
+    } else if boot.jwks {
+        "jwks"
+    } else if boot.defaults.jwt_secret.is_some() {
+        "jwt"
+    } else if boot.defaults.admin_token.is_some()
+        || boot.defaults.publish_key.is_some()
+        || boot.defaults.subscribe_token.is_some()
+    {
+        "static"
     } else if auth_configured {
         "configured"
     } else {
@@ -1729,23 +1731,15 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
 #[cfg(test)]
 mod auth_mode_classifier_tests {
     use super::classify_auth_mode_inner;
-    use crate::config::ConfigReloadSeed;
-    use crate::config_reload::{AuthBootDefaults, JwksBootDefaults, WebhookBootDefaults};
-    use std::path::PathBuf;
-    use std::time::Duration;
+    use crate::config::AuthBootSummary;
 
-    fn empty_seed() -> ConfigReloadSeed {
-        ConfigReloadSeed {
-            path: PathBuf::from("/dev/null"),
-            auth_boot_defaults: AuthBootDefaults::default(),
-            jwks_boot: None,
-            webhook_boot: None,
-        }
+    fn boot() -> AuthBootSummary {
+        AuthBootSummary::default()
     }
 
     #[test]
-    fn no_seed_no_provider_is_noop() {
-        assert_eq!(classify_auth_mode_inner(false, None), "noop");
+    fn no_strategy_no_provider_is_noop() {
+        assert_eq!(classify_auth_mode_inner(false, &boot()), "noop");
     }
 
     /// Regression for the session-170 finding: a deployment booted with no
@@ -1754,90 +1748,81 @@ mod auth_mode_classifier_tests {
     /// so the `auth_configured` boolean was always `true`, flipping the
     /// classifier off `"noop"` and onto the catch-all `"configured"` bucket.
     #[test]
-    fn no_seed_with_provider_is_configured() {
-        assert_eq!(classify_auth_mode_inner(true, None), "configured");
+    fn provider_but_no_recognized_strategy_is_configured() {
+        assert_eq!(classify_auth_mode_inner(true, &boot()), "configured");
     }
 
     #[test]
-    fn empty_seed_no_provider_is_noop() {
-        assert_eq!(classify_auth_mode_inner(false, Some(&empty_seed())), "noop");
+    fn static_token_classifies_static() {
+        let mut b = boot();
+        b.defaults.publish_key = Some("k".into());
+        assert_eq!(classify_auth_mode_inner(true, &b), "static");
     }
 
     #[test]
-    fn empty_seed_with_provider_is_configured() {
-        assert_eq!(classify_auth_mode_inner(true, Some(&empty_seed())), "configured");
+    fn admin_token_only_also_classifies_static() {
+        let mut b = boot();
+        b.defaults.admin_token = Some("k".into());
+        assert_eq!(classify_auth_mode_inner(true, &b), "static");
     }
 
     #[test]
-    fn static_token_seed_classifies_static() {
-        let mut seed = empty_seed();
-        seed.auth_boot_defaults.publish_key = Some("k".into());
-        assert_eq!(classify_auth_mode_inner(true, Some(&seed)), "static");
+    fn subscribe_token_only_also_classifies_static() {
+        let mut b = boot();
+        b.defaults.subscribe_token = Some("k".into());
+        assert_eq!(classify_auth_mode_inner(true, &b), "static");
     }
 
     #[test]
-    fn admin_token_only_seed_also_classifies_static() {
-        let mut seed = empty_seed();
-        seed.auth_boot_defaults.admin_token = Some("k".into());
-        assert_eq!(classify_auth_mode_inner(true, Some(&seed)), "static");
+    fn jwt_secret_classifies_jwt() {
+        let mut b = boot();
+        b.defaults.jwt_secret = Some("s".into());
+        assert_eq!(classify_auth_mode_inner(true, &b), "jwt");
     }
 
     #[test]
-    fn subscribe_token_only_seed_also_classifies_static() {
-        let mut seed = empty_seed();
-        seed.auth_boot_defaults.subscribe_token = Some("k".into());
-        assert_eq!(classify_auth_mode_inner(true, Some(&seed)), "static");
+    fn jwks_classifies_jwks() {
+        let mut b = boot();
+        b.jwks = true;
+        assert_eq!(classify_auth_mode_inner(true, &b), "jwks");
     }
 
     #[test]
-    fn jwt_secret_seed_classifies_jwt() {
-        let mut seed = empty_seed();
-        seed.auth_boot_defaults.jwt_secret = Some("s".into());
-        assert_eq!(classify_auth_mode_inner(true, Some(&seed)), "jwt");
+    fn webhook_classifies_webhook() {
+        let mut b = boot();
+        b.webhook = true;
+        assert_eq!(classify_auth_mode_inner(true, &b), "webhook");
     }
 
+    /// The actual fix: a CLI-only invocation (no `--config`, so the old
+    /// seed-based classifier saw `None` and reported `"configured"`) now
+    /// reports the real strategy because `AuthBootSummary` is populated
+    /// from the CLI flags regardless of `--config`.
     #[test]
-    fn jwks_boot_seed_classifies_jwks() {
-        let mut seed = empty_seed();
-        seed.jwks_boot = Some(JwksBootDefaults {
-            jwks_url: Some("https://idp/jwks".into()),
-            refresh_interval: Duration::from_secs(60),
-            fetch_timeout: Duration::from_secs(10),
-        });
-        assert_eq!(classify_auth_mode_inner(true, Some(&seed)), "jwks");
-    }
-
-    #[test]
-    fn webhook_boot_seed_classifies_webhook() {
-        let mut seed = empty_seed();
-        seed.webhook_boot = Some(WebhookBootDefaults {
-            webhook_url: Some("https://decider".into()),
-            allow_cache_ttl: Duration::from_secs(30),
-            deny_cache_ttl: Duration::from_secs(5),
-            fetch_timeout: Duration::from_secs(2),
-            cache_capacity: 4096,
-        });
-        assert_eq!(classify_auth_mode_inner(true, Some(&seed)), "webhook");
+    fn cli_only_no_config_reports_real_strategy_not_configured() {
+        let mut b = boot();
+        b.defaults.jwt_secret = Some("s".into());
+        assert_eq!(classify_auth_mode_inner(true, &b), "jwt");
     }
 
     #[test]
     fn webhook_beats_jwks_beats_jwt_beats_static() {
-        // Documented precedence: a single seed carrying every bucket
-        // resolves to the highest-precedence one.
-        let mut seed = empty_seed();
-        seed.auth_boot_defaults.publish_key = Some("k".into());
-        seed.auth_boot_defaults.jwt_secret = Some("s".into());
-        seed.jwks_boot = Some(JwksBootDefaults::default());
-        seed.webhook_boot = Some(WebhookBootDefaults::default());
-        assert_eq!(classify_auth_mode_inner(true, Some(&seed)), "webhook");
+        // Documented precedence: every bucket set resolves to the
+        // highest-precedence one.
+        let mut b = boot();
+        b.defaults.publish_key = Some("k".into());
+        b.defaults.jwt_secret = Some("s".into());
+        b.jwks = true;
+        b.webhook = true;
+        assert_eq!(classify_auth_mode_inner(true, &b), "webhook");
 
-        seed.webhook_boot = None;
-        assert_eq!(classify_auth_mode_inner(true, Some(&seed)), "jwks");
+        b.webhook = false;
+        assert_eq!(classify_auth_mode_inner(true, &b), "jwks");
 
-        seed.jwks_boot = None;
-        assert_eq!(classify_auth_mode_inner(true, Some(&seed)), "jwt");
+        b.jwks = false;
+        assert_eq!(classify_auth_mode_inner(true, &b), "jwt");
 
-        seed.auth_boot_defaults.jwt_secret = None;
-        assert_eq!(classify_auth_mode_inner(true, Some(&seed)), "static");
+        b.defaults.jwt_secret = None;
+        assert_eq!(classify_auth_mode_inner(true, &b), "static");
     }
 }

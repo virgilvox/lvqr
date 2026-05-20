@@ -6,35 +6,35 @@
 
 ## Session 174 entry point (start here)
 
-**State at session-174 start**: `origin/main` HEAD `d9f278c` (session
-173 work is committed-pending -- not yet pushed; see the session-173
-close block below). Workspace green; session 173 touched lvqr-whep +
-lvqr-ingest + lvqr-whip (lvqr-whep lib 27 -> 35, lvqr-whip lib -> 40,
-two new e2e integration tests `e2e_str0m_loopback_pli` +
-`e2e_str0m_loopback_param_sets`; lvqr-ingest lib 34/0/0), clippy + fmt
-clean on the changed crates, `cargo build -p lvqr-cli` clean. v1.0.0
-live on all channels.
+**State at session-174 start**: `origin/main` HEAD `d3da6cc` (session
+173 squash-merged via PR #1, see the session-173 close block below).
+Workspace green; `cargo test --workspace --lib` 922/0/0, all PR CI
+workflows green. Session 173 touched lvqr-whep + lvqr-ingest +
+lvqr-whip + lvqr-cmaf, added `vendor/mp4-atom` (vendored + hardened),
+fixed CI debt (fuzz/JS/HLS lanes), e2e tests `e2e_str0m_loopback_pli` +
+`e2e_str0m_loopback_param_sets`. v1.0.0 live on all channels.
 `tracking/HANDOFF.md` holds sessions 173 -> 150; sessions 84-149 are
 in `tracking/archive/HANDOFF-pre-v1.0.md`, 1-83 in
 `tracking/archive/HANDOFF-tier0-3.md`.
 
-**Audit findings still open** (`tracking/AUDIT-2026-04-29.md`
-"Remaining open"). Session 173 closed C-2 + I-6 (WHEP PLI / FIR
-keyframe replay), I-9 (WHEP keyframes lacked in-band SPS/PPS), AND
-I-1 (WHIP + WHEP trickle ICE PATCH). The only remaining audit item:
+**Audit findings: ALL CLOSED.** `tracking/AUDIT-2026-04-29.md` has no
+remaining open items. Session 173 closed C-2 + I-6 (WHEP PLI / FIR
+keyframe replay), I-9 (WHEP in-band SPS/PPS), I-1 (WHIP + WHEP trickle
+ICE), the fuzz-found mp4-atom OOM + panic DoS, and -- in the follow-up
+on branch `audit/auth-mode-classifier` -- the **auth classifier
+promotion ladder**. The ladder was fixed by DECOUPLING it from the
+reload seed rather than the deferred `ConfigReloadSeed.path:
+Option<PathBuf>` reload-pipeline rework: a new always-populated
+`ServeConfig.auth_boot: AuthBootSummary` (built from CLI auth flags
+regardless of `--config`) feeds `classify_auth_mode`, so a CLI-only
+invocation reports its real `auth_mode` (`static`/`jwt`/`jwks`/
+`webhook`) instead of `configured`. The hot-reload seed is untouched.
 
-1. **Auth classifier promotion ladder** -- small but deferred per
-   the session-170 note "until the reload pipeline is open for
-   another reason." The classifier
-   (`crates/lvqr-cli/src/lib.rs:144-171`, 11 unit tests) is already
-   written and correct; it only fails to fire for CLI-only
-   `--publish-key` / `--jwt-secret` invocations without `--config`
-   because those don't populate `config_reload`. The fix is widening
-   `ConfigReloadSeed.path` (`crates/lvqr-cli/src/config.rs:332`)
-   from `PathBuf` to `Option<PathBuf>` + a reload-handle that
-   no-ops the file-apply when `path` is `None`, then the ladder is
-   a one-line edit. Pick this up opportunistically the next time the
-   reload pipeline is being touched anyway.
+The audit cycle that started session 165 is complete. Next work is
+roadmap (`tracking/PLAN_V1.1.md` / `tracking/ROADMAP.md`) -- e.g. the
+session-172 fuzz backlog (11 absent targets) now that the fuzz lane
+builds again, or dropping the interim `vendor/mp4-atom` patch once
+upstream mp4-atom hardens its allocations + `Buf` reads.
 
 **Project rules reminder** (`CLAUDE.md`): no Claude attribution in
 commits / no `Co-Authored-By`; no emojis or em-dashes; `cargo fmt`
@@ -197,15 +197,22 @@ lane is the confirmation. Real-browser decode of the SPS/PPS-injected
 keyframes also cannot be proven on this host (loopback str0m client
 has no decoder) -- candidate for the planned Playwright E2E suite.
 
-### Committed + PR'd (session 173 close)
+### MERGED to main (session 173 close)
 
-All session-173 work is on branch `audit/whep-webrtc-correctness`,
-pushed to `origin`. PR https://github.com/virgilvox/lvqr/pull/1
-("WebRTC egress/ingress correctness: close audit C-2/I-6/I-9/I-1") is
-open against `main` (no Claude attribution per CLAUDE.md). The audit's
-only remaining item is the cosmetic `auth_mode` server-info label
-ladder (deferred; the fix would rework the hot-reload pipeline, which
-reads a required config-file path, for no functional gain).
+All session-173 work landed on `main` as squash commit `d3da6cc`
+(PR #1 https://github.com/virgilvox/lvqr/pull/1, MERGED 2026-05-20; no
+Claude attribution per CLAUDE.md; feature branch deleted). It closed
+the WebRTC audit findings (C-2/I-6/I-9/I-1), the first-PR-exposed CI
+debt (fuzz workspace + rml_rtmp patch, JS build order, LL-HLS timeout),
+and a fuzz-found `mp4-atom` DoS (OOM allocation caps + bounds-safe Buf
+reads, vendored at `vendor/mp4-atom`, verified on CI/Linux ASan). All
+10 PR CI workflows were green; `cargo test --workspace --lib` 922/0/0.
+The audit's only remaining item is the cosmetic `auth_mode` server-info
+label ladder (deferred; the seed-based fix would rework the hot-reload
+pipeline, which reads a required config-file path, for no functional
+gain -- a decoupled fix that adds the boot-strategy summary to
+ServeConfig directly avoids that, at the cost of touching every
+ServeConfig construction site).
 
 ### Pre-existing CI debt fixed on the same branch (first-PR exposure)
 
