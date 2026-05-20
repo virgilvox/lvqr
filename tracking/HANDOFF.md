@@ -264,13 +264,25 @@ NOT introduced by session 173 (lvqr-cmaf is untouched here); the
 broken fuzz lane simply masked it before. The crash repro is preserved
 at `crates/lvqr-cmaf/fuzz/artifacts/detect_codec_strings/crash-69b662e6...`
 (artifacts/ is not auto-run by the fuzzer, so committing it does not
-re-trigger CI). Recommended fix (its own focused security PR, needs
-nightly + cargo-fuzz to verify, which the dev host lacks): bound
-`mp4-atom`'s allocations -- upgrade to a version that uses
-`try_reserve` / caps capacity by remaining input, or vendor+patch it,
-or add a strict bounded box-tree pre-validator in `init.rs` that
-rejects malformed/oversized boxes before `Moov::decode`. Move the
-crash file into `corpus/` as a regression seed when the fix lands.
+re-trigger CI).
+
+**Attempted + reverted (lesson for the follow-up).** I tried the
+obvious fix -- upgrade `mp4-atom` 0.10.1 -> 0.11.0, which caps the
+`saiz` `Vec::with_capacity` at `.min(4096)` (the 34 GB path). It is
+NOT sufficient: the same input then OOMs at ~62 GB through a DIFFERENT
+still-uncapped `with_capacity` in 0.11 (the remaining uncapped sites
+are `chnl` `layout_channel_count`, `ftab` `utf_16_len`, `uncv`
+`component_count`, `rref` `reference_type_count`). Worse, this CANNOT
+be verified on the macOS dev host: macOS overcommit lets a 62 GB
+`Vec::with_capacity` succeed lazily (the regression unit test passed
+locally), while Linux CI refuses it -> `handle_alloc_error` abort, so
+the upgrade silently broke the `Test (Linux)` lane. Reverted the whole
+attempt. The correct fix needs a Linux + cargo-fuzz host: vendor+patch
+`mp4-atom` to cap ALL count-driven `with_capacity` sites (or a strict
+bounded box-tree pre-validator in `init.rs` before `Moov::decode`),
+verified by running the corpus seed under ASan. Only move the crash
+file into `corpus/` once the fix is verified on Linux (a corpus seed
+that still crashes hard-reds the fuzz lane).
 
 Authoritative LL-HLS conformance still needs a self-hosted macOS runner
 with Apple HLS Tools (`mediastreamvalidator` is not on GH-hosted

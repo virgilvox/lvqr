@@ -3,6 +3,11 @@
 **/*.rs.bk
 *.pdb
 
+# Standalone fuzz workspaces (each crates/*/fuzz is its own workspace
+# root) generate their own lockfile + build dir; both are artifacts.
+crates/*/fuzz/Cargo.lock
+crates/*/fuzz/target/
+
 # WASM
 /pkg/
 crates/lvqr-wasm/pkg/
