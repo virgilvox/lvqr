@@ -17,23 +17,36 @@ impl Buf for &[u8] {
         self.len()
     }
 
+    // LVQR hardening: clamp to the available bytes so an adversarial
+    // (truncated) atom body cannot panic the decoder on an
+    // out-of-bounds slice/advance. For valid input there is always
+    // enough, so this is a no-op; for malformed input the decoder gets
+    // a short/empty slice and surfaces a decode error instead of a
+    // process-aborting panic (fuzz-found via subs.rs).
     fn slice(&self, size: usize) -> &[u8] {
-        self[..size].as_ref()
+        &self[..size.min(self.len())]
     }
 
     fn advance(&mut self, n: usize) {
-        *self = &self[n..];
+        *self = &self[n.min(self.len())..];
     }
 }
 
 impl<T: AsRef<[u8]>> Buf for Cursor<T> {
     fn remaining(&self) -> usize {
-        self.get_ref().as_ref().len() - self.position() as usize
+        // saturating: a position past the end (after a clamped advance)
+        // must not underflow into a huge `remaining`.
+        let len = self.get_ref().as_ref().len();
+        len.saturating_sub(self.position() as usize)
     }
 
+    // LVQR hardening: clamp to the available bytes (see the &[u8] impl).
     fn slice(&self, size: usize) -> &[u8] {
-        let pos = self.position() as usize;
-        self.get_ref().as_ref()[pos..pos + size].as_ref()
+        let data = self.get_ref().as_ref();
+        let len = data.len();
+        let start = (self.position() as usize).min(len);
+        let end = start.saturating_add(size).min(len);
+        &data[start..end]
     }
 
     fn advance(&mut self, n: usize) {
@@ -61,12 +74,13 @@ impl Buf for bytes::Bytes {
         self.len()
     }
 
+    // LVQR hardening: clamp to the available bytes (see the &[u8] impl).
     fn slice(&self, size: usize) -> &[u8] {
-        &self[..size]
+        &self[..size.min(self.len())]
     }
 
     fn advance(&mut self, n: usize) {
-        bytes::Buf::advance(self, n);
+        bytes::Buf::advance(self, n.min(self.len()));
     }
 }
 

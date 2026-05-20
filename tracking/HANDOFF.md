@@ -268,19 +268,32 @@ AND could not be verified locally: macOS overcommit lets a 62 GB
 false-passed on the dev box while Linux CI aborted. Lesson: OOM fixes
 must be verified through CI (Linux + ASan), never on this macOS host.
 
-**Fix:** vendor `mp4-atom` 0.10.1 at `vendor/mp4-atom` and cap all 11
-count-driven `Vec::with_capacity` sites at `.min(4096)` (pre-reserve
-only; the decode loop still reads the genuine entries, so valid
-segments are byte-identical). Wired via root `[patch.crates-io]`; the
-standalone `crates/lvqr-cmaf/fuzz` workspace re-declares the patch
-(it does not inherit the root's, same as the rml_rtmp lesson). The
-crash input is the `fuzz/corpus/detect_codec_strings/crash-69b662e6...`
-regression seed; new unit test `detect_codec_strings_no_oom_on_fuzz_crash_69b662e6`.
+**Fix (two parts, both in vendored `mp4-atom`):**
+1. **OOM** -- cap all 11 count-driven `Vec::with_capacity` sites at
+   `.min(4096)` (pre-reserve only; the decode loop still reads the
+   genuine entries, so valid segments are byte-identical).
+2. **Panic** -- once the OOM was capped, CI's fuzzer mutated into a
+   second DoS: `Buf::slice(4)` in a truncated `subs` box panicked
+   out-of-bounds (`buf.rs:21`), which under `panic = "abort"` aborts
+   the relay. Fixed by clamping the vendored `Buf` `slice` / `advance`
+   / `remaining` primitives (`buf.rs`) to the available bytes -- a
+   no-op for valid input (always enough), a short/empty slice ->
+   decode error (not a panic) for malformed input.
+
+Wired via root `[patch.crates-io]`; the standalone
+`crates/lvqr-cmaf/fuzz` workspace re-declares the patch (it does not
+inherit the root's, same as the rml_rtmp lesson). Both crash inputs
+(`crash-69b662e6` OOM, `crash-2e683b11` panic) are
+`fuzz/corpus/detect_codec_strings/` regression seeds; unit test
+`detect_codec_strings_no_panic_or_oom_on_fuzz_crashes` covers both.
 Verified: `cargo build --workspace --all-targets` clean, `cargo test
 --workspace --lib` 922/0/0, clippy + fmt clean -- AND through CI on
-Linux (the `Fuzz (detect_codec_strings)` lane runs the corpus seed
-under ASan; `Test (Linux)` runs the unit test). Interim: upstream 0.11
-caps some sites; drop the vendored patch once a release caps them all.
+Linux (the `Fuzz (detect_codec_strings)` lane runs the corpus seeds
+under ASan; `Test (Linux)` runs the unit test), which is the
+authoritative check since macOS overcommit hides over-allocations and
+its panic strategy differs. Interim: drop the vendored patch once an
+upstream mp4-atom release caps the allocations AND makes `Buf` reads
+bounds-safe.
 
 Authoritative LL-HLS conformance still needs a self-hosted macOS runner
 with Apple HLS Tools (`mediastreamvalidator` is not on GH-hosted
