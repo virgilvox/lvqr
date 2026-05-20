@@ -111,10 +111,12 @@ struct ServeArgs {
     /// WHEP HTTP listen port. Set to 0 to disable WHEP egress. When
     /// non-zero, `lvqr serve` binds a dedicated axum server on this
     /// port exposing `POST/PATCH/DELETE /whep/{broadcast}` for
-    /// WebRTC subscribers. The WHEP backend uses `str0m` and
-    /// completes ICE/DTLS against real browser clients; RTP media
-    /// write is not yet wired, so subscribers will connect but see
-    /// no frames until the media-write session lands.
+    /// WebRTC subscribers. The WHEP backend uses `str0m`, completes
+    /// ICE/DTLS against real browser clients, and packetizes H.264 /
+    /// HEVC video and Opus audio (AAC transcodes to Opus on
+    /// `--features aac-opus`) onto the wire. PATCH applies trickle ICE
+    /// candidates and a subscriber PLI / FIR triggers a keyframe
+    /// replay.
     #[arg(long, default_value = "0", env = "LVQR_WHEP_PORT")]
     whep_port: u16,
 

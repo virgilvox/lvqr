@@ -105,6 +105,11 @@ jobs:
           done
 
       - name: Push synthetic RTMP fixture with ffmpeg
+        # The push is a ~20s real-time fixture (`-re -t 20`). Cap the
+        # step so a stuck RTMP connect (macOS-runner ffmpeg/timing
+        # flake) fails fast instead of burning the whole 30-minute job
+        # budget, as happened when this lane was cancelled at 30m.
+        timeout-minutes: 3
         run: |
           set -euo pipefail
           # Canonical fixture: 20 seconds of 640x360@30fps H.264

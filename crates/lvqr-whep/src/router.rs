@@ -160,6 +160,27 @@ async fn handle_offer(
         handle.on_audio_config(&cfg.track, cfg.codec, &cfg.config_bytes);
     }
 
+    // Seed the new session with the publisher's video parameter sets
+    // (SPS/PPS) if known, BEFORE the keyframe seed below so that a
+    // keyframe replayed on the subscriber's first PLI already has the
+    // parameter sets available to inject. RTMP-origin keyframes are
+    // IDR-only; without this a browser decoder cannot initialize.
+    if let Some(ps) = server.cached_video_param_sets(&broadcast) {
+        handle.on_video_config(&ps.track, ps.codec, &ps.param_sets_annexb);
+    }
+
+    // Audit C-2 / I-6: seed the new session with the in-progress
+    // GOP's keyframe if the publisher has already produced one. The
+    // sample is delivered through the normal raw-sample path with an
+    // unset (`0`) ingest timestamp; the session caches it but does
+    // not write it until ICE connects, and replays it only when this
+    // subscriber sends a PLI / FIR. Without the seed a subscriber
+    // that joins mid-GOP cannot answer its own first PLI until the
+    // publisher happens to emit the next keyframe.
+    if let Some(kf) = server.cached_video_keyframe(&broadcast) {
+        handle.on_raw_sample(&kf.track, kf.codec, &kf.sample, 0);
+    }
+
     let session_id = SessionId::new_random();
     server.state.sessions.insert(
         session_id.clone(),

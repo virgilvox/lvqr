@@ -48,12 +48,13 @@
 //! `aac-opus` Cargo feature so deployments without GStreamer
 //! continue to build the crate with the legacy drop-and-warn shape.
 //!
-//! What this module still deliberately does NOT do:
-//!
-//! * Trickle ICE ingestion. WHEP rarely needs trickle once the offer
-//!   already embeds every host candidate; the HTTP surface still
-//!   accepts PATCH bodies so conformant clients do not error out.
-//!   `add_trickle` logs once and returns success.
+//! Audit I-1 (this revision): trickle ICE PATCH bodies are now parsed
+//! and applied. `add_trickle` extracts each `a=candidate:` line and
+//! forwards a parsed `str0m::Candidate` through the session message
+//! channel to the poll task, which calls `Rtc::add_remote_candidate`.
+//! WHEP rarely needs trickle once the offer embeds every host
+//! candidate, but a subscriber on a changing network (or one that
+//! enumerates srflx candidates asynchronously) is now honored.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(feature = "aac-opus")]
@@ -69,7 +70,7 @@ use lvqr_core::now_unix_ms;
 use lvqr_ingest::MediaCodec;
 use str0m::change::{SdpAnswer, SdpOffer};
 use str0m::format::Codec;
-use str0m::media::{MediaKind, MediaTime, Mid, Pt};
+use str0m::media::{KeyframeRequestKind, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
@@ -270,7 +271,7 @@ impl SdpAnswerer for Str0mAnswerer {
         let handle: Box<dyn SessionHandle> = Box::new(Str0mSessionHandle {
             samples: sample_tx,
             shutdown: Some(shutdown_tx),
-            trickle_warned: AtomicBool::new(false),
+            trickle_parse_warned: AtomicBool::new(false),
             unknown_track_warned: AtomicBool::new(false),
         });
         Ok((handle, answer_bytes))
@@ -354,6 +355,29 @@ enum SessionMsg {
         channels: u8,
         object_type: u8,
     },
+    /// The publisher's video parameter sets (H.264 SPS/PPS), Annex B
+    /// framed. Stored on `SessionCtx` and prepended ahead of any
+    /// keyframe that does not already carry them in-band, so a decoder
+    /// fed by an RTMP-origin stream (IDR-only keyframes) can
+    /// initialize. Delivered by the bridge's `on_video_config` hook.
+    VideoConfig { param_sets: Bytes },
+    /// A trickle ICE remote candidate parsed from a PATCH body (audit
+    /// I-1). Applied via `Rtc::add_remote_candidate` inside the poll
+    /// task, which is the sole owner of the `!Sync` `Rtc`.
+    RemoteCandidate(Candidate),
+}
+
+/// Most-recent video keyframe this session has seen, retained so a
+/// subscriber PLI / FIR can be answered by replaying it (audit C-2 /
+/// I-6). Updated on every keyframe `SessionMsg::Video` regardless of
+/// connection state, so a sample seeded at session-start (the
+/// in-progress GOP's IDR, delivered by the router before ICE
+/// completes) is available for the subscriber's very first PLI.
+#[derive(Clone)]
+struct CachedKeyframe {
+    payload: Bytes,
+    dts: u64,
+    codec: MediaCodec,
 }
 
 /// Poll-task-local state captured across iterations. The task is
@@ -427,7 +451,47 @@ struct SessionCtx {
     /// Session 113: one-shot warn guard for AAC drops when the
     /// session was created without an AAC-to-Opus factory.
     aac_without_factory_warned: bool,
+
+    /// Audit C-2 / I-6: most-recent video keyframe seen on this
+    /// session. Replayed to the subscriber on a received PLI / FIR.
+    /// `None` until the first keyframe (seeded or live) arrives.
+    last_keyframe: Option<CachedKeyframe>,
+    /// One-shot debug guard for the first keyframe replay so a
+    /// subscriber on a lossy link cannot spam the log with one line
+    /// per PLI.
+    keyframe_replay_logged: bool,
+    /// One-shot warn guard for a PLI / FIR that arrived before any
+    /// keyframe was cached (publisher had not produced a keyframe
+    /// yet, or this is a video-less session). Nothing to replay; the
+    /// subscriber recovers when the publisher's next keyframe lands.
+    pli_unanswerable_logged: bool,
+
+    /// Video parameter sets (H.264 SPS/PPS), Annex B framed, delivered
+    /// by the bridge's `on_video_config` hook. Prepended ahead of any
+    /// keyframe that does not already carry them in-band so an
+    /// RTMP-origin stream (IDR-only keyframes) is decodable by the
+    /// subscriber's WebRTC decoder. `None` until the publisher's
+    /// sequence header arrives (or for ingests that embed the
+    /// parameter sets in the keyframe directly, e.g. WHIP).
+    video_param_sets: Option<Bytes>,
+
+    /// Wall-clock instant of the last keyframe replay, used to debounce
+    /// PLI / FIR storms. A subscriber on a lossy link (or a misbehaving
+    /// one) can emit many keyframe requests in quick succession;
+    /// replaying a full keyframe for each would amplify downlink
+    /// bandwidth at exactly the wrong time. Replays are rate-limited to
+    /// one per [`MIN_KEYFRAME_REPLAY_INTERVAL`]. `None` until the first
+    /// replay, so a fresh subscriber's first PLI is always honored.
+    last_replay_at: Option<Instant>,
 }
+
+/// Minimum spacing between keyframe replays for one session. Picked to
+/// be shorter than a typical GOP (so recovery is prompt) but long
+/// enough that a PLI storm cannot turn into a keyframe flood. A
+/// keyframe is large relative to a delta frame, so unbounded replay on
+/// a lossy link would worsen the very congestion that triggered the
+/// loss.
+const MIN_KEYFRAME_REPLAY_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Run the sans-IO `Rtc` state machine forward.
 ///
@@ -480,9 +544,27 @@ async fn run_session_loop(
                 }
                 Ok(Output::Event(event)) => {
                     absorb_event(&event, &mut ctx, &broadcast);
-                    if let Event::IceConnectionStateChange(IceConnectionState::Disconnected) = &event {
-                        tracing::info!(%broadcast, "ice disconnected; ending session loop");
-                        return;
+                    match &event {
+                        Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
+                            tracing::info!(%broadcast, "ice disconnected; ending session loop");
+                            return;
+                        }
+                        // Audit C-2 / I-6: a subscriber's PLI / FIR
+                        // surfaces here. LVQR is a relay (it never
+                        // re-encodes and does not control the
+                        // publisher's encoder), so the only thing it
+                        // can do is replay the most-recent keyframe to
+                        // this subscriber. `rtc` is free to borrow
+                        // again here: `poll_output` returned the
+                        // `Output` by value, so its borrow ended before
+                        // the match arm body. Replaying inside the
+                        // drain loop means the next `poll_output`
+                        // iterations packetize and transmit it without
+                        // waiting for the select.
+                        Event::KeyframeRequest(req) => {
+                            replay_keyframe_for_pli(&mut rtc, &mut ctx, &broadcast, req.kind);
+                        }
+                        _ => {}
                     }
                 }
                 Err(e) => {
@@ -547,6 +629,21 @@ async fn run_session_loop(
             msg = samples.recv() => {
                 match msg {
                     Some(SessionMsg::Video { payload, dts, keyframe, codec, ingest_time_ms }) => {
+                        // Audit C-2 / I-6: retain the latest keyframe
+                        // (the current GOP's IDR) so a subscriber PLI /
+                        // FIR can be answered by replaying it. Cached
+                        // before the write and regardless of connection
+                        // state so the router-seeded keyframe (which
+                        // arrives pre-`Connected`) is ready for the
+                        // subscriber's first PLI. `Bytes::clone` is a
+                        // refcount bump, not a copy.
+                        if keyframe && matches!(codec, MediaCodec::H264 | MediaCodec::H265) {
+                            ctx.last_keyframe = Some(CachedKeyframe {
+                                payload: payload.clone(),
+                                dts,
+                                codec,
+                            });
+                        }
                         match write_sample(&mut rtc, &mut ctx, &broadcast, payload, dts, keyframe, codec) {
                             Ok(true) => {
                                 // Tier 4 item 4.7 session 110 B: one
@@ -657,6 +754,28 @@ async fn run_session_loop(
                         {
                             let _ = (config_bytes, sample_rate, channels, object_type);
                         }
+                    }
+                    Some(SessionMsg::VideoConfig { param_sets }) => {
+                        // Store the SPS/PPS so keyframes (live or
+                        // replayed) get them prepended in-band. Logged
+                        // once; re-delivery on publisher reconnect just
+                        // refreshes the bytes.
+                        let first = ctx.video_param_sets.is_none();
+                        ctx.video_param_sets = Some(param_sets.clone());
+                        if first {
+                            tracing::debug!(
+                                %broadcast,
+                                len = param_sets.len(),
+                                "whep: video parameter sets (SPS/PPS) received; will inject ahead of keyframes",
+                            );
+                        }
+                    }
+                    Some(SessionMsg::RemoteCandidate(c)) => {
+                        // Audit I-1: apply a trickled remote candidate.
+                        // Infallible; str0m ignores a candidate it
+                        // cannot pair with.
+                        tracing::debug!(%broadcast, candidate = %c, "whep: applying trickled remote candidate");
+                        rtc.add_remote_candidate(c);
                     }
                     None => {
                         // All senders dropped (handle dropped). The
@@ -790,7 +909,7 @@ fn write_sample(
     broadcast: &str,
     payload: Bytes,
     dts: u64,
-    _keyframe: bool,
+    keyframe: bool,
     codec: MediaCodec,
 ) -> Result<bool, ()> {
     if !ctx.connected {
@@ -874,7 +993,24 @@ fn write_sample(
                 tracing::trace!(%broadcast, "avcc->annex_b produced empty output; dropping sample");
                 return Ok(false);
             }
-            annex_b
+            // RTMP keyframes carry only the IDR slice; the SPS/PPS live
+            // in the avcC sequence header, delivered out-of-band via
+            // `on_video_config`. A WebRTC decoder (RFC 6184) needs the
+            // parameter sets in-band ahead of the IDR or it cannot
+            // initialize. Prepend them to keyframes that do not already
+            // carry one (a no-op for ingests like WHIP whose keyframes
+            // embed the parameter sets in the RTP stream).
+            if keyframe
+                && let Some(ps) = ctx.video_param_sets.as_ref()
+                && !annexb_contains_param_set(codec, &annex_b)
+            {
+                let mut with_ps = Vec::with_capacity(ps.len() + annex_b.len());
+                with_ps.extend_from_slice(ps);
+                with_ps.extend_from_slice(&annex_b);
+                with_ps
+            } else {
+                annex_b
+            }
         }
         MediaCodec::Opus => payload.to_vec(),
         MediaCodec::Aac => unreachable!("AAC handled above"),
@@ -901,6 +1037,104 @@ fn write_sample(
             }
             Err(())
         }
+    }
+}
+
+/// Answer a subscriber's received PLI / FIR by replaying the most-
+/// recent cached video keyframe (audit C-2 / I-6).
+///
+/// LVQR relays an already-encoded stream; it cannot ask the upstream
+/// publisher's encoder for a fresh IDR on demand (RTMP / SRT / RTSP /
+/// WHIP ingest all carry an opaque encoded bitstream, and most
+/// publishers will not honor an out-of-band keyframe request even
+/// when one exists). The contained, re-encode-free response is to
+/// resend the keyframe we already have buffered: it is the IDR the
+/// current live delta frames depend on, so replaying it gives the
+/// subscriber's decoder a usable anchor and the subsequent live
+/// frames decode against it.
+///
+/// The keyframe is replayed with its original dts (see
+/// [`crate::server::VideoKeyframeSnapshot`] for why a fresh forward
+/// timestamp would be wrong). When nothing is cached yet, the PLI is
+/// counted and warned once; the subscriber recovers on the
+/// publisher's next natural keyframe.
+fn replay_keyframe_for_pli(rtc: &mut Rtc, ctx: &mut SessionCtx, broadcast: &str, kind: KeyframeRequestKind) {
+    let kind_label = match kind {
+        KeyframeRequestKind::Pli => "pli",
+        KeyframeRequestKind::Fir => "fir",
+    };
+    metrics::counter!(
+        "lvqr_whep_keyframe_requests_total",
+        "broadcast" => broadcast.to_string(),
+        "kind" => kind_label,
+    )
+    .increment(1);
+
+    // Pre-`Connected` PLIs cannot be served (no writable stream yet);
+    // str0m would drop the write anyway. A subscriber that is not yet
+    // connected has no decoder waiting, so dropping is correct.
+    let Some(keyframe) = ctx.last_keyframe.clone() else {
+        if !ctx.pli_unanswerable_logged {
+            ctx.pli_unanswerable_logged = true;
+            tracing::warn!(
+                %broadcast,
+                kind = kind_label,
+                "whep: keyframe request with no cached keyframe to replay; subscriber recovers on next publisher keyframe",
+            );
+        }
+        metrics::counter!(
+            "lvqr_whep_keyframe_replay_skipped_total",
+            "broadcast" => broadcast.to_string(),
+            "reason" => "no_cached_keyframe",
+        )
+        .increment(1);
+        return;
+    };
+
+    // Debounce PLI / FIR storms: at most one replay per
+    // MIN_KEYFRAME_REPLAY_INTERVAL. `last_replay_at` is only set after
+    // a replay actually reaches the wire, so a fresh subscriber's first
+    // request (or one that arrived pre-`Connected`) is never debounced.
+    let now = Instant::now();
+    if let Some(prev) = ctx.last_replay_at
+        && now.duration_since(prev) < MIN_KEYFRAME_REPLAY_INTERVAL
+    {
+        metrics::counter!(
+            "lvqr_whep_keyframe_replay_skipped_total",
+            "broadcast" => broadcast.to_string(),
+            "reason" => "debounced",
+        )
+        .increment(1);
+        return;
+    }
+
+    // `Ok(false)` (pre-`Connected` / codec-routing drop) and `Err(())`
+    // (str0m write error, already logged once by `write_sample`) are
+    // both non-wire events, so only `Ok(true)` records a replay.
+    if let Ok(true) = write_sample(
+        rtc,
+        ctx,
+        broadcast,
+        keyframe.payload,
+        keyframe.dts,
+        true,
+        keyframe.codec,
+    ) {
+        ctx.last_replay_at = Some(now);
+        if !ctx.keyframe_replay_logged {
+            ctx.keyframe_replay_logged = true;
+            tracing::debug!(
+                %broadcast,
+                kind = kind_label,
+                dts = keyframe.dts,
+                "whep: replayed cached keyframe in response to subscriber keyframe request (logging once)",
+            );
+        }
+        metrics::counter!(
+            "lvqr_whep_keyframe_replays_total",
+            "broadcast" => broadcast.to_string(),
+        )
+        .increment(1);
     }
 }
 
@@ -1000,6 +1234,55 @@ fn avcc_to_annex_b(avcc: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Scan an Annex B byte stream for a parameter-set NALU and return
+/// `true` if one is present.
+///
+/// Used to decide whether a keyframe already carries its parameter
+/// sets in-band (so the out-of-band SPS/PPS need not be prepended).
+/// H.264 parameter sets are NAL types 7 (SPS) and 8 (PPS); H.265 are
+/// 32 (VPS), 33 (SPS), 34 (PPS). Handles both 3-byte (`00 00 01`) and
+/// 4-byte (`00 00 00 01`) start codes -- the 4-byte form is found via
+/// its trailing `00 00 01`.
+fn annexb_contains_param_set(codec: MediaCodec, data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            let hdr = data[i + 3];
+            let is_param_set = match codec {
+                MediaCodec::H264 => {
+                    let t = hdr & 0x1F;
+                    t == 7 || t == 8
+                }
+                MediaCodec::H265 => {
+                    let t = (hdr >> 1) & 0x3F;
+                    t == 32 || t == 33 || t == 34
+                }
+                _ => false,
+            };
+            if is_param_set {
+                return true;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Extract the `candidate:...` attribute values from a trickle ICE
+/// SDP fragment, one per `a=candidate:` line, ready for
+/// [`Candidate::from_sdp_string`]. Other fragment lines (`a=mid:`,
+/// `a=ice-ufrag:`, `a=end-of-candidates`, `m=`, blank) are ignored.
+/// Accepts both `\r\n` and `\n` line endings. (Audit I-1.)
+fn trickle_candidate_lines(fragment: &str) -> impl Iterator<Item = &str> {
+    fragment.lines().filter_map(|line| {
+        let line = line.trim();
+        let attr = line.strip_prefix("a=")?;
+        attr.starts_with("candidate:").then_some(attr)
+    })
+}
+
 /// Per-session handle produced by [`Str0mAnswerer::create_session`].
 ///
 /// Owns the sample `mpsc::UnboundedSender` and the shutdown
@@ -1008,18 +1291,20 @@ fn avcc_to_annex_b(avcc: &[u8]) -> Vec<u8> {
 /// `select!` sees either the shutdown resolve or the sample
 /// channel return `None` and exits cleanly on the next wakeup.
 ///
-/// Two warn-once flags ride alongside the senders. Trickle ICE
-/// ingestion is still TODO, and unknown track kinds (anything
-/// outside the negotiated H.264 / HEVC video + Opus audio set)
-/// are dropped with a one-shot warn. Each flag fires once per
-/// session so a wedged stream cannot drown the tracing output.
+/// Two warn-once flags ride alongside the senders: one for
+/// unparseable trickle ICE candidate lines (audit I-1 wired trickle
+/// application; malformed lines are skipped, not fatal) and one for
+/// unknown track kinds (anything outside the negotiated H.264 / HEVC
+/// video + Opus audio set), dropped with a one-shot warn. Each flag
+/// fires once per session so a wedged stream cannot drown the log.
 /// AAC publishers reach Opus-negotiated subscribers via the
 /// `aac-opus` feature's [`lvqr_transcode::AacToOpusEncoder`]
 /// (session 113); the audio path is wired when that feature is on.
 pub struct Str0mSessionHandle {
     samples: mpsc::UnboundedSender<SessionMsg>,
     shutdown: Option<oneshot::Sender<()>>,
-    trickle_warned: AtomicBool,
+    /// One-shot warn guard for unparseable trickle candidate lines.
+    trickle_parse_warned: AtomicBool,
     unknown_track_warned: AtomicBool,
 }
 
@@ -1035,9 +1320,33 @@ impl Drop for Str0mSessionHandle {
 }
 
 impl SessionHandle for Str0mSessionHandle {
-    fn add_trickle(&self, _sdp_fragment: &[u8]) -> Result<(), WhepError> {
-        if !self.trickle_warned.swap(true, Ordering::Relaxed) {
-            tracing::warn!("str0m trickle ICE not yet wired; ignoring fragment");
+    /// Apply trickle ICE candidates from a PATCH body (audit I-1).
+    ///
+    /// Same shape as the WHIP ingest side: extract every `a=candidate:`
+    /// line, parse it with [`Candidate::from_sdp_string`] (which keeps
+    /// the host / srflx / relay type), and forward it to the poll task
+    /// to call [`Rtc::add_remote_candidate`]. Lenient: a single
+    /// unparseable line is logged once and skipped rather than failing
+    /// the PATCH; a non-UTF-8 body is the one hard error -> 400.
+    fn add_trickle(&self, sdp_fragment: &[u8]) -> Result<(), WhepError> {
+        let text = std::str::from_utf8(sdp_fragment)
+            .map_err(|e| WhepError::MalformedOffer(format!("trickle fragment is not utf8: {e}")))?;
+
+        for cand_str in trickle_candidate_lines(text) {
+            match Candidate::from_sdp_string(cand_str) {
+                Ok(candidate) => {
+                    let _ = self.samples.send(SessionMsg::RemoteCandidate(candidate));
+                }
+                Err(e) => {
+                    if !self.trickle_parse_warned.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            error = %e,
+                            candidate = %cand_str,
+                            "whep: skipping unparseable trickle candidate (logging once)",
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1105,6 +1414,18 @@ impl SessionHandle for Str0mSessionHandle {
             sample_rate,
             channels,
             object_type,
+        };
+        let _ = self.samples.send(msg);
+    }
+
+    fn on_video_config(&self, _track: &str, codec: MediaCodec, param_sets_annexb: &[u8]) {
+        // Only video codecs carry parameter sets; ignore anything
+        // else and ignore an empty blob.
+        if !matches!(codec, MediaCodec::H264 | MediaCodec::H265) || param_sets_annexb.is_empty() {
+            return;
+        }
+        let msg = SessionMsg::VideoConfig {
+            param_sets: Bytes::copy_from_slice(param_sets_annexb),
         };
         let _ = self.samples.send(msg);
     }
@@ -1322,6 +1643,49 @@ mod tests {
         assert_eq!(out, vec![0x00, 0x00, 0x00, 0x01, 0x65, 1, 2, 3]);
     }
 
+    // ---- annexb_contains_param_set (SPS/PPS injection guard) ----
+
+    #[test]
+    fn annexb_param_set_detected_h264_sps_and_pps() {
+        // 4-byte start code + SPS (type 7).
+        let sps = [0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xC0, 0x1E];
+        assert!(annexb_contains_param_set(MediaCodec::H264, &sps));
+        // 4-byte start code + PPS (type 8).
+        let pps = [0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x3C];
+        assert!(annexb_contains_param_set(MediaCodec::H264, &pps));
+    }
+
+    #[test]
+    fn annexb_param_set_not_detected_for_idr_only_h264() {
+        // 4-byte start code + IDR slice (type 5) only -- the RTMP shape.
+        let idr = [0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x40];
+        assert!(!annexb_contains_param_set(MediaCodec::H264, &idr));
+        // A non-IDR slice (type 1) likewise carries no parameter set.
+        let p = [0x00, 0x00, 0x00, 0x01, 0x41, 0x9A, 0x00];
+        assert!(!annexb_contains_param_set(MediaCodec::H264, &p));
+    }
+
+    #[test]
+    fn annexb_param_set_detected_with_three_byte_start_code() {
+        // 3-byte start code variant, SPS after some leading delta NAL.
+        let mut data = vec![0x00, 0x00, 0x01, 0x41, 0xAA]; // P slice
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x67, 0x42]); // SPS
+        assert!(annexb_contains_param_set(MediaCodec::H264, &data));
+    }
+
+    #[test]
+    fn annexb_param_set_detected_h265_vps_sps_pps() {
+        // H.265 NAL type is bits 1..6 of the first header byte. VPS=32
+        // -> 0x40, SPS=33 -> 0x42, PPS=34 -> 0x44.
+        for hdr in [0x40u8, 0x42, 0x44] {
+            let nal = [0x00, 0x00, 0x00, 0x01, hdr, 0x01];
+            assert!(annexb_contains_param_set(MediaCodec::H265, &nal), "hdr={hdr:#x}");
+        }
+        // H.265 IDR_W_RADL is type 19 -> 0x26: not a parameter set.
+        let idr = [0x00, 0x00, 0x00, 0x01, 0x26, 0x01];
+        assert!(!annexb_contains_param_set(MediaCodec::H265, &idr));
+    }
+
     // ---- end-to-end: on_raw_sample pushes through the channel ----
 
     // Tier 4 item 4.7 session 110 B: negative assertion that the
@@ -1467,6 +1831,91 @@ mod tests {
         handle.on_audio_config("1.mp4", MediaCodec::Aac, &[]);
         // Non-AAC codec flows through the early-return branch.
         handle.on_audio_config("1.mp4", MediaCodec::Opus, &[0x00, 0x00]);
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(handle);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // ---- Audit C-2 / I-6: PLI keyframe-replay guard logic ----
+
+    /// A keyframe request with nothing cached is a no-op: it flips the
+    /// warn-once guard and leaves the cache empty without touching the
+    /// (unconnected) `Rtc`. Models a PLI that arrives before the
+    /// publisher has produced any keyframe.
+    #[test]
+    fn replay_keyframe_no_op_when_nothing_cached() {
+        let mut rtc = RtcConfig::new().enable_h264(true).build(Instant::now());
+        let mut ctx = SessionCtx::default();
+        assert!(ctx.last_keyframe.is_none());
+
+        replay_keyframe_for_pli(&mut rtc, &mut ctx, "live/test", KeyframeRequestKind::Pli);
+
+        assert!(ctx.pli_unanswerable_logged, "warn-once guard must flip");
+        assert!(ctx.last_keyframe.is_none(), "no keyframe should have been synthesized");
+        assert!(!ctx.keyframe_replay_logged, "nothing was replayed");
+    }
+
+    /// With a cached keyframe but no completed handshake, the replay
+    /// runs the write path, which short-circuits on `!connected` and
+    /// returns `Ok(false)`. The replay must treat that as a non-event
+    /// (no replay counted / logged) and must not panic on the
+    /// borrow-then-write of the cached sample.
+    #[test]
+    fn replay_keyframe_pre_connected_is_dropped() {
+        let mut rtc = RtcConfig::new().enable_h264(true).build(Instant::now());
+        let mut ctx = SessionCtx {
+            last_keyframe: Some(CachedKeyframe {
+                payload: Bytes::from(avcc_buf(&[&[0x65, 0xAA, 0xBB][..]])),
+                dts: 4242,
+                codec: MediaCodec::H264,
+            }),
+            ..SessionCtx::default()
+        };
+        assert!(!ctx.connected);
+
+        replay_keyframe_for_pli(&mut rtc, &mut ctx, "live/test", KeyframeRequestKind::Fir);
+
+        assert!(
+            ctx.last_keyframe.is_some(),
+            "the cached keyframe is retained for the next PLI"
+        );
+        assert!(
+            !ctx.keyframe_replay_logged,
+            "a pre-Connected write is dropped by str0m, so no replay should be recorded",
+        );
+    }
+
+    // ---- Trickle ICE candidate parsing (audit I-1) ----
+
+    #[test]
+    fn trickle_candidate_lines_extracts_only_candidate_attrs() {
+        let frag = "a=ice-ufrag:abcd\r\n\
+            a=mid:0\r\n\
+            a=candidate:1 1 udp 2113929471 203.0.113.100 10100 typ host\r\n\
+            a=candidate:2 1 udp 1694498815 198.51.100.7 51000 typ srflx raddr 203.0.113.100 rport 10100\r\n\
+            a=end-of-candidates\r\n";
+        let lines: Vec<&str> = trickle_candidate_lines(frag).collect();
+        assert_eq!(lines.len(), 2, "two candidate lines expected: {lines:?}");
+        assert!(lines[0].starts_with("candidate:1 "));
+        assert!(lines[1].contains("typ srflx"));
+    }
+
+    #[tokio::test]
+    async fn add_trickle_is_lenient_and_rejects_non_utf8() {
+        let answerer = Str0mAnswerer::new(Str0mConfig::default());
+        let (handle, _answer) = answerer
+            .create_session("live/test", CHROME_AUDIO_OFFER.as_bytes())
+            .expect("offer accepted");
+
+        handle
+            .add_trickle(b"a=candidate:1 1 udp 2113929471 203.0.113.100 10100 typ host\r\na=end-of-candidates\r\n")
+            .expect("valid fragment is accepted");
+        handle
+            .add_trickle(b"a=candidate:bogus nonsense\r\n")
+            .expect("malformed candidate line is lenient");
+        let err = handle.add_trickle(&[0xff, 0xfe]).expect_err("non-utf8 must error");
+        assert!(matches!(err, WhepError::MalformedOffer(_)), "got {err:?}");
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         drop(handle);

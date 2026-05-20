@@ -21,6 +21,20 @@ rust-version = "1.85"
 # The DASH renderer's session-33 attribute-escape path handles
 # the output side; this target covers the input side.
 
+# Standalone workspace root. This crate is in the parent workspace's
+# `exclude` list, so it must declare its own (empty) workspace table or
+# `cargo +nightly fuzz` errors "current package believes it's in a
+# workspace when it's not" when it resolves this manifest on its own.
+[workspace]
+
+# Inherit the root's mp4-atom hardening patch (capped count-driven
+# allocations). A standalone workspace does not inherit the parent's
+# [patch.crates-io], so re-declare it here or the detect_codec_strings
+# fuzz target would run against the unpatched crates.io mp4-atom and
+# OOM on adversarial init segments (the exact bug this target catches).
+[patch.crates-io]
+mp4-atom = { path = "../../../vendor/mp4-atom" }
+
 [package.metadata]
 cargo-fuzz = true
 

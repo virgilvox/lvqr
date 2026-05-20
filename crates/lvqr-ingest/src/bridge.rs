@@ -291,6 +291,19 @@ impl RtmpMoqBridge {
                     // Hand the init segment to the sink so every new MoQ
                     // group starts with it.
                     stream.video_sink.set_init_segment(init.clone());
+                    // Deliver the SPS/PPS parameter sets to raw-sample
+                    // observers (notably WHEP) as an Annex B blob.
+                    // RTMP keyframes carry only the IDR slice; the
+                    // parameter sets live here in the sequence header,
+                    // and a WebRTC subscriber needs them in-band before
+                    // the IDR. Built before `config` is moved into the
+                    // stream below.
+                    if let Some(obs) = raw_observer_video.as_ref() {
+                        let param_sets = annex_b_param_sets(&config);
+                        if !param_sets.is_empty() {
+                            obs.on_video_config(&stream_name, "0.mp4", crate::MediaCodec::H264, &param_sets);
+                        }
+                    }
                     stream.video_config = Some(config);
                     stream.video_init = Some(init.clone());
                     // Video init writer is hardcoded to 90 kHz
@@ -587,6 +600,27 @@ impl RtmpMoqBridge {
     pub fn stream_names(&self) -> Vec<String> {
         self.streams.iter().map(|e| e.key().clone()).collect()
     }
+}
+
+/// Build an Annex B byte stream of the H.264 parameter-set NALUs
+/// (every SPS then every PPS, each 4-byte start-code prefixed) from an
+/// FLV AVC sequence header.
+///
+/// WHEP prepends this verbatim before a keyframe IDR (RTMP keyframes
+/// carry only the picture NALUs; the parameter sets live in the
+/// sequence header). Returns an empty `Vec` when the config carries no
+/// parameter sets.
+fn annex_b_param_sets(config: &VideoConfig) -> Vec<u8> {
+    const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+    let mut out = Vec::new();
+    for nal in config.sps_list.iter().chain(config.pps_list.iter()) {
+        if nal.is_empty() {
+            continue;
+        }
+        out.extend_from_slice(&START_CODE);
+        out.extend_from_slice(nal);
+    }
+    out
 }
 
 /// Write the catalog track whenever codec configuration changes.

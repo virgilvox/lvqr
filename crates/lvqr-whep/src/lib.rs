@@ -21,11 +21,10 @@
 //! to `lvqr-transcode/transcode` so the GStreamer dep graph stays
 //! opt-in.
 //!
-//! ## Open items
-//!
-//! Trickle ICE ingestion is still TODO (one-shot warn flag per
-//! session in [`Str0mSessionHandle`]); operators relying on
-//! candidate trickling should keep this in mind.
+//! Trickle ICE PATCH bodies are applied as of the audit I-1 wiring:
+//! [`Str0mSessionHandle::add_trickle`] parses each `a=candidate:`
+//! line and forwards a parsed `str0m::Candidate` to the poll task,
+//! which calls `Rtc::add_remote_candidate`.
 //!
 //! The full design note lives at `crates/lvqr-whep/docs/design.md`.
 
