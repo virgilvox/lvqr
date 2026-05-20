@@ -217,6 +217,16 @@ in-branch:
   empty `[workspace]` table. They are in the root `exclude` list, so a
   recent nightly cargo errored "current package believes it's in a
   workspace when it's not" and all 9 fuzz targets failed to build.
+  Follow-up: making each fuzz crate a standalone workspace dropped the
+  root's `[patch.crates-io]` (vendored `rml_rtmp` fork), so the three
+  fuzz crates that transitively use it (`lvqr-ingest`, `lvqr-rtsp`,
+  `lvqr-whip`) compiled against the unpatched crates.io `rml_rtmp 0.8.0`
+  and failed (`no variant Amf0DataReceived` / `no method
+  finish_publishing_with_error`). Those three fuzz manifests now
+  re-declare `[patch.crates-io] rml_rtmp = { path = "../../../vendor/rml_rtmp" }`.
+  `rml_rtmp` is the only root patch, so the other five fuzz crates need
+  nothing. Verified: all 8 resolve standalone to the vendored fork and
+  `lvqr-ingest` compiles within the fuzz workspace.
 - `c497653` fix(js): root `bindings/js` build now runs in dependency
   order (`core -> player -> dvr-player -> admin-ui`) instead of npm's
   alphabetical `--workspaces` order, which built admin-ui before the

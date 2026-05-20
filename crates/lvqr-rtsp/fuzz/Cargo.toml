@@ -25,6 +25,15 @@ rust-version = "1.85"
 # workspace when it's not" when it resolves this manifest on its own.
 [workspace]
 
+# rml_rtmp is vendored at the repo root via [patch.crates-io] (the
+# session-152 SCTE-35 fork that adds the `Amf0DataReceived` event +
+# `finish_publishing_with_error`). A standalone workspace does not
+# inherit the parent's patch, so re-declare it here or the
+# rml_rtmp-dependent lvqr crates fail to compile against the unpatched
+# crates.io rml_rtmp 0.8.0.
+[patch.crates-io]
+rml_rtmp = { path = "../../../vendor/rml_rtmp" }
+
 [package.metadata]
 cargo-fuzz = true
 
