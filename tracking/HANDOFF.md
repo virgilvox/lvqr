@@ -241,6 +241,37 @@ in-branch:
 - macOS hw-videotoolbox lane is already `continue-on-error: true`
   (ci.yml), so its known panic-isolation flake does not gate.
 
+After the fixes, 8 of 9 fuzz targets pass (the 3 rml_rtmp ones included)
+and Playwright + Vitest build. PR #1 is `MERGEABLE` (UNSTABLE: the
+remaining reds are non-required).
+
+### NEW open finding: `detect_codec_strings` OOM in mp4-atom (real DoS)
+
+Repairing the fuzz lane made it actually run for the first time in a
+while, and within ~9s it caught a **pre-existing** crash: the
+`detect_codec_strings` target OOMs (AddressSanitizer:
+"allocator is trying to allocate 0x7fff80000 bytes" ~= 34 GB) on a
+104-byte adversarial init segment. The over-allocation is inside
+`mp4-atom 0.10.1`'s box decoder (an internal length/count field read
+from attacker bytes), reached via
+`lvqr_cmaf::detect_video_codec_string` / `detect_audio_codec_string`
+(`crates/lvqr-cmaf/src/init.rs:789,831`), which decode publisher-
+supplied init segments with no schema bound. This is a publisher-
+reachable DoS against the HLS/DASH egress codec-string path -- exactly
+the class the fuzz target's own doc-comment was written to catch.
+
+NOT introduced by session 173 (lvqr-cmaf is untouched here); the
+broken fuzz lane simply masked it before. The crash repro is preserved
+at `crates/lvqr-cmaf/fuzz/artifacts/detect_codec_strings/crash-69b662e6...`
+(artifacts/ is not auto-run by the fuzzer, so committing it does not
+re-trigger CI). Recommended fix (its own focused security PR, needs
+nightly + cargo-fuzz to verify, which the dev host lacks): bound
+`mp4-atom`'s allocations -- upgrade to a version that uses
+`try_reserve` / caps capacity by remaining input, or vendor+patch it,
+or add a strict bounded box-tree pre-validator in `init.rs` that
+rejects malformed/oversized boxes before `Moov::decode`. Move the
+crash file into `corpus/` as a regression seed when the fix lands.
+
 Authoritative LL-HLS conformance still needs a self-hosted macOS runner
 with Apple HLS Tools (`mediastreamvalidator` is not on GH-hosted
 runners) -- a long-documented, user-bound gap, not code-bound.
