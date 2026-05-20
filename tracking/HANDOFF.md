@@ -192,8 +192,21 @@ whep lib 35/0/0; clippy + fmt clean; `cargo build -p lvqr-cli` clean.
 `--features aac-opus` needs `gstreamer-1.0` (not on this host; same
 reason `rtmp_whep_audio_e2e` runs 0 tests). The SessionCtx changes
 are feature-agnostic (new non-gated fields + `..Default::default()`),
-so the gated build is expected clean; confirm on a GStreamer host /
-CI lane. Not committed/pushed -- awaiting the usual go-ahead.
+so the gated build is expected clean; the PR's `Feature transcode` CI
+lane is the confirmation. Real-browser decode of the SPS/PPS-injected
+keyframes also cannot be proven on this host (loopback str0m client
+has no decoder) -- candidate for the planned Playwright E2E suite.
+
+### Committed + PR'd (session 173 close)
+
+All session-173 work is on branch `audit/whep-webrtc-correctness`,
+commit `0dab367` (one commit, no Claude attribution per CLAUDE.md),
+pushed to `origin`. PR https://github.com/virgilvox/lvqr/pull/1
+("WebRTC egress/ingress correctness: close audit C-2/I-6/I-9/I-1") is
+open against `main` with CI running. The audit's only remaining item
+is the cosmetic `auth_mode` server-info label ladder (deferred; the
+fix would rework the hot-reload pipeline, which reads a required
+config-file path, for no functional gain).
 
 ## Session 172 (2026-05-19) -- audit finding B-5 CMAF `styp` at HLS partial + DASH segment HTTP cache
 
