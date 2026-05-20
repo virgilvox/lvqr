@@ -27,6 +27,14 @@ rust-version = "1.85"
 # workspace when it's not" when it resolves this manifest on its own.
 [workspace]
 
+# Inherit the root's mp4-atom hardening patch (capped count-driven
+# allocations). A standalone workspace does not inherit the parent's
+# [patch.crates-io], so re-declare it here or the detect_codec_strings
+# fuzz target would run against the unpatched crates.io mp4-atom and
+# OOM on adversarial init segments (the exact bug this target catches).
+[patch.crates-io]
+mp4-atom = { path = "../../../vendor/mp4-atom" }
+
 [package.metadata]
 cargo-fuzz = true
 

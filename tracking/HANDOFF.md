@@ -245,44 +245,42 @@ After the fixes, 8 of 9 fuzz targets pass (the 3 rml_rtmp ones included)
 and Playwright + Vitest build. PR #1 is `MERGEABLE` (UNSTABLE: the
 remaining reds are non-required).
 
-### NEW open finding: `detect_codec_strings` OOM in mp4-atom (real DoS)
+### Found AND fixed: `detect_codec_strings` OOM DoS (vendored mp4-atom cap)
 
-Repairing the fuzz lane made it actually run for the first time in a
-while, and within ~9s it caught a **pre-existing** crash: the
-`detect_codec_strings` target OOMs (AddressSanitizer:
-"allocator is trying to allocate 0x7fff80000 bytes" ~= 34 GB) on a
-104-byte adversarial init segment. The over-allocation is inside
-`mp4-atom 0.10.1`'s box decoder (an internal length/count field read
-from attacker bytes), reached via
-`lvqr_cmaf::detect_video_codec_string` / `detect_audio_codec_string`
-(`crates/lvqr-cmaf/src/init.rs:789,831`), which decode publisher-
-supplied init segments with no schema bound. This is a publisher-
-reachable DoS against the HLS/DASH egress codec-string path -- exactly
-the class the fuzz target's own doc-comment was written to catch.
+Repairing the fuzz lane made it run for the first time in a while, and
+within ~9s it caught a **pre-existing** crash: `detect_codec_strings`
+OOM'd (AddressSanitizer: "allocator is trying to allocate
+0x7fff80000 bytes" ~= 34 GB, then ~62 GB after the first cap) on a
+104-byte adversarial init segment. Root cause: `mp4-atom`'s box
+decoders do `Vec::with_capacity(count)` on counts read straight from
+attacker bytes, uncapped (`saiz`/`uncv`/`rref`/`flac`/`chnl`/`ftab`/
+`hvcc`). Reached via `lvqr_cmaf::detect_video_codec_string` /
+`detect_audio_codec_string` -> `Moov::decode`, which decode
+publisher-supplied init segments. Publisher-reachable DoS. NOT
+introduced by session 173 (lvqr-cmaf untouched); the broken fuzz lane
+had masked it.
 
-NOT introduced by session 173 (lvqr-cmaf is untouched here); the
-broken fuzz lane simply masked it before. The crash repro is preserved
-at `crates/lvqr-cmaf/fuzz/artifacts/detect_codec_strings/crash-69b662e6...`
-(artifacts/ is not auto-run by the fuzzer, so committing it does not
-re-trigger CI).
+**The macOS verification trap (worth remembering).** First attempt --
+bumping `mp4-atom` 0.10.1 -> 0.11.0 -- was insufficient (0.11 caps
+`saiz` but the same input then OOMs ~62 GB via another uncapped site)
+AND could not be verified locally: macOS overcommit lets a 62 GB
+`Vec::with_capacity` succeed lazily, so the regression unit test
+false-passed on the dev box while Linux CI aborted. Lesson: OOM fixes
+must be verified through CI (Linux + ASan), never on this macOS host.
 
-**Attempted + reverted (lesson for the follow-up).** I tried the
-obvious fix -- upgrade `mp4-atom` 0.10.1 -> 0.11.0, which caps the
-`saiz` `Vec::with_capacity` at `.min(4096)` (the 34 GB path). It is
-NOT sufficient: the same input then OOMs at ~62 GB through a DIFFERENT
-still-uncapped `with_capacity` in 0.11 (the remaining uncapped sites
-are `chnl` `layout_channel_count`, `ftab` `utf_16_len`, `uncv`
-`component_count`, `rref` `reference_type_count`). Worse, this CANNOT
-be verified on the macOS dev host: macOS overcommit lets a 62 GB
-`Vec::with_capacity` succeed lazily (the regression unit test passed
-locally), while Linux CI refuses it -> `handle_alloc_error` abort, so
-the upgrade silently broke the `Test (Linux)` lane. Reverted the whole
-attempt. The correct fix needs a Linux + cargo-fuzz host: vendor+patch
-`mp4-atom` to cap ALL count-driven `with_capacity` sites (or a strict
-bounded box-tree pre-validator in `init.rs` before `Moov::decode`),
-verified by running the corpus seed under ASan. Only move the crash
-file into `corpus/` once the fix is verified on Linux (a corpus seed
-that still crashes hard-reds the fuzz lane).
+**Fix:** vendor `mp4-atom` 0.10.1 at `vendor/mp4-atom` and cap all 11
+count-driven `Vec::with_capacity` sites at `.min(4096)` (pre-reserve
+only; the decode loop still reads the genuine entries, so valid
+segments are byte-identical). Wired via root `[patch.crates-io]`; the
+standalone `crates/lvqr-cmaf/fuzz` workspace re-declares the patch
+(it does not inherit the root's, same as the rml_rtmp lesson). The
+crash input is the `fuzz/corpus/detect_codec_strings/crash-69b662e6...`
+regression seed; new unit test `detect_codec_strings_no_oom_on_fuzz_crash_69b662e6`.
+Verified: `cargo build --workspace --all-targets` clean, `cargo test
+--workspace --lib` 922/0/0, clippy + fmt clean -- AND through CI on
+Linux (the `Fuzz (detect_codec_strings)` lane runs the corpus seed
+under ASan; `Test (Linux)` runs the unit test). Interim: upstream 0.11
+caps some sites; drop the vendored patch once a release caps them all.
 
 Authoritative LL-HLS conformance still needs a self-hosted macOS runner
 with Apple HLS Tools (`mediastreamvalidator` is not on GH-hosted

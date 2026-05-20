@@ -258,6 +258,14 @@ lvqr-transcode = { version = "1.0.0", path = "crates/lvqr-transcode" }
 # handle_amf0_data). MIT-licensed upstream; LVQR fork keeps the same
 # license.
 rml_rtmp = { path = "vendor/rml_rtmp" }
+# Interim security hardening: cap count-driven `Vec::with_capacity` in
+# mp4-atom's box decoders (saiz/uncv/rref/flac/chnl/ftab/hvcc) at 4096
+# so an adversarial fMP4 init segment cannot trigger a multi-GB
+# allocation (publisher-reachable OOM DoS via lvqr-cmaf's codec-string
+# detectors; fuzz-found). Upstream 0.11 caps some of these; drop this
+# patch once a release caps them all. See vendor/mp4-atom (Apache-2.0 /
+# MIT, same as upstream).
+mp4-atom = { path = "vendor/mp4-atom" }
 
 [profile.release]
 lto = true
