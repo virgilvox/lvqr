@@ -9,7 +9,7 @@ use lvqr_test_utils::flv::{
     flv_audio_aac_lc_seq_header_44k_stereo, flv_audio_raw, flv_video_nalu, flv_video_seq_header,
 };
 use lvqr_test_utils::rtmp::{read_until, rtmp_client_handshake, send_result, send_results};
-use rml_rtmp::sessions::{ClientSession, ClientSessionConfig, ClientSessionEvent, PublishRequestType};
+use rml_rtmp::sessions::{ClientSession, ClientSessionConfig, ClientSessionEvent, PublishRequestType, StreamMetadata};
 use rml_rtmp::time::RtmpTimestamp;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -275,6 +275,62 @@ async fn rtmp_audio_produces_cmaf() {
     let moof_size = u32::from_be_bytes([media_frame[0], media_frame[1], media_frame[2], media_frame[3]]) as usize;
     let mdat_payload = &media_frame[moof_size + 8..];
     assert_eq!(mdat_payload, &aac_data);
+
+    drop(stream);
+    server_handle.abort();
+}
+
+/// Audit finding I-5b: a publisher that advertises a non-H.264
+/// video codec (here VP6, FLV codec_id 4) must be hard-rejected.
+/// The depacketizer drops every non-7 video tag, so without the
+/// reject the publish is accepted and silently produces no playable
+/// output. The server now sends an `onStatus(error)` and tears the
+/// connection down; we observe the teardown via the bridge's active
+/// stream count dropping back to zero (which only happens when the
+/// `on_unpublish` cleanup path runs).
+#[tokio::test]
+async fn rtmp_unsupported_video_codec_hard_rejects_publish() {
+    let origin = lvqr_moq::OriginProducer::new();
+    let bridge = lvqr_ingest::RtmpMoqBridge::new(origin.clone());
+
+    let port = find_available_port();
+    let rtmp_config = lvqr_ingest::RtmpConfig {
+        bind_addr: ([127, 0, 0, 1], port).into(),
+    };
+    let rtmp_server = bridge.create_rtmp_server(rtmp_config);
+    let server_handle = tokio::spawn(async move { rtmp_server.run(tokio_util::sync::CancellationToken::new()).await });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (mut stream, mut session) = connect_and_publish(port, "live", "bad-codec").await;
+    assert_eq!(
+        bridge.active_stream_count(),
+        1,
+        "publish should be accepted before metadata arrives"
+    );
+
+    // Advertise VP6 (FLV video codec_id 4) via @setDataFrame onMetaData.
+    let mut metadata = StreamMetadata::new();
+    metadata.video_codec_id = Some(4);
+    let result = session.publish_metadata(&metadata).expect("publish_metadata failed");
+    send_result(&mut stream, &result).await;
+
+    // Poll (10 ms tick, 2 s budget) until the bridge drops the stream.
+    // A fixed sleep would be flaky on a loaded CI runner; the count
+    // returning to zero is the deterministic signal that the reject +
+    // `on_unpublish` cleanup ran.
+    let mut rejected = false;
+    for _ in 0..200 {
+        if bridge.active_stream_count() == 0 {
+            rejected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        rejected,
+        "publisher advertising a non-H.264 video codec must be hard-rejected and torn down"
+    );
 
     drop(stream);
     server_handle.abort();

@@ -446,6 +446,70 @@ impl ServerSession {
         Ok(self.serializer.serialize(&payload, false, false)?)
     }
 
+    /// Rejects the currently-active publishing stream with an
+    /// `onStatus` message at level `"error"` and transitions it to
+    /// `Completed`. Returns the packet to send to the publisher
+    /// plus the stream key that was rejected, or `None` if no stream
+    /// is currently in the `Publishing` state.
+    ///
+    /// LVQR fork addition (session 172). Upstream `rml_rtmp` ships
+    /// `finish_playing` for the PLAY side but has no symmetric way
+    /// to end a PUBLISH mid-stream with an error the encoder can
+    /// surface. `reject_request` only works on an *outstanding*
+    /// pre-accept request, so once `accept_request` has moved the
+    /// stream into `Publishing` there is no built-in path to tell a
+    /// publisher "your stream was accepted but I cannot ingest it".
+    /// LVQR uses this to hard-reject a publisher whose declared
+    /// video codec the ingest pipeline cannot depacketize (audit
+    /// finding I-5b): the encoder sees a clear `onStatus` error
+    /// instead of a connection that silently produces no playable
+    /// output. Mirrors `finish_playing`'s shape; additive, so no
+    /// existing flow changes.
+    pub fn finish_publishing_with_error(
+        &mut self,
+        code: &str,
+        description: &str,
+    ) -> Result<Option<(Packet, String)>, ServerSessionError> {
+        let stream_id = self
+            .active_streams
+            .iter()
+            .find(|(_, stream)| matches!(stream.current_state, StreamState::Publishing { .. }))
+            .map(|(id, _)| *id);
+        let stream_id = match stream_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        let stream_key = match self.active_streams.get_mut(&stream_id) {
+            Some(ActiveStream {
+                current_state: state,
+            }) => {
+                let k = match state {
+                    StreamState::Publishing { stream_key: k, .. } => k.clone(),
+                    _ => return Ok(None),
+                };
+                *state = StreamState::Completed;
+                k
+            }
+            None => return Ok(None),
+        };
+
+        let status_message = RtmpMessage::Amf0Command {
+            command_name: "onStatus".to_string(),
+            transaction_id: 0.0,
+            command_object: Amf0Value::Null,
+            additional_arguments: vec![Amf0Value::Object(create_status_object(
+                "error",
+                code,
+                description,
+            ))],
+        };
+
+        let payload = status_message.into_message_payload(self.get_epoch(), stream_id)?;
+        let packet = self.serializer.serialize(&payload, false, false)?;
+        Ok(Some((packet, stream_key)))
+    }
+
     fn handle_abort_message(
         &self,
         _stream_id: u32,

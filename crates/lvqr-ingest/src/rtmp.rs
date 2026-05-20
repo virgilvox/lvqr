@@ -405,14 +405,31 @@ async fn handle_rtmp_session(
                         // unsupported-codec warning until the deeper
                         // enhanced-RTMP fourCC parser lands.
                         //
-                        // Hard-reject via `onStatus(error)` is the
-                        // right long-term shape but requires
-                        // additional `rml_rtmp` surgery to call
-                        // `session.publish_rejected` mid-stream;
-                        // documented as still-open in the audit.
-                        // This commit closes the operator-visibility
-                        // gap (warn + counter) so unsupported
-                        // publishes are no longer silent at info.
+                        // Audit finding I-5b: hard-reject the publish
+                        // via `onStatus(error)`. Session 166 added the
+                        // warn + counter (operator visibility); this
+                        // closes the loop by telling the *publisher*.
+                        // The depacketizer at `remux::flv::parse_video_tag`
+                        // returns `Unknown` for any video codec_id != 7,
+                        // so a VP6 / H.263 / screen-video publisher today
+                        // gets an accepted publish that silently produces
+                        // zero playable output with no feedback. The new
+                        // vendored `finish_publishing_with_error` (mirrors
+                        // upstream `finish_playing`) sends the encoder a
+                        // clear error and we tear the connection down.
+                        //
+                        // Audio mismatches stay warn-only: a publisher
+                        // with valid H.264 video but an exotic audio
+                        // codec should keep its (muted) playback rather
+                        // than be kicked entirely. Escalating audio to a
+                        // hard reject is a one-line follow-up if operators
+                        // want stricter behaviour.
+                        //
+                        // Enhanced-RTMP HEVC / AV1 publishers leave
+                        // `video_codec_id` unset (the field carries a
+                        // legacy numeric codec_id only), so `None` does
+                        // not trip this branch and those streams are
+                        // unaffected.
                         if let Some(id) = metadata.video_codec_id
                             && id != 7
                         {
@@ -420,7 +437,7 @@ async fn handle_rtmp_session(
                                 app = %app_name,
                                 key = %stream_key,
                                 video_codec_id = id,
-                                "RTMP publisher advertises non-H.264 video codec; downstream depacketization will corrupt"
+                                "RTMP publisher advertises non-H.264 video codec; rejecting publish"
                             );
                             metrics::counter!(
                                 "lvqr_rtmp_unsupported_codec_total",
@@ -428,6 +445,39 @@ async fn handle_rtmp_session(
                                 "codec_id" => id.to_string(),
                             )
                             .increment(1);
+
+                            let description =
+                                format!("unsupported video codec_id {id}; lvqr ingests H.264 (codec_id 7) only");
+                            match session.finish_publishing_with_error("NetStream.Publish.BadName", &description) {
+                                Ok(Some((packet, _key))) => {
+                                    // Best-effort: the publisher may have
+                                    // already gone away. Either way we
+                                    // tear down below.
+                                    let _ = stream.write_all(&packet.bytes).await;
+                                }
+                                Ok(None) => {
+                                    debug!(app = %app_name, key = %stream_key, "no active publish to reject");
+                                }
+                                Err(e) => {
+                                    warn!(error = ?e, "failed to serialize onStatus reject");
+                                }
+                            }
+                            metrics::counter!(
+                                "lvqr_rtmp_publish_rejected_total",
+                                "kind" => "video",
+                                "codec_id" => id.to_string(),
+                            )
+                            .increment(1);
+
+                            // The publish was accepted earlier, so
+                            // `on_publish` already fired; clean up the
+                            // downstream broadcast before closing the
+                            // connection so no orphaned broadcast state
+                            // lingers.
+                            if !current_app.is_empty() && !current_key.is_empty() {
+                                (on_unpublish)(&current_app, &current_key);
+                            }
+                            return Ok(());
                         }
                         // FLV audio codec_id 10 = AAC. Other values
                         // (0=Linear PCM, 1=ADPCM, 2=MP3, 4-6=Nellymoser,

@@ -1442,6 +1442,60 @@ fn can_finish_playing_stream() {
     verify_is_onstatus(&message, "status", "NetStream.Play.Complete");
 }
 
+// LVQR fork test (session 172): the publish-side error reject that
+// mirrors `finish_playing`. Drives a session into the Publishing
+// state, then asserts `finish_publishing_with_error` emits an
+// `onStatus` at level "error" carrying the supplied code, and that
+// a session with no active publish returns `None`.
+#[test]
+fn can_finish_publishing_with_error() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    perform_connection(
+        TEST_APP_NAME,
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+    let stream_id = create_active_stream(&mut session, &mut serializer, &mut deserializer);
+    start_publishing(
+        TEST_STREAM_KEY,
+        stream_id,
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+
+    let (packet, rejected_key) = session
+        .finish_publishing_with_error("NetStream.Publish.BadName", "unsupported video codec_id 4")
+        .unwrap()
+        .expect("an active publishing stream should yield Some(_)");
+    assert_eq!(rejected_key, TEST_STREAM_KEY);
+
+    let payload = deserializer
+        .get_next_message(&packet.bytes[..])
+        .unwrap()
+        .unwrap();
+    let message = payload.to_rtmp_message().unwrap();
+    verify_is_onstatus(&message, "error", "NetStream.Publish.BadName");
+}
+
+#[test]
+fn finish_publishing_with_error_returns_none_without_active_publish() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    perform_connection(
+        TEST_APP_NAME,
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+    // A connected session that never started publishing has no
+    // stream in the Publishing state, so the reject is a no-op.
+    let result = session
+        .finish_publishing_with_error("NetStream.Publish.BadName", "no active publish")
+        .unwrap();
+    assert!(result.is_none(), "expected None when nothing is publishing");
+}
+
 #[test]
 fn sends_ack_after_receiving_window_ack_bytes() {
     let (mut deserializer, mut serializer, mut session) = common_basic_setup();
