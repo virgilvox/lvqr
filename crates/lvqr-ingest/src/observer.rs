@@ -110,6 +110,29 @@ pub trait RawSampleObserver: Send + Sync {
     /// Consumers that do not need codec_config can leave the
     /// default no-op impl.
     fn on_audio_config(&self, _broadcast: &str, _track: &str, _codec: MediaCodec, _codec_config: &[u8]) {}
+
+    /// Called once per video track when the bridge learns the codec
+    /// configuration (H.264 SPS/PPS, H.265 VPS/SPS/PPS), delivered as
+    /// an **Annex B byte stream** of the parameter-set NALUs (each
+    /// start-code prefixed). Unlike [`Self::on_audio_config`], which
+    /// passes the raw config box body, this hook passes the
+    /// already-framed parameter sets so the consumer can prepend them
+    /// verbatim before a keyframe.
+    ///
+    /// Why this exists: RTMP / FLV carries SPS/PPS only in the AVC
+    /// sequence header (the avcC record), never in the per-keyframe
+    /// NALU payload. A WebRTC subscriber (RFC 6184) needs the
+    /// parameter sets in-band before each IDR or its decoder cannot
+    /// initialize. `lvqr-whep` consumes this hook to inject the
+    /// parameter sets ahead of keyframes that lack them. Ingests
+    /// whose keyframes already carry in-band SPS/PPS (e.g. WHIP,
+    /// where the browser sends them in the RTP stream) need not call
+    /// this; the WHEP injector skips keyframes that already contain a
+    /// parameter set.
+    ///
+    /// Default no-op; consumers that do not packetize raw video
+    /// inherit it.
+    fn on_video_config(&self, _broadcast: &str, _track: &str, _codec: MediaCodec, _param_sets_annexb: &[u8]) {}
 }
 
 /// Drop-in raw-sample observer that does nothing.

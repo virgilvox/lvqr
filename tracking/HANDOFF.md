@@ -4,51 +4,26 @@
 
 **Last Updated**: 2026-05-19 (session 172 closed two audit findings -- B-5 CMAF `styp` and I-5b RTMP `onStatus(error)` hard-reject -- plus wired 2 more fuzz targets into CI, rotated the HANDOFF, and freed 33 GiB of build cache; full per-item detail in the Session 172 block below. B-5 detail: CMAF `styp` at the HLS partial + DASH segment HTTP cache; commit `0370380` adds `lvqr_cmaf::styp::CMAF_CHUNK_STYP_BYTES` (24-byte `cmfc / [cmfc, iso6]` box) + `prepend_cmaf_chunk_styp(body)` helper, threads it through `HlsServer::push_chunk_bytes` and `DashServer::push_video_segment` / `push_audio_segment` on cache-insert so the HTTP response body is a wire-ready CMAF chunk per ISO/IEC 23000-19 §7.4; `build_moof_mdat`, FragmentBroadcasterRegistry payloads, archive recorder writes, and the `/playback/*` DVR replay path stay byte-identical so the nine pre-existing `b"moof"` byte-equality assertions on those surfaces keep passing; four HLS / DASH HTTP-served assertions (`rtmp_hls_e2e.rs:241,254`, `rtmp_dash_e2e.rs:148`, `srt_dash_e2e.rs:230`) flipped to `b"styp"` at offset 4..8 with `b"moof"` reasserted at offset 28..32; 909 / 0 / 0 workspace lib across 29 binaries; clippy + fmt clean; commit `112f972` annotates the AUDIT-2026-04-29 doc with the closure note. Previously: session 171 post-push triage on `30ad8fb` (session-170 head) -- 8 of 10 push-triggered workflows green; LL-HLS Conformance routine-cancelled (cancel-in-progress shape, not a regression); Supply-chain audit was the only true red and got root-caused + closed in this session via commit `59e891e chore(deps): bump wasmtime 43.0.1 -> 43.0.2 for RUSTSEC-2026-0114` -- the workspace pin (`Cargo.toml:185`) already accepts any `43.x.y` so only `Cargo.lock` needed updating; `cargo update -p wasmtime` pulled the patch + the matching cranelift 0.130.1 -> 0.130.2 sidegrades; `cargo audit` locally clears (0 vulns; was 1); `cargo build -p lvqr-wasm -p lvqr-agent` clean; `cargo test -p lvqr-wasm -p lvqr-agent --lib` 28 tests pass; lockfile diff is wasmtime + cranelift + pulley + crc only with the windows-sys reference shifts being resolver-side dep-tree re-exploration not real downgrades. previous session 170 (2026-04-30) audit-cycle real-wire reproduction + lvqr-dash Default impls + auth_mode classifier sentinel fix -- 5 commits on top of v1.0.0: `c257f9d feat(dash): Default impls on Mpd / Period / AdaptationSet / Representation / SegmentTemplate` (closes session-168 deferral on the C-3 1.0.0 SemVer break -- external embedders can now write `Mpd { periods, ..Default::default() }` and stay forwards-compatible against the 4 optional timing fields C-3 added; 38 lvqr-dash lib tests pass), `34ef1e9 docs(audit): annotate session-170 real-wire reproduction + counter snapshot` (first operator-driven real-wire pass against `c832d92` head -- C-3 dynamic MPD with availabilityStartTime + publishTime + UTCTiming(direct) all rendered live, C-4 LL-HLS playlist shape, C-6 WHIP 415 on VP9/VP8/AV1 SDPs with `lvqr_whip_unsupported_codec_total{broadcast=...}` accumulator verified per request, C-9 WHEP 422 on AAC publisher with `lvqr_whep_audio_codec_unavailable_total{broadcast,codec=aac}=1`, I-5 RTMP non-AVC video via ffmpeg flv1 with `lvqr_rtmp_unsupported_codec_total{kind=video,codec_id=2}=1`; honest enumeration of cells untestable on this host -- no OBS / mpv / VLC / mediastreamvalidator / MP4Box / moq-rs / libsrt-enabled ffmpeg / browser-driver harness; HLS conformance "failure" on c832d92 surfaced as a GHA artifact-upload outage not a content regression), `0b2d6eb fix(server-info): honour ServeConfig.auth=None sentinel for open-access classifier` (root-cause fix for the auth_mode finding -- main.rs's build_auth was always returning Arc::new(NoopAuthProvider) and wrapping as Some(auth), violating the documented ServeConfig.auth=None sentinel; classifier now correctly reports auth_mode="noop" on a no-flags relay, live-wire confirmed; classifier extracted as classify_auth_mode_inner pure function with 11 new unit tests covering every label + the documented webhook > jwks > jwt > static > configured > noop precedence), `afac4ba docs(audit): close session-170 auth_mode classifier finding`, `dbdd9ea docs(audit): clarify auth_mode classifier fix is partial` (still-deferred: CLI-only `--publish-key` / `--jwt-secret` without `--config` reports "configured" not "static"/"jwt" because promotion gates on config_reload_seed which today requires a PathBuf -- needs ConfigReloadSeed.path: Option<PathBuf> + reload-handle no-op-when-None refactor, left for a future session). `cargo fmt` + `cargo clippy -p lvqr-cli --tests -- -D warnings` + `cargo clippy -p lvqr-dash --tests -- -D warnings` clean. 61 lvqr-cli lib tests pass (50 pre-existing + 11 new classifier tests); 38 lvqr-dash lib tests pass; 6 auth_integration + 5 config_reload_e2e + 3 rtmp_hls_e2e + 1 whip_hls_e2e + 2 srt_hls_e2e (incl. HEVC) + 1 srt_dash_e2e + 1 rtsp_hls_e2e + 2 rtmp_dash_e2e + 3 scte35_hls_dash_e2e all green on `c832d92`. Operator finding still pending follow-up: classifier promotion ladder for CLI-only static/jwt invocations. CI conformance on c832d92: dash-conformance success (MP4Box -dash-check + ffmpeg pull green); hls-conformance content steps green (ffmpeg pull exit 0; ffprobe exit 0) but workflow marked failure due to GHA artifact-upload service outage (5x Request timeout retries on the actions/upload-artifact@v4 step). Session 170 closes 8 of the original 10 critical (C-1 / C-3 / C-4 / C-5 / C-6 / C-7 / C-9 / C-10), 5 of 8 important, 4 of 7 backlog from AUDIT-2026-04-29.md. Remaining open: C-2 WHEP PLI/FIR (large cross-crate); I-1 WHIP trickle ICE PATCH (medium, str0m API surgery); I-5b RTMP onStatus(error) hard reject (rml_rtmp surgery); I-6 WHEP rtcp-fb consumer (tied to C-2); B-5 CMAF styp at chunk-serving layer (cross-crate). previous session 164 post-publish wave -- 12 commits on top of v1.0.0: README architecture diagrams hoisted to the top, in-browser WHIP demo streamer + signed-URL generator + protocol-URL recipes + TOML config builder added to the admin-ui, 7 follow-up WebRTC fixes (CORS / ICE-host-candidate / wildcard bind / FragmentBroadcasterRegistry-as-source / `local_addr = candidate_addr` / H264 codec pinning / WHEP default port flip), in-tree WIP for `GET /api/v1/server-info` route + DVR HLS-port fix. v1.0.0 release verified still LIVE on every channel: `gh release view v1.0.0` shows not-draft / not-prerelease + 4 binary assets uploaded with sha256 digests; crates.io / npm / PyPI / ghcr.io publishes from session 163 stand unchanged. CI on the head commit `d14b726` has 7/9 workflows green + 1 cancelled (LL-HLS routine cancel-in-progress) + 1 red (CI workflow); the red workflow has 2 pre-existing flakes -- `Test (macOS, informational)` is `continue-on-error: true` so not a merge gate, `Test (Linux)` flakes on `federation_link_propagates_broadcast_between_two_clusters` which is the same flake we already skip on `macos-latest` via commit e7277cb. Neither flake is a regression from this session's work. previous session 163 close (2026-04-28) + publish wave: **v1.0.0 PUBLISHED** on crates.io (all 26 crates) + npm (`@lvqr/{core, dvr-player, player, admin-ui}`) + PyPI (`lvqr 1.0.0`); tags `v1.0.0` + `python-v1.0.0` pushed to `origin`; commit `2ee3c9f`. **Pre-publish ultrathink audit** added 21 more Vitest tests on the admin-ui (52 total: 20 url + 7 connection + 4 plugins + 10 stores + 11 components), fixed a real bug (`bindings/python/python/lvqr/__init__.py` `__version__` had drifted to `0.3.2` across the prior 0.3.3 + 1.0.0 bumps; corrected to `1.0.0` + locked behind a pytest guard), wired a 401/403 toast on App.vue bootstrap so a wrong bearer token does not silently render an empty dashboard, verified CORS posture (line 1271 of `crates/lvqr-cli/src/lib.rs` wraps the combined admin router in `CorsLayer::permissive()` -- `OPTIONS` preflight returns `access-control-allow-origin: *` + `access-control-allow-methods: *` + `access-control-allow-headers: *`; the SPA works cross-origin from any deployment host out of the box), audited XSS surface (no `v-html` / `innerHTML` anywhere in admin-ui src), audited per-crate Cargo.toml inheritance (no 0.4.2 stragglers; every internal dep uses `version.workspace = true`), audited Cargo.lock (lvqr-* crates all flipped to `1.0.0`), end-to-end smoked the dev server (vite serves index.html + main.ts module + admin endpoints respond cross-origin with the configured wasm-filter chain). Final audit gate: cargo fmt + clippy + cargo build --workspace --release green; `npm run build` clean across all four JS packages; `npm run test:admin-ui` 52/52; `npm run test:sdk` 89/89 against a locally booted lvqr serve; `pytest` 39/39 (was 38; +1 version-guard test). Pre-publish state was: v1.0.0 STAGED on `main` -- workspace `Cargo.toml` 0.4.2 -> 1.0.0; `@lvqr/{core, dvr-player, player}` 0.3.3 / 0.3.3 / 0.3.2 -> 1.0.0; Python `lvqr` 0.3.3 -> 1.0.0; new `@lvqr/admin-ui 1.0.0` package shipped with 19 routes wired against `/api/v1/*` + design tokens from the storybook + 31 Vitest unit tests + a mobile-first responsive shell. Audit gate: cargo fmt + clippy + workspace test green; `npm run build` clean across all four JS packages + admin-ui dist; `npm run test:sdk` 89/89 against a local `lvqr serve --admin-port 18090 --mesh-enabled --cluster-listen 127.0.0.1:18093 --no-auth-signal --wasm-filter ...`; `pytest` 38/38; `npm run test:admin-ui` 31/31. Operator-gated steps remaining: `cargo publish` (Tier 0 -> Tier 6 per CLAUDE.md), `npm publish --access public` x 4 (core -> dvr-player -> player -> admin-ui), `python -m twine upload`, `git tag v1.0.0 python-v1.0.0 && git push`. previous session 162 close: SDK 0.3.3 release wave staged on `main`. `@lvqr/core` package.json bumped 0.3.2 -> 0.3.3 + CHANGELOG `## Unreleased (post-0.3.2)` block promoted to `## [0.3.3] - 2026-04-28` with `### Removed` subsection for the dead `./wasm` subpath drop; `@lvqr/dvr-player` package.json already at 0.3.3 from session 154 + new CHANGELOG.md created (first publish to npm); `bindings/python/pyproject.toml` 0.3.2 -> 0.3.3 + CHANGELOG promoted; workspace README "Client libraries" table refreshed including the stale-before-this-session Rust 0.4.1 -> 0.4.2 row catch-up. `npm run build` clean; `npm run test:sdk` 76/0; `pytest` 38/0; `npm pack --dry-run` clean for `@lvqr/core 0.3.3` and `@lvqr/dvr-player 0.3.3`; `python -m build` produces `lvqr-0.3.3.tar.gz` + `lvqr-0.3.3-py3-none-any.whl`. `npm publish` + `twine upload` + `git tag python-v0.3.3` are operator-gated and run externally; previous session 161 close: v0.4.2 PUBLISHED on crates.io with all 26 publishable crates uploaded in topological dependency order, git tag `v0.4.2` pushed to origin).
 
-## Session 173 entry point (start here)
+## Session 174 entry point (start here)
 
-**State at session-173 start**: `origin/main` HEAD `d9f278c`,
-workspace green (`cargo test --workspace --lib` 909/0/0; full
-lib+integration 1248/0/0; vendored rml_rtmp 174/0/0), clippy + fmt
-clean, `target/` was cleaned at session-172 close so the first build
-is cold. v1.0.0 live on all channels. `tracking/HANDOFF.md` was
-rotated at session 172 -- this live file holds sessions 172 -> 150;
-sessions 84-149 are in `tracking/archive/HANDOFF-pre-v1.0.md`,
-1-83 in `tracking/archive/HANDOFF-tier0-3.md`.
+**State at session-174 start**: `origin/main` HEAD `d9f278c` (session
+173 work is committed-pending -- not yet pushed; see the session-173
+close block below). Workspace green; session 173 touched lvqr-whep +
+lvqr-ingest + lvqr-whip (lvqr-whep lib 27 -> 35, lvqr-whip lib -> 40,
+two new e2e integration tests `e2e_str0m_loopback_pli` +
+`e2e_str0m_loopback_param_sets`; lvqr-ingest lib 34/0/0), clippy + fmt
+clean on the changed crates, `cargo build -p lvqr-cli` clean. v1.0.0
+live on all channels.
+`tracking/HANDOFF.md` holds sessions 173 -> 150; sessions 84-149 are
+in `tracking/archive/HANDOFF-pre-v1.0.md`, 1-83 in
+`tracking/archive/HANDOFF-tier0-3.md`.
 
 **Audit findings still open** (`tracking/AUDIT-2026-04-29.md`
-"Remaining open"), in recommended order:
+"Remaining open"). Session 173 closed C-2 + I-6 (WHEP PLI / FIR
+keyframe replay), I-9 (WHEP keyframes lacked in-band SPS/PPS), AND
+I-1 (WHIP + WHEP trickle ICE PATCH). The only remaining audit item:
 
-1. **C-2 WHEP PLI / FIR keyframe-request feedback** + **I-6 WHEP
-   `rtcp-fb` consumer** -- do these together; they are the same
-   surface. Today the WHEP str0m event loop
-   (`crates/lvqr-whep/src/str0m_backend.rs:446` `run_session_loop`,
-   main loop `:469`, event match `:745-760`) handles
-   `IceConnectionStateChange` / `Connected` / `MediaAdded` but has
-   **no `Event::KeyframeRequest` arm**, so a subscriber's PLI / FIR
-   (sent when its decoder needs a keyframe to start or recover) is
-   silently dropped. A late-joining or packet-loss-hit WHEP
-   subscriber can sit on a black frame until the publisher happens
-   to emit the next GOP keyframe. **First decision the session must
-   lock**: how to honor a PLI given LVQR does not re-encode --
-   either (a) propagate the keyframe request upstream to the
-   publisher (cross-crate: a keyframe-request channel from WHEP back
-   through `FragmentBroadcasterRegistry` to the RTMP / WHIP ingest
-   side; not all ingests can force a keyframe on demand), or (b)
-   cache the most-recent keyframe / GOP-start fragment per broadcast
-   and replay it to the PLIing subscriber (contained to lvqr-whep +
-   lvqr-fragment; no ingest-side change; this is the lower-risk
-   path and the recommended starting point). Confirm str0m's
-   current API surfaces `Event::KeyframeRequest` for received PLI in
-   the pinned version before committing to the design. I-6 falls out
-   of the same work: once the loop consumes RTCP feedback, the
-   advertised `rtcp-fb` lines stop being decorative.
-2. **I-1 WHIP trickle ICE PATCH** -- medium, self-contained str0m
-   API surgery. The WHIP handler logs the trickle-ICE PATCH body but
-   never applies the candidates to the session. Good alternative if
-   the next session wants a contained win rather than the larger
-   C-2/I-6 effort. (This is also the source of 2 of the workspace's
-   4 TODO markers, both in `crates/lvqr-whep/src/str0m_backend.rs`.)
-3. **Auth classifier promotion ladder** -- small but deferred per
+1. **Auth classifier promotion ladder** -- small but deferred per
    the session-170 note "until the reload pipeline is open for
    another reason." The classifier
    (`crates/lvqr-cli/src/lib.rs:144-171`, 11 unit tests) is already
@@ -68,6 +43,157 @@ prefer `cargo test -p <crate> --lib` over `--workspace` for
 iteration speed. Vendored `rml_rtmp` lives at `vendor/rml_rtmp` and
 is wired via `[patch.crates-io]`; additive methods there follow the
 session-152 / 155 / 172 precedent.
+
+## Session 173 (2026-05-19) -- audit C-2 + I-6 WHEP PLI / FIR keyframe-request consumption
+
+Closed C-2 (WHEP egress had no PLI / FIR handling) and I-6 (the
+advertised `rtcp-fb` lines were decorative) together, per the
+session-173 entry point's recommendation. Contained entirely to
+lvqr-whep.
+
+### Design decision (locked before code)
+
+The entry point asked to choose between (a) upstream keyframe-request
+propagation through `FragmentBroadcasterRegistry` and (b) cache +
+replay the most-recent keyframe per broadcast. (a) was ruled
+infeasible: LVQR relays an already-encoded bitstream over every
+ingest (RTMP / SRT / RTSP / WHIP) and does not control the
+publisher's encoder, so it cannot force a fresh IDR on demand. (b) is
+the only viable contained response and is correct because the cached
+keyframe is always the current GOP's IDR -- exactly the reference the
+live delta frames the subscriber is already receiving depend on. Not
+a real product trade-off once (a) is eliminated, so I proceeded with
+(b) (the conservative option the entry point recommended) without
+escalating.
+
+str0m 0.18 API confirmed before committing:
+- `Event::KeyframeRequest(KeyframeRequest { mid, rid, kind })` fires
+  from received PLI / FIR (`session.rs:666`); video defaults
+  `fb_pli: is_video` so the answer already advertises `nack pli` and
+  the event fires without extra config.
+- `Writer::write` uses our `rtp_time` verbatim, with seq numbers
+  assigned independently/monotonically; the receive buffer dedupes by
+  seq, not timestamp (`buffer_rx.rs`). So replaying with the keyframe's
+  ORIGINAL dts is production-correct (live delta frames, dts greater,
+  stay forward) AND reliably re-emitted by the client (fresh seq). A
+  fabricated forward timestamp would push live frames into the past
+  relative to the anchor; rejected.
+
+### What shipped (all in lvqr-whep)
+
+- `server.rs`: `VideoKeyframeSnapshot` + `WhepState.video_keyframes`
+  (mirrors `audio_configs`); observer updates it on every video
+  keyframe; `cached_video_keyframe` accessor.
+- `router.rs`: `handle_offer` seeds a new session with the cached
+  keyframe via `on_raw_sample(..., 0)` right after the audio-config
+  replay, so a mid-GOP joiner can answer its own first PLI.
+- `str0m_backend.rs`: `SessionCtx.last_keyframe` (updated in the
+  `SessionMsg::Video` arm regardless of connection state, so the
+  seed is ready pre-`Connected`); the `Output::Event` drain arm
+  gains an `Event::KeyframeRequest` case -> `replay_keyframe_for_pli`
+  (replays via the existing `write_sample`, original dts). Counters:
+  `lvqr_whep_keyframe_requests_total{broadcast,kind}`,
+  `lvqr_whep_keyframe_replays_total{broadcast}`,
+  `lvqr_whep_keyframe_replay_skipped_total{broadcast,reason}`.
+  `build_moof_mdat` and all other egress paths untouched.
+
+### Follow-up bug caught during the audit + fixed: keyframes lacked in-band SPS/PPS
+
+Auditing whether the replay actually helps a real decoder surfaced a
+deeper latent bug. RTMP / FLV carries SPS/PPS only in the AVC
+sequence header (`VideoConfig.sps_list`/`pps_list`); per-keyframe
+`Nalu` payloads are IDR-only. The WHEP write path sent IDR with NO
+in-band parameter sets, and there was no video-config hook. A real
+browser decoder (RFC 6184) cannot init without them, so RTMP-origin
+WHEP video never rendered for a fresh subscriber and the C-2 replay
+was equally undecodable. The loopback tests missed it because str0m's
+test client depacketizes but does not run a decoder; the browser WHEP
+cell was never wire-tested (session-170 "Untestable on this host").
+
+Fix (additive, mirrors the audio-config plumbing):
+- `lvqr-ingest`: new default-no-op `RawSampleObserver::on_video_config`;
+  the RTMP bridge builds an Annex B SPS/PPS blob (`annex_b_param_sets`)
+  from the sequence header and calls it.
+- `lvqr-whep`: `WhepState.video_param_sets` cache + observer impl;
+  router seeds new sessions; `SessionHandle::on_video_config` ->
+  `SessionMsg::VideoConfig` -> `SessionCtx.video_param_sets`;
+  `write_sample` prepends the parameter sets ahead of any keyframe
+  that does not already carry one (`annexb_contains_param_set` guard,
+  so WHIP-origin in-band SPS/PPS are not double-stuffed). SRT / RTSP
+  ingests can adopt the `on_video_config` call later; the guard means
+  they degrade to current behaviour until they do.
+
+Also added a PLI / FIR replay debounce (`MIN_KEYFRAME_REPLAY_INTERVAL`
+= 250 ms, `SessionCtx.last_replay_at`) so a keyframe-request storm on
+a lossy/abusive link cannot amplify into a keyframe flood; first
+request (and pre-`Connected` ones) never debounced;
+`..._replay_skipped_total{reason="debounced"}` makes it observable.
+
+### Tests
+
+- New `tests/e2e_str0m_loopback_pli.rs`: real recvonly str0m client
+  completes ICE/DTLS/SRTP, server is fed exactly ONE keyframe then
+  P-frames, client sends a real PLI via `Writer::request_keyframe`,
+  test asserts a SECOND keyframe (`MediaData::is_keyframe()`) arrives
+  -- provably a replay (shared counter asserts only one keyframe
+  sample was fed).
+- New `tests/e2e_str0m_loopback_param_sets.rs`: server delivers
+  SPS/PPS via `on_video_config` then feeds IDR-only keyframes; asserts
+  the client receives a keyframe whose Annex B contains an SPS NAL
+  (type 7), proving in-band injection.
+- Lib unit tests: `replay_keyframe_no_op_when_nothing_cached`,
+  `replay_keyframe_pre_connected_is_dropped`, four `annexb_param_set_*`
+  cases.
+- `cargo test -p lvqr-whep`: lib 33/0/0, e2e loopbacks (incl. new PLI
+  + param-sets) all 1/1, integration_signaling 17/0/0, proptest 4/0/0.
+  `cargo test -p lvqr-ingest --lib` 34/0/0. `cargo clippy -p lvqr-whep
+  -p lvqr-ingest --all-targets -- -D warnings` clean (only the
+  long-standing rml_rtmp vendor warning); `cargo fmt` clean; `cargo
+  build -p lvqr-cli` clean.
+
+### Then continued into I-1: WHIP + WHEP trickle ICE PATCH
+
+Picked up the (then-)largest remaining audit item in the same
+session. Both WHIP and WHEP handlers logged the trickle PATCH body
+and discarded it; both now apply candidates.
+
+Key discovery: `str0m::Candidate::from_sdp_string` (backed by the `is`
+0.8 ICE crate) parses a full `candidate:...` attribute string AND
+preserves the candidate type (host / srflx / relay). The audit's
+stated blocker -- that `Candidate::host(addr, Udp)` loses srflx/relay
+type -- is therefore moot; no hand-rolled candidate parser needed.
+
+Wiring (both crates, same shape): `add_trickle` extracts each
+`a=candidate:` line (`trickle_candidate_lines`), parses it with
+`Candidate::from_sdp_string`, and forwards the parsed candidate to the
+poll task that owns the `!Sync` `Rtc` -- WHIP via a new dedicated
+`mpsc<Candidate>` channel + select arm, WHEP via a new
+`SessionMsg::RemoteCandidate` on its existing channel. The task calls
+`Rtc::add_remote_candidate` (infallible). Lenient: an unparseable
+candidate line is logged once + skipped (trickle is best-effort); a
+non-UTF-8 body is the one hard error (-> `MalformedOffer` / 400).
+Stale docs corrected: the "does NOT do trickle" module notes in both
+str0m backends, the `lvqr-whep` crate-level "Trickle ICE is still
+TODO" note + the `Str0mSessionHandle` warn-flag note, and -- caught
+in the same sweep -- the badly-stale `--whep-port` CLI help text that
+still claimed "RTP media write is not yet wired, so subscribers will
+connect but see no frames" (WHEP media has worked for many sessions;
+the help now describes H.264/HEVC/Opus packetization, trickle, and
+PLI keyframe replay).
+
+Tests: `trickle_candidate_lines` unit tests (host + srflx extraction,
+bare-LF, no-candidate), a `from_sdp_string` type-preservation sanity
+check (WHIP), and an `add_trickle` behaviour test (valid applied,
+malformed lenient, non-utf8 -> 400) in each crate. whip lib 40/0/0,
+whep lib 35/0/0; clippy + fmt clean; `cargo build -p lvqr-cli` clean.
+
+### Caveat / not verified here
+
+`--features aac-opus` needs `gstreamer-1.0` (not on this host; same
+reason `rtmp_whep_audio_e2e` runs 0 tests). The SessionCtx changes
+are feature-agnostic (new non-gated fields + `..Default::default()`),
+so the gated build is expected clean; confirm on a GStreamer host /
+CI lane. Not committed/pushed -- awaiting the usual go-ahead.
 
 ## Session 172 (2026-05-19) -- audit finding B-5 CMAF `styp` at HLS partial + DASH segment HTTP cache
 

@@ -13,10 +13,6 @@
 //!   events on the floor. An AAC encoder is out of scope; a
 //!   follow-up session will land the `Opus -> AAC` path or wire an
 //!   Opus-native track through a separate sink.
-//! * **Trickle ICE ingestion.** The HTTP `PATCH` route accepts
-//!   bodies for conformance but the answerer logs once and returns
-//!   success. WHIP clients that enumerate host candidates in the
-//!   offer do not need trickle.
 //! * **Simulcast / RID / layer selection.** Single ingest track
 //!   per session; multi-layer ingest lands when we wire up the
 //!   ABR / transcoding story.
@@ -34,7 +30,7 @@ use str0m::media::{Frequency, MediaKind};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::bridge::{IngestAudioSample, IngestSample, IngestSampleSink};
 use crate::server::{SdpAnswerer, SessionHandle, WhipError};
@@ -147,6 +143,12 @@ impl SdpAnswerer for Str0mIngestAnswerer {
         let answer_bytes = Bytes::from(answer.to_sdp_string());
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        // Trickle ICE: candidates parsed from PATCH bodies are sent
+        // here and applied inside the poll task that owns `Rtc`
+        // (audit I-1). `Rtc` is `!Sync` and lives on the task; the
+        // channel is the only safe way to feed it from the HTTP
+        // handler thread.
+        let (trickle_tx, trickle_rx) = mpsc::unbounded_channel::<Candidate>();
         let broadcast_owned = broadcast.to_string();
         let sink = self.sink.clone();
 
@@ -155,6 +157,7 @@ impl SdpAnswerer for Str0mIngestAnswerer {
             socket,
             local_addr,
             shutdown_rx,
+            trickle_rx,
             broadcast_owned,
             sink,
         ));
@@ -167,7 +170,8 @@ impl SdpAnswerer for Str0mIngestAnswerer {
 
         let handle: Box<dyn SessionHandle> = Box::new(Str0mIngestSessionHandle {
             shutdown: Some(shutdown_tx),
-            trickle_warned: AtomicBool::new(false),
+            trickle: trickle_tx,
+            trickle_parse_warned: AtomicBool::new(false),
         });
         Ok((handle, answer_bytes))
     }
@@ -213,10 +217,20 @@ async fn run_session_loop(
     socket: UdpSocket,
     local_addr: SocketAddr,
     mut shutdown: oneshot::Receiver<()>,
+    mut trickle: mpsc::UnboundedReceiver<Candidate>,
     broadcast: String,
     sink: Arc<dyn IngestSampleSink>,
 ) {
-    run_session_loop_inner(&mut rtc, &socket, local_addr, &mut shutdown, &broadcast, &sink).await;
+    run_session_loop_inner(
+        &mut rtc,
+        &socket,
+        local_addr,
+        &mut shutdown,
+        &mut trickle,
+        &broadcast,
+        &sink,
+    )
+    .await;
     sink.on_disconnect(&broadcast);
 }
 
@@ -225,6 +239,7 @@ async fn run_session_loop_inner(
     socket: &UdpSocket,
     local_addr: SocketAddr,
     shutdown: &mut oneshot::Receiver<()>,
+    trickle: &mut mpsc::UnboundedReceiver<Candidate>,
     broadcast: &str,
     sink: &Arc<dyn IngestSampleSink>,
 ) {
@@ -259,6 +274,24 @@ async fn run_session_loop_inner(
             _ = &mut *shutdown => {
                 tracing::debug!(%broadcast, "whip session shutdown signalled");
                 return;
+            }
+            cand = trickle.recv() => {
+                match cand {
+                    Some(c) => {
+                        // Audit I-1: apply a trickled remote candidate.
+                        // `add_remote_candidate` is infallible; str0m
+                        // ignores a candidate it cannot pair with, so a
+                        // late or redundant candidate is harmless.
+                        tracing::debug!(%broadcast, candidate = %c, "whip: applying trickled remote candidate");
+                        rtc.add_remote_candidate(c);
+                    }
+                    None => {
+                        // All trickle senders dropped (handle gone).
+                        // The shutdown arm drives real teardown; this
+                        // just stops us busy-looping on a closed channel.
+                        return;
+                    }
+                }
             }
             recv = socket.recv_from(&mut buf) => {
                 match recv {
@@ -450,7 +483,12 @@ fn forward_audio_sample(
 /// Per-session handle produced by [`Str0mIngestAnswerer::create_session`].
 pub struct Str0mIngestSessionHandle {
     shutdown: Option<oneshot::Sender<()>>,
-    trickle_warned: AtomicBool,
+    /// Trickle ICE candidates parsed from PATCH bodies, forwarded to
+    /// the poll task that owns `Rtc` (audit I-1).
+    trickle: mpsc::UnboundedSender<Candidate>,
+    /// One-shot warn guard for unparseable candidate lines, so a
+    /// client emitting malformed candidates cannot spam the log.
+    trickle_parse_warned: AtomicBool,
 }
 
 impl Drop for Str0mIngestSessionHandle {
@@ -462,12 +500,62 @@ impl Drop for Str0mIngestSessionHandle {
 }
 
 impl SessionHandle for Str0mIngestSessionHandle {
-    fn add_trickle(&self, _sdp_fragment: &[u8]) -> Result<(), WhipError> {
-        if !self.trickle_warned.swap(true, Ordering::Relaxed) {
-            tracing::warn!("whip str0m trickle ICE not yet wired; ignoring fragment");
+    /// Apply trickle ICE candidates from a PATCH body (audit I-1).
+    ///
+    /// The body is an `application/trickle-ice-sdpfrag` (or legacy
+    /// `application/sdp`) fragment. We extract every `a=candidate:`
+    /// line, parse it with [`Candidate::from_sdp_string`] (which
+    /// preserves the candidate type -- host / srflx / relay -- unlike
+    /// the host-only [`Candidate::host`] used at session start), and
+    /// forward it to the poll task to call
+    /// [`Rtc::add_remote_candidate`].
+    ///
+    /// Lenient by design: an individual unparseable candidate line is
+    /// logged once and skipped rather than failing the whole PATCH, so
+    /// one bad line cannot break an otherwise-progressing session
+    /// (the WHIP draft expects trickle to be best-effort). A body that
+    /// is not valid UTF-8 is the one hard error -> 400.
+    fn add_trickle(&self, sdp_fragment: &[u8]) -> Result<(), WhipError> {
+        let text = std::str::from_utf8(sdp_fragment)
+            .map_err(|e| WhipError::MalformedOffer(format!("trickle fragment is not utf8: {e}")))?;
+
+        let mut applied = 0usize;
+        for cand_str in trickle_candidate_lines(text) {
+            match Candidate::from_sdp_string(cand_str) {
+                Ok(candidate) => {
+                    // Send failure means the poll task has exited; the
+                    // session is tearing down and the candidate is moot.
+                    if self.trickle.send(candidate).is_ok() {
+                        applied += 1;
+                    }
+                }
+                Err(e) => {
+                    if !self.trickle_parse_warned.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            error = %e,
+                            candidate = %cand_str,
+                            "whip: skipping unparseable trickle candidate (logging once)",
+                        );
+                    }
+                }
+            }
         }
+        tracing::debug!(applied, "whip: trickle ICE candidates queued");
         Ok(())
     }
+}
+
+/// Extract the `candidate:...` attribute values from a trickle ICE
+/// SDP fragment, one per `a=candidate:` line, ready for
+/// [`Candidate::from_sdp_string`]. Other fragment lines (`a=mid:`,
+/// `a=ice-ufrag:`, `a=end-of-candidates`, `m=`, blank) are ignored.
+/// Accepts both `\r\n` and `\n` line endings.
+fn trickle_candidate_lines(fragment: &str) -> impl Iterator<Item = &str> {
+    fragment.lines().filter_map(|line| {
+        let line = line.trim();
+        let attr = line.strip_prefix("a=")?;
+        attr.starts_with("candidate:").then_some(attr)
+    })
 }
 
 #[cfg(test)]
@@ -545,5 +633,69 @@ mod tests {
         let answerer = Str0mIngestAnswerer::new(Str0mIngestConfig::default(), Arc::new(NoopIngestSampleSink));
         let err = unwrap_err(answerer.create_session("live/test", b"not an sdp document"));
         assert!(matches!(err, WhipError::MalformedOffer(_)), "got {err:?}");
+    }
+
+    // ---- Trickle ICE candidate parsing (audit I-1) ----
+
+    #[test]
+    fn trickle_candidate_lines_extracts_only_candidate_attrs() {
+        let frag = "a=ice-ufrag:abcd\r\n\
+            a=ice-pwd:secret\r\n\
+            m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+            a=mid:0\r\n\
+            a=candidate:1 1 udp 2113929471 203.0.113.100 10100 typ host\r\n\
+            a=candidate:2 1 udp 1694498815 198.51.100.7 51000 typ srflx raddr 203.0.113.100 rport 10100\r\n\
+            a=end-of-candidates\r\n";
+        let lines: Vec<&str> = trickle_candidate_lines(frag).collect();
+        assert_eq!(lines.len(), 2, "two candidate lines expected: {lines:?}");
+        assert!(lines[0].starts_with("candidate:1 "));
+        assert!(lines[1].contains("typ srflx"));
+    }
+
+    #[test]
+    fn trickle_candidate_lines_handles_bare_lf_and_no_candidates() {
+        assert_eq!(trickle_candidate_lines("a=end-of-candidates\n").count(), 0);
+        assert_eq!(trickle_candidate_lines("").count(), 0);
+        let lf = "a=candidate:1 1 udp 2113929471 203.0.113.100 10100 typ host\n";
+        assert_eq!(trickle_candidate_lines(lf).count(), 1);
+    }
+
+    #[test]
+    fn from_sdp_string_parses_host_and_srflx() {
+        // Sanity-check the str0m parser we rely on keeps the type.
+        let host = Candidate::from_sdp_string("candidate:1 1 udp 2113929471 203.0.113.100 10100 typ host")
+            .expect("host parses");
+        assert_eq!(host.kind(), str0m::CandidateKind::Host);
+        let srflx = Candidate::from_sdp_string(
+            "candidate:2 1 udp 1694498815 198.51.100.7 51000 typ srflx raddr 203.0.113.100 rport 10100",
+        )
+        .expect("srflx parses");
+        assert_eq!(srflx.kind(), str0m::CandidateKind::ServerReflexive);
+    }
+
+    #[tokio::test]
+    async fn add_trickle_is_lenient_and_rejects_non_utf8() {
+        let answerer = Str0mIngestAnswerer::new(Str0mIngestConfig::default(), Arc::new(NoopIngestSampleSink));
+        let (handle, _answer) = answerer
+            .create_session("live/test", CHROME_AUDIO_OFFER.as_bytes())
+            .expect("offer accepted");
+
+        // Valid mixed fragment: applied.
+        handle
+            .add_trickle(b"a=candidate:1 1 udp 2113929471 203.0.113.100 10100 typ host\r\na=end-of-candidates\r\n")
+            .expect("valid fragment is accepted");
+        // A malformed candidate line is skipped, not fatal.
+        handle
+            .add_trickle(b"a=candidate:bogus nonsense here\r\n")
+            .expect("malformed candidate line is lenient (still Ok)");
+        // A fragment with no candidate lines is a no-op success.
+        handle.add_trickle(b"a=mid:0\r\n").expect("no-candidate fragment is Ok");
+        // Non-UTF-8 is the one hard error.
+        let err = handle.add_trickle(&[0xff, 0xfe]).expect_err("non-utf8 must error");
+        assert!(matches!(err, WhipError::MalformedOffer(_)), "got {err:?}");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(handle);
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

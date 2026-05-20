@@ -37,6 +37,48 @@ pub(crate) struct AudioConfigSnapshot {
     pub config_bytes: Bytes,
 }
 
+/// Cached most-recent video keyframe (GOP-start) for a broadcast.
+///
+/// Populated by [`WhepServer`]'s [`RawSampleObserver`] impl on every
+/// video sample flagged [`RawSample::keyframe`], so a subscriber that
+/// joins mid-GOP can be seeded with the in-progress GOP's IDR. On a
+/// PLI / FIR the session replays this exact sample (audit C-2 / I-6):
+/// because the cache always holds the latest keyframe, it is the
+/// reference the current live delta frames depend on, so replaying it
+/// gives the decoder a usable anchor without re-encoding upstream.
+///
+/// `sample.dts` is preserved verbatim. The replay deliberately keeps
+/// the original decode timestamp: str0m assigns fresh (monotonic)
+/// RTP sequence numbers per write, and its receive buffer dedupes by
+/// sequence number rather than timestamp, so the late joiner emits the
+/// replayed keyframe as a new frame while subsequent live delta frames
+/// (whose dts is greater than the keyframe's) stay forward in time. A
+/// fabricated forward timestamp would instead push those live frames
+/// into the past relative to the anchor and risk decoder drops.
+#[derive(Debug, Clone)]
+pub(crate) struct VideoKeyframeSnapshot {
+    pub track: String,
+    pub codec: MediaCodec,
+    pub sample: RawSample,
+}
+
+/// Cached H.264 / H.265 parameter sets (SPS/PPS, or VPS/SPS/PPS) for a
+/// broadcast, as an Annex B byte stream delivered by the ingest
+/// bridge's [`RawSampleObserver::on_video_config`] hook.
+///
+/// RTMP / FLV carries the parameter sets only in the AVC sequence
+/// header, never in the per-keyframe NALU payload, so a WHEP
+/// subscriber's decoder would never see them in-band and could not
+/// initialize. The session prepends these ahead of any keyframe that
+/// does not already carry them. Cached per broadcast so a subscriber
+/// that joins after the publisher's sequence header still gets them.
+#[derive(Debug, Clone)]
+pub(crate) struct VideoParamSetsSnapshot {
+    pub track: String,
+    pub codec: MediaCodec,
+    pub param_sets_annexb: Bytes,
+}
+
 /// Unique identifier for an active WHEP subscriber session.
 ///
 /// Encoded as 16 random bytes rendered as 32 lowercase hex
@@ -201,6 +243,15 @@ pub trait SessionHandle: Send + Sync + 'static {
     /// AudioSpecificConfig for [`MediaCodec::Aac`], empty for
     /// codecs that do not carry an explicit config.
     fn on_audio_config(&self, _track: &str, _codec: MediaCodec, _codec_config: &[u8]) {}
+
+    /// Called once per video track when the upstream bridge learns the
+    /// codec parameter sets (H.264 SPS/PPS), delivered as an Annex B
+    /// byte stream. The str0m backend stores them and prepends them
+    /// ahead of any keyframe that does not already carry them in-band,
+    /// so a decoder fed by an RTMP-origin stream (whose keyframes are
+    /// IDR-only) can initialize. Default no-op for implementations
+    /// that do not packetize raw video.
+    fn on_video_config(&self, _track: &str, _codec: MediaCodec, _param_sets_annexb: &[u8]) {}
 }
 
 /// Concrete SDP answerer contract. Separating this from the
@@ -252,6 +303,19 @@ pub(crate) struct WhepState {
     /// the publisher's first sequence header still sees the config.
     /// Session 113.
     pub audio_configs: DashMap<String, AudioConfigSnapshot>,
+    /// Most-recent video keyframe per broadcast. Populated by
+    /// [`RawSampleObserver::on_raw_sample`] on every keyframe video
+    /// sample; consumed on every new `create_session` so a WHEP
+    /// subscriber that joins mid-GOP is seeded with the in-progress
+    /// GOP's IDR and can answer its own PLI / FIR by replaying it
+    /// (audit C-2 / I-6).
+    pub video_keyframes: DashMap<String, VideoKeyframeSnapshot>,
+    /// Most-recent video parameter sets (SPS/PPS) per broadcast,
+    /// Annex B framed. Populated by
+    /// [`RawSampleObserver::on_video_config`]; consumed on every new
+    /// `create_session` so a subscriber gets the parameter sets it
+    /// needs to decode keyframes from an RTMP-origin stream.
+    pub video_param_sets: DashMap<String, VideoParamSetsSnapshot>,
     /// Authentication provider consulted on the POST /whep/{broadcast}
     /// offer. `NoopAuthProvider` by default (open access);
     /// overridden via [`WhepServer::with_auth_provider`]. Mirrors the
@@ -294,6 +358,8 @@ impl WhepServer {
                 answerer,
                 sessions: DashMap::new(),
                 audio_configs: DashMap::new(),
+                video_keyframes: DashMap::new(),
+                video_param_sets: DashMap::new(),
                 auth,
             }),
         }
@@ -314,6 +380,25 @@ impl WhepServer {
         self.state.audio_configs.get(broadcast).map(|e| e.value().clone())
     }
 
+    /// Look up the cached most-recent video keyframe for `broadcast`,
+    /// if any. Used by the router's `handle_offer` path to seed a
+    /// freshly-created session so it can replay the in-progress GOP's
+    /// IDR on the subscriber's first PLI / FIR (audit C-2 / I-6).
+    /// Returns a clone so the caller does not hold a dashmap guard
+    /// while calling back into `SessionHandle`.
+    pub(crate) fn cached_video_keyframe(&self, broadcast: &str) -> Option<VideoKeyframeSnapshot> {
+        self.state.video_keyframes.get(broadcast).map(|e| e.value().clone())
+    }
+
+    /// Look up the cached video parameter sets for `broadcast`, if
+    /// any. Used by the router to seed a freshly-created session so it
+    /// can inject SPS/PPS ahead of keyframes from an RTMP-origin
+    /// stream. Returns a clone so the caller does not hold a dashmap
+    /// guard while calling back into `SessionHandle`.
+    pub(crate) fn cached_video_param_sets(&self, broadcast: &str) -> Option<VideoParamSetsSnapshot> {
+        self.state.video_param_sets.get(broadcast).map(|e| e.value().clone())
+    }
+
     /// Number of active subscriber sessions currently registered.
     /// Exposed for tests and for a future admin metrics hook.
     pub fn session_count(&self) -> usize {
@@ -331,6 +416,21 @@ impl WhepServer {
 /// shows up in profiling.
 impl RawSampleObserver for WhepServer {
     fn on_raw_sample(&self, broadcast: &str, track: &str, codec: MediaCodec, sample: &RawSample, ingest_time_ms: u64) {
+        // Audit C-2 / I-6: keep the most-recent video keyframe per
+        // broadcast so a subscriber that joins mid-GOP (or loses the
+        // keyframe to packet loss) can be served a usable anchor on
+        // PLI / FIR. Only H.264 / H.265 keyframes are anchors; audio
+        // samples and inter frames are ignored.
+        if sample.keyframe && matches!(codec, MediaCodec::H264 | MediaCodec::H265) {
+            self.state.video_keyframes.insert(
+                broadcast.to_string(),
+                VideoKeyframeSnapshot {
+                    track: track.to_string(),
+                    codec,
+                    sample: sample.clone(),
+                },
+            );
+        }
         for entry in self.state.sessions.iter() {
             let session = entry.value();
             if session.broadcast == broadcast {
@@ -350,6 +450,21 @@ impl RawSampleObserver for WhepServer {
             let session = entry.value();
             if session.broadcast == broadcast {
                 session.handle.on_audio_config(track, codec, codec_config);
+            }
+        }
+    }
+
+    fn on_video_config(&self, broadcast: &str, track: &str, codec: MediaCodec, param_sets_annexb: &[u8]) {
+        let snapshot = VideoParamSetsSnapshot {
+            track: track.to_string(),
+            codec,
+            param_sets_annexb: Bytes::copy_from_slice(param_sets_annexb),
+        };
+        self.state.video_param_sets.insert(broadcast.to_string(), snapshot);
+        for entry in self.state.sessions.iter() {
+            let session = entry.value();
+            if session.broadcast == broadcast {
+                session.handle.on_video_config(track, codec, param_sets_annexb);
             }
         }
     }
