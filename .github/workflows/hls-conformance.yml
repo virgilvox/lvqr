@@ -125,26 +125,49 @@ jobs:
 
       - name: Push synthetic RTMP fixture with ffmpeg
         # The push is a ~20s real-time fixture (`-re -t 20`). Cap the
-        # step so a stuck RTMP connect (macOS-runner ffmpeg/timing
-        # flake) fails fast instead of burning the whole 30-minute job
-        # budget, as happened when this lane was cancelled at 30m.
-        timeout-minutes: 3
+        # step so a stuck attempt fails fast instead of burning the
+        # whole 30-minute job budget, as happened when this lane was
+        # cancelled at 30m.
+        timeout-minutes: 4
         run: |
-          set -euo pipefail
+          set -uo pipefail
           # Canonical fixture: 20 seconds of 640x360@30fps H.264
           # baseline with AAC-LC 44.1 kHz stereo. Keyframe every
           # second (g=30) keeps partial/segment boundaries
           # deterministic for the validator's timing checks.
-          ffmpeg -hide_banner -loglevel warning \
-            -re \
-            -f lavfi -i testsrc=size=640x360:rate=30 \
-            -f lavfi -i sine=frequency=440:sample_rate=44100 \
-            -c:v libx264 -preset ultrafast -tune zerolatency \
-            -profile:v baseline -level 3.1 -pix_fmt yuv420p \
-            -g 30 -keyint_min 30 -sc_threshold 0 \
-            -c:a aac -b:a 128k -ac 2 \
-            -t 20 \
-            -f flv rtmp://127.0.0.1:1935/live/test 2>&1 | tee /tmp/msv-out/ffmpeg-publish.log
+          #
+          # Retry the publish. On a cold runner the relay intermittently
+          # fails the RTMP handshake on the first connection: the TCP is
+          # accepted but the handshake does not complete, ffmpeg reports
+          # `Error opening output: Input/output error` and then stalls on
+          # cleanup (the lane's recurring flake). Real RTMP clients
+          # reconnect; mirror that with up to 3 attempts, each bounded by
+          # `timeout 60` so a stuck attempt is killed fast rather than
+          # hanging the whole step.
+          published=""
+          for attempt in 1 2 3; do
+            echo "ffmpeg RTMP publish attempt ${attempt}/3"
+            if timeout 60 ffmpeg -hide_banner -loglevel warning \
+              -re \
+              -f lavfi -i testsrc=size=640x360:rate=30 \
+              -f lavfi -i sine=frequency=440:sample_rate=44100 \
+              -c:v libx264 -preset ultrafast -tune zerolatency \
+              -profile:v baseline -level 3.1 -pix_fmt yuv420p \
+              -g 30 -keyint_min 30 -sc_threshold 0 \
+              -c:a aac -b:a 128k -ac 2 \
+              -t 20 \
+              -f flv rtmp://127.0.0.1:1935/live/test 2>&1 | tee /tmp/msv-out/ffmpeg-publish.log; then
+              published=1
+              break
+            fi
+            echo "publish attempt ${attempt} failed (see ffmpeg-publish.log above); retrying after 2s"
+            sleep 2
+          done
+          if [ -z "$published" ]; then
+            echo "all ffmpeg RTMP publish attempts failed" >&2
+            cat /tmp/msv-out/lvqr-serve.log >&2 || true
+            exit 1
+          fi
 
       - name: Give the playlist time to finalize
         run: sleep 3
