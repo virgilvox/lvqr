@@ -1,24 +1,68 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, reactive, ref } from 'vue';
 import PageHeader from '@/components/ui/PageHeader.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import KpiTile from '@/components/ui/KpiTile.vue';
 import Card from '@/components/ui/Card.vue';
 import Badge from '@/components/ui/Badge.vue';
+import Button from '@/components/ui/Button.vue';
 import { useTranscodeStore } from '@/stores/transcode';
 import { usePolling } from '@/composables/usePolling';
+import { useToast } from '@/composables/useToast';
 
-// Read-only introspection of the startup-configured transcode ladder via
-// GET /api/v1/transcode/ladders. Runtime ladder editing (add / remove
-// renditions, swap encoder) is a separate CRUD surface tracked for a later
-// slice; this view lists what is configured plus live per-output counters.
+// Introspection + runtime CRUD of the transcode ladder via
+// /api/v1/transcode/ladders. The encoder backend stays a startup choice;
+// renditions can be added / removed at runtime (new broadcasts and already-
+// live sources both pick up an added rendition).
 const transcode = useTranscodeStore();
+const { push } = useToast();
 usePolling(() => transcode.fetch(), { intervalMs: 10_000 });
 
 const state = computed(() => transcode.state);
 const enabled = computed(() => state.value?.enabled ?? false);
 const renditions = computed(() => state.value?.renditions ?? []);
 const active = computed(() => state.value?.active ?? []);
+
+const form = reactive({ name: '', width: 1280, height: 720, video_bitrate_kbps: 2500, audio_bitrate_kbps: 128 });
+const submitting = ref(false);
+const removing = ref<string | null>(null);
+
+async function submitAdd() {
+  const name = form.name.trim();
+  if (!name || name.includes('/')) {
+    push('error', "rendition name is required and must not contain '/'");
+    return;
+  }
+  submitting.value = true;
+  try {
+    await transcode.addRendition({
+      name,
+      width: form.width,
+      height: form.height,
+      video_bitrate_kbps: form.video_bitrate_kbps,
+      audio_bitrate_kbps: form.audio_bitrate_kbps,
+    });
+    push('success', `added rendition ${name}`);
+    form.name = '';
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    push('error', msg.includes('409') ? `rendition ${name} already exists` : msg, 6000);
+  } finally {
+    submitting.value = false;
+  }
+}
+
+async function removeRendition(name: string) {
+  removing.value = name;
+  try {
+    await transcode.removeRendition(name);
+    push('success', `removed rendition ${name}`);
+  } catch (e) {
+    push('error', e instanceof Error ? e.message : String(e), 6000);
+  } finally {
+    removing.value = null;
+  }
+}
 </script>
 
 <template>
@@ -48,14 +92,41 @@ const active = computed(() => state.value?.active ?? []);
             <span role="columnheader">Resolution</span>
             <span role="columnheader" class="num">Video kbps</span>
             <span role="columnheader" class="num">Audio kbps</span>
+            <span role="columnheader" class="act"></span>
           </div>
           <div v-for="r in renditions" :key="r.name" class="tr" role="row">
             <span role="cell"><Badge variant="tally">{{ r.name }}</Badge></span>
             <span role="cell" class="mono">{{ r.width }}x{{ r.height }}</span>
             <span role="cell" class="num">{{ r.video_bitrate_kbps.toLocaleString() }}</span>
             <span role="cell" class="num">{{ r.audio_bitrate_kbps.toLocaleString() }}</span>
+            <span role="cell" class="act">
+              <Button
+                variant="ghost"
+                :loading="removing === r.name"
+                :aria-label="`Remove ${r.name}`"
+                @click="removeRendition(r.name)"
+              >
+                Remove
+              </Button>
+            </span>
           </div>
         </div>
+
+        <form class="addform" @submit.prevent="submitAdd">
+          <div class="kicker">ADD RENDITION</div>
+          <div class="fields">
+            <label><span>Name</span><input v-model="form.name" placeholder="360p" required /></label>
+            <label><span>Width</span><input v-model.number="form.width" type="number" min="2" required /></label>
+            <label><span>Height</span><input v-model.number="form.height" type="number" min="2" required /></label>
+            <label><span>Video kbps</span><input v-model.number="form.video_bitrate_kbps" type="number" min="1" required /></label>
+            <label><span>Audio kbps</span><input v-model.number="form.audio_bitrate_kbps" type="number" min="1" required /></label>
+            <Button variant="primary" type="submit" :loading="submitting">Add</Button>
+          </div>
+          <p class="note">
+            New renditions use the relay's startup encoder backend
+            (<code>{{ state.encoder }}</code>) and apply to new and already-live broadcasts.
+          </p>
+        </form>
       </Card>
 
       <Card kicker="LIVE" title="Active outputs" wire>
@@ -120,7 +191,7 @@ const active = computed(() => state.value?.active ?? []);
 }
 .tr {
   display: grid;
-  grid-template-columns: 1fr 1.2fr 1fr 1fr;
+  grid-template-columns: 1fr 1.2fr 1fr 1fr auto;
   gap: var(--s-3);
   align-items: center;
   padding: 8px 4px;
@@ -128,6 +199,58 @@ const active = computed(() => state.value?.active ?? []);
 }
 .tr.atr {
   grid-template-columns: 1.6fr 1fr 0.8fr 1fr 0.6fr;
+}
+.act {
+  text-align: right;
+}
+.addform {
+  margin-top: var(--s-4);
+  padding-top: var(--s-4);
+  border-top: 1px solid var(--chalk-hi);
+}
+.addform .kicker {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: var(--ink-faint);
+  margin-bottom: var(--s-2);
+}
+.fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--s-3);
+}
+.fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.fields label span {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.fields input {
+  border: 1px solid var(--chalk-hi);
+  background: var(--paper-hi);
+  padding: 6px 9px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  width: 96px;
+}
+.fields input[type='text'],
+.fields label:first-child input {
+  width: 120px;
+}
+.note {
+  margin-top: var(--s-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-muted);
 }
 .tr.th {
   font-family: var(--font-mono);

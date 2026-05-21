@@ -217,3 +217,51 @@ pub async fn http_post_json(addr: SocketAddr, path: &str, bearer: Option<&str>, 
     let body = raw[split + 4..].to_vec();
     HttpResponse { status, headers, body }
 }
+
+/// Issue a `DELETE` request (no body) and read the full response. Optional
+/// bearer token. Mirrors [`http_post_json`]'s raw HTTP/1.1 + `Connection:
+/// close` shape.
+pub async fn http_delete(addr: SocketAddr, path: &str, bearer: Option<&str>) -> HttpResponse {
+    let timeout = Duration::from_secs(5);
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .expect("http_delete: connect timed out")
+        .expect("http_delete: connect failed");
+
+    let mut req = format!("DELETE {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    if let Some(token) = bearer {
+        req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    req.push_str("\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .expect("http_delete: write failed");
+
+    let mut raw = Vec::with_capacity(2048);
+    tokio::time::timeout(timeout, stream.read_to_end(&mut raw))
+        .await
+        .expect("http_delete: read timed out")
+        .expect("http_delete: read failed");
+
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("http_delete: response missing header terminator");
+    let header_text = std::str::from_utf8(&raw[..split]).expect("http_delete: headers are not utf-8");
+    let mut lines = header_text.lines();
+    let status_line = lines.next().expect("http_delete: response missing status line");
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("http_delete: could not parse status line: {status_line:?}"));
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            Some((k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect();
+    let body = raw[split + 4..].to_vec();
+    HttpResponse { status, headers, body }
+}

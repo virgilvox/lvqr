@@ -588,6 +588,29 @@ export class LvqrAdminClient {
   }
 
   /**
+   * `POST /api/v1/transcode/ladders` -- add a rendition to the live ladder at
+   * runtime. Throws on non-2xx (notably HTTP 409 when the rendition already
+   * exists, or 503 when the relay has no transcode runner). Requires an admin
+   * token. Only the rendition spec fields are sent.
+   */
+  async addRendition(spec: RenditionInfo): Promise<void> {
+    await this.sendJson<unknown>('POST', '/api/v1/transcode/ladders', spec);
+  }
+
+  /**
+   * `DELETE /api/v1/transcode/ladders/{name}` -- remove a rendition from the
+   * live ladder at runtime. Throws on non-2xx (404 when no such rendition,
+   * 503 when no runner). Requires an admin token.
+   */
+  async removeRendition(name: string): Promise<void> {
+    const path = `/api/v1/transcode/ladders/${encodeURIComponent(name)}`;
+    const resp = await this.fetchWithTimeout(`${this.baseUrl}${path}`, { method: 'DELETE' });
+    if (!resp.ok) {
+      throw new Error(`DELETE ${path}: HTTP ${resp.status} ${resp.statusText}`);
+    }
+  }
+
+  /**
    * `GET /api/v1/agents` -- configured in-process agents plus live
    * per-attachment counters. Always 200; `enabled: false` when no agent is
    * configured (or the relay was built without an agent feature).

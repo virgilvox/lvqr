@@ -41,7 +41,8 @@ pub use config_reload_routes::{ConfigReloadFuture, ConfigReloadStatus, ConfigRel
 pub use routes::{
     AdminError, AdminState, AgentActiveStats, AgentInfo, AgentState, ArchiveBroadcastInfo, ArchiveState,
     ArchiveTrackInfo, MeshPeerStats, MeshState, MetricsRender, RenditionInfo, StreamDetailInfo, StreamInfo, TrackInfo,
-    TranscodeActiveStats, TranscodeState, WasmFilterBroadcastStats, WasmFilterSlotStats, WasmFilterState, build_router,
+    TranscodeActiveStats, TranscodeMutateFn, TranscodeMutateResult, TranscodeMutation, TranscodeState,
+    WasmFilterBroadcastStats, WasmFilterSlotStats, WasmFilterState, build_router,
 };
 pub use server_info_routes::{
     BoundAddresses, RuntimeFeatures, ServerInfo, ServerInfoFn, default_server_info, server_info_fn_with_uptime,

@@ -217,6 +217,35 @@ pub struct TranscodeActiveStats {
     pub panics: u64,
 }
 
+/// A runtime ladder mutation requested via the transcode admin routes and
+/// applied by the closure wired with [`AdminState::with_transcode_mutate`].
+/// The admin crate stays free of `lvqr-transcode`: the CLI closure builds the
+/// concrete encoder factory from [`RenditionInfo`] and the configured encoder.
+#[derive(Debug, Clone)]
+pub enum TranscodeMutation {
+    /// Add a rendition to the live ladder.
+    Add(RenditionInfo),
+    /// Remove the named rendition from the live ladder.
+    Remove(String),
+}
+
+/// Outcome of applying a [`TranscodeMutation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscodeMutateResult {
+    /// The rendition was added.
+    Added,
+    /// A rendition with that name already exists (maps to 409).
+    Conflict,
+    /// The rendition was removed.
+    Removed,
+    /// No rendition with that name exists (maps to 404).
+    NotFound,
+}
+
+/// Closure backing the transcode mutation routes. Wired by the CLI on
+/// `transcode`-feature builds; `None` -> the routes return 503.
+pub type TranscodeMutateFn = Arc<dyn Fn(TranscodeMutation) -> TranscodeMutateResult + Send + Sync>;
+
 /// In-process agent state returned by `GET /api/v1/agents`.
 ///
 /// `enabled` reflects whether the binary was built with an agent feature
@@ -400,6 +429,11 @@ pub struct AdminState {
     /// live-tail). Populated by [`AdminState::with_log_broadcaster`] from
     /// `lvqr_observability::log_broadcaster()`. `None` -> the route 503s.
     log_broadcaster: Option<lvqr_observability::LogBroadcaster>,
+    /// Closure backing the transcode ladder mutation routes
+    /// (`POST`/`DELETE /api/v1/transcode/ladders`). Populated by
+    /// [`AdminState::with_transcode_mutate`] on `transcode`-feature builds;
+    /// `None` -> the mutation routes return 503.
+    transcode_mutate: Option<TranscodeMutateFn>,
 }
 
 impl AdminState {
@@ -450,6 +484,7 @@ impl AdminState {
                 recordings: Vec::new(),
             }),
             log_broadcaster: None,
+            transcode_mutate: None,
         }
     }
 
@@ -545,6 +580,14 @@ impl AdminState {
     /// without it the route reports `enabled: false`.
     pub fn with_transcode(mut self, get: impl Fn() -> TranscodeState + Send + Sync + 'static) -> Self {
         self.get_transcode = Arc::new(get);
+        self
+    }
+
+    /// Wire the transcode ladder mutation closure backing
+    /// `POST`/`DELETE /api/v1/transcode/ladders`. The CLI calls this only on
+    /// `transcode`-feature builds; without it the mutation routes return 503.
+    pub fn with_transcode_mutate(mut self, mutate: TranscodeMutateFn) -> Self {
+        self.transcode_mutate = Some(mutate);
         self
     }
 
@@ -683,7 +726,11 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/api/v1/mesh", get(get_mesh))
         .route("/api/v1/slo", get(get_slo))
         .route("/api/v1/wasm-filter", get(get_wasm_filter))
-        .route("/api/v1/transcode/ladders", get(get_transcode))
+        .route(
+            "/api/v1/transcode/ladders",
+            get(get_transcode).post(add_transcode_rendition),
+        )
+        .route("/api/v1/transcode/ladders/{name}", delete(remove_transcode_rendition))
         .route("/api/v1/agents", get(get_agents))
         .route("/api/v1/archive", get(get_archive))
         .route(
@@ -977,6 +1024,75 @@ async fn get_wasm_filter(State(state): State<AdminState>) -> Result<Json<WasmFil
 /// per-output counters. Returns `enabled: false` when no ladder is wired.
 async fn get_transcode(State(state): State<AdminState>) -> Result<Json<TranscodeState>, AdminError> {
     Ok(Json((state.get_transcode)()))
+}
+
+/// `POST /api/v1/transcode/ladders` -- add a rendition to the live ladder at
+/// runtime. Body is a [`RenditionInfo`]. 201 on add, 409 when a rendition of
+/// that name already exists, 400 on an invalid spec, 503 when transcode
+/// mutation is not available (no `transcode` feature / no runner).
+async fn add_transcode_rendition(State(state): State<AdminState>, Json(spec): Json<RenditionInfo>) -> Response {
+    let name = spec.name.trim();
+    if name.is_empty() || name.contains('/') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "rendition name must be non-empty and contain no '/'" })),
+        )
+            .into_response();
+    }
+    if spec.width == 0 || spec.height == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "width and height must be non-zero" })),
+        )
+            .into_response();
+    }
+    let Some(mutate) = state.transcode_mutate.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "transcode mutation not available on this relay" })),
+        )
+            .into_response();
+    };
+    match mutate(TranscodeMutation::Add(spec)) {
+        TranscodeMutateResult::Added => (StatusCode::CREATED, Json(json!({ "status": "added" }))).into_response(),
+        TranscodeMutateResult::Conflict => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "a rendition with that name already exists" })),
+        )
+            .into_response(),
+        // Add never yields Removed/NotFound.
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "unexpected mutation result" })),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /api/v1/transcode/ladders/{name}` -- remove a rendition from the
+/// live ladder at runtime. 200 on removal, 404 when no such rendition, 503
+/// when transcode mutation is not available.
+async fn remove_transcode_rendition(State(state): State<AdminState>, Path(name): Path<String>) -> Response {
+    let Some(mutate) = state.transcode_mutate.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "transcode mutation not available on this relay" })),
+        )
+            .into_response();
+    };
+    match mutate(TranscodeMutation::Remove(name)) {
+        TranscodeMutateResult::Removed => (StatusCode::OK, Json(json!({ "status": "removed" }))).into_response(),
+        TranscodeMutateResult::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no rendition with that name" })),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "unexpected mutation result" })),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /api/v1/agents` -- configured in-process agents plus live
@@ -2004,6 +2120,137 @@ mod tests {
                     .body(Body::empty())
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn add_body(name: &str) -> Body {
+        Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "name": name,
+                "width": 1280,
+                "height": 720,
+                "video_bitrate_kbps": 2500,
+                "audio_bitrate_kbps": 128
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn post_add(uri: &str, body: Body) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    fn mutate_stub() -> TranscodeMutateFn {
+        Arc::new(|m| match m {
+            TranscodeMutation::Add(r) if r.name == "dup" => TranscodeMutateResult::Conflict,
+            TranscodeMutation::Add(_) => TranscodeMutateResult::Added,
+            TranscodeMutation::Remove(n) if n == "ghost" => TranscodeMutateResult::NotFound,
+            TranscodeMutation::Remove(_) => TranscodeMutateResult::Removed,
+        })
+    }
+
+    #[tokio::test]
+    async fn transcode_add_503_when_mutation_unwired() {
+        let state = test_state(vec![]);
+        let app = build_router(state);
+        let response = app
+            .oneshot(post_add("/api/v1/transcode/ladders", add_body("720p")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn transcode_add_400_on_invalid_name() {
+        let state = test_state(vec![]).with_transcode_mutate(mutate_stub());
+        let app = build_router(state);
+        for bad in ["", "a/b"] {
+            let response = app
+                .clone()
+                .oneshot(post_add("/api/v1/transcode/ladders", add_body(bad)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "name {bad:?} must 400");
+        }
+    }
+
+    #[tokio::test]
+    async fn transcode_add_201_and_409() {
+        let state = test_state(vec![]).with_transcode_mutate(mutate_stub());
+        let app = build_router(state);
+        let ok = app
+            .clone()
+            .oneshot(post_add("/api/v1/transcode/ladders", add_body("360p")))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::CREATED);
+        let conflict = app
+            .oneshot(post_add("/api/v1/transcode/ladders", add_body("dup")))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn transcode_remove_200_404_503() {
+        // 503 unwired
+        let app = build_router(test_state(vec![]));
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/transcode/ladders/720p")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let app = build_router(test_state(vec![]).with_transcode_mutate(mutate_stub()));
+        let removed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/transcode/ladders/720p")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::OK);
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/transcode/ladders/ghost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn transcode_mutation_respects_admin_auth() {
+        let auth: SharedAuth = Arc::new(StaticAuthProvider::new(StaticAuthConfig {
+            admin_token: Some("secret".into()),
+            ..Default::default()
+        }));
+        let state = test_state(vec![]).with_auth(auth).with_transcode_mutate(mutate_stub());
+        let app = build_router(state);
+        // No token -> the header auth middleware rejects before the handler.
+        let response = app
+            .oneshot(post_add("/api/v1/transcode/ladders", add_body("720p")))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);

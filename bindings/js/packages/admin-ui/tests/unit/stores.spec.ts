@@ -209,6 +209,34 @@ describe('per-resource stores', () => {
     expect(s.error).toContain('HTTP 500');
   });
 
+  it('transcode.addRendition calls client.addRendition then refetches', async () => {
+    const addSpy = vi.fn().mockResolvedValue(undefined);
+    const listSpy = vi.fn().mockResolvedValue({ enabled: true, encoder: 'software', renditions: [], active: [] });
+    stubClient({ addRendition: addSpy, transcodeLadders: listSpy });
+    const s = useTranscodeStore();
+    const spec = { name: '360p', width: 640, height: 360, video_bitrate_kbps: 800, audio_bitrate_kbps: 96 };
+    await s.addRendition(spec);
+    expect(addSpy).toHaveBeenCalledWith(spec);
+    expect(listSpy).toHaveBeenCalledTimes(1); // refetch
+  });
+
+  it('transcode.removeRendition calls client.removeRendition then refetches', async () => {
+    const rmSpy = vi.fn().mockResolvedValue(undefined);
+    const listSpy = vi.fn().mockResolvedValue({ enabled: true, encoder: 'software', renditions: [], active: [] });
+    stubClient({ removeRendition: rmSpy, transcodeLadders: listSpy });
+    const s = useTranscodeStore();
+    await s.removeRendition('480p');
+    expect(rmSpy).toHaveBeenCalledWith('480p');
+    expect(listSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('transcode.addRendition propagates client errors (e.g. 409)', async () => {
+    const addSpy = vi.fn().mockRejectedValue(new Error('POST /api/v1/transcode/ladders: HTTP 409 Conflict'));
+    stubClient({ addRendition: addSpy, transcodeLadders: vi.fn() });
+    const s = useTranscodeStore();
+    await expect(s.addRendition({ name: 'dup', width: 1, height: 1, video_bitrate_kbps: 1, audio_bitrate_kbps: 1 })).rejects.toThrow('409');
+  });
+
   it('agents.fetch calls client.agents', async () => {
     const spy = vi.fn().mockResolvedValue({
       enabled: true,

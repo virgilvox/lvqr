@@ -197,14 +197,20 @@ impl TranscodeRunnerHandle {
 
     /// Add a rendition factory to the live ladder. New broadcasts pick it up
     /// via the `on_entry_created` callback; already-live sources get a drain
-    /// task spawned retroactively. No-op returning `false` when a factory for
-    /// the same rendition name is already registered (the caller should map
-    /// that to a 409). Must be called from within a tokio runtime.
+    /// task spawned retroactively. No-op returning `false` when a factory with
+    /// the same `(name, rendition)` is already registered (the caller should
+    /// map that to a 409). Note a single rendition legitimately carries
+    /// multiple factories of different names -- e.g. a `"software"` video
+    /// encoder plus an `"audio-passthrough"` -- so the guard keys on the
+    /// `(factory name, rendition)` pair, not the rendition name alone. Must be
+    /// called from within a tokio runtime.
     pub fn add_rendition(&self, factory: Arc<dyn TranscoderFactory>) -> bool {
-        let name = factory.rendition().name.clone();
         {
             let mut factories = self.inner.factories.write();
-            if factories.iter().any(|f| f.rendition().name == name) {
+            if factories
+                .iter()
+                .any(|f| f.name() == factory.name() && f.rendition().name == factory.rendition().name)
+            {
                 return false;
             }
             factories.push(Arc::clone(&factory));
@@ -753,6 +759,43 @@ mod tests {
             0,
             "output-shaped broadcast must not be transcoded"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_factories_share_a_rendition_name() {
+        // A rendition carries both a video encoder and an audio passthrough
+        // (different factory names, same rendition). The dup guard keys on
+        // (factory name, rendition), so both must register; removing the
+        // rendition drops both.
+        struct AltFactory {
+            rendition: RenditionSpec,
+        }
+        impl TranscoderFactory for AltFactory {
+            fn name(&self) -> &str {
+                "alt"
+            }
+            fn rendition(&self) -> &RenditionSpec {
+                &self.rendition
+            }
+            fn build(&self, _ctx: &TranscoderContext) -> Option<Box<dyn Transcoder>> {
+                None
+            }
+        }
+
+        let registry = FragmentBroadcasterRegistry::new();
+        let handle = TranscodeRunner::new()
+            .with_factory(PassthroughTranscoderFactory::new(RenditionSpec::preset_720p()))
+            .install(&registry);
+
+        // Same rendition "720p", different factory name "alt" -> accepted.
+        assert!(handle.add_rendition(Arc::new(AltFactory {
+            rendition: RenditionSpec::preset_720p(),
+        })));
+        assert_eq!(handle.renditions().len(), 2, "two factories, both for 720p");
+
+        // Removing the rendition drops both factories.
+        handle.remove_rendition("720p");
+        assert!(handle.renditions().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

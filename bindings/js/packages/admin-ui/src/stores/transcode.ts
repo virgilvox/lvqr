@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia';
 import { ref } from 'vue';
-import type { TranscodeState } from '@lvqr/core';
+import type { RenditionInfo, TranscodeState } from '@lvqr/core';
 import { useConnectionStore } from './connection';
 
 /**
@@ -25,5 +25,21 @@ export const useTranscodeStore = defineStore('transcode', () => {
     }
   }
 
-  return { state, error, lastFetchedAt, fetch };
+  /** Add a rendition at runtime, then refresh. Throws on failure (e.g. 409). */
+  async function addRendition(spec: RenditionInfo): Promise<void> {
+    const conn = useConnectionStore();
+    if (!conn.client) throw new Error('no active connection');
+    await conn.client.addRendition(spec);
+    await fetch();
+  }
+
+  /** Remove a rendition at runtime, then refresh. Throws on failure (e.g. 404). */
+  async function removeRendition(name: string): Promise<void> {
+    const conn = useConnectionStore();
+    if (!conn.client) throw new Error('no active connection');
+    await conn.client.removeRendition(name);
+    await fetch();
+  }
+
+  return { state, error, lastFetchedAt, fetch, addRendition, removeRendition };
 });

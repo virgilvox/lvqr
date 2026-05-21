@@ -1141,56 +1141,117 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         })
     });
 
-    // Read-only transcode-ladder introspection for
-    // `GET /api/v1/transcode/ladders`. Surfaces the configured ladder
-    // (declaration order) plus live per-output counters from the runner
-    // handle. Only wired on `transcode`-feature builds; otherwise the
-    // route reports `enabled: false` via the AdminState default. The
-    // ladder is configured at startup, so this is introspection, not
-    // mutation (runtime CRUD is a separate, later surface).
+    // Transcode-ladder introspection + runtime CRUD for
+    // `/api/v1/transcode/ladders`. Wired only on `transcode`-feature builds
+    // with a runner installed (a startup ladder); otherwise the route
+    // reports `enabled: false` and mutation 503s via the AdminState default.
+    // The introspection closure reads the runner's LIVE ladder so it reflects
+    // runtime add/remove edits, and the mutation closure builds the concrete
+    // encoder factory (video per `--transcode-encoder` + an audio
+    // passthrough) and applies it through the runner handle.
     #[cfg(feature = "transcode")]
-    let admin_state = {
-        let renditions: Vec<lvqr_admin::RenditionInfo> = config
-            .transcode_renditions
-            .iter()
-            .map(|r| lvqr_admin::RenditionInfo {
-                name: r.name.clone(),
-                width: r.width,
-                height: r.height,
-                video_bitrate_kbps: r.video_bitrate_kbps,
-                audio_bitrate_kbps: r.audio_bitrate_kbps,
-            })
-            .collect();
+    let admin_state = if let Some(handle) = transcode_runner_handle.clone() {
         let encoder = config.transcode_encoder.as_str().to_string();
-        let handle = transcode_runner_handle.clone();
-        admin_state.with_transcode(move || {
-            let active: Vec<lvqr_admin::TranscodeActiveStats> = handle
-                .as_ref()
-                .map(|h| {
-                    h.tracked()
-                        .into_iter()
-                        .map(|(transcoder, rendition, broadcast, track)| {
-                            let fragments_seen = h.fragments_seen(&transcoder, &rendition, &broadcast, &track);
-                            let panics = h.panics(&transcoder, &rendition, &broadcast, &track);
-                            lvqr_admin::TranscodeActiveStats {
-                                transcoder,
-                                rendition,
-                                broadcast,
-                                track,
-                                fragments_seen,
-                                panics,
-                            }
-                        })
-                        .collect()
+        let handle_intro = handle.clone();
+        let admin_state = admin_state.with_transcode(move || {
+            let renditions: Vec<lvqr_admin::RenditionInfo> = handle_intro
+                .renditions()
+                .into_iter()
+                .map(|r| lvqr_admin::RenditionInfo {
+                    name: r.name,
+                    width: r.width,
+                    height: r.height,
+                    video_bitrate_kbps: r.video_bitrate_kbps,
+                    audio_bitrate_kbps: r.audio_bitrate_kbps,
                 })
-                .unwrap_or_default();
+                .collect();
+            let active: Vec<lvqr_admin::TranscodeActiveStats> = handle_intro
+                .tracked()
+                .into_iter()
+                .map(|(transcoder, rendition, broadcast, track)| {
+                    let fragments_seen = handle_intro.fragments_seen(&transcoder, &rendition, &broadcast, &track);
+                    let panics = handle_intro.panics(&transcoder, &rendition, &broadcast, &track);
+                    lvqr_admin::TranscodeActiveStats {
+                        transcoder,
+                        rendition,
+                        broadcast,
+                        track,
+                        fragments_seen,
+                        panics,
+                    }
+                })
+                .collect();
             lvqr_admin::TranscodeState {
                 enabled: !renditions.is_empty(),
                 encoder: encoder.clone(),
-                renditions: renditions.clone(),
+                renditions,
                 active,
             }
-        })
+        });
+
+        let registry_for_mutate = shared_registry.clone();
+        let encoder_kind = config.transcode_encoder;
+        admin_state.with_transcode_mutate(Arc::new(move |mutation| match mutation {
+            lvqr_admin::TranscodeMutation::Add(info) => {
+                let spec = lvqr_transcode::RenditionSpec::new(
+                    info.name,
+                    info.width,
+                    info.height,
+                    info.video_bitrate_kbps,
+                    info.audio_bitrate_kbps,
+                );
+                // Skip suffixes for the new factories = the current ladder's
+                // names. The runner's own output guard is the load-bearing
+                // protection, but this keeps the factories consistent too.
+                let skip: Vec<String> = handle.renditions().into_iter().map(|r| r.name).collect();
+                let video: Arc<dyn lvqr_transcode::TranscoderFactory> = match encoder_kind {
+                    config::TranscodeEncoderKind::Software => Arc::new(
+                        lvqr_transcode::SoftwareTranscoderFactory::new(spec.clone(), registry_for_mutate.clone())
+                            .skip_source_suffixes(skip.clone()),
+                    ),
+                    #[cfg(feature = "hw-videotoolbox")]
+                    config::TranscodeEncoderKind::VideoToolbox => Arc::new(
+                        lvqr_transcode::VideoToolboxTranscoderFactory::new(spec.clone(), registry_for_mutate.clone())
+                            .skip_source_suffixes(skip.clone()),
+                    ),
+                    #[cfg(feature = "hw-nvenc")]
+                    config::TranscodeEncoderKind::Nvenc => Arc::new(
+                        lvqr_transcode::NvencTranscoderFactory::new(spec.clone(), registry_for_mutate.clone())
+                            .skip_source_suffixes(skip.clone()),
+                    ),
+                    #[cfg(feature = "hw-vaapi")]
+                    config::TranscodeEncoderKind::Vaapi => Arc::new(
+                        lvqr_transcode::VaapiTranscoderFactory::new(spec.clone(), registry_for_mutate.clone())
+                            .skip_source_suffixes(skip.clone()),
+                    ),
+                    #[cfg(feature = "hw-qsv")]
+                    config::TranscodeEncoderKind::Qsv => Arc::new(
+                        lvqr_transcode::QsvTranscoderFactory::new(spec.clone(), registry_for_mutate.clone())
+                            .skip_source_suffixes(skip.clone()),
+                    ),
+                };
+                if !handle.add_rendition(video) {
+                    return lvqr_admin::TranscodeMutateResult::Conflict;
+                }
+                // Audio passthrough for the same rendition (a rendition is
+                // video + audio, mirroring the startup install path).
+                let audio: Arc<dyn lvqr_transcode::TranscoderFactory> = Arc::new(
+                    lvqr_transcode::AudioPassthroughTranscoderFactory::new(spec, registry_for_mutate.clone())
+                        .skip_source_suffixes(skip),
+                );
+                handle.add_rendition(audio);
+                lvqr_admin::TranscodeMutateResult::Added
+            }
+            lvqr_admin::TranscodeMutation::Remove(name) => {
+                if !handle.renditions().iter().any(|r| r.name == name) {
+                    return lvqr_admin::TranscodeMutateResult::NotFound;
+                }
+                handle.remove_rendition(&name);
+                lvqr_admin::TranscodeMutateResult::Removed
+            }
+        }))
+    } else {
+        admin_state
     };
 
     // Read-only in-process agent introspection for `GET /api/v1/agents`.
