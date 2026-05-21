@@ -175,7 +175,7 @@ pub struct WasmFilterSlotStats {
 /// track)` the runner has observed -- so an operator can see which source
 /// broadcasts are currently being transcoded into which renditions and how
 /// many fragments each output has produced.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscodeState {
     pub enabled: bool,
     /// Encoder backend label: `"software"`, `"videotoolbox"`, `"nvenc"`,
@@ -189,7 +189,7 @@ pub struct TranscodeState {
 /// One configured rendition in the transcode ladder. Mirrors the operator
 /// `lvqr_transcode::RenditionSpec` without the admin crate taking a
 /// `lvqr-transcode` dependency.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenditionInfo {
     pub name: String,
     pub width: u32,
@@ -203,7 +203,7 @@ pub struct RenditionInfo {
 /// `(broadcast, track)`; `panics` is the count of caught panics across the
 /// transcoder's lifecycle hooks (a non-zero value flags an unhealthy
 /// encoder). Atomic snapshots; may drift a fragment or two between reads.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscodeActiveStats {
     pub transcoder: String,
     pub rendition: String,
