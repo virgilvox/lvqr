@@ -79,6 +79,17 @@ impl RunnerInner {
         if self.tasks.contains_key(&key) {
             return false;
         }
+        // Never transcode a transcode OUTPUT. Outputs are named
+        // `<source>/<rendition>`, so the broadcast's final path segment is a
+        // rendition name. Checking against the LIVE ladder (not a per-factory
+        // frozen skip list) is what makes runtime `add_rendition` safe: a
+        // newly added rendition must not transcode another rendition's output
+        // (which would recurse), and the pre-existing factories' frozen skip
+        // lists do not know the new rendition's name.
+        let last_seg = broadcast.rsplit('/').next().unwrap_or(broadcast);
+        if self.factories.read().iter().any(|f| f.rendition().name == last_seg) {
+            return false;
+        }
         let ctx = TranscoderContext {
             broadcast: broadcast.to_string(),
             track: track.to_string(),
@@ -717,6 +728,31 @@ mod tests {
         let names: Vec<String> = handle.renditions().iter().map(|r| r.name.clone()).collect();
         assert!(!names.contains(&"480p".to_string()), "480p gone from ladder: {names:?}");
         assert!(names.contains(&"720p".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn does_not_transcode_a_rendition_output_broadcast() {
+        // A broadcast whose final segment matches a rendition name is a
+        // transcode output and must never be (re-)transcoded, or runtime adds
+        // would recurse. The source "live/x" is transcoded; the output-shaped
+        // "live/x/720p" is skipped.
+        let registry = FragmentBroadcasterRegistry::new();
+        let handle = TranscodeRunner::new()
+            .with_factory(PassthroughTranscoderFactory::new(RenditionSpec::preset_720p()))
+            .install(&registry);
+
+        let src = registry.get_or_create("live/x", "0.mp4", meta());
+        let output = registry.get_or_create("live/x/720p", "0.mp4", meta());
+        src.emit(frag(0));
+        output.emit(frag(0));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(handle.fragments_seen("passthrough", "720p", "live/x", "0.mp4"), 1);
+        assert_eq!(
+            handle.fragments_seen("passthrough", "720p", "live/x/720p", "0.mp4"),
+            0,
+            "output-shaped broadcast must not be transcoded"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
