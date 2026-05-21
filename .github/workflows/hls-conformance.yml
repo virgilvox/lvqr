@@ -55,7 +55,9 @@ jobs:
           prefix-key: hls-conformance-v1
 
       - name: Install ffmpeg
-        run: brew install ffmpeg
+        # coreutils provides `gtimeout` -- macOS has no GNU `timeout`,
+        # which the publish-retry loop below uses to bound each attempt.
+        run: brew install ffmpeg coreutils
 
       - name: Locate mediastreamvalidator
         id: msv_locate
@@ -142,12 +144,12 @@ jobs:
           # `Error opening output: Input/output error` and then stalls on
           # cleanup (the lane's recurring flake). Real RTMP clients
           # reconnect; mirror that with up to 3 attempts, each bounded by
-          # `timeout 60` so a stuck attempt is killed fast rather than
-          # hanging the whole step.
+          # `gtimeout 60` (GNU coreutils -- macOS has no `timeout`) so a
+          # stuck attempt is killed fast rather than hanging the step.
           published=""
           for attempt in 1 2 3; do
             echo "ffmpeg RTMP publish attempt ${attempt}/3"
-            if timeout 60 ffmpeg -hide_banner -loglevel warning \
+            if gtimeout 60 ffmpeg -hide_banner -loglevel warning \
               -re \
               -f lavfi -i testsrc=size=640x360:rate=30 \
               -f lavfi -i sine=frequency=440:sample_rate=44100 \
