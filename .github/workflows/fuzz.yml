@@ -90,6 +90,24 @@ jobs:
             fuzz_dir: crates/lvqr-cmaf/fuzz
           - target: playlist_builder
             fuzz_dir: crates/lvqr-hls/fuzz
+          # Adversarial network/publisher parsers wired in from the
+          # session-172 backlog: SCTE-35 (RTMP onCuePoint), MPEG-TS
+          # demux, and the RTSP RTP request/header/depacketizer paths.
+          # All consume untrusted wire bytes and must never panic.
+          - target: parse_scte35
+            fuzz_dir: crates/lvqr-codec/fuzz
+          - target: ts_demux
+            fuzz_dir: crates/lvqr-codec/fuzz
+          - target: parse_rtsp_request
+            fuzz_dir: crates/lvqr-rtsp/fuzz
+          - target: parse_rtp_header
+            fuzz_dir: crates/lvqr-rtsp/fuzz
+          - target: depack_h264
+            fuzz_dir: crates/lvqr-rtsp/fuzz
+          - target: depack_hevc
+            fuzz_dir: crates/lvqr-rtsp/fuzz
+          - target: depack_aac
+            fuzz_dir: crates/lvqr-rtsp/fuzz
     steps:
       - uses: actions/checkout@v4
 
