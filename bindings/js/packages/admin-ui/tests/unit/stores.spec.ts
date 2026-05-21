@@ -10,6 +10,7 @@ import { useConfigReloadStore } from '../../src/stores/configReload';
 import { useWasmFilterStore } from '../../src/stores/wasmFilter';
 import { useHealthStore } from '../../src/stores/health';
 import { useClusterStore } from '../../src/stores/cluster';
+import { useStreamDetailStore } from '../../src/stores/streamDetail';
 
 // Sanity-test every per-resource store by stubbing the active connection's
 // LvqrAdminClient and asserting that a store fetch hits the right method.
@@ -129,6 +130,56 @@ describe('per-resource stores', () => {
     await s.fetch();
     expect(spy).toHaveBeenCalledTimes(1);
     expect(s.state?.chain_length).toBe(1);
+  });
+
+  it('streamDetail.fetch calls client.streamDetail and populates tracks', async () => {
+    const spy = vi.fn().mockResolvedValue({
+      name: 'live/demo',
+      subscribers: 3,
+      tracks: [{ track: '0.mp4', kind: 'video', codec: 'avc1.640028', timescale: 90000, fragments: 12, subscribers: 3, lagged_skips: 0 }],
+    });
+    stubClient({ streamDetail: spy });
+    const s = useStreamDetailStore();
+    await s.fetch('live/demo');
+    expect(spy).toHaveBeenCalledWith('live/demo');
+    expect(s.detail?.tracks).toHaveLength(1);
+    expect(s.offline).toBe(false);
+    expect(s.error).toBeNull();
+  });
+
+  it('streamDetail.fetch flips offline=true when client returns null (404)', async () => {
+    const spy = vi.fn().mockResolvedValue(null);
+    stubClient({ streamDetail: spy });
+    const s = useStreamDetailStore();
+    await s.fetch('live/missing');
+    expect(s.offline).toBe(true);
+    expect(s.detail).toBeNull();
+    expect(s.error).toBeNull();
+  });
+
+  it('streamDetail.fetch captures transport errors without throwing', async () => {
+    const spy = vi.fn().mockRejectedValue(new Error('HTTP 500'));
+    stubClient({ streamDetail: spy });
+    const s = useStreamDetailStore();
+    await s.fetch('live/demo');
+    expect(s.error).toContain('HTTP 500');
+    expect(s.loading).toBe(false);
+  });
+
+  it('streamDetail.fetch resets prior broadcast data on name change', async () => {
+    const spy = vi
+      .fn()
+      .mockResolvedValueOnce({ name: 'live/a', subscribers: 1, tracks: [{ track: '0.mp4', kind: 'video', codec: 'avc1', timescale: 90000, fragments: 1, subscribers: 1, lagged_skips: 0 }] })
+      .mockResolvedValueOnce(null);
+    stubClient({ streamDetail: spy });
+    const s = useStreamDetailStore();
+    await s.fetch('live/a');
+    expect(s.detail?.name).toBe('live/a');
+    await s.fetch('live/b');
+    // switching name to one the relay 404s -> detail cleared, offline set
+    expect(s.current).toBe('live/b');
+    expect(s.offline).toBe(true);
+    expect(s.detail).toBeNull();
   });
 
   it('health.fetch calls client.healthz', async () => {

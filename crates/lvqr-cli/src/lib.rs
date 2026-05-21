@@ -141,6 +141,37 @@ use crate::ws::{WsRelayState, spawn_recordings, ws_ingest_handler, ws_relay_hand
 /// `Option<SharedAuth>` so the open-auth case threads `None` through and
 /// the classifier stays honest even after the streamkey-CRUD wrap inside
 /// `start()` replaces the inner provider with a `MultiKeyAuthProvider`.
+/// Classify a registry track for the `GET /api/v1/streams/{name}` detail
+/// view. Special LVQR sidecar tracks are matched by id first; otherwise the
+/// RFC 6381 codec prefix decides video vs audio. Presentation hint only --
+/// the relay treats every track uniformly on the wire.
+fn track_kind(track: &str, codec: &str) -> &'static str {
+    match track {
+        "scte35" => return "scte35",
+        "captions" => return "captions",
+        "0.timing" => return "timing",
+        t if t.ends_with(".catalog") || t == ".catalog" => return "catalog",
+        _ => {}
+    }
+    let codec = codec.to_ascii_lowercase();
+    if codec.starts_with("avc1")
+        || codec.starts_with("avc3")
+        || codec.starts_with("hvc1")
+        || codec.starts_with("hev1")
+        || codec.starts_with("vp08")
+        || codec.starts_with("vp09")
+        || codec.starts_with("vp8")
+        || codec.starts_with("vp9")
+        || codec.starts_with("av01")
+    {
+        "video"
+    } else if codec.starts_with("mp4a") || codec.starts_with("opus") || codec.starts_with("ac-3") {
+        "audio"
+    } else {
+        "data"
+    }
+}
+
 fn classify_auth_mode(config: &ServeConfig) -> &'static str {
     classify_auth_mode_inner(config.auth.is_some(), &config.auth_boot)
 }
@@ -1012,6 +1043,7 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let metrics_state = relay.metrics().clone();
     let registry_for_stats = shared_registry.clone();
     let registry_for_streams = shared_registry.clone();
+    let registry_for_detail = shared_registry.clone();
 
     let admin_state = lvqr_admin::AdminState::new(
         move || {
@@ -1073,6 +1105,41 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // so `GET /api/v1/slo` returns per-(broadcast, transport)
     // p50 / p95 / p99 / max samples.
     let admin_state = admin_state.with_slo(slo_tracker.clone());
+
+    // Per-broadcast detail for `GET /api/v1/streams/{name}`. Introspects the
+    // shared registry for every track whose broadcast matches, surfacing the
+    // codec / fragment / subscriber / lag counters the operator console's
+    // stream-detail view renders. Returns None (-> 404) when no track exists.
+    let admin_state = admin_state.with_stream_detail(move |name| {
+        let mut tracks: Vec<lvqr_admin::TrackInfo> = registry_for_detail
+            .keys()
+            .into_iter()
+            .filter(|(broadcast, _track)| broadcast == name)
+            .filter_map(|(broadcast, track)| {
+                let b = registry_for_detail.get(&broadcast, &track)?;
+                let meta = b.meta();
+                Some(lvqr_admin::TrackInfo {
+                    kind: track_kind(&track, &meta.codec).to_string(),
+                    track,
+                    codec: meta.codec,
+                    timescale: meta.timescale,
+                    fragments: b.emitted_count(),
+                    subscribers: b.subscriber_count(),
+                    lagged_skips: b.lagged_skips(),
+                })
+            })
+            .collect();
+        if tracks.is_empty() {
+            return None;
+        }
+        tracks.sort_by(|a, b| a.track.cmp(&b.track));
+        let subscribers = tracks.iter().map(|t| t.subscribers).max().unwrap_or(0);
+        Some(lvqr_admin::StreamDetailInfo {
+            name: name.to_string(),
+            subscribers,
+            tracks,
+        })
+    });
 
     // Session 146: wire the runtime stream-key store into the
     // admin router. When streamkeys_enabled is false the store is
@@ -1727,6 +1794,34 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
 
 // Auth middleware extracted to `crate::auth_middleware`.
 // WS relay + ingest + recorder event bridge extracted to `crate::ws`.
+
+#[cfg(test)]
+mod track_kind_tests {
+    use super::track_kind;
+
+    #[test]
+    fn sidecar_tracks_match_by_id() {
+        assert_eq!(track_kind("scte35", ""), "scte35");
+        assert_eq!(track_kind("captions", ""), "captions");
+        assert_eq!(track_kind("0.timing", ""), "timing");
+        assert_eq!(track_kind("0.catalog", ""), "catalog");
+    }
+
+    #[test]
+    fn codec_prefix_decides_video_audio() {
+        assert_eq!(track_kind("0.mp4", "avc1.640028"), "video");
+        assert_eq!(track_kind("0.mp4", "hvc1.1.6.L93.B0"), "video");
+        assert_eq!(track_kind("0.mp4", "av01.0.04M.08"), "video");
+        assert_eq!(track_kind("1.mp4", "mp4a.40.2"), "audio");
+        assert_eq!(track_kind("1.mp4", "opus"), "audio");
+    }
+
+    #[test]
+    fn unknown_codec_is_data() {
+        assert_eq!(track_kind("x.bin", "application/octet-stream"), "data");
+        assert_eq!(track_kind("x.bin", ""), "data");
+    }
+}
 
 #[cfg(test)]
 mod auth_mode_classifier_tests {

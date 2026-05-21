@@ -66,6 +66,12 @@ describe('LvqrAdminClient against a running lvqr', () => {
     }
   });
 
+  it('streamDetail resolves null for an offline broadcast', async () => {
+    // No publisher in the test harness, so any name 404s -> null.
+    const detail = await admin.streamDetail('live/never-published');
+    expect(detail).toBeNull();
+  });
+
   it('mesh returns a MeshState shape', async () => {
     const mesh = await admin.mesh();
     expect(typeof mesh.enabled).toBe('boolean');

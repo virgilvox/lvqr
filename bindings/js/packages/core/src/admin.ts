@@ -18,6 +18,42 @@ export interface StreamInfo {
 }
 
 /**
+ * Per-track counters for a broadcast, surfaced by
+ * `GET /api/v1/streams/{name}`. Mirrors `lvqr_admin::TrackInfo`. `kind`
+ * is a presentation hint derived server-side from the track id and codec
+ * (`"video"` / `"audio"` / `"captions"` / `"scte35"` / `"timing"` /
+ * `"catalog"` / `"data"`); the relay treats every track uniformly.
+ */
+export interface TrackInfo {
+  /** Track id, e.g. `"0.mp4"`, `"1.mp4"`, `"captions"`. */
+  track: string;
+  /** Presentation grouping hint. */
+  kind: string;
+  /** RFC 6381 codec string, e.g. `"avc1.640028"`. */
+  codec: string;
+  /** Media timescale (90000 for typical video; sample rate for audio). */
+  timescale: number;
+  /** Total fragments emitted on this track since broadcast start. */
+  fragments: number;
+  /** Live subscriber count on this track's broadcast channel. */
+  subscribers: number;
+  /** Fragments dropped to lagging subscribers. */
+  lagged_skips: number;
+}
+
+/**
+ * Per-broadcast detail surfaced by `GET /api/v1/streams/{name}`. Mirrors
+ * `lvqr_admin::StreamDetailInfo`. `subscribers` is the busiest track's
+ * subscriber count. The route returns HTTP 404 when no track for the
+ * broadcast is currently registered.
+ */
+export interface StreamDetailInfo {
+  name: string;
+  subscribers: number;
+  tracks: TrackInfo[];
+}
+
+/**
  * Per-peer offload stats surfaced by `GET /api/v1/mesh`. Mirrors
  * `lvqr_admin::MeshPeerStats`. `intended_children` reflects what the
  * topology planner assigned; `forwarded_frames` reflects the
@@ -403,6 +439,26 @@ export class LvqrAdminClient {
   /** `GET /api/v1/streams` -- list of active broadcasts. */
   async listStreams(): Promise<StreamInfo[]> {
     return this.getJson<StreamInfo[]>('/api/v1/streams');
+  }
+
+  /**
+   * `GET /api/v1/streams/{name}` -- per-broadcast track detail. The
+   * broadcast name is URL-encoded so names containing `/` (e.g.
+   * `"live/demo"`) address the path segment correctly. Resolves to
+   * `null` when the relay has no track for the broadcast (HTTP 404),
+   * letting callers render an "offline" state instead of an error;
+   * any other non-2xx still throws.
+   */
+  async streamDetail(name: string): Promise<StreamDetailInfo | null> {
+    const path = `/api/v1/streams/${encodeURIComponent(name)}`;
+    const resp = await this.fetchWithTimeout(`${this.baseUrl}${path}`);
+    if (resp.status === 404) {
+      return null;
+    }
+    if (!resp.ok) {
+      throw new Error(`GET ${path}: HTTP ${resp.status} ${resp.statusText}`);
+    }
+    return (await resp.json()) as StreamDetailInfo;
   }
 
   /** `GET /api/v1/mesh` -- current peer-mesh state. */

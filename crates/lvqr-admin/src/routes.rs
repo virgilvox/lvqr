@@ -1,4 +1,4 @@
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -17,6 +17,44 @@ use std::sync::Arc;
 pub struct StreamInfo {
     pub name: String,
     pub subscribers: usize,
+}
+
+/// Per-broadcast detail returned by `GET /api/v1/streams/{name}`.
+///
+/// Built by introspecting the `FragmentBroadcasterRegistry` for every
+/// `(broadcast, track)` entry whose broadcast matches `name`. The list
+/// route `GET /api/v1/streams` stays a lean `{name, subscribers}` shape;
+/// this route carries the heavier per-track breakdown so the operator
+/// console's stream-detail view does not pay for it on every poll of the
+/// list. `subscribers` is the maximum per-track subscriber count across
+/// the broadcast's tracks (each egress transport subscribes per track, so
+/// the busiest track is the truest "viewers" proxy without a dedicated
+/// session counter). Returns 404 when no track for `name` exists.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StreamDetailInfo {
+    pub name: String,
+    pub subscribers: usize,
+    pub tracks: Vec<TrackInfo>,
+}
+
+/// Per-track counters for a broadcast, exposed via
+/// `GET /api/v1/streams/{name}`. `kind` is derived from the track id and
+/// RFC 6381 `codec` string (video / audio / captions / scte35 / catalog /
+/// data) for display grouping; the relay treats every track uniformly so
+/// `kind` is a presentation hint, not a wire distinction. Counters are
+/// atomic snapshots and may drift by a fragment or two between reads.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TrackInfo {
+    pub track: String,
+    pub kind: String,
+    pub codec: String,
+    pub timescale: u32,
+    /// Total fragments emitted on this track since broadcast start.
+    pub fragments: u64,
+    /// Live subscriber count on this track's broadcast channel.
+    pub subscribers: usize,
+    /// Fragments dropped to lagging subscribers (broadcast-channel skips).
+    pub lagged_skips: u64,
 }
 
 /// Mesh state returned by the API.
@@ -126,6 +164,11 @@ pub struct WasmFilterSlotStats {
 /// metrics. Set up by Phase 4 (metrics).
 pub type MetricsRender = Arc<dyn Fn() -> String + Send + Sync>;
 
+/// Snapshot closure backing `GET /api/v1/streams/{name}`. Takes a broadcast
+/// name and returns its per-track detail, or `None` (-> 404) when no track
+/// for that broadcast is registered.
+pub type StreamDetailFn = Arc<dyn Fn(&str) -> Option<StreamDetailInfo> + Send + Sync>;
+
 /// Shared state for the admin API.
 ///
 /// Uses callbacks so the admin crate doesn't depend on relay or ingest types.
@@ -190,6 +233,13 @@ pub struct AdminState {
     /// bound + features) so dashboards can pre-bake the response
     /// shape before the CLI is wired.
     server_info: Option<crate::server_info_routes::ServerInfoFn>,
+    /// Per-broadcast detail closure backing `GET /api/v1/streams/{name}`.
+    /// Populated by [`AdminState::with_stream_detail`]; lvqr-cli's
+    /// composition root passes a closure that introspects the
+    /// `FragmentBroadcasterRegistry`. The default returns `None` for
+    /// every name so the route replies 404 until wired -- keeping the
+    /// admin crate free of a `lvqr-fragment` dependency.
+    get_stream_detail: StreamDetailFn,
 }
 
 impl AdminState {
@@ -223,6 +273,7 @@ impl AdminState {
             config_reload_status: None,
             config_reload_trigger: None,
             server_info: None,
+            get_stream_detail: Arc::new(|_name| None),
         }
     }
 
@@ -296,6 +347,19 @@ impl AdminState {
     /// chain_length: 0, broadcasts: []}`. PLAN Phase D session 137.
     pub fn with_wasm_filter(mut self, get: impl Fn() -> WasmFilterState + Send + Sync + 'static) -> Self {
         self.get_wasm_filter = Arc::new(get);
+        self
+    }
+
+    /// Wire the per-broadcast detail closure backing
+    /// `GET /api/v1/streams/{name}`. The closure receives the requested
+    /// broadcast name and returns `Some(detail)` when at least one track
+    /// for that broadcast exists, `None` otherwise (the route maps `None`
+    /// to 404). Without this call every name resolves to 404.
+    pub fn with_stream_detail(
+        mut self,
+        get: impl Fn(&str) -> Option<StreamDetailInfo> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_stream_detail = Arc::new(get);
         self
     }
 
@@ -404,6 +468,7 @@ pub fn build_router(state: AdminState) -> Router {
     let mut api_routes: Router<AdminState> = Router::new()
         .route("/api/v1/stats", get(get_stats))
         .route("/api/v1/streams", get(list_streams))
+        .route("/api/v1/streams/{name}", get(get_stream_detail))
         .route("/api/v1/mesh", get(get_mesh))
         .route("/api/v1/slo", get(get_slo))
         .route("/api/v1/wasm-filter", get(get_wasm_filter))
@@ -475,6 +540,18 @@ async fn get_stats(State(state): State<AdminState>) -> Result<Json<RelayStats>, 
 
 async fn list_streams(State(state): State<AdminState>) -> Result<Json<Vec<StreamInfo>>, AdminError> {
     Ok(Json((state.get_streams)()))
+}
+
+/// `GET /api/v1/streams/{name}` -- per-broadcast track breakdown. Returns
+/// 404 when no track for the broadcast is currently registered.
+async fn get_stream_detail(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+) -> Result<Json<StreamDetailInfo>, AdminError> {
+    match (state.get_stream_detail)(&name) {
+        Some(detail) => Ok(Json(detail)),
+        None => Err(AdminError::NotFound(format!("no active broadcast named {name:?}"))),
+    }
 }
 
 async fn get_mesh(State(state): State<AdminState>) -> Result<Json<MeshState>, AdminError> {
@@ -1451,5 +1528,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn stream_detail_404_when_unwired() {
+        let state = test_state(vec![("live/demo", 1)]);
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/streams/live%2Fdemo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn stream_detail_renders_wired_snapshot() {
+        let state = test_state(vec![]).with_stream_detail(|name| {
+            if name != "live/demo" {
+                return None;
+            }
+            Some(StreamDetailInfo {
+                name: name.to_string(),
+                subscribers: 3,
+                tracks: vec![
+                    TrackInfo {
+                        track: "0.mp4".into(),
+                        kind: "video".into(),
+                        codec: "avc1.640028".into(),
+                        timescale: 90_000,
+                        fragments: 120,
+                        subscribers: 3,
+                        lagged_skips: 0,
+                    },
+                    TrackInfo {
+                        track: "1.mp4".into(),
+                        kind: "audio".into(),
+                        codec: "mp4a.40.2".into(),
+                        timescale: 48_000,
+                        fragments: 240,
+                        subscribers: 2,
+                        lagged_skips: 1,
+                    },
+                ],
+            })
+        });
+        let app = build_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/streams/live%2Fdemo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let detail: StreamDetailInfo = serde_json::from_slice(&body).unwrap();
+        assert_eq!(detail.name, "live/demo");
+        assert_eq!(detail.subscribers, 3);
+        assert_eq!(detail.tracks.len(), 2);
+        assert_eq!(detail.tracks[0].track, "0.mp4");
+        assert_eq!(detail.tracks[0].kind, "video");
+        assert_eq!(detail.tracks[0].fragments, 120);
+        assert_eq!(detail.tracks[1].kind, "audio");
+        assert_eq!(detail.tracks[1].lagged_skips, 1);
+
+        // Unknown broadcast -> 404.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/streams/live%2Fmissing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
