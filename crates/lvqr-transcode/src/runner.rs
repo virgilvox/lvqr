@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
-use lvqr_fragment::{BroadcasterStream, FragmentBroadcasterRegistry, FragmentStream};
-use parking_lot::Mutex;
+use dashmap::mapref::entry::Entry;
+use lvqr_fragment::{BroadcasterStream, FragmentBroadcaster, FragmentBroadcasterRegistry, FragmentStream};
+use parking_lot::RwLock;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -39,25 +40,109 @@ pub struct TranscoderStats {
 /// live under separate keys so metrics distinguish them.
 type StatsKey = (String, String, String, String);
 
+/// Shared runner state held jointly by the registry `on_entry_created`
+/// callback and the [`TranscodeRunnerHandle`]. The factory set is mutable
+/// (behind an `RwLock`) so renditions can be added / removed at runtime;
+/// `tasks` is keyed per drain instance so a removed rendition can abort just
+/// its tasks; `registry` is a (cheap, shared) clone so a runtime-added
+/// rendition can retroactively spawn drain tasks against already-live
+/// sources.
+struct RunnerInner {
+    registry: FragmentBroadcasterRegistry,
+    factories: RwLock<Vec<Arc<dyn TranscoderFactory>>>,
+    tasks: DashMap<StatsKey, JoinHandle<()>>,
+    stats: DashMap<StatsKey, Arc<TranscoderStats>>,
+}
+
+impl RunnerInner {
+    /// Build + spawn a drain task for `factory` against the source
+    /// broadcaster `bc`, unless an identical instance is already running or
+    /// the factory opts out of this `(broadcast, track)`. Returns true iff a
+    /// task was spawned. Idempotent on the `StatsKey` so retroactive spawning
+    /// (runtime add) cannot race the `on_entry_created` callback into a
+    /// duplicate drain (which would double-produce output fragments).
+    fn spawn_for(
+        &self,
+        broadcast: &str,
+        track: &str,
+        bc: &Arc<FragmentBroadcaster>,
+        factory: &Arc<dyn TranscoderFactory>,
+    ) -> bool {
+        let rendition = factory.rendition().clone();
+        let key: StatsKey = (
+            factory.name().to_string(),
+            rendition.name.clone(),
+            broadcast.to_string(),
+            track.to_string(),
+        );
+        // Cheap pre-check before the (potentially slow) factory build.
+        if self.tasks.contains_key(&key) {
+            return false;
+        }
+        let ctx = TranscoderContext {
+            broadcast: broadcast.to_string(),
+            track: track.to_string(),
+            meta: bc.meta(),
+            rendition: rendition.clone(),
+        };
+        let Some(transcoder) = factory.build(&ctx) else {
+            return false;
+        };
+        let handle = match Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                warn!(
+                    broadcast = %broadcast,
+                    track = %track,
+                    "TranscodeRunner: no tokio runtime; no drain spawned",
+                );
+                return false;
+            }
+        };
+        // Reserve the key under the shard lock so a concurrent caller cannot
+        // also spawn this instance. Build happened above (outside the lock);
+        // if we lost the race the built transcoder is dropped here.
+        match self.tasks.entry(key.clone()) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                let sub = bc.subscribe();
+                let stat = Arc::clone(
+                    self.stats
+                        .entry(key.clone())
+                        .or_insert_with(|| Arc::new(TranscoderStats::default()))
+                        .value(),
+                );
+                let task = handle.spawn(drive(transcoder, key.0.clone(), ctx, sub, stat));
+                slot.insert(task);
+                true
+            }
+        }
+    }
+}
+
 /// Cheaply-cloneable handle returned by
 /// [`TranscodeRunner::install`].
 ///
 /// Holds the spawned per-transcoder drain tasks alive for the
 /// server lifetime; tests and admin consumers read per-
 /// `(transcoder, rendition, broadcast, track)` counters off this
-/// handle. Dropping it aborts every spawned task; mid-stride
-/// aborts do NOT call [`Transcoder::on_stop`], matching the
+/// handle. Mid-stride aborts (drop / [`Self::remove_rendition`]) do NOT
+/// call [`Transcoder::on_stop`], matching the
 /// [`lvqr_agent::AgentRunnerHandle`] shutdown shape.
+///
+/// The ladder is mutable at runtime via [`Self::add_rendition`] /
+/// [`Self::remove_rendition`]; [`Self::renditions`] reports the current set
+/// so introspection stays consistent with edits.
 #[derive(Clone)]
 pub struct TranscodeRunnerHandle {
-    stats: Arc<DashMap<StatsKey, Arc<TranscoderStats>>>,
-    _tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    inner: Arc<RunnerInner>,
 }
 
 impl std::fmt::Debug for TranscodeRunnerHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TranscodeRunnerHandle")
-            .field("tracked_keys", &self.stats.len())
+            .field("tracked_keys", &self.inner.stats.len())
+            .field("renditions", &self.inner.factories.read().len())
             .finish()
     }
 }
@@ -84,11 +169,67 @@ impl TranscodeRunnerHandle {
     /// Snapshot of every `(transcoder, rendition, broadcast, track)`
     /// quadruple the runner has spawned a drain task for.
     pub fn tracked(&self) -> Vec<StatsKey> {
-        self.stats.iter().map(|e| e.key().clone()).collect()
+        self.inner.stats.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// The current ladder's rendition specs, in registration order. Reflects
+    /// runtime [`Self::add_rendition`] / [`Self::remove_rendition`] edits, so
+    /// the admin introspection route stays consistent with the live ladder.
+    pub fn renditions(&self) -> Vec<crate::RenditionSpec> {
+        self.inner
+            .factories
+            .read()
+            .iter()
+            .map(|f| f.rendition().clone())
+            .collect()
+    }
+
+    /// Add a rendition factory to the live ladder. New broadcasts pick it up
+    /// via the `on_entry_created` callback; already-live sources get a drain
+    /// task spawned retroactively. No-op returning `false` when a factory for
+    /// the same rendition name is already registered (the caller should map
+    /// that to a 409). Must be called from within a tokio runtime.
+    pub fn add_rendition(&self, factory: Arc<dyn TranscoderFactory>) -> bool {
+        let name = factory.rendition().name.clone();
+        {
+            let mut factories = self.inner.factories.write();
+            if factories.iter().any(|f| f.rendition().name == name) {
+                return false;
+            }
+            factories.push(Arc::clone(&factory));
+        }
+        // Retroactively spawn against every already-live source. The factory
+        // opts out of non-source / wrong-kind tracks via `build()`.
+        for (broadcast, track) in self.inner.registry.keys() {
+            if let Some(bc) = self.inner.registry.get(&broadcast, &track) {
+                self.inner.spawn_for(&broadcast, &track, &bc, &factory);
+            }
+        }
+        true
+    }
+
+    /// Remove every factory + drain task for `rendition`. Returns the number
+    /// of drain tasks aborted. Aborting skips `on_stop`; the rendition's
+    /// already-published output broadcasters drain to their subscribers and
+    /// close when the source ends. Returns 0 when no such rendition exists.
+    pub fn remove_rendition(&self, rendition: &str) -> usize {
+        self.inner.factories.write().retain(|f| f.rendition().name != rendition);
+        let mut aborted = 0usize;
+        self.inner.tasks.retain(|key, task| {
+            if key.1 == rendition {
+                task.abort();
+                aborted += 1;
+                false
+            } else {
+                true
+            }
+        });
+        aborted
     }
 
     fn stat(&self, transcoder: &str, rendition: &str, broadcast: &str, track: &str) -> Option<Arc<TranscoderStats>> {
-        self.stats
+        self.inner
+            .stats
             .get(&(
                 transcoder.to_string(),
                 rendition.to_string(),
@@ -176,64 +317,29 @@ impl TranscodeRunner {
     /// runtime. If no tokio runtime is available the warn logs
     /// and no task spawns.
     pub fn install(self, registry: &FragmentBroadcasterRegistry) -> TranscodeRunnerHandle {
-        let stats: Arc<DashMap<StatsKey, Arc<TranscoderStats>>> = Arc::new(DashMap::new());
-        let tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::new(RunnerInner {
+            registry: registry.clone(),
+            factories: RwLock::new(self.factories),
+            tasks: DashMap::new(),
+            stats: DashMap::new(),
+        });
 
-        let factories = self.factories;
-        let stats_cb = Arc::clone(&stats);
-        let tasks_cb = Arc::clone(&tasks);
-
+        let inner_cb = Arc::clone(&inner);
         registry.on_entry_created(move |broadcast, track, bc| {
-            let handle = match Handle::try_current() {
-                Ok(h) => h,
-                Err(_) => {
-                    warn!(
-                        broadcast = %broadcast,
-                        track = %track,
-                        "TranscodeRunner: registry callback fired outside tokio runtime; no drain spawned",
-                    );
-                    return;
-                }
-            };
-
+            // Snapshot the current factory Arcs so a concurrent add/remove
+            // does not hold the read lock across the spawn loop.
+            let factories: Vec<Arc<dyn TranscoderFactory>> = inner_cb.factories.read().clone();
             for factory in &factories {
-                let rendition = factory.rendition().clone();
-                let ctx = TranscoderContext {
-                    broadcast: broadcast.to_string(),
-                    track: track.to_string(),
-                    meta: bc.meta(),
-                    rendition: rendition.clone(),
-                };
-                let Some(transcoder) = factory.build(&ctx) else {
-                    continue;
-                };
-
-                let sub = bc.subscribe();
-                let key: StatsKey = (
-                    factory.name().to_string(),
-                    rendition.name.clone(),
-                    broadcast.to_string(),
-                    track.to_string(),
-                );
-                let stat = Arc::clone(
-                    stats_cb
-                        .entry(key.clone())
-                        .or_insert_with(|| Arc::new(TranscoderStats::default()))
-                        .value(),
-                );
-                let factory_name = factory.name().to_string();
-                let ctx_for_task = ctx.clone();
-                let task = handle.spawn(drive(transcoder, factory_name, ctx_for_task, sub, stat));
-                tasks_cb.lock().push(task);
+                inner_cb.spawn_for(broadcast, track, bc, factory);
             }
         });
 
         info!(
-            tracked = stats.len(),
+            renditions = inner.factories.read().len(),
             "TranscodeRunner installed on FragmentBroadcasterRegistry",
         );
 
-        TranscodeRunnerHandle { stats, _tasks: tasks }
+        TranscodeRunnerHandle { inner }
     }
 }
 
@@ -538,6 +644,105 @@ mod tests {
     fn runner_default_is_empty() {
         let r = TranscodeRunner::default();
         assert_eq!(r.factory_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_rendition_spawns_for_existing_live_source() {
+        let registry = FragmentBroadcasterRegistry::new();
+        let handle = TranscodeRunner::new()
+            .with_factory(PassthroughTranscoderFactory::new(RenditionSpec::preset_720p()))
+            .install(&registry);
+
+        let bc = registry.get_or_create("live/x", "0.mp4", meta());
+        bc.emit(frag(0));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Add 480p at runtime; it must spawn a drain task against the
+        // already-live source.
+        assert!(handle.add_rendition(Arc::new(
+            PassthroughTranscoderFactory::new(RenditionSpec::preset_480p())
+        )));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        bc.emit(frag(1));
+        bc.emit(frag(2));
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        assert_eq!(handle.fragments_seen("passthrough", "720p", "live/x", "0.mp4"), 3);
+        let s480 = handle.fragments_seen("passthrough", "480p", "live/x", "0.mp4");
+        assert!(s480 >= 2, "runtime-added 480p must see post-add fragments; saw {s480}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_rendition_rejects_duplicate_name() {
+        let registry = FragmentBroadcasterRegistry::new();
+        let handle = TranscodeRunner::new()
+            .with_factory(PassthroughTranscoderFactory::new(RenditionSpec::preset_720p()))
+            .install(&registry);
+
+        // Same rendition name -> rejected.
+        assert!(!handle.add_rendition(Arc::new(
+            PassthroughTranscoderFactory::new(RenditionSpec::preset_720p())
+        )));
+        // Distinct name -> accepted.
+        assert!(handle.add_rendition(Arc::new(
+            PassthroughTranscoderFactory::new(RenditionSpec::preset_240p())
+        )));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_rendition_aborts_its_drain_and_leaves_others() {
+        let registry = FragmentBroadcasterRegistry::new();
+        let handle = TranscodeRunner::new()
+            .with_ladder(RenditionSpec::default_ladder(), PassthroughTranscoderFactory::new)
+            .install(&registry);
+
+        let bc = registry.get_or_create("live/r", "0.mp4", meta());
+        bc.emit(frag(0));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let aborted = handle.remove_rendition("480p");
+        assert_eq!(aborted, 1, "exactly the 480p drain task aborts");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        bc.emit(frag(1));
+        bc.emit(frag(2));
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let s720 = handle.fragments_seen("passthrough", "720p", "live/r", "0.mp4");
+        let s480 = handle.fragments_seen("passthrough", "480p", "live/r", "0.mp4");
+        assert!(s720 >= 3, "surviving 720p keeps draining; saw {s720}");
+        assert!(s480 < s720, "removed 480p stopped draining ({s480}) vs 720p ({s720})");
+
+        let names: Vec<String> = handle.renditions().iter().map(|r| r.name.clone()).collect();
+        assert!(!names.contains(&"480p".to_string()), "480p gone from ladder: {names:?}");
+        assert!(names.contains(&"720p".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renditions_reflects_runtime_edits() {
+        let registry = FragmentBroadcasterRegistry::new();
+        let handle = TranscodeRunner::new()
+            .with_factory(PassthroughTranscoderFactory::new(RenditionSpec::preset_720p()))
+            .install(&registry);
+
+        let names =
+            |h: &TranscodeRunnerHandle| -> Vec<String> { h.renditions().iter().map(|r| r.name.clone()).collect() };
+        assert_eq!(names(&handle), vec!["720p".to_string()]);
+
+        assert!(handle.add_rendition(Arc::new(
+            PassthroughTranscoderFactory::new(RenditionSpec::preset_480p())
+        )));
+        let mut after_add = names(&handle);
+        after_add.sort();
+        assert_eq!(after_add, vec!["480p".to_string(), "720p".to_string()]);
+
+        assert_eq!(
+            handle.remove_rendition("720p"),
+            0,
+            "no live source, so no task to abort"
+        );
+        assert_eq!(names(&handle), vec!["480p".to_string()]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
