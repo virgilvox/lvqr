@@ -213,6 +213,54 @@ pub struct TranscodeActiveStats {
     pub panics: u64,
 }
 
+/// In-process agent state returned by `GET /api/v1/agents`.
+///
+/// `enabled` reflects whether the binary was built with an agent feature
+/// (e.g. `whisper`) AND at least one agent was configured at startup. When
+/// false, both lists are empty and the route still returns 200. Read-only
+/// introspection of a startup-configured agent set; runtime start/stop is a
+/// separate CRUD surface for a later slice.
+///
+/// `agents` is the configured agent set; `active` carries one entry per live
+/// `(agent, broadcast, track)` the runner has observed, so an operator can
+/// see which broadcasts each agent is attached to plus its fragment / panic
+/// counters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentState {
+    pub enabled: bool,
+    pub agents: Vec<AgentInfo>,
+    #[serde(default)]
+    pub active: Vec<AgentActiveStats>,
+}
+
+/// One configured in-process agent. `name` is the agent's registry name
+/// (the track-id it publishes under, e.g. `"captions"`); `kind` is a
+/// display grouping. `model` / `window_ms` are agent-specific config (set
+/// for the Whisper captions agent); both are `None` for agents that do not
+/// use them. No secrets are exposed -- `model` is a local file path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub window_ms: Option<u32>,
+}
+
+/// Live per-attachment agent counters. `fragments_seen` is the cumulative
+/// fragment count the named agent has processed for `(broadcast, track)`;
+/// `panics` counts caught panics across the agent's lifecycle hooks (a
+/// non-zero value flags an unhealthy agent). Atomic snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentActiveStats {
+    pub agent: String,
+    pub broadcast: String,
+    pub track: String,
+    pub fragments_seen: u64,
+    pub panics: u64,
+}
+
 /// Provider for /metrics endpoint output. Returns Prometheus text-format
 /// metrics. Set up by Phase 4 (metrics).
 pub type MetricsRender = Arc<dyn Fn() -> String + Send + Sync>;
@@ -299,6 +347,11 @@ pub struct AdminState {
     /// indirection keeps `lvqr-admin` free of a `lvqr-transcode`
     /// dependency so non-transcode builds pay no graph cost.
     get_transcode: Arc<dyn Fn() -> TranscodeState + Send + Sync>,
+    /// Snapshot callback for the `GET /api/v1/agents` route. Populated by
+    /// [`AdminState::with_agents`]; defaults to a "no agents configured"
+    /// closure returning `enabled: false`. Keeps `lvqr-admin` free of any
+    /// agent-crate dependency.
+    get_agents: Arc<dyn Fn() -> AgentState + Send + Sync>,
 }
 
 impl AdminState {
@@ -337,6 +390,11 @@ impl AdminState {
                 enabled: false,
                 encoder: String::new(),
                 renditions: Vec::new(),
+                active: Vec::new(),
+            }),
+            get_agents: Arc::new(|| AgentState {
+                enabled: false,
+                agents: Vec::new(),
                 active: Vec::new(),
             }),
         }
@@ -434,6 +492,15 @@ impl AdminState {
     /// without it the route reports `enabled: false`.
     pub fn with_transcode(mut self, get: impl Fn() -> TranscodeState + Send + Sync + 'static) -> Self {
         self.get_transcode = Arc::new(get);
+        self
+    }
+
+    /// Wire the in-process agent snapshot closure backing
+    /// `GET /api/v1/agents`. The CLI composition root calls this only on
+    /// agent-feature builds (e.g. `whisper`) with a configured agent;
+    /// without it the route reports `enabled: false`.
+    pub fn with_agents(mut self, get: impl Fn() -> AgentState + Send + Sync + 'static) -> Self {
+        self.get_agents = Arc::new(get);
         self
     }
 
@@ -547,6 +614,7 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/api/v1/slo", get(get_slo))
         .route("/api/v1/wasm-filter", get(get_wasm_filter))
         .route("/api/v1/transcode/ladders", get(get_transcode))
+        .route("/api/v1/agents", get(get_agents))
         .route(
             "/api/v1/streamkeys",
             get(crate::streamkey_routes::list_streamkeys).post(crate::streamkey_routes::mint_streamkey),
@@ -831,6 +899,12 @@ async fn get_wasm_filter(State(state): State<AdminState>) -> Result<Json<WasmFil
 /// per-output counters. Returns `enabled: false` when no ladder is wired.
 async fn get_transcode(State(state): State<AdminState>) -> Result<Json<TranscodeState>, AdminError> {
     Ok(Json((state.get_transcode)()))
+}
+
+/// `GET /api/v1/agents` -- configured in-process agents plus live
+/// per-attachment counters. Returns `enabled: false` when none are wired.
+async fn get_agents(State(state): State<AdminState>) -> Result<Json<AgentState>, AdminError> {
+    Ok(Json((state.get_agents)()))
 }
 
 /// Middleware that validates the `Authorization: Bearer` header against the
@@ -1785,6 +1859,73 @@ mod tests {
                     .body(Body::empty())
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn agents_route_defaults_to_disabled_when_unconfigured() {
+        let state = test_state(vec![]);
+        let app = build_router(state);
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/agents").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let st: AgentState = serde_json::from_slice(&body).unwrap();
+        assert!(!st.enabled);
+        assert!(st.agents.is_empty());
+        assert!(st.active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agents_route_renders_configured_agents() {
+        let state = test_state(vec![]).with_agents(|| AgentState {
+            enabled: true,
+            agents: vec![AgentInfo {
+                name: "captions".into(),
+                kind: "captions".into(),
+                model: Some("/models/ggml-tiny.en.bin".into()),
+                window_ms: Some(5_000),
+            }],
+            active: vec![AgentActiveStats {
+                agent: "captions".into(),
+                broadcast: "live/demo".into(),
+                track: "1.mp4".into(),
+                fragments_seen: 17,
+                panics: 0,
+            }],
+        });
+        let app = build_router(state);
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/agents").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let st: AgentState = serde_json::from_slice(&body).unwrap();
+        assert!(st.enabled);
+        assert_eq!(st.agents.len(), 1);
+        assert_eq!(st.agents[0].name, "captions");
+        assert_eq!(st.agents[0].model.as_deref(), Some("/models/ggml-tiny.en.bin"));
+        assert_eq!(st.agents[0].window_ms, Some(5_000));
+        assert_eq!(st.active.len(), 1);
+        assert_eq!(st.active[0].broadcast, "live/demo");
+        assert_eq!(st.active[0].fragments_seen, 17);
+    }
+
+    #[tokio::test]
+    async fn agents_route_respects_admin_auth() {
+        let auth: SharedAuth = Arc::new(StaticAuthProvider::new(StaticAuthConfig {
+            admin_token: Some("secret".into()),
+            ..Default::default()
+        }));
+        let state = test_state(vec![]).with_auth(auth);
+        let app = build_router(state);
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/agents").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);

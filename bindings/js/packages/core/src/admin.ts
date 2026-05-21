@@ -87,6 +87,40 @@ export interface TranscodeState {
   active: TranscodeActiveStats[];
 }
 
+/** One configured in-process agent. Mirrors `lvqr_admin::AgentInfo`. */
+export interface AgentInfo {
+  /** Agent registry name / published track id (e.g. `"captions"`). */
+  name: string;
+  /** Display grouping (e.g. `"captions"`). */
+  kind: string;
+  /** Agent-specific model file path (Whisper); null when not applicable. */
+  model: string | null;
+  /** Agent-specific inference window in ms (Whisper); null when not applicable. */
+  window_ms: number | null;
+}
+
+/** Live per-attachment agent counters. Mirrors `lvqr_admin::AgentActiveStats`. */
+export interface AgentActiveStats {
+  agent: string;
+  broadcast: string;
+  track: string;
+  fragments_seen: number;
+  panics: number;
+}
+
+/**
+ * In-process agent state from `GET /api/v1/agents`. Mirrors
+ * `lvqr_admin::AgentState`. `enabled` is true only when the relay was built
+ * with an agent feature (e.g. `whisper`) AND an agent is configured;
+ * otherwise both lists are empty (the route still returns 200). Read-only
+ * introspection of a startup-configured agent set.
+ */
+export interface AgentState {
+  enabled: boolean;
+  agents: AgentInfo[];
+  active: AgentActiveStats[];
+}
+
 /**
  * Per-peer offload stats surfaced by `GET /api/v1/mesh`. Mirrors
  * `lvqr_admin::MeshPeerStats`. `intended_children` reflects what the
@@ -507,6 +541,15 @@ export class LvqrAdminClient {
    */
   async transcodeLadders(): Promise<TranscodeState> {
     return this.getJson<TranscodeState>('/api/v1/transcode/ladders');
+  }
+
+  /**
+   * `GET /api/v1/agents` -- configured in-process agents plus live
+   * per-attachment counters. Always 200; `enabled: false` when no agent is
+   * configured (or the relay was built without an agent feature).
+   */
+  async agents(): Promise<AgentState> {
+    return this.getJson<AgentState>('/api/v1/agents');
   }
 
   /**

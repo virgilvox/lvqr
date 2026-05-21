@@ -1193,6 +1193,55 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         })
     };
 
+    // Read-only in-process agent introspection for `GET /api/v1/agents`.
+    // Surfaces the configured agent set (currently the Whisper captions
+    // agent when `--whisper-model` is set) plus live per-attachment
+    // counters from the runner handle. Only wired on `whisper`-feature
+    // builds; otherwise the route reports `enabled: false`. Runtime
+    // start/stop is a separate CRUD surface for a later slice.
+    #[cfg(feature = "whisper")]
+    let admin_state = {
+        let agents: Vec<lvqr_admin::AgentInfo> = config
+            .whisper_model
+            .as_ref()
+            .map(|path| {
+                vec![lvqr_admin::AgentInfo {
+                    name: "captions".to_string(),
+                    kind: "captions".to_string(),
+                    model: Some(path.display().to_string()),
+                    window_ms: Some(lvqr_agent_whisper::WhisperConfig::new(path.clone()).window_ms),
+                }]
+            })
+            .unwrap_or_default();
+        let handle = agent_runner_handle.clone();
+        admin_state.with_agents(move || {
+            let active: Vec<lvqr_admin::AgentActiveStats> = handle
+                .as_ref()
+                .map(|h| {
+                    h.tracked()
+                        .into_iter()
+                        .map(|(agent, broadcast, track)| {
+                            let fragments_seen = h.fragments_seen(&agent, &broadcast, &track);
+                            let panics = h.panics(&agent, &broadcast, &track);
+                            lvqr_admin::AgentActiveStats {
+                                agent,
+                                broadcast,
+                                track,
+                                fragments_seen,
+                                panics,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            lvqr_admin::AgentState {
+                enabled: !agents.is_empty(),
+                agents: agents.clone(),
+                active,
+            }
+        })
+    };
+
     // Session 146: wire the runtime stream-key store into the
     // admin router. When streamkeys_enabled is false the store is
     // None and the routes are still mounted, but list returns

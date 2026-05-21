@@ -85,6 +85,18 @@ describe('LvqrAdminClient against a running lvqr', () => {
     }
   });
 
+  it('agents returns an AgentState shape', async () => {
+    const a = await admin.agents();
+    expect(typeof a.enabled).toBe('boolean');
+    expect(Array.isArray(a.agents)).toBe(true);
+    expect(Array.isArray(a.active)).toBe(true);
+    // The CI test relay runs without an agent configured, so it reports
+    // disabled with empty lists.
+    if (!a.enabled) {
+      expect(a.agents).toHaveLength(0);
+    }
+  });
+
   it('mesh returns a MeshState shape', async () => {
     const mesh = await admin.mesh();
     expect(typeof mesh.enabled).toBe('boolean');

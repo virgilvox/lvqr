@@ -12,6 +12,7 @@ import { useHealthStore } from '../../src/stores/health';
 import { useClusterStore } from '../../src/stores/cluster';
 import { useStreamDetailStore } from '../../src/stores/streamDetail';
 import { useTranscodeStore } from '../../src/stores/transcode';
+import { useAgentsStore } from '../../src/stores/agents';
 
 // Sanity-test every per-resource store by stubbing the active connection's
 // LvqrAdminClient and asserting that a store fetch hits the right method.
@@ -203,6 +204,30 @@ describe('per-resource stores', () => {
     const spy = vi.fn().mockRejectedValue(new Error('HTTP 500'));
     stubClient({ transcodeLadders: spy });
     const s = useTranscodeStore();
+    await s.fetch();
+    expect(s.error).toContain('HTTP 500');
+  });
+
+  it('agents.fetch calls client.agents', async () => {
+    const spy = vi.fn().mockResolvedValue({
+      enabled: true,
+      agents: [{ name: 'captions', kind: 'captions', model: '/m/ggml.bin', window_ms: 5000 }],
+      active: [{ agent: 'captions', broadcast: 'live/x', track: '1.mp4', fragments_seen: 9, panics: 0 }],
+    });
+    stubClient({ agents: spy });
+    const s = useAgentsStore();
+    await s.fetch();
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(s.state?.enabled).toBe(true);
+    expect(s.state?.agents[0].name).toBe('captions');
+    expect(s.state?.active[0].fragments_seen).toBe(9);
+    expect(s.error).toBeNull();
+  });
+
+  it('agents.fetch captures errors without throwing', async () => {
+    const spy = vi.fn().mockRejectedValue(new Error('HTTP 500'));
+    stubClient({ agents: spy });
+    const s = useAgentsStore();
     await s.fetch();
     expect(s.error).toContain('HTTP 500');
   });
