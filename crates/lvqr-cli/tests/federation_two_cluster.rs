@@ -182,31 +182,52 @@ async fn federation_link_propagates_broadcast_between_two_clusters() {
     // moq-lite remote error (code=13/24) on `next_group`. Retrying
     // for up to PROPAGATION_TIMEOUT is robust without bounding the
     // happy-path latency.
-    let mut group_sub = {
+    // Retry the FULL subscribe -> next_group -> read_frame sequence as a
+    // unit, not just next_group. The per-track `forward_track` task is
+    // one-shot: it copies the remote group then blocks on the remote's
+    // next group, and the sibling catalog/1.mp4 forwarders (for tracks A
+    // never published) tear down with a benign remote next_group error.
+    // A downstream subscribe can land between the local group header
+    // being appended and the frame being copied into it, surfacing as a
+    // `read_frame` error even though `next_group` already succeeded --
+    // which the previous shape (read_frame outside the retry) turned into
+    // an immediate fast failure. The local track retains the completed
+    // group, so a fresh subscription re-reads it; retrying the whole
+    // sequence for up to PROPAGATION_TIMEOUT is robust without bounding
+    // happy-path latency.
+    let frame: Bytes = {
         let deadline = Instant::now() + PROPAGATION_TIMEOUT;
         loop {
-            let mut track_sub = bc.subscribe_track(&Track::new("0.mp4")).expect("subscribe 0.mp4 on B");
-            let attempt_label = match tokio::time::timeout(Duration::from_millis(500), track_sub.next_group()).await {
-                Ok(Ok(Some(g))) => break g,
-                Ok(Ok(None)) => "track closed before a group landed",
-                Ok(Err(_)) => "next_group remote error",
-                Err(_) => "next_group inner timeout (500ms)",
-            };
-            if Instant::now() >= deadline {
-                panic!(
-                    "0.mp4 track on B never produced a group within {:?}; last attempt: {}",
-                    PROPAGATION_TIMEOUT, attempt_label
-                );
+            let attempt: Result<Bytes, &'static str> = async {
+                let mut track_sub = bc.subscribe_track(&Track::new("0.mp4")).expect("subscribe 0.mp4 on B");
+                let mut group = match tokio::time::timeout(Duration::from_millis(500), track_sub.next_group()).await {
+                    Ok(Ok(Some(g))) => g,
+                    Ok(Ok(None)) => return Err("track closed before a group landed"),
+                    Ok(Err(_)) => return Err("next_group remote error"),
+                    Err(_) => return Err("next_group inner timeout (500ms)"),
+                };
+                match tokio::time::timeout(Duration::from_millis(500), group.read_frame()).await {
+                    Ok(Ok(Some(f))) => Ok(f),
+                    Ok(Ok(None)) => Err("group closed before the federated frame arrived"),
+                    Ok(Err(_)) => Err("read_frame remote error"),
+                    Err(_) => Err("read_frame inner timeout (500ms)"),
+                }
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            .await;
+            match attempt {
+                Ok(f) => break f,
+                Err(attempt_label) => {
+                    if Instant::now() >= deadline {
+                        panic!(
+                            "0.mp4 frame on B never arrived within {:?}; last attempt: {}",
+                            PROPAGATION_TIMEOUT, attempt_label
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
         }
     };
-
-    let frame = tokio::time::timeout(PROPAGATION_TIMEOUT, group_sub.read_frame())
-        .await
-        .expect("read_frame timeout on B")
-        .expect("read_frame error on B")
-        .expect("group on B closed before the federated frame arrived");
     assert_eq!(
         &*frame, b"hello-federation",
         "federated frame bytes must equal the source"
