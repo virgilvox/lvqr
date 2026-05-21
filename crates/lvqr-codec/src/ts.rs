@@ -451,6 +451,13 @@ impl TsDemuxer {
         } else {
             data.len()
         };
+        // A malicious PES_packet_length can declare a payload that ends
+        // before the variable-length PES header does (es_end < es_start),
+        // which would panic the `data[es_start..es_end]` slice. Treat
+        // that as a malformed packet and drop it.
+        if es_start > es_end {
+            return None;
+        }
         let payload = data[es_start..es_end].to_vec();
         if payload.is_empty() {
             return None;
@@ -608,6 +615,37 @@ mod tests {
         assert_eq!(packets[0].stream_type, StreamType::H264);
         assert_eq!(packets[0].pts, Some(90_000));
         assert_eq!(packets[0].payload, b"nalunalunalu");
+    }
+
+    #[test]
+    fn malformed_pes_packet_length_does_not_panic() {
+        // Regression (ts_demux fuzz): a PES whose PES_packet_length
+        // declares a payload that ends before the variable-length PES
+        // header does (es_end < es_start) must not panic the payload
+        // slice. The fuzzer hit es_start=44, es_end=41.
+        let mut demux = TsDemuxer::new();
+        let video_pid = 0x100;
+        let pmt_pid = 0x1000;
+        demux.feed(&make_ts_packet(PAT_PID, true, &minimal_pat(pmt_pid)));
+        demux.feed(&make_ts_packet(pmt_pid, true, &minimal_pmt(video_pid, 0x101)));
+
+        // header_data_length = 35 -> es_start = 9 + 35 = 44.
+        // PES_packet_length  = 35 -> es_end   = 6 + 35 = 41.
+        let mut pes = vec![
+            0x00, 0x00, 0x01, // start code
+            0xE0, // stream_id (video)
+            0x00, 0x23, // PES_packet_length = 35
+            0x80, // marker bits
+            0x00, // flags: no PTS/DTS
+            0x23, // header_data_length = 35
+        ];
+        pes.resize(44, 0xFF); // data.len() == es_start == 44
+        assert!(demux.feed(&make_ts_packet(video_pid, true, &pes)).is_empty());
+
+        // A new PUSI flushes the malformed buffer through finish_pes,
+        // which must return None instead of panicking on the slice.
+        let flushed = demux.feed(&make_ts_packet(video_pid, true, &minimal_pes(90_000, b"ok")));
+        assert!(flushed.is_empty(), "malformed PES must be dropped, not yielded");
     }
 
     #[test]
