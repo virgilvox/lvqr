@@ -47,6 +47,23 @@ pub trait SegmentIndex: Send + Sync {
     fn latest(&self, broadcast: &str, track: &str) -> Result<Option<SegmentRef>, ArchiveError>;
 }
 
+/// Per-`(broadcast, track)` aggregate produced by
+/// [`RedbSegmentIndex::list_summaries`]. Built in a single table scan so an
+/// operator console can list recorded streams without a per-stream query.
+/// `first_start_dts` / `last_end_dts` are in `timescale` units; the decode
+/// span `last_end_dts - first_start_dts` divided by `timescale` is the
+/// recorded duration in seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveSummary {
+    pub broadcast: String,
+    pub track: String,
+    pub segment_count: u64,
+    pub first_start_dts: u64,
+    pub last_end_dts: u64,
+    pub timescale: u32,
+    pub total_bytes: u64,
+}
+
 /// The single redb table name. Keeping this out of a const def at
 /// the module level so that a future schema migration can bump
 /// the name and know at compile time which call sites refer to
@@ -78,6 +95,44 @@ impl RedbSegmentIndex {
             write.commit().map_err(storage)?;
         }
         Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Aggregate every indexed segment into one [`ArchiveSummary`] per
+    /// `(broadcast, track)`, in a single full table scan. Ordered by
+    /// `(broadcast, track)` ascending. Used by the admin archive
+    /// introspection route; an empty vec means nothing has been recorded.
+    ///
+    /// This is a synchronous full B-tree scan -- callers inside a tokio
+    /// runtime over a large archive should consider `spawn_blocking`. The
+    /// scan reads only keys plus the small per-segment value rows (no media
+    /// bytes), so it is cheap for typical archive sizes.
+    pub fn list_summaries(&self) -> Result<Vec<ArchiveSummary>, ArchiveError> {
+        use std::collections::BTreeMap;
+        let read = self.db.begin_read().map_err(storage)?;
+        let table = read.open_table(SEGMENTS_TABLE).map_err(storage)?;
+        let mut acc: BTreeMap<(String, String), ArchiveSummary> = BTreeMap::new();
+        for entry in table.range::<&[u8]>(..).map_err(storage)? {
+            let (k, v) = entry.map_err(storage)?;
+            let (br, tr, sdts) = Self::decode_key(k.value())?;
+            let seg = SegmentRef::decode(&br, &tr, sdts, v.value())?;
+            acc.entry((br.clone(), tr.clone()))
+                .and_modify(|s| {
+                    s.segment_count += 1;
+                    s.first_start_dts = s.first_start_dts.min(seg.start_dts);
+                    s.last_end_dts = s.last_end_dts.max(seg.end_dts);
+                    s.total_bytes += seg.length;
+                })
+                .or_insert(ArchiveSummary {
+                    broadcast: br,
+                    track: tr,
+                    segment_count: 1,
+                    first_start_dts: seg.start_dts,
+                    last_end_dts: seg.end_dts,
+                    timescale: seg.timescale,
+                    total_bytes: seg.length,
+                });
+        }
+        Ok(acc.into_values().collect())
     }
 
     /// Decode a key into its `(broadcast, track, start_dts)`
@@ -366,6 +421,43 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].segment_seq, 1);
         assert_eq!(got[1].segment_seq, 2);
+    }
+
+    #[test]
+    fn list_summaries_aggregates_per_broadcast_track() {
+        let (idx, _dir) = fresh();
+        // live/a: two tracks. live/b: one track.
+        idx.record(&seg("live/a", "0.mp4", 1, 0, 90_000)).unwrap();
+        idx.record(&seg("live/a", "0.mp4", 2, 90_000, 180_000)).unwrap();
+        idx.record(&seg("live/a", "1.mp4", 1, 0, 48_000)).unwrap();
+        idx.record(&seg("live/b", "0.mp4", 1, 0, 90_000)).unwrap();
+
+        let summaries = idx.list_summaries().unwrap();
+        assert_eq!(summaries.len(), 3, "one per (broadcast, track): {summaries:#?}");
+
+        // Ordered by (broadcast, track) ascending.
+        let a0 = &summaries[0];
+        assert_eq!((a0.broadcast.as_str(), a0.track.as_str()), ("live/a", "0.mp4"));
+        assert_eq!(a0.segment_count, 2);
+        assert_eq!(a0.first_start_dts, 0);
+        assert_eq!(a0.last_end_dts, 180_000);
+        assert_eq!(a0.timescale, 90_000);
+        // seg() sets length = 1024 * seq, so seq 1 + seq 2 = 1024 + 2048.
+        assert_eq!(a0.total_bytes, 1024 + 2048);
+
+        let a1 = &summaries[1];
+        assert_eq!((a1.broadcast.as_str(), a1.track.as_str()), ("live/a", "1.mp4"));
+        assert_eq!(a1.segment_count, 1);
+
+        let b0 = &summaries[2];
+        assert_eq!((b0.broadcast.as_str(), b0.track.as_str()), ("live/b", "0.mp4"));
+        assert_eq!(b0.segment_count, 1);
+    }
+
+    #[test]
+    fn list_summaries_empty_on_fresh_index() {
+        let (idx, _dir) = fresh();
+        assert!(idx.list_summaries().unwrap().is_empty());
     }
 
     #[test]

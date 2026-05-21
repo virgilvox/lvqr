@@ -91,5 +91,5 @@ pub mod writer;
 pub mod provenance;
 
 pub use error::ArchiveError;
-pub use index::{RedbSegmentIndex, SegmentIndex};
+pub use index::{ArchiveSummary, RedbSegmentIndex, SegmentIndex};
 pub use segment::SegmentRef;

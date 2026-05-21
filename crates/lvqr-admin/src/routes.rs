@@ -261,6 +261,41 @@ pub struct AgentActiveStats {
     pub panics: u64,
 }
 
+/// Archived-recording state returned by `GET /api/v1/archive`.
+///
+/// `enabled` reflects whether the relay was started with `--archive-dir`
+/// (a DVR archive index). When false, `recordings` is empty and the route
+/// still returns 200. Read-only introspection: lists what the segment index
+/// has recorded so the console can offer each broadcast to the DVR scrubber.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveState {
+    pub enabled: bool,
+    pub recordings: Vec<ArchiveBroadcastInfo>,
+}
+
+/// One recorded broadcast: its tracks plus aggregates. `duration_secs` is
+/// the longest track's recorded decode span; `segment_count` / `total_bytes`
+/// sum across tracks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveBroadcastInfo {
+    pub broadcast: String,
+    pub segment_count: u64,
+    pub total_bytes: u64,
+    pub duration_secs: f64,
+    pub tracks: Vec<ArchiveTrackInfo>,
+}
+
+/// One recorded track within a broadcast. `duration_secs` is the recorded
+/// decode span (`(last_end - first_start) / timescale`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveTrackInfo {
+    pub track: String,
+    pub segment_count: u64,
+    pub total_bytes: u64,
+    pub duration_secs: f64,
+    pub timescale: u32,
+}
+
 /// Provider for /metrics endpoint output. Returns Prometheus text-format
 /// metrics. Set up by Phase 4 (metrics).
 pub type MetricsRender = Arc<dyn Fn() -> String + Send + Sync>;
@@ -352,6 +387,11 @@ pub struct AdminState {
     /// closure returning `enabled: false`. Keeps `lvqr-admin` free of any
     /// agent-crate dependency.
     get_agents: Arc<dyn Fn() -> AgentState + Send + Sync>,
+    /// Snapshot callback for the `GET /api/v1/archive` route. Populated by
+    /// [`AdminState::with_archive`]; defaults to a "no archive configured"
+    /// closure returning `enabled: false`. Keeps `lvqr-admin` free of a
+    /// `lvqr-archive` dependency.
+    get_archive: Arc<dyn Fn() -> ArchiveState + Send + Sync>,
 }
 
 impl AdminState {
@@ -396,6 +436,10 @@ impl AdminState {
                 enabled: false,
                 agents: Vec::new(),
                 active: Vec::new(),
+            }),
+            get_archive: Arc::new(|| ArchiveState {
+                enabled: false,
+                recordings: Vec::new(),
             }),
         }
     }
@@ -501,6 +545,14 @@ impl AdminState {
     /// without it the route reports `enabled: false`.
     pub fn with_agents(mut self, get: impl Fn() -> AgentState + Send + Sync + 'static) -> Self {
         self.get_agents = Arc::new(get);
+        self
+    }
+
+    /// Wire the archive-recording snapshot closure backing
+    /// `GET /api/v1/archive`. The CLI composition root calls this only when
+    /// `--archive-dir` is set; without it the route reports `enabled: false`.
+    pub fn with_archive(mut self, get: impl Fn() -> ArchiveState + Send + Sync + 'static) -> Self {
+        self.get_archive = Arc::new(get);
         self
     }
 
@@ -615,6 +667,7 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/api/v1/wasm-filter", get(get_wasm_filter))
         .route("/api/v1/transcode/ladders", get(get_transcode))
         .route("/api/v1/agents", get(get_agents))
+        .route("/api/v1/archive", get(get_archive))
         .route(
             "/api/v1/streamkeys",
             get(crate::streamkey_routes::list_streamkeys).post(crate::streamkey_routes::mint_streamkey),
@@ -905,6 +958,12 @@ async fn get_transcode(State(state): State<AdminState>) -> Result<Json<Transcode
 /// per-attachment counters. Returns `enabled: false` when none are wired.
 async fn get_agents(State(state): State<AdminState>) -> Result<Json<AgentState>, AdminError> {
     Ok(Json((state.get_agents)()))
+}
+
+/// `GET /api/v1/archive` -- recorded broadcasts from the DVR segment index.
+/// Returns `enabled: false` when the relay was started without `--archive-dir`.
+async fn get_archive(State(state): State<AdminState>) -> Result<Json<ArchiveState>, AdminError> {
+    Ok(Json((state.get_archive)()))
 }
 
 /// Middleware that validates the `Authorization: Bearer` header against the
@@ -1926,6 +1985,71 @@ mod tests {
         let app = build_router(state);
         let response = app
             .oneshot(Request::builder().uri("/api/v1/agents").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn archive_route_defaults_to_disabled_when_unconfigured() {
+        let state = test_state(vec![]);
+        let app = build_router(state);
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/archive").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let st: ArchiveState = serde_json::from_slice(&body).unwrap();
+        assert!(!st.enabled);
+        assert!(st.recordings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn archive_route_renders_recordings() {
+        let state = test_state(vec![]).with_archive(|| ArchiveState {
+            enabled: true,
+            recordings: vec![ArchiveBroadcastInfo {
+                broadcast: "live/demo".into(),
+                segment_count: 3,
+                total_bytes: 6144,
+                duration_secs: 6.0,
+                tracks: vec![ArchiveTrackInfo {
+                    track: "0.mp4".into(),
+                    segment_count: 3,
+                    total_bytes: 6144,
+                    duration_secs: 6.0,
+                    timescale: 90_000,
+                }],
+            }],
+        });
+        let app = build_router(state);
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/archive").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let st: ArchiveState = serde_json::from_slice(&body).unwrap();
+        assert!(st.enabled);
+        assert_eq!(st.recordings.len(), 1);
+        assert_eq!(st.recordings[0].broadcast, "live/demo");
+        assert_eq!(st.recordings[0].segment_count, 3);
+        assert_eq!(st.recordings[0].tracks.len(), 1);
+        assert_eq!(st.recordings[0].tracks[0].track, "0.mp4");
+        assert!((st.recordings[0].duration_secs - 6.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn archive_route_respects_admin_auth() {
+        let auth: SharedAuth = Arc::new(StaticAuthProvider::new(StaticAuthConfig {
+            admin_token: Some("secret".into()),
+            ..Default::default()
+        }));
+        let state = test_state(vec![]).with_auth(auth);
+        let app = build_router(state);
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/archive").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);

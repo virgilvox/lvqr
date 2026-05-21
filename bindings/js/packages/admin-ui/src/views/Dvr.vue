@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
+import { useRoute } from 'vue-router';
 import PageHeader from '@/components/ui/PageHeader.vue';
 import Card from '@/components/ui/Card.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
@@ -11,10 +12,22 @@ import '@lvqr/dvr-player';
 
 const streams = useStreamsStore();
 const conn = useConnectionStore();
+const route = useRoute();
 
 usePolling(() => streams.fetch(), { intervalMs: 10_000 });
 
 const selected = ref<string>('');
+
+// Preselect a broadcast from the `?broadcast=` query so the Recordings view
+// (and other links) can deep-link straight into the scrubber. Reacts to
+// query changes since the view stays mounted across navigations.
+watch(
+  () => route.query.broadcast,
+  (b) => {
+    if (typeof b === 'string' && b) selected.value = b;
+  },
+  { immediate: true },
+);
 // Pull the HLS URL from the broadcastUrls helper, which honors the
 // connection profile's per-protocol port overrides. Using joinUrl
 // against the admin baseUrl was a real bug -- LVQR binds HLS on a

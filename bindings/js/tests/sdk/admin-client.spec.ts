@@ -97,6 +97,16 @@ describe('LvqrAdminClient against a running lvqr', () => {
     }
   });
 
+  it('archive returns an ArchiveState shape', async () => {
+    const a = await admin.archive();
+    expect(typeof a.enabled).toBe('boolean');
+    expect(Array.isArray(a.recordings)).toBe(true);
+    // The CI test relay runs without --archive-dir, so it reports disabled.
+    if (!a.enabled) {
+      expect(a.recordings).toHaveLength(0);
+    }
+  });
+
   it('mesh returns a MeshState shape', async () => {
     const mesh = await admin.mesh();
     expect(typeof mesh.enabled).toBe('boolean');

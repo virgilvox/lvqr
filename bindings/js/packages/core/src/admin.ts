@@ -121,6 +121,38 @@ export interface AgentState {
   active: AgentActiveStats[];
 }
 
+/** One recorded track within a broadcast. Mirrors `lvqr_admin::ArchiveTrackInfo`. */
+export interface ArchiveTrackInfo {
+  /** Track id (e.g. `"0.mp4"`, `"1.mp4"`). */
+  track: string;
+  segment_count: number;
+  total_bytes: number;
+  /** Recorded decode span in seconds. */
+  duration_secs: number;
+  timescale: number;
+}
+
+/** One recorded broadcast with aggregates. Mirrors `lvqr_admin::ArchiveBroadcastInfo`. */
+export interface ArchiveBroadcastInfo {
+  broadcast: string;
+  segment_count: number;
+  total_bytes: number;
+  /** Longest track's recorded duration, in seconds. */
+  duration_secs: number;
+  tracks: ArchiveTrackInfo[];
+}
+
+/**
+ * Archive-recording state from `GET /api/v1/archive`. Mirrors
+ * `lvqr_admin::ArchiveState`. `enabled` is true when the relay was started
+ * with `--archive-dir`; otherwise `recordings` is empty (the route still
+ * returns 200). Read-only introspection of the DVR segment index.
+ */
+export interface ArchiveState {
+  enabled: boolean;
+  recordings: ArchiveBroadcastInfo[];
+}
+
 /**
  * Per-peer offload stats surfaced by `GET /api/v1/mesh`. Mirrors
  * `lvqr_admin::MeshPeerStats`. `intended_children` reflects what the
@@ -550,6 +582,15 @@ export class LvqrAdminClient {
    */
   async agents(): Promise<AgentState> {
     return this.getJson<AgentState>('/api/v1/agents');
+  }
+
+  /**
+   * `GET /api/v1/archive` -- recorded broadcasts from the DVR segment index.
+   * Always 200; `enabled: false` (empty list) when the relay was started
+   * without `--archive-dir`.
+   */
+  async archive(): Promise<ArchiveState> {
+    return this.getJson<ArchiveState>('/api/v1/archive');
   }
 
   /**

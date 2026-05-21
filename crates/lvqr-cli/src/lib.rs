@@ -1242,6 +1242,63 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         })
     };
 
+    // Read-only archive introspection for `GET /api/v1/archive`. Aggregates
+    // the DVR segment index into one entry per recorded broadcast (with its
+    // tracks) so the console can offer each recording to the scrubber. Only
+    // wired when `--archive-dir` set a segment index; otherwise the route
+    // reports `enabled: false`. The list is a synchronous index scan; for a
+    // very large archive a future revision can cache or page it.
+    let archive_for_admin: Option<Arc<lvqr_archive::RedbSegmentIndex>> =
+        archive_index.as_ref().map(|(_dir, index)| Arc::clone(index));
+    let admin_state = admin_state.with_archive(move || {
+        let Some(index) = archive_for_admin.as_ref() else {
+            return lvqr_admin::ArchiveState {
+                enabled: false,
+                recordings: Vec::new(),
+            };
+        };
+        let summaries = match index.list_summaries() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "archive list_summaries failed for /api/v1/archive");
+                Vec::new()
+            }
+        };
+        let mut by_broadcast: std::collections::BTreeMap<String, Vec<lvqr_admin::ArchiveTrackInfo>> =
+            std::collections::BTreeMap::new();
+        for s in summaries {
+            let duration_secs = if s.timescale > 0 {
+                s.last_end_dts.saturating_sub(s.first_start_dts) as f64 / f64::from(s.timescale)
+            } else {
+                0.0
+            };
+            by_broadcast
+                .entry(s.broadcast)
+                .or_default()
+                .push(lvqr_admin::ArchiveTrackInfo {
+                    track: s.track,
+                    segment_count: s.segment_count,
+                    total_bytes: s.total_bytes,
+                    duration_secs,
+                    timescale: s.timescale,
+                });
+        }
+        let recordings = by_broadcast
+            .into_iter()
+            .map(|(broadcast, tracks)| lvqr_admin::ArchiveBroadcastInfo {
+                broadcast,
+                segment_count: tracks.iter().map(|t| t.segment_count).sum(),
+                total_bytes: tracks.iter().map(|t| t.total_bytes).sum(),
+                duration_secs: tracks.iter().map(|t| t.duration_secs).fold(0.0_f64, f64::max),
+                tracks,
+            })
+            .collect();
+        lvqr_admin::ArchiveState {
+            enabled: true,
+            recordings,
+        }
+    });
+
     // Session 146: wire the runtime stream-key store into the
     // admin router. When streamkeys_enabled is false the store is
     // None and the routes are still mounted, but list returns
