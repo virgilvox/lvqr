@@ -1141,6 +1141,58 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         })
     });
 
+    // Read-only transcode-ladder introspection for
+    // `GET /api/v1/transcode/ladders`. Surfaces the configured ladder
+    // (declaration order) plus live per-output counters from the runner
+    // handle. Only wired on `transcode`-feature builds; otherwise the
+    // route reports `enabled: false` via the AdminState default. The
+    // ladder is configured at startup, so this is introspection, not
+    // mutation (runtime CRUD is a separate, later surface).
+    #[cfg(feature = "transcode")]
+    let admin_state = {
+        let renditions: Vec<lvqr_admin::RenditionInfo> = config
+            .transcode_renditions
+            .iter()
+            .map(|r| lvqr_admin::RenditionInfo {
+                name: r.name.clone(),
+                width: r.width,
+                height: r.height,
+                video_bitrate_kbps: r.video_bitrate_kbps,
+                audio_bitrate_kbps: r.audio_bitrate_kbps,
+            })
+            .collect();
+        let encoder = config.transcode_encoder.as_str().to_string();
+        let handle = transcode_runner_handle.clone();
+        admin_state.with_transcode(move || {
+            let active: Vec<lvqr_admin::TranscodeActiveStats> = handle
+                .as_ref()
+                .map(|h| {
+                    h.tracked()
+                        .into_iter()
+                        .map(|(transcoder, rendition, broadcast, track)| {
+                            let fragments_seen = h.fragments_seen(&transcoder, &rendition, &broadcast, &track);
+                            let panics = h.panics(&transcoder, &rendition, &broadcast, &track);
+                            lvqr_admin::TranscodeActiveStats {
+                                transcoder,
+                                rendition,
+                                broadcast,
+                                track,
+                                fragments_seen,
+                                panics,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            lvqr_admin::TranscodeState {
+                enabled: !renditions.is_empty(),
+                encoder: encoder.clone(),
+                renditions: renditions.clone(),
+                active,
+            }
+        })
+    };
+
     // Session 146: wire the runtime stream-key store into the
     // admin router. When streamkeys_enabled is false the store is
     // None and the routes are still mounted, but list returns

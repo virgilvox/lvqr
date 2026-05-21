@@ -160,6 +160,59 @@ pub struct WasmFilterSlotStats {
     pub dropped: u64,
 }
 
+/// Transcode ladder state returned by `GET /api/v1/transcode/ladders`.
+///
+/// `enabled` reflects whether the binary was built with the `transcode`
+/// feature AND at least one `--transcode-rendition` was configured. When
+/// false, `encoder` is empty and both lists are empty; the route still
+/// returns 200 OK so dashboards do not need a separate 404 path. Read-only
+/// introspection: the ladder is configured at process startup, so this
+/// surface lists what is configured plus live per-output counters; it does
+/// not mutate the ladder.
+///
+/// `renditions` is the configured ladder in declaration order.
+/// `active` carries one entry per live `(transcoder, rendition, broadcast,
+/// track)` the runner has observed -- so an operator can see which source
+/// broadcasts are currently being transcoded into which renditions and how
+/// many fragments each output has produced.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TranscodeState {
+    pub enabled: bool,
+    /// Encoder backend label: `"software"`, `"videotoolbox"`, `"nvenc"`,
+    /// `"vaapi"`, or `"qsv"`. Empty when `enabled` is false.
+    pub encoder: String,
+    pub renditions: Vec<RenditionInfo>,
+    #[serde(default)]
+    pub active: Vec<TranscodeActiveStats>,
+}
+
+/// One configured rendition in the transcode ladder. Mirrors the operator
+/// `lvqr_transcode::RenditionSpec` without the admin crate taking a
+/// `lvqr-transcode` dependency.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RenditionInfo {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub video_bitrate_kbps: u32,
+    pub audio_bitrate_kbps: u32,
+}
+
+/// Live per-output transcode counters. `fragments_seen` is the cumulative
+/// fragment count the named transcoder has produced for `rendition` from
+/// `(broadcast, track)`; `panics` is the count of caught panics across the
+/// transcoder's lifecycle hooks (a non-zero value flags an unhealthy
+/// encoder). Atomic snapshots; may drift a fragment or two between reads.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TranscodeActiveStats {
+    pub transcoder: String,
+    pub rendition: String,
+    pub broadcast: String,
+    pub track: String,
+    pub fragments_seen: u64,
+    pub panics: u64,
+}
+
 /// Provider for /metrics endpoint output. Returns Prometheus text-format
 /// metrics. Set up by Phase 4 (metrics).
 pub type MetricsRender = Arc<dyn Fn() -> String + Send + Sync>;
@@ -240,6 +293,12 @@ pub struct AdminState {
     /// every name so the route replies 404 until wired -- keeping the
     /// admin crate free of a `lvqr-fragment` dependency.
     get_stream_detail: StreamDetailFn,
+    /// Snapshot callback for the `GET /api/v1/transcode/ladders` route.
+    /// Populated by [`AdminState::with_transcode`]; defaults to a
+    /// "no ladder configured" closure returning `enabled: false`. The
+    /// indirection keeps `lvqr-admin` free of a `lvqr-transcode`
+    /// dependency so non-transcode builds pay no graph cost.
+    get_transcode: Arc<dyn Fn() -> TranscodeState + Send + Sync>,
 }
 
 impl AdminState {
@@ -274,6 +333,12 @@ impl AdminState {
             config_reload_trigger: None,
             server_info: None,
             get_stream_detail: Arc::new(|_name| None),
+            get_transcode: Arc::new(|| TranscodeState {
+                enabled: false,
+                encoder: String::new(),
+                renditions: Vec::new(),
+                active: Vec::new(),
+            }),
         }
     }
 
@@ -360,6 +425,15 @@ impl AdminState {
         get: impl Fn(&str) -> Option<StreamDetailInfo> + Send + Sync + 'static,
     ) -> Self {
         self.get_stream_detail = Arc::new(get);
+        self
+    }
+
+    /// Wire the transcode-ladder snapshot closure backing
+    /// `GET /api/v1/transcode/ladders`. The CLI composition root calls
+    /// this only on `transcode`-feature builds with a configured ladder;
+    /// without it the route reports `enabled: false`.
+    pub fn with_transcode(mut self, get: impl Fn() -> TranscodeState + Send + Sync + 'static) -> Self {
+        self.get_transcode = Arc::new(get);
         self
     }
 
@@ -472,6 +546,7 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/api/v1/mesh", get(get_mesh))
         .route("/api/v1/slo", get(get_slo))
         .route("/api/v1/wasm-filter", get(get_wasm_filter))
+        .route("/api/v1/transcode/ladders", get(get_transcode))
         .route(
             "/api/v1/streamkeys",
             get(crate::streamkey_routes::list_streamkeys).post(crate::streamkey_routes::mint_streamkey),
@@ -750,6 +825,12 @@ async fn post_client_sample(
 /// PLAN Phase D session 137.
 async fn get_wasm_filter(State(state): State<AdminState>) -> Result<Json<WasmFilterState>, AdminError> {
     Ok(Json((state.get_wasm_filter)()))
+}
+
+/// `GET /api/v1/transcode/ladders` -- configured transcode ladder plus live
+/// per-output counters. Returns `enabled: false` when no ladder is wired.
+async fn get_transcode(State(state): State<AdminState>) -> Result<Json<TranscodeState>, AdminError> {
+    Ok(Json((state.get_transcode)()))
 }
 
 /// Middleware that validates the `Authorization: Bearer` header against the
@@ -1611,5 +1692,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn transcode_route_defaults_to_disabled_when_unconfigured() {
+        let state = test_state(vec![]);
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/transcode/ladders")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let st: TranscodeState = serde_json::from_slice(&body).unwrap();
+        assert!(!st.enabled);
+        assert!(st.encoder.is_empty());
+        assert!(st.renditions.is_empty());
+        assert!(st.active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn transcode_route_renders_configured_ladder() {
+        let state = test_state(vec![]).with_transcode(|| TranscodeState {
+            enabled: true,
+            encoder: "software".into(),
+            renditions: vec![
+                RenditionInfo {
+                    name: "720p".into(),
+                    width: 1280,
+                    height: 720,
+                    video_bitrate_kbps: 2500,
+                    audio_bitrate_kbps: 128,
+                },
+                RenditionInfo {
+                    name: "480p".into(),
+                    width: 854,
+                    height: 480,
+                    video_bitrate_kbps: 1200,
+                    audio_bitrate_kbps: 96,
+                },
+            ],
+            active: vec![TranscodeActiveStats {
+                transcoder: "software".into(),
+                rendition: "720p".into(),
+                broadcast: "live/demo".into(),
+                track: "0.mp4".into(),
+                fragments_seen: 42,
+                panics: 0,
+            }],
+        });
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/transcode/ladders")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let st: TranscodeState = serde_json::from_slice(&body).unwrap();
+        assert!(st.enabled);
+        assert_eq!(st.encoder, "software");
+        assert_eq!(st.renditions.len(), 2);
+        assert_eq!(st.renditions[0].name, "720p");
+        assert_eq!(st.renditions[0].height, 720);
+        assert_eq!(st.active.len(), 1);
+        assert_eq!(st.active[0].rendition, "720p");
+        assert_eq!(st.active[0].fragments_seen, 42);
+        assert_eq!(st.active[0].panics, 0);
+    }
+
+    #[tokio::test]
+    async fn transcode_route_respects_admin_auth() {
+        let auth: SharedAuth = Arc::new(StaticAuthProvider::new(StaticAuthConfig {
+            admin_token: Some("secret".into()),
+            ..Default::default()
+        }));
+        let state = test_state(vec![]).with_auth(auth);
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/transcode/ladders")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

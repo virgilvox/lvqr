@@ -11,6 +11,7 @@ import { useWasmFilterStore } from '../../src/stores/wasmFilter';
 import { useHealthStore } from '../../src/stores/health';
 import { useClusterStore } from '../../src/stores/cluster';
 import { useStreamDetailStore } from '../../src/stores/streamDetail';
+import { useTranscodeStore } from '../../src/stores/transcode';
 
 // Sanity-test every per-resource store by stubbing the active connection's
 // LvqrAdminClient and asserting that a store fetch hits the right method.
@@ -180,6 +181,30 @@ describe('per-resource stores', () => {
     expect(s.current).toBe('live/b');
     expect(s.offline).toBe(true);
     expect(s.detail).toBeNull();
+  });
+
+  it('transcode.fetch calls client.transcodeLadders', async () => {
+    const spy = vi.fn().mockResolvedValue({
+      enabled: true,
+      encoder: 'software',
+      renditions: [{ name: '720p', width: 1280, height: 720, video_bitrate_kbps: 2500, audio_bitrate_kbps: 128 }],
+      active: [],
+    });
+    stubClient({ transcodeLadders: spy });
+    const s = useTranscodeStore();
+    await s.fetch();
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(s.state?.enabled).toBe(true);
+    expect(s.state?.renditions[0].name).toBe('720p');
+    expect(s.error).toBeNull();
+  });
+
+  it('transcode.fetch captures errors without throwing', async () => {
+    const spy = vi.fn().mockRejectedValue(new Error('HTTP 500'));
+    stubClient({ transcodeLadders: spy });
+    const s = useTranscodeStore();
+    await s.fetch();
+    expect(s.error).toContain('HTTP 500');
   });
 
   it('health.fetch calls client.healthz', async () => {

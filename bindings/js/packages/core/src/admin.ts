@@ -53,6 +53,40 @@ export interface StreamDetailInfo {
   tracks: TrackInfo[];
 }
 
+/** One configured rendition in the transcode ladder. Mirrors `lvqr_admin::RenditionInfo`. */
+export interface RenditionInfo {
+  name: string;
+  width: number;
+  height: number;
+  video_bitrate_kbps: number;
+  audio_bitrate_kbps: number;
+}
+
+/** Live per-output transcode counters. Mirrors `lvqr_admin::TranscodeActiveStats`. */
+export interface TranscodeActiveStats {
+  transcoder: string;
+  rendition: string;
+  broadcast: string;
+  track: string;
+  fragments_seen: number;
+  panics: number;
+}
+
+/**
+ * Transcode ladder state from `GET /api/v1/transcode/ladders`. Mirrors
+ * `lvqr_admin::TranscodeState`. `enabled` is true only when the relay was
+ * built with the `transcode` feature AND a ladder is configured; otherwise
+ * `encoder` is empty and both lists are empty (the route still returns 200).
+ * Read-only introspection of a startup-configured ladder.
+ */
+export interface TranscodeState {
+  enabled: boolean;
+  /** `"software"` / `"videotoolbox"` / `"nvenc"` / `"vaapi"` / `"qsv"`; empty when disabled. */
+  encoder: string;
+  renditions: RenditionInfo[];
+  active: TranscodeActiveStats[];
+}
+
 /**
  * Per-peer offload stats surfaced by `GET /api/v1/mesh`. Mirrors
  * `lvqr_admin::MeshPeerStats`. `intended_children` reflects what the
@@ -464,6 +498,15 @@ export class LvqrAdminClient {
   /** `GET /api/v1/mesh` -- current peer-mesh state. */
   async mesh(): Promise<MeshState> {
     return this.getJson<MeshState>('/api/v1/mesh');
+  }
+
+  /**
+   * `GET /api/v1/transcode/ladders` -- configured transcode ladder plus
+   * live per-output counters. Always 200; `enabled: false` when the relay
+   * has no ladder configured (or was built without the `transcode` feature).
+   */
+  async transcodeLadders(): Promise<TranscodeState> {
+    return this.getJson<TranscodeState>('/api/v1/transcode/ladders');
   }
 
   /**

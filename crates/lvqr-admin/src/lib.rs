@@ -39,8 +39,9 @@ pub mod cluster_routes;
 
 pub use config_reload_routes::{ConfigReloadFuture, ConfigReloadStatus, ConfigReloadStatusFn, ConfigReloadTriggerFn};
 pub use routes::{
-    AdminError, AdminState, MeshPeerStats, MeshState, MetricsRender, StreamDetailInfo, StreamInfo, TrackInfo,
-    WasmFilterBroadcastStats, WasmFilterSlotStats, WasmFilterState, build_router,
+    AdminError, AdminState, MeshPeerStats, MeshState, MetricsRender, RenditionInfo, StreamDetailInfo, StreamInfo,
+    TrackInfo, TranscodeActiveStats, TranscodeState, WasmFilterBroadcastStats, WasmFilterSlotStats, WasmFilterState,
+    build_router,
 };
 pub use server_info_routes::{
     BoundAddresses, RuntimeFeatures, ServerInfo, ServerInfoFn, default_server_info, server_info_fn_with_uptime,

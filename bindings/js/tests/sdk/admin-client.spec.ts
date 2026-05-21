@@ -72,6 +72,19 @@ describe('LvqrAdminClient against a running lvqr', () => {
     expect(detail).toBeNull();
   });
 
+  it('transcodeLadders returns a TranscodeState shape', async () => {
+    const t = await admin.transcodeLadders();
+    expect(typeof t.enabled).toBe('boolean');
+    expect(typeof t.encoder).toBe('string');
+    expect(Array.isArray(t.renditions)).toBe(true);
+    expect(Array.isArray(t.active)).toBe(true);
+    // The CI test relay runs without a transcode ladder, so it reports
+    // disabled with empty lists.
+    if (!t.enabled) {
+      expect(t.renditions).toHaveLength(0);
+    }
+  });
+
   it('mesh returns a MeshState shape', async () => {
     const mesh = await admin.mesh();
     expect(typeof mesh.enabled).toBe('boolean');
