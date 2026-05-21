@@ -93,16 +93,35 @@ jobs:
             --whep-port 0 \
             > /tmp/msv-out/lvqr-serve.log 2>&1 &
           echo $! > /tmp/lvqr-serve.pid
-          # Wait for the HLS port to bind. `nc -z` exits 0 once the
-          # listener is up; 20 * 0.5s = 10s budget which is plenty
-          # on a cold GitHub runner.
-          for i in $(seq 1 20); do
-            if nc -z 127.0.0.1 8888 2>/dev/null; then
-              echo "lvqr serve HLS port is ready"
+          # Wait for BOTH the HLS port (8888, consumed downstream) AND
+          # the RTMP port (1935, where ffmpeg publishes) to bind. The
+          # previous check waited only on 8888, so on a cold runner the
+          # ffmpeg publish step could start before the RTMP listener was
+          # up -- the RTMP connect then hung until the 3-minute push
+          # timeout fired (the recurring flake on this lane). `nc -z`
+          # exits 0 once a listener is up; 30 * 0.5s = 15s budget is
+          # plenty on a cold GitHub runner.
+          hls_ready=""
+          rtmp_ready=""
+          for i in $(seq 1 30); do
+            if [ -z "$hls_ready" ] && nc -z 127.0.0.1 8888 2>/dev/null; then
+              hls_ready=1
+              echo "lvqr serve HLS port (8888) is ready"
+            fi
+            if [ -z "$rtmp_ready" ] && nc -z 127.0.0.1 1935 2>/dev/null; then
+              rtmp_ready=1
+              echo "lvqr serve RTMP port (1935) is ready"
+            fi
+            if [ -n "$hls_ready" ] && [ -n "$rtmp_ready" ]; then
               break
             fi
             sleep 0.5
           done
+          if [ -z "$hls_ready" ] || [ -z "$rtmp_ready" ]; then
+            echo "lvqr serve did not bind both ports in time (hls=${hls_ready:-no} rtmp=${rtmp_ready:-no})" >&2
+            cat /tmp/msv-out/lvqr-serve.log >&2 || true
+            exit 1
+          fi
 
       - name: Push synthetic RTMP fixture with ffmpeg
         # The push is a ~20s real-time fixture (`-re -t 20`). Cap the
