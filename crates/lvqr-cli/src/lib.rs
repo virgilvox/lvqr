@@ -1299,6 +1299,15 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         }
     });
 
+    // Wire the process-global log broadcaster (installed by
+    // `lvqr_observability::init` in main) into the `GET /api/v1/logs` SSE
+    // live-tail route. When init was not called (e.g. an embedder using a
+    // custom subscriber) the global is unset and the route 503s.
+    let admin_state = match lvqr_observability::log_broadcaster() {
+        Some(b) => admin_state.with_log_broadcaster(b),
+        None => admin_state,
+    };
+
     // Session 146: wire the runtime stream-key store into the
     // admin router. When streamkeys_enabled is false the store is
     // None and the routes are still mounted, but list returns

@@ -37,6 +37,7 @@ export {
   type ArchiveTrackInfo,
   type ArchiveBroadcastInfo,
   type ArchiveState,
+  type LogLine,
   type MeshPeerStats,
   type MeshState,
   type SloEntry,

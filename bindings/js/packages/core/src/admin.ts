@@ -153,6 +153,18 @@ export interface ArchiveState {
   recordings: ArchiveBroadcastInfo[];
 }
 
+/** One captured log line streamed by `GET /api/v1/logs`. Mirrors `lvqr_observability::LogLine`. */
+export interface LogLine {
+  /** Capture time in ms since the Unix epoch. */
+  ts_ms: number;
+  /** `"ERROR"` / `"WARN"` / `"INFO"` / `"DEBUG"` / `"TRACE"`. */
+  level: string;
+  /** Event target (usually the emitting module path). */
+  target: string;
+  /** Rendered message plus any structured fields. */
+  message: string;
+}
+
 /**
  * Per-peer offload stats surfaced by `GET /api/v1/mesh`. Mirrors
  * `lvqr_admin::MeshPeerStats`. `intended_children` reflects what the
@@ -591,6 +603,18 @@ export class LvqrAdminClient {
    */
   async archive(): Promise<ArchiveState> {
     return this.getJson<ArchiveState>('/api/v1/archive');
+  }
+
+  /**
+   * Absolute URL for the `GET /api/v1/logs` SSE live-tail stream, suitable
+   * for `new EventSource(url)`. Because the browser `EventSource` API cannot
+   * set an `Authorization` header, the configured bearer token is appended as
+   * a `?token=` query param. Note: tokens in URLs can be captured by proxy /
+   * access logs -- prefer a short-lived admin token for log streaming.
+   */
+  logsStreamUrl(): string {
+    const base = `${this.baseUrl}/api/v1/logs`;
+    return this.options.bearerToken ? `${base}?token=${encodeURIComponent(this.options.bearerToken)}` : base;
   }
 
   /**

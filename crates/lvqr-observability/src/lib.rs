@@ -86,8 +86,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod log_capture;
 mod log_format;
 pub mod metric_bridge;
+pub use log_capture::{CaptureLayer, LogBroadcaster, LogLine, log_broadcaster};
 pub use log_format::CorrelatedFormat;
 pub use metric_bridge::OtelMetricsRecorder;
 
@@ -409,10 +411,17 @@ pub fn init(config: ObservabilityConfig) -> Result<ObservabilityHandle> {
         tracing_opentelemetry::layer().with_tracer(tracer)
     });
 
+    // Install the process-global log capture so the admin live-tail endpoint
+    // can replay recent lines and stream new ones. Composed under the same
+    // EnvFilter as the stdout layer, so only events the operator chose to log
+    // are captured.
+    let capture_layer = log_capture::CaptureLayer::new(log_capture::install_global());
+
     tracing_subscriber::registry()
         .with(filter)
         .with(fmt_layer)
         .with(otel_layer)
+        .with(capture_layer)
         .try_init()
         .map_err(|e| anyhow::anyhow!("install global tracing subscriber: {e}"))
         .context("lvqr-observability init")?;

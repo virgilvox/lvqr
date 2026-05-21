@@ -1,16 +1,20 @@
-use axum::extract::{Path, State};
-use axum::http::{Request, StatusCode, header};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{
     Json, Router,
     routing::{delete, get, post},
 };
+use futures::StreamExt;
 use lvqr_auth::{AuthContext, AuthDecision, NoopAuthProvider, SharedAuth, SharedStreamKeyStore};
 use lvqr_core::RelayStats;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::convert::Infallible;
 use std::sync::Arc;
+use tokio::sync::broadcast::error::RecvError;
 
 /// Stream info returned by the API.
 #[derive(Debug, Serialize, Deserialize)]
@@ -392,6 +396,10 @@ pub struct AdminState {
     /// closure returning `enabled: false`. Keeps `lvqr-admin` free of a
     /// `lvqr-archive` dependency.
     get_archive: Arc<dyn Fn() -> ArchiveState + Send + Sync>,
+    /// Process-global log broadcaster backing `GET /api/v1/logs` (SSE
+    /// live-tail). Populated by [`AdminState::with_log_broadcaster`] from
+    /// `lvqr_observability::log_broadcaster()`. `None` -> the route 503s.
+    log_broadcaster: Option<lvqr_observability::LogBroadcaster>,
 }
 
 impl AdminState {
@@ -441,6 +449,7 @@ impl AdminState {
                 enabled: false,
                 recordings: Vec::new(),
             }),
+            log_broadcaster: None,
         }
     }
 
@@ -553,6 +562,15 @@ impl AdminState {
     /// `--archive-dir` is set; without it the route reports `enabled: false`.
     pub fn with_archive(mut self, get: impl Fn() -> ArchiveState + Send + Sync + 'static) -> Self {
         self.get_archive = Arc::new(get);
+        self
+    }
+
+    /// Wire the process-global log broadcaster backing the
+    /// `GET /api/v1/logs` SSE live-tail route. The CLI composition root
+    /// passes `lvqr_observability::log_broadcaster()`; without it the route
+    /// returns 503.
+    pub fn with_log_broadcaster(mut self, broadcaster: lvqr_observability::LogBroadcaster) -> Self {
+        self.log_broadcaster = Some(broadcaster);
         self
     }
 
@@ -703,11 +721,18 @@ pub fn build_router(state: AdminState) -> Router {
     let api_dual_auth_routes: Router<AdminState> =
         Router::new().route("/api/v1/slo/client-sample", post(post_client_sample));
 
+    // `GET /api/v1/logs` (SSE live-tail) lives off the header auth middleware
+    // because the browser `EventSource` API cannot set an `Authorization`
+    // header -- the handler authenticates a `?token=` query param (or a
+    // bearer header for non-browser clients) itself.
+    let api_logs_route: Router<AdminState> = Router::new().route("/api/v1/logs", get(get_logs));
+
     Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))
         .merge(api_routes)
         .merge(api_dual_auth_routes)
+        .merge(api_logs_route)
         .with_state(state)
 }
 
@@ -964,6 +989,67 @@ async fn get_agents(State(state): State<AdminState>) -> Result<Json<AgentState>,
 /// Returns `enabled: false` when the relay was started without `--archive-dir`.
 async fn get_archive(State(state): State<AdminState>) -> Result<Json<ArchiveState>, AdminError> {
     Ok(Json((state.get_archive)()))
+}
+
+/// Query parameters for `GET /api/v1/logs`. `token` carries the admin token
+/// because the browser `EventSource` API cannot set request headers.
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    token: Option<String>,
+}
+
+/// Render one captured log line as an SSE data event (JSON payload).
+fn log_sse_event(line: &lvqr_observability::LogLine) -> Event {
+    Event::default().data(serde_json::to_string(line).unwrap_or_default())
+}
+
+/// `GET /api/v1/logs` -- Server-Sent Events live tail. Authenticates via the
+/// `?token=` query param (browser `EventSource`) or a bearer `Authorization`
+/// header (other clients), then streams the recent backlog followed by live
+/// lines. Returns 401 when the admin token is required and absent/wrong, and
+/// 503 when log capture was not installed (e.g. a custom subscriber).
+async fn get_logs(State(state): State<AdminState>, headers: HeaderMap, Query(q): Query<LogsQuery>) -> Response {
+    let token = q.token.unwrap_or_else(|| {
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(str::to_string)
+            .unwrap_or_default()
+    });
+    if let AuthDecision::Deny { reason } = state.auth.check(&AuthContext::Admin { token }) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": reason }))).into_response();
+    }
+
+    let Some(broadcaster) = state.log_broadcaster.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "log capture not installed" })),
+        )
+            .into_response();
+    };
+
+    let backlog = futures::stream::iter(
+        broadcaster
+            .snapshot()
+            .into_iter()
+            .map(|line| Ok::<Event, Infallible>(log_sse_event(&line))),
+    );
+    let live = futures::stream::unfold(broadcaster.subscribe(), |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(line) => return Some((Ok::<Event, Infallible>(log_sse_event(&line)), rx)),
+                // A slow client fell behind the channel window: skip the
+                // dropped lines and keep streaming rather than stalling.
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    });
+
+    Sse::new(backlog.chain(live))
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// Middleware that validates the `Authorization: Bearer` header against the
@@ -2053,5 +2139,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logs_route_503_when_capture_not_installed() {
+        // No broadcaster wired (the common case in tests, where the global
+        // capture layer was never installed via observability::init).
+        let state = test_state(vec![]);
+        let app = build_router(state);
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/logs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn logs_route_401_without_token_when_auth_configured() {
+        let auth: SharedAuth = Arc::new(StaticAuthProvider::new(StaticAuthConfig {
+            admin_token: Some("secret".into()),
+            ..Default::default()
+        }));
+        // Wire a broadcaster so we exercise the auth gate, not the 503 path.
+        let state = test_state(vec![])
+            .with_auth(auth)
+            .with_log_broadcaster(lvqr_observability::LogBroadcaster::default());
+        let app = build_router(state);
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/logs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logs_route_streams_with_query_token() {
+        let auth: SharedAuth = Arc::new(StaticAuthProvider::new(StaticAuthConfig {
+            admin_token: Some("secret".into()),
+            ..Default::default()
+        }));
+        let broadcaster = lvqr_observability::LogBroadcaster::default();
+        let state = test_state(vec![]).with_auth(auth).with_log_broadcaster(broadcaster);
+        let app = build_router(state);
+        // `?token=` matches the admin token -> 200 + SSE content type. We do
+        // not read the (infinite) body; the response head returns immediately.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/logs?token=secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(ct.starts_with("text/event-stream"), "content-type was {ct}");
     }
 }
