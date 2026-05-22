@@ -183,3 +183,15 @@ for (const route of A11Y_ROUTES) {
     expect(results.violations, JSON.stringify(results.violations.map((v) => `${v.id}@${route}`))).toEqual([]);
   });
 }
+
+// Responsive: no horizontal page scroll at a 390px mobile viewport across
+// every view (the rail collapses to a drawer at the 1023px breakpoint).
+test('responsive: no horizontal overflow at 390px', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  for (const route of A11Y_ROUTES) {
+    await page.goto(route);
+    await page.waitForTimeout(150);
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    expect(overflow, `horizontal overflow on ${route}`).toBeLessThanOrEqual(1);
+  }
+});

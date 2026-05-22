@@ -187,9 +187,18 @@ const initials = computed(() => {
   .tb-menu {
     display: inline-flex;
   }
+  /* Drop the non-essential topbar items on narrow viewports so the bar fits
+     without forcing horizontal page scroll; the avatar stays clickable to
+     open the connection drawer and a long profile label cannot overflow. */
   .tb-divider,
-  .tb-cluster {
+  .tb-cluster,
+  .tb-version,
+  .tb-user-name {
     display: none;
+  }
+  .topbar {
+    gap: var(--s-3);
+    padding: 0 var(--s-3);
   }
 }
 </style>

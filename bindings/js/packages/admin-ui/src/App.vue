@@ -141,7 +141,10 @@ watch(
 
 @media (max-width: 1023px) {
   .app {
-    grid-template-columns: 1fr;
+    /* minmax(0, 1fr) (not 1fr) so the single column is capped at the
+       viewport: a child's min-content can never force the track wider than
+       the screen and scroll the whole page horizontally. */
+    grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
       'topbar'
       'main'
