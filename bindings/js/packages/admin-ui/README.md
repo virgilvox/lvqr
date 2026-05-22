@@ -18,14 +18,14 @@ already exposes:
 |---|---|---|
 | Dashboard | `/api/v1/{stats, streams, slo}` | KPIs + top streams + top SLO rows |
 | Streams | `/api/v1/streams` | Filterable list |
-| Stream detail | `/api/v1/{streams, slo, mesh}` | Per-broadcast view |
-| Recordings | -- (placeholder) | LVQR has no archive list API yet; v1.x backlog |
-| DVR | embedded `<lvqr-dvr-player>` | Live HLS DVR scrub |
+| Stream detail | `/api/v1/streams/{name}` + `/api/v1/{slo, mesh}` | Per-broadcast tracks + SLO + mesh |
+| Recordings | `/api/v1/archive` | Recorded broadcasts; deep-links into DVR scrub |
+| DVR | embedded `<lvqr-dvr-player>` | Live HLS DVR scrub (`?broadcast=` preselect) |
 | Ingest | `/api/v1/{stats, streams}` + recipes | Publisher quickstart per protocol |
 | Filters | `/api/v1/wasm-filter` | Read-only ordered slot list + per-slot counters |
 | Filter detail | `/api/v1/wasm-filter` | Per-slot drilldown |
-| Transcode | -- (placeholder) | Process-startup config; v1.x backlog |
-| Agents | -- (placeholder) | Process-startup config; v1.x backlog |
+| Transcode | `/api/v1/transcode/ladders` | Ladder + live counters; runtime add/remove rendition |
+| Agents | `/api/v1/agents` | Configured agents + attachments; runtime start/stop |
 | Egress | `/api/v1/slo` | Per-transport latency breakdown |
 | Cluster | `/api/v1/cluster/{nodes, broadcasts, config}` | Read-only |
 | Mesh | `/api/v1/mesh` | Tree viz + per-peer detail |
@@ -33,13 +33,14 @@ already exposes:
 | Auth | `/api/v1/streamkeys/*` + `/api/v1/config-reload` | Stream key CRUD; provider status (read-only) |
 | Provenance | `/playback/verify/<broadcast>` | C2PA verify form |
 | Observability | `/metrics` + `/api/v1/{stats, slo}` | KPIs + Prometheus scrape recipe |
-| Logs | -- (placeholder) | No live tail route; recipe shown |
+| Logs | `/api/v1/logs` (SSE) | Live tail with level filter (query-token auth) |
 | Settings | `/api/v1/config-reload` | Hot reload trigger; connection profiles |
 
-Where LVQR doesn't expose a route the mockup describes, the view renders a
-clear placeholder + a v1.x backlog comment + a "configure via `lvqr serve`
-flag X" hint. The console adapts to the LVQR surface; it never invents
-server routes.
+Every view now maps to a live `/api/v1/*` route. Where a subsystem is
+configured at process startup the view surfaces its live state; the
+transcode and agent views additionally support runtime add/remove against
+the relay. The console adapts to the LVQR surface; it never invents server
+routes.
 
 ## Deployment recipes
 
@@ -174,12 +175,28 @@ npm run preview      # serve dist/ locally (for testing the production bundle)
 npm run test:unit    # vitest unit tests
 ```
 
+## Runtime mutation surface
+
+* Live log tail: `GET /api/v1/logs` Server-Sent Events stream with a level
+  filter, surfaced in the Logs view. Because `EventSource` cannot set an
+  `Authorization` header, the admin token rides as a `?token=` query param;
+  prefer a short-lived token since URLs can land in proxy logs.
+* Transcode ladders: add / remove renditions at runtime from the Transcode
+  view (`POST` / `DELETE /api/v1/transcode/ladders`). Requires a transcode
+  ladder configured at startup (the runner only installs then); runtime-added
+  renditions are not advertised in the HLS master playlist (composed at
+  startup) though their output broadcasts are directly accessible.
+* AI agents: start / stop the Whisper captions agent at runtime from the
+  Agents view (`POST` / `DELETE /api/v1/agents`). The relay must be built
+  with `--features whisper`; the model path is read on the relay host.
+
 ## Known v1.0 limitations
 
-* Live log tail: no LVQR admin route yet. Use `journalctl -u lvqr.service
-  -f` or `kubectl logs -f` against the host.
-* Server-side ingest CRUD: configured via CLI flags + TOML config file.
-* Transcode + AI agent edits: process-startup config.
+* Server-side ingest CRUD: ingest listeners are bound at startup via CLI
+  flags + TOML config; runtime listener start/stop is on the v1.x backlog.
+* Broadcast stop / kick subscriber: not exposed -- egress subscribers are
+  anonymous stream readers and ingest sessions have no per-connection cancel
+  handle; v1.x backlog.
 * WASM chain edits: process-startup config; the UI surfaces the chain's
   read-only ordered-list view + per-slot counters. Node-graph editor is
   on the v1.x backlog.
