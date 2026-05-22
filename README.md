@@ -211,7 +211,10 @@ projection into that type, not a rewrite of the egress side.
   one file per `(broadcast, track)` plus an init segment.
 - **DVR archive** (`--archive-dir`) with a `redb` segment index, the
   `/playback/*` scrub routes, range-request support, and Linux
-  `io-uring` writes behind the `io-uring` feature flag.
+  `io-uring` writes behind the `io-uring` feature flag. Recorded
+  broadcasts are enumerated at `GET /api/v1/archive` (per-broadcast
+  track / segment / byte / duration aggregates), surfaced in the
+  console's Recordings view and deep-linked into the DVR scrubber.
 
 ### Observability
 
@@ -221,6 +224,11 @@ projection into that type, not a rewrite of the egress side.
   client SLO samples, and auth failures.
 - OTLP gRPC export of spans + metrics via `LVQR_OTLP_ENDPOINT`,
   composed alongside Prometheus through `metrics-util::FanoutBuilder`.
+- **Live log tail** at `GET /api/v1/logs` (Server-Sent Events) with a
+  level filter, backed by a bounded in-memory ring + a `tokio::sync::
+  broadcast` capture layer composed into the tracing subscriber.
+  Surfaced in the console's Logs view; the admin token rides as
+  `?token=` since `EventSource` cannot set an `Authorization` header.
 - **Latency SLO tracker** with five transports instrumented:
   `"hls"`, `"dash"`, `"ws"`, `"whep"`, and `"moq"`. Server-side
   glass-to-glass for HLS / DASH / WHEP / WS rides
@@ -421,15 +429,21 @@ at `http://localhost:3000`.
 
 ```bash
 curl http://localhost:8080/healthz                # liveness
+curl http://localhost:8080/api/v1/server-info     # version, uptime, bound listeners, features
 curl http://localhost:8080/api/v1/streams         # active broadcasts
+curl http://localhost:8080/api/v1/streams/live%2Fdemo # per-broadcast track detail
 curl http://localhost:8080/api/v1/stats           # connection counts
 curl http://localhost:8080/api/v1/slo             # latency snapshot
+curl http://localhost:8080/api/v1/archive         # recorded broadcasts (with --archive-dir)
+curl http://localhost:8080/api/v1/transcode/ladders # transcode ladder + live counters
+curl http://localhost:8080/api/v1/agents          # in-process agents + attachments
 curl http://localhost:8080/api/v1/wasm-filter     # WASM chain state
 curl http://localhost:8080/api/v1/streamkeys      # stream-key catalog
 curl http://localhost:8080/api/v1/config-reload   # hot reload status
 curl http://localhost:8080/api/v1/mesh            # mesh topology
 curl http://localhost:8080/api/v1/cluster/nodes   # gossip members
 curl http://localhost:8080/api/v1/cluster/federation # federation links
+curl -N "http://localhost:8080/api/v1/logs?token=$ADMIN" # live log tail (SSE)
 curl http://localhost:8080/metrics                # Prometheus scrape
 ```
 
@@ -495,6 +509,13 @@ lvqr serve --whisper-model ggml-tiny.en.bin
 # http://localhost:8888/hls/live/demo/captions/playlist.m3u8
 ```
 
+Agents start and stop at runtime from the admin console's Agents view
+-- or `POST` / `DELETE /api/v1/agents` -- attaching to new and
+already-live broadcasts. Under `--features whisper` the agent runner
+installs even with no startup model, so captions can be started from
+zero; `GET /api/v1/agents` lists configured agents plus live
+per-`(broadcast, track)` attachments and counters.
+
 ### Server-side transcoding (ABR)
 
 ```bash
@@ -522,10 +543,19 @@ lvqr serve --transcode-rendition 720p --transcode-encoder qsv
 ```
 
 The LL-HLS master playlist composes one `EXT-X-STREAM-INF` per
-rendition automatically. NVENC / VAAPI / QSV backends are on the
-v1.2 roadmap; the current macOS HW path is HW-only by design (a
-factory that silently falls back to CPU under load defeats the
-purpose of an operator-pickable hardware tier).
+rendition automatically. All four hardware backends (VideoToolbox /
+NVENC / VA-API / Quick Sync) ship today behind their Cargo features;
+every backend is HW-only by design (a factory that silently falls
+back to CPU under load defeats the purpose of an operator-pickable
+hardware tier).
+
+Renditions are editable at runtime too: the admin console's Transcode
+view -- and `POST` / `DELETE /api/v1/transcode/ladders` -- adds or
+removes a rendition against new and already-live broadcasts without a
+restart. Runtime add requires a ladder configured at startup (that is
+what installs the transcode runner); runtime-added renditions are not
+advertised in the master playlist (composed at startup) but their
+output broadcasts are directly playable.
 
 ### C2PA provenance
 
@@ -854,10 +884,10 @@ so the addition is non-breaking.
 | Package | Install | Surface |
 |---|---|---|
 | `lvqr-core` (Rust) | `cargo add lvqr-core` | Shared types, `EventBus`, admin client. Latest: 1.0.0 (crates.io). |
-| `@lvqr/core` (TS) | `npm i @lvqr/core` | MoQ-Lite subscriber over WebTransport, WebSocket fMP4 fallback, full admin client (`configReload` / `triggerConfigReload` + `listStreamKeys` / `mintStreamKey` / `revokeStreamKey` / `rotateStreamKey` plus health / stats / mesh / SLO / wasm-filter), `MeshPeer` WebRTC DataChannel relay with `pushFrame` + `onChildOpen` + `parentPeerId` + `forwardedFrameCount` + `MeshConfig.capacity`. Latest: 1.0.0. |
+| `@lvqr/core` (TS) | `npm i @lvqr/core` | MoQ-Lite subscriber over WebTransport, WebSocket fMP4 fallback, full admin client: config reload, stream-key CRUD, `serverInfo`, `streamDetail`, `transcodeLadders` + `addRendition` / `removeRendition`, `agents` + `addAgent` / `removeAgent`, `archive`, `logsStreamUrl` (SSE), plus health / stats / mesh / SLO / wasm-filter; `MeshPeer` WebRTC DataChannel relay with `pushFrame` + `onChildOpen` + `parentPeerId` + `forwardedFrameCount` + `MeshConfig.capacity`. Latest: 1.0.0. |
 | `@lvqr/player` | `npm i @lvqr/player` | Drop-in `<lvqr-player>` web component with MSE fallback. Latest: 1.0.0. |
 | `@lvqr/dvr-player` | `npm i @lvqr/dvr-player` | Drop-in `<lvqr-dvr-player>` HLS DVR scrub component with custom seek bar, LIVE pill, Go Live, hover thumbnails, SCTE-35 ad-break marker rendering (`markers="visible/hidden"` + `lvqr-dvr-markers-changed` / `lvqr-dvr-marker-crossed` events + `getMarkers()` API), opt-in client-side glass-to-glass SLO sampler. Latest: 1.0.0. |
-| `@lvqr/admin-ui` | `npm i @lvqr/admin-ui` | Operator admin console -- Vue 3 SPA wired against every `/api/v1/*` route. Multi-relay connection profiles, themable via CSS custom properties, plugin plumbing via `window.__LVQR_ADMIN_PLUGINS__`. Static-deploy behind any host (nginx, Caddy, Digital Ocean App Platform). Latest: 1.0.0. |
+| `@lvqr/admin-ui` | `npm i @lvqr/admin-ui` | Operator admin console -- Vue 3 SPA, every view backed by a live route: dashboard, streams + per-broadcast detail, recordings (archive), DVR scrub, ingest-listener inventory, WASM filters, transcode ladders with **runtime rendition add/remove**, agents with **runtime start/stop**, egress SLO, cluster, mesh, federation, auth (stream-key CRUD), provenance, observability, and a **live SSE log tail**. Multi-relay connection profiles, themable via CSS custom properties, plugin plumbing via `window.__LVQR_ADMIN_PLUGINS__`. Static-deploy behind any host (nginx, Caddy, Digital Ocean App Platform). Latest: 1.0.0. |
 | `lvqr` (Python) | `pip install lvqr` | Admin API client (`config_reload_status` / `trigger_config_reload`, `list_streamkeys` / `mint_streamkey` / `revoke_streamkey` / `rotate_streamkey`, plus health / stats / mesh / SLO / wasm-filter), `bearer_token` kwarg, dataclass returns. Latest: 1.0.0. |
 
 Full TypeScript reference: [`docs/sdk/javascript.md`](docs/sdk/javascript.md).
@@ -910,7 +940,7 @@ Programmable data plane
   lvqr-wasm           wasmtime fragment-filter runtime + hot-reload
   lvqr-agent          AI-agents framework (trait + runner)
   lvqr-agent-whisper  WhisperCaptionsAgent (AAC -> PCM -> WebVTT)
-  lvqr-transcode      GStreamer ABR ladder (software + VideoToolbox)
+  lvqr-transcode      GStreamer ABR ladder (software + 4 HW backends) + runtime add/remove
 
 Infrastructure
   lvqr-cli            single-binary composition root
@@ -999,7 +1029,7 @@ Captions (--features whisper):
 
 Server-side transcoding (--features transcode):
   --transcode-rendition <NAME>          Repeatable; preset or .toml
-  --transcode-encoder software|videotoolbox  [default: software]
+  --transcode-encoder software|videotoolbox|nvenc|vaapi|qsv  [default: software]
   --source-bandwidth-kbps <N>           Override master variant BANDWIDTH
 
 C2PA signing (--features c2pa, requires --archive-dir):
@@ -1050,9 +1080,6 @@ A few things worth knowing before you ship:
 - **Self-signed TLS certs at boot are for local dev only.** Use
   real certificates in production or front the relay with a TLS-
   terminating proxy.
-- **WHEP trickle ICE for inbound candidates is not yet wired.**
-  Outbound trickle works; inbound continues to ride the SDP
-  exchange.
 - **The HLS conformance harness uses internal validators by
   default.** Wiring `mediastreamvalidator` (Apple's reference
   validator) into CI is the single open conformance gap on
