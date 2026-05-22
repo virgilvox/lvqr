@@ -18,6 +18,7 @@ cross-cluster federation, and a browser peer mesh -- without a
 separate Redis, Kafka, external segmenter, or signaling server.
 
 ```bash
+# 1. Run the relay -- self-signed TLS, no auth, zero external deps
 cargo install lvqr-cli
 lvqr serve
 ```
@@ -26,6 +27,22 @@ The server boots with sensible defaults (MoQ on 4443/udp, RTMP on
 1935/tcp, LL-HLS on 8888/tcp, admin + WebSocket on 8080/tcp), a
 self-signed TLS cert if none is supplied, no auth, and zero external
 dependencies.
+
+```bash
+# 2. (optional) Run the operator console against it
+git clone https://github.com/virgilvox/lvqr
+cd lvqr/bindings/js/packages/admin-ui && npm install && npm run dev
+# open http://localhost:5173 -- it auto-connects to http://localhost:8080
+```
+
+[`@lvqr/admin-ui`](bindings/js/packages/admin-ui) is a Vue 3 SPA where
+every view maps to a live `/api/v1/*` route -- streams + per-broadcast
+detail, recordings, DVR scrub, ingest-listener inventory, transcode
+ladders and AI agents with **runtime add/remove + start/stop**, a live
+SSE **log tail**, SLO, cluster, mesh, and C2PA verify. It deploys as a
+static bundle (`npm run build`) behind any host and points at one or
+many relays. Full quickstart + deployment recipes:
+[admin-ui README](bindings/js/packages/admin-ui/README.md).
 
 ---
 
