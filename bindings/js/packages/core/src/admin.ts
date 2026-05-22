@@ -121,6 +121,14 @@ export interface AgentState {
   active: AgentActiveStats[];
 }
 
+/** Body for `POST /api/v1/agents`. Mirrors `lvqr_admin::AddAgentRequest`. */
+export interface AddAgentRequest {
+  /** Path to a whisper.cpp `ggml-*.bin` model file (server-side path). */
+  model: string;
+  /** Optional inference window override in ms (default applied server-side). */
+  window_ms?: number;
+}
+
 /** One recorded track within a broadcast. Mirrors `lvqr_admin::ArchiveTrackInfo`. */
 export interface ArchiveTrackInfo {
   /** Track id (e.g. `"0.mp4"`, `"1.mp4"`). */
@@ -617,6 +625,27 @@ export class LvqrAdminClient {
    */
   async agents(): Promise<AgentState> {
     return this.getJson<AgentState>('/api/v1/agents');
+  }
+
+  /**
+   * `POST /api/v1/agents` -- start an in-process agent at runtime. Throws on
+   * non-2xx (409 already running, 503 when no agent runner / feature).
+   * Requires an admin token.
+   */
+  async addAgent(req: AddAgentRequest): Promise<void> {
+    await this.sendJson<unknown>('POST', '/api/v1/agents', req);
+  }
+
+  /**
+   * `DELETE /api/v1/agents/{name}` -- stop a running agent. Throws on non-2xx
+   * (404 when no such agent, 503 when no runner). Requires an admin token.
+   */
+  async removeAgent(name: string): Promise<void> {
+    const path = `/api/v1/agents/${encodeURIComponent(name)}`;
+    const resp = await this.fetchWithTimeout(`${this.baseUrl}${path}`, { method: 'DELETE' });
+    if (!resp.ok) {
+      throw new Error(`DELETE ${path}: HTTP ${resp.status} ${resp.statusText}`);
+    }
   }
 
   /**

@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
-use lvqr_fragment::{BroadcasterStream, FragmentBroadcasterRegistry, FragmentStream};
-use parking_lot::Mutex;
+use dashmap::mapref::entry::Entry;
+use lvqr_fragment::{BroadcasterStream, FragmentBroadcaster, FragmentBroadcasterRegistry, FragmentStream};
+use parking_lot::RwLock;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -34,25 +35,95 @@ pub struct AgentStats {
 
 type StatsKey = (String, String, String);
 
+/// Shared runner state held jointly by the registry `on_entry_created`
+/// callback and the [`AgentRunnerHandle`]. The factory set is mutable (behind
+/// an `RwLock`) so agents can be started / stopped at runtime; `tasks` is
+/// keyed per drain instance so a stopped agent can abort just its tasks;
+/// `registry` is a (cheap, shared) clone so a runtime-added agent can
+/// retroactively attach to already-live sources.
+struct RunnerInner {
+    registry: FragmentBroadcasterRegistry,
+    factories: RwLock<Vec<Arc<dyn AgentFactory>>>,
+    tasks: DashMap<StatsKey, JoinHandle<()>>,
+    stats: DashMap<StatsKey, Arc<AgentStats>>,
+}
+
+impl RunnerInner {
+    /// Build + spawn a drain task for `factory` against the source
+    /// broadcaster `bc`, unless an identical instance is already running or
+    /// the factory opts out of this `(broadcast, track)`. Returns true iff a
+    /// task was spawned. Idempotent on the `StatsKey` so retroactive spawning
+    /// (runtime start) cannot race the `on_entry_created` callback into a
+    /// duplicate drain.
+    fn spawn_for(
+        &self,
+        broadcast: &str,
+        track: &str,
+        bc: &Arc<FragmentBroadcaster>,
+        factory: &Arc<dyn AgentFactory>,
+    ) -> bool {
+        let key: StatsKey = (factory.name().to_string(), broadcast.to_string(), track.to_string());
+        if self.tasks.contains_key(&key) {
+            return false;
+        }
+        let ctx = AgentContext {
+            broadcast: broadcast.to_string(),
+            track: track.to_string(),
+            meta: bc.meta(),
+        };
+        let Some(agent) = factory.build(&ctx) else {
+            return false;
+        };
+        let handle = match Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                warn!(
+                    broadcast = %broadcast,
+                    track = %track,
+                    "AgentRunner: no tokio runtime; no drain spawned",
+                );
+                return false;
+            }
+        };
+        match self.tasks.entry(key.clone()) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                let sub = bc.subscribe();
+                let stat = Arc::clone(
+                    self.stats
+                        .entry(key.clone())
+                        .or_insert_with(|| Arc::new(AgentStats::default()))
+                        .value(),
+                );
+                let task = handle.spawn(drive(agent, key.0.clone(), ctx, sub, stat));
+                slot.insert(task);
+                true
+            }
+        }
+    }
+}
+
 /// Cheaply-cloneable handle returned by
 /// [`AgentRunner::install`].
 ///
 /// Holds the spawned per-agent drain tasks alive for the
 /// server lifetime; tests and admin consumers read per-
 /// `(agent, broadcast, track)` counters off this handle.
-/// Dropping it aborts every spawned task; mid-stride aborts
-/// do NOT call [`Agent::on_stop`], same shutdown shape as
-/// `WasmFilterBridgeHandle`.
+/// Mid-stride aborts (drop / [`Self::remove_agent`]) do NOT call
+/// [`Agent::on_stop`], same shutdown shape as `WasmFilterBridgeHandle`.
+///
+/// The agent set is mutable at runtime via [`Self::add_agent`] /
+/// [`Self::remove_agent`]; [`Self::agent_names`] reports the current set.
 #[derive(Clone)]
 pub struct AgentRunnerHandle {
-    stats: Arc<DashMap<StatsKey, Arc<AgentStats>>>,
-    _tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    inner: Arc<RunnerInner>,
 }
 
 impl std::fmt::Debug for AgentRunnerHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentRunnerHandle")
-            .field("tracked_keys", &self.stats.len())
+            .field("tracked_keys", &self.inner.stats.len())
+            .field("agents", &self.inner.factories.read().len())
             .finish()
     }
 }
@@ -79,11 +150,63 @@ impl AgentRunnerHandle {
     /// Snapshot of every `(agent, broadcast, track)` triple the
     /// runner has spawned a drain task for.
     pub fn tracked(&self) -> Vec<StatsKey> {
-        self.stats.iter().map(|e| e.key().clone()).collect()
+        self.inner.stats.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// The current agent set's names, in registration order. Reflects runtime
+    /// [`Self::add_agent`] / [`Self::remove_agent`] edits so introspection
+    /// stays consistent with edits.
+    pub fn agent_names(&self) -> Vec<String> {
+        self.inner
+            .factories
+            .read()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect()
+    }
+
+    /// Add an agent factory to the live set. New broadcasts pick it up via the
+    /// `on_entry_created` callback; already-live sources get a drain task
+    /// spawned retroactively. No-op returning `false` when a factory with that
+    /// name is already registered (the caller should map that to a 409). Must
+    /// be called from within a tokio runtime.
+    pub fn add_agent(&self, factory: Arc<dyn AgentFactory>) -> bool {
+        {
+            let mut factories = self.inner.factories.write();
+            if factories.iter().any(|f| f.name() == factory.name()) {
+                return false;
+            }
+            factories.push(Arc::clone(&factory));
+        }
+        for (broadcast, track) in self.inner.registry.keys() {
+            if let Some(bc) = self.inner.registry.get(&broadcast, &track) {
+                self.inner.spawn_for(&broadcast, &track, &bc, &factory);
+            }
+        }
+        true
+    }
+
+    /// Remove the named agent + abort its drain tasks. Returns the number of
+    /// drain tasks aborted. Aborting skips `on_stop`. Returns 0 (and removes
+    /// nothing) when no agent with that name exists.
+    pub fn remove_agent(&self, name: &str) -> usize {
+        self.inner.factories.write().retain(|f| f.name() != name);
+        let mut aborted = 0usize;
+        self.inner.tasks.retain(|key, task| {
+            if key.0 == name {
+                task.abort();
+                aborted += 1;
+                false
+            } else {
+                true
+            }
+        });
+        aborted
     }
 
     fn stat(&self, agent: &str, broadcast: &str, track: &str) -> Option<Arc<AgentStats>> {
-        self.stats
+        self.inner
+            .stats
             .get(&(agent.to_string(), broadcast.to_string(), track.to_string()))
             .map(|e| Arc::clone(e.value()))
     }
@@ -154,64 +277,31 @@ impl AgentRunner {
     /// available (the registry callback fires from a non-tokio
     /// context), the warn is logged and no task spawns.
     pub fn install(self, registry: &FragmentBroadcasterRegistry) -> AgentRunnerHandle {
-        let stats: Arc<DashMap<StatsKey, Arc<AgentStats>>> = Arc::new(DashMap::new());
-        let tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::new(RunnerInner {
+            registry: registry.clone(),
+            factories: RwLock::new(self.factories),
+            tasks: DashMap::new(),
+            stats: DashMap::new(),
+        });
 
-        let factories = self.factories;
-        let stats_cb = Arc::clone(&stats);
-        let tasks_cb = Arc::clone(&tasks);
-
+        let inner_cb = Arc::clone(&inner);
         registry.on_entry_created(move |broadcast, track, bc| {
-            let handle = match Handle::try_current() {
-                Ok(h) => h,
-                Err(_) => {
-                    warn!(
-                        broadcast = %broadcast,
-                        track = %track,
-                        "AgentRunner: registry callback fired outside tokio runtime; no drain spawned",
-                    );
-                    return;
-                }
-            };
-
-            let ctx = AgentContext {
-                broadcast: broadcast.to_string(),
-                track: track.to_string(),
-                meta: bc.meta(),
-            };
-
+            // Snapshot the current factory Arcs so a concurrent add/remove
+            // does not hold the read lock across the spawn loop. spawn_for
+            // subscribes synchronously inside the callback so no emit can race
+            // ahead of the drain loop.
+            let factories: Vec<Arc<dyn AgentFactory>> = inner_cb.factories.read().clone();
             for factory in &factories {
-                let Some(agent) = factory.build(&ctx) else {
-                    continue;
-                };
-                // Subscribe synchronously inside the callback so
-                // no emit can race ahead of the drain loop. The
-                // BroadcasterStream owns only the Receiver side
-                // (not an `Arc<FragmentBroadcaster>`), so the
-                // drain task does not extend the broadcaster's
-                // lifetime past the producers' -- the recv loop
-                // sees `Closed` once every ingest clone drops.
-                let sub = bc.subscribe();
-                let key: StatsKey = (factory.name().to_string(), broadcast.to_string(), track.to_string());
-                let stat = Arc::clone(
-                    stats_cb
-                        .entry(key.clone())
-                        .or_insert_with(|| Arc::new(AgentStats::default()))
-                        .value(),
-                );
-                let agent_name = factory.name().to_string();
-                let ctx_for_task = ctx.clone();
-                let task = handle.spawn(drive(agent, agent_name, ctx_for_task, sub, stat));
-                tasks_cb.lock().push(task);
+                inner_cb.spawn_for(broadcast, track, bc, factory);
             }
         });
 
         info!(
-            factories = registry_callback_factory_count(&tasks),
+            agents = inner.factories.read().len(),
             "AgentRunner installed on FragmentBroadcasterRegistry"
         );
 
-        AgentRunnerHandle { stats, _tasks: tasks }
+        AgentRunnerHandle { inner }
     }
 }
 
@@ -297,14 +387,6 @@ async fn drive(
         panics = stats.panics.load(Ordering::Relaxed),
         "AgentRunner: drain terminated",
     );
-}
-
-/// Snapshot the spawned-task count from inside the install
-/// log line. Pulled into a tiny helper because the `tasks`
-/// `Mutex` is acquired briefly and the locking pattern reads
-/// better in a function than inline in a `info!` call.
-fn registry_callback_factory_count(tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>) -> usize {
-    tasks.lock().len()
 }
 
 #[cfg(test)]
@@ -453,6 +535,132 @@ mod tests {
         }
 
         assert_eq!(*capture.stops.lock(), 1, "on_stop fires exactly once");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_agent_spawns_for_existing_live_source() {
+        let registry = FragmentBroadcasterRegistry::new();
+        let cap_a = Arc::new(Capture::default());
+        let handle = AgentRunner::new()
+            .with_factory(CaptureFactory {
+                capture: Arc::clone(&cap_a),
+                name: "a",
+                accept_track: None,
+            })
+            .install(&registry);
+
+        let bc = registry.get_or_create("live", "0.mp4", meta());
+        bc.emit(frag(0));
+
+        // Add a second agent at runtime; it must attach to the already-live
+        // source.
+        let cap_b = Arc::new(Capture::default());
+        assert!(handle.add_agent(Arc::new(CaptureFactory {
+            capture: Arc::clone(&cap_b),
+            name: "b",
+            accept_track: None,
+        })));
+
+        let cap_for_poll = Arc::clone(&cap_b);
+        poll_until(move || !cap_for_poll.fragments.lock().is_empty(), POLL_TIMEOUT).await;
+        bc.emit(frag(1));
+        let cap_for_poll = Arc::clone(&cap_b);
+        poll_until(move || !cap_for_poll.fragments.lock().is_empty(), POLL_TIMEOUT).await;
+
+        assert!(
+            !cap_b.fragments.lock().is_empty(),
+            "runtime-added agent 'b' must see post-add fragments"
+        );
+        assert!(handle.fragments_seen("b", "live", "0.mp4") >= 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_agent_rejects_duplicate_name() {
+        let registry = FragmentBroadcasterRegistry::new();
+        let handle = AgentRunner::new()
+            .with_factory(CaptureFactory {
+                capture: Arc::new(Capture::default()),
+                name: "captions",
+                accept_track: None,
+            })
+            .install(&registry);
+
+        assert!(!handle.add_agent(Arc::new(CaptureFactory {
+            capture: Arc::new(Capture::default()),
+            name: "captions",
+            accept_track: None,
+        })));
+        assert!(handle.add_agent(Arc::new(CaptureFactory {
+            capture: Arc::new(Capture::default()),
+            name: "overlay",
+            accept_track: None,
+        })));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_agent_aborts_its_drain_and_leaves_others() {
+        let registry = FragmentBroadcasterRegistry::new();
+        let cap_a = Arc::new(Capture::default());
+        let cap_b = Arc::new(Capture::default());
+        let handle = AgentRunner::new()
+            .with_factory(CaptureFactory {
+                capture: Arc::clone(&cap_a),
+                name: "a",
+                accept_track: None,
+            })
+            .with_factory(CaptureFactory {
+                capture: Arc::clone(&cap_b),
+                name: "b",
+                accept_track: None,
+            })
+            .install(&registry);
+
+        let bc = registry.get_or_create("live", "0.mp4", meta());
+        bc.emit(frag(0));
+        let cap_for_poll = Arc::clone(&cap_b);
+        poll_until(move || !cap_for_poll.fragments.lock().is_empty(), POLL_TIMEOUT).await;
+
+        let aborted = handle.remove_agent("b");
+        assert_eq!(aborted, 1, "exactly agent b's drain task aborts");
+
+        bc.emit(frag(1));
+        bc.emit(frag(2));
+        let cap_for_poll = Arc::clone(&cap_a);
+        poll_until(move || cap_for_poll.fragments.lock().len() >= 3, POLL_TIMEOUT).await;
+
+        let seen_a = handle.fragments_seen("a", "live", "0.mp4");
+        let seen_b = handle.fragments_seen("b", "live", "0.mp4");
+        assert!(seen_a >= 3, "surviving agent a keeps draining; saw {seen_a}");
+        assert!(
+            seen_b < seen_a,
+            "removed agent b stopped draining ({seen_b}) vs a ({seen_a})"
+        );
+        assert_eq!(handle.agent_names(), vec!["a".to_string()], "b gone from the set");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_names_reflects_runtime_edits() {
+        let registry = FragmentBroadcasterRegistry::new();
+        let handle = AgentRunner::new()
+            .with_factory(CaptureFactory {
+                capture: Arc::new(Capture::default()),
+                name: "captions",
+                accept_track: None,
+            })
+            .install(&registry);
+        assert_eq!(handle.agent_names(), vec!["captions".to_string()]);
+
+        assert!(handle.add_agent(Arc::new(CaptureFactory {
+            capture: Arc::new(Capture::default()),
+            name: "overlay",
+            accept_track: None,
+        })));
+        let mut names = handle.agent_names();
+        names.sort();
+        assert_eq!(names, vec!["captions".to_string(), "overlay".to_string()]);
+
+        assert_eq!(handle.remove_agent("captions"), 0, "no live source -> no task aborted");
+        assert_eq!(handle.agent_names(), vec!["overlay".to_string()]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -637,12 +845,16 @@ mod tests {
 
     #[test]
     fn agent_runner_handle_debug_redacts_internals() {
-        let stats: Arc<DashMap<StatsKey, Arc<AgentStats>>> = Arc::new(DashMap::new());
-        stats.insert(("a".into(), "b".into(), "c".into()), Arc::new(AgentStats::default()));
-        let handle = AgentRunnerHandle {
-            stats,
-            _tasks: Arc::new(Mutex::new(Vec::new())),
-        };
+        let inner = Arc::new(RunnerInner {
+            registry: FragmentBroadcasterRegistry::new(),
+            factories: RwLock::new(Vec::new()),
+            tasks: DashMap::new(),
+            stats: DashMap::new(),
+        });
+        inner
+            .stats
+            .insert(("a".into(), "b".into(), "c".into()), Arc::new(AgentStats::default()));
+        let handle = AgentRunnerHandle { inner };
         let printed = format!("{handle:?}");
         assert!(printed.contains("tracked_keys"));
         assert!(printed.contains("1"), "{printed}");

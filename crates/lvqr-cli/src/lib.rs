@@ -653,32 +653,33 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // `BroadcasterCaptionsBridge` above picks it up and feeds
     // the HLS subtitle rendition. Without the flag (or without
     // the `whisper` feature at all) no AI state is constructed.
+    // The agent runner is ALWAYS installed under the `whisper` feature (with
+    // the startup captions agent when `--whisper-model` is set, empty
+    // otherwise) so the runtime agent CRUD route can start an agent from zero.
     #[cfg(feature = "whisper")]
-    let agent_runner_handle = if let Some(ref path) = config.whisper_model {
-        if hls_server.is_none() {
-            // The captions track reaches browser players only via
-            // the HLS subtitle rendition that `BroadcasterCaptionsBridge`
-            // wires above. With HLS disabled the WhisperCaptionsAgent
-            // still runs and publishes cues onto the registry and the
-            // in-process `CaptionStream`, but browser subscribers see
-            // nothing. Warn so misconfigured deployments surface early
-            // rather than through silent captions loss.
-            tracing::warn!(
-                path = %path.display(),
-                "whisper captions agent enabled without HLS surface; browser clients will not receive captions"
-            );
+    let agent_runner_handle = {
+        let mut runner = lvqr_agent::AgentRunner::new();
+        if let Some(ref path) = config.whisper_model {
+            if hls_server.is_none() {
+                // The captions track reaches browser players only via
+                // the HLS subtitle rendition that `BroadcasterCaptionsBridge`
+                // wires above. With HLS disabled the WhisperCaptionsAgent
+                // still runs and publishes cues onto the registry and the
+                // in-process `CaptionStream`, but browser subscribers see
+                // nothing. Warn so misconfigured deployments surface early
+                // rather than through silent captions loss.
+                tracing::warn!(
+                    path = %path.display(),
+                    "whisper captions agent enabled without HLS surface; browser clients will not receive captions"
+                );
+            }
+            let factory =
+                lvqr_agent_whisper::WhisperCaptionsFactory::new(lvqr_agent_whisper::WhisperConfig::new(path.clone()))
+                    .with_caption_registry(shared_registry.clone());
+            tracing::info!(path = %path.display(), "whisper captions agent enabled");
+            runner = runner.with_factory(factory);
         }
-        let factory =
-            lvqr_agent_whisper::WhisperCaptionsFactory::new(lvqr_agent_whisper::WhisperConfig::new(path.clone()))
-                .with_caption_registry(shared_registry.clone());
-        tracing::info!(path = %path.display(), "whisper captions agent enabled");
-        Some(
-            lvqr_agent::AgentRunner::new()
-                .with_factory(factory)
-                .install(&shared_registry),
-        )
-    } else {
-        None
+        Some(runner.install(&shared_registry))
     };
 
     // Install the broadcaster-based DASH composition bridge. Same
@@ -1254,53 +1255,107 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         admin_state
     };
 
-    // Read-only in-process agent introspection for `GET /api/v1/agents`.
-    // Surfaces the configured agent set (currently the Whisper captions
-    // agent when `--whisper-model` is set) plus live per-attachment
-    // counters from the runner handle. Only wired on `whisper`-feature
-    // builds; otherwise the route reports `enabled: false`. Runtime
-    // start/stop is a separate CRUD surface for a later slice.
+    // In-process agent introspection + runtime CRUD for `/api/v1/agents`.
+    // The introspection closure reads the runner's LIVE agent set (so it
+    // reflects runtime start/stop), enriched with model/window metadata from
+    // a shared map the mutation closure keeps in sync. The mutation closure
+    // builds the Whisper captions factory from the request and applies it via
+    // the runner handle. Only on `whisper`-feature builds.
     #[cfg(feature = "whisper")]
-    let admin_state = {
-        let agents: Vec<lvqr_admin::AgentInfo> = config
-            .whisper_model
-            .as_ref()
-            .map(|path| {
-                vec![lvqr_admin::AgentInfo {
+    let admin_state = if let Some(handle) = agent_runner_handle.clone() {
+        // Per-agent-name model/window metadata; the runner's name-only view
+        // does not carry it. Seeded with the startup agent if configured.
+        let meta: Arc<std::sync::RwLock<std::collections::HashMap<String, lvqr_admin::AgentInfo>>> =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        if let Some(ref path) = config.whisper_model {
+            let cfg = lvqr_agent_whisper::WhisperConfig::new(path.clone());
+            meta.write().expect("agent meta lock poisoned").insert(
+                "captions".to_string(),
+                lvqr_admin::AgentInfo {
                     name: "captions".to_string(),
                     kind: "captions".to_string(),
                     model: Some(path.display().to_string()),
-                    window_ms: Some(lvqr_agent_whisper::WhisperConfig::new(path.clone()).window_ms),
-                }]
-            })
-            .unwrap_or_default();
-        let handle = agent_runner_handle.clone();
-        admin_state.with_agents(move || {
-            let active: Vec<lvqr_admin::AgentActiveStats> = handle
-                .as_ref()
-                .map(|h| {
-                    h.tracked()
-                        .into_iter()
-                        .map(|(agent, broadcast, track)| {
-                            let fragments_seen = h.fragments_seen(&agent, &broadcast, &track);
-                            let panics = h.panics(&agent, &broadcast, &track);
-                            lvqr_admin::AgentActiveStats {
-                                agent,
-                                broadcast,
-                                track,
-                                fragments_seen,
-                                panics,
-                            }
-                        })
-                        .collect()
+                    window_ms: Some(cfg.window_ms),
+                },
+            );
+        }
+
+        let handle_intro = handle.clone();
+        let meta_intro = Arc::clone(&meta);
+        let admin_state = admin_state.with_agents(move || {
+            let names = handle_intro.agent_names();
+            let guard = meta_intro.read().expect("agent meta lock poisoned");
+            let agents: Vec<lvqr_admin::AgentInfo> = names
+                .iter()
+                .map(|name| {
+                    guard.get(name).cloned().unwrap_or_else(|| lvqr_admin::AgentInfo {
+                        name: name.clone(),
+                        kind: "agent".to_string(),
+                        model: None,
+                        window_ms: None,
+                    })
                 })
-                .unwrap_or_default();
+                .collect();
+            let active: Vec<lvqr_admin::AgentActiveStats> = handle_intro
+                .tracked()
+                .into_iter()
+                .map(|(agent, broadcast, track)| {
+                    let fragments_seen = handle_intro.fragments_seen(&agent, &broadcast, &track);
+                    let panics = handle_intro.panics(&agent, &broadcast, &track);
+                    lvqr_admin::AgentActiveStats {
+                        agent,
+                        broadcast,
+                        track,
+                        fragments_seen,
+                        panics,
+                    }
+                })
+                .collect();
             lvqr_admin::AgentState {
                 enabled: !agents.is_empty(),
-                agents: agents.clone(),
+                agents,
                 active,
             }
-        })
+        });
+
+        let registry_for_agent = shared_registry.clone();
+        let meta_mut = Arc::clone(&meta);
+        admin_state.with_agent_mutate(Arc::new(move |mutation| match mutation {
+            lvqr_admin::AgentMutation::Add(req) => {
+                let mut cfg = lvqr_agent_whisper::WhisperConfig::new(&req.model);
+                if let Some(w) = req.window_ms {
+                    cfg = cfg.with_window_ms(w);
+                }
+                let window = cfg.window_ms;
+                let factory = lvqr_agent_whisper::WhisperCaptionsFactory::new(cfg)
+                    .with_caption_registry(registry_for_agent.clone());
+                let name = lvqr_agent::AgentFactory::name(&factory).to_string();
+                let factory_arc: Arc<dyn lvqr_agent::AgentFactory> = Arc::new(factory);
+                if !handle.add_agent(factory_arc) {
+                    return lvqr_admin::AgentMutateResult::Conflict;
+                }
+                meta_mut.write().expect("agent meta lock poisoned").insert(
+                    name.clone(),
+                    lvqr_admin::AgentInfo {
+                        name,
+                        kind: "captions".to_string(),
+                        model: Some(req.model),
+                        window_ms: Some(window),
+                    },
+                );
+                lvqr_admin::AgentMutateResult::Added
+            }
+            lvqr_admin::AgentMutation::Remove(name) => {
+                if !handle.agent_names().iter().any(|n| n == &name) {
+                    return lvqr_admin::AgentMutateResult::NotFound;
+                }
+                handle.remove_agent(&name);
+                meta_mut.write().expect("agent meta lock poisoned").remove(&name);
+                lvqr_admin::AgentMutateResult::Removed
+            }
+        }))
+    } else {
+        admin_state
     };
 
     // Read-only archive introspection for `GET /api/v1/archive`. Aggregates

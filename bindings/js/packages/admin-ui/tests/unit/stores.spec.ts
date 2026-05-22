@@ -261,6 +261,27 @@ describe('per-resource stores', () => {
     expect(s.error).toContain('HTTP 500');
   });
 
+  it('agents.addAgent calls client.addAgent then refetches', async () => {
+    const addSpy = vi.fn().mockResolvedValue(undefined);
+    const listSpy = vi.fn().mockResolvedValue({ enabled: true, agents: [], active: [] });
+    stubClient({ addAgent: addSpy, agents: listSpy });
+    const s = useAgentsStore();
+    const req = { model: '/m/ggml.bin', window_ms: 3000 };
+    await s.addAgent(req);
+    expect(addSpy).toHaveBeenCalledWith(req);
+    expect(listSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('agents.removeAgent calls client.removeAgent then refetches', async () => {
+    const rmSpy = vi.fn().mockResolvedValue(undefined);
+    const listSpy = vi.fn().mockResolvedValue({ enabled: false, agents: [], active: [] });
+    stubClient({ removeAgent: rmSpy, agents: listSpy });
+    const s = useAgentsStore();
+    await s.removeAgent('captions');
+    expect(rmSpy).toHaveBeenCalledWith('captions');
+    expect(listSpy).toHaveBeenCalledTimes(1);
+  });
+
   it('archive.fetch calls client.archive', async () => {
     const spy = vi.fn().mockResolvedValue({
       enabled: true,

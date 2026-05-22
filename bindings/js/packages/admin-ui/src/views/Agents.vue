@@ -1,23 +1,63 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, reactive, ref } from 'vue';
 import PageHeader from '@/components/ui/PageHeader.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import KpiTile from '@/components/ui/KpiTile.vue';
 import Card from '@/components/ui/Card.vue';
 import Badge from '@/components/ui/Badge.vue';
+import Button from '@/components/ui/Button.vue';
 import { useAgentsStore } from '@/stores/agents';
 import { usePolling } from '@/composables/usePolling';
+import { useToast } from '@/composables/useToast';
 
-// Read-only introspection of startup-configured in-process agents via
-// GET /api/v1/agents. Runtime start/stop is a separate CRUD surface tracked
-// for a later slice; this view lists configured agents + live attachments.
+// Introspection + runtime CRUD of in-process agents via /api/v1/agents.
+// Today this drives the Whisper captions agent: start one by giving a model
+// path, stop it by name. New and already-live broadcasts both pick up a
+// started agent.
 const agents = useAgentsStore();
+const { push } = useToast();
 usePolling(() => agents.fetch(), { intervalMs: 10_000 });
 
 const state = computed(() => agents.state);
-const enabled = computed(() => state.value?.enabled ?? false);
-const configured = computed(() => state.value?.agents ?? []);
-const active = computed(() => state.value?.active ?? []);
+const enabled = computed(() => agents.state?.enabled ?? false);
+const configured = computed(() => agents.state?.agents ?? []);
+const active = computed(() => agents.state?.active ?? []);
+
+const form = reactive({ model: '', window_ms: 5000 });
+const submitting = ref(false);
+const removing = ref<string | null>(null);
+
+async function submitAdd() {
+  if (!form.model.trim()) {
+    push('error', 'a model path is required');
+    return;
+  }
+  submitting.value = true;
+  try {
+    await agents.addAgent({ model: form.model.trim(), window_ms: form.window_ms });
+    push('success', 'started captions agent');
+    form.model = '';
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes('409')) push('error', 'an agent is already running', 6000);
+    else if (msg.includes('503')) push('error', 'agent mutation unavailable (build with --features whisper)', 7000);
+    else push('error', msg, 6000);
+  } finally {
+    submitting.value = false;
+  }
+}
+
+async function removeAgent(name: string) {
+  removing.value = name;
+  try {
+    await agents.removeAgent(name);
+    push('success', `stopped agent ${name}`);
+  } catch (e) {
+    push('error', e instanceof Error ? e.message : String(e), 6000);
+  } finally {
+    removing.value = null;
+  }
+}
 </script>
 
 <template>
@@ -30,58 +70,75 @@ const active = computed(() => state.value?.active ?? []);
 
     <div v-else-if="!state" class="state state-loading"><span class="spinner" /> Loading agents...</div>
 
-    <template v-else-if="enabled">
-      <section class="kpis">
-        <KpiTile label="Configured agents" :value="configured.length" />
-        <KpiTile label="Live attachments" :value="active.length" accent="wire" />
-      </section>
-
-      <Card v-for="a in configured" :key="a.name" :kicker="a.kind.toUpperCase()" :title="a.name">
-        <template #actions><Badge variant="ready">attached</Badge></template>
-        <dl class="meta">
-          <template v-if="a.model">
-            <dt>Model</dt>
-            <dd class="mono">{{ a.model }}</dd>
-          </template>
-          <template v-if="a.window_ms != null">
-            <dt>Window</dt>
-            <dd class="mono">{{ a.window_ms }} ms</dd>
-          </template>
-        </dl>
-      </Card>
-
-      <Card kicker="LIVE" title="Attachments" wire>
-        <div v-if="active.length" class="atable" role="table" aria-label="Live agent attachments">
-          <div class="tr th" role="row">
-            <span role="columnheader">Agent</span>
-            <span role="columnheader">Source</span>
-            <span role="columnheader">Track</span>
-            <span role="columnheader" class="num">Fragments</span>
-            <span role="columnheader" class="num">Panics</span>
-          </div>
-          <div v-for="x in active" :key="`${x.agent}|${x.broadcast}|${x.track}`" class="tr" role="row">
-            <span role="cell"><Badge variant="tally">{{ x.agent }}</Badge></span>
-            <span role="cell" class="mono">{{ x.broadcast }}</span>
-            <span role="cell" class="mono">{{ x.track }}</span>
-            <span role="cell" class="num">{{ x.fragments_seen.toLocaleString() }}</span>
-            <span role="cell" class="num" :class="{ warn: x.panics > 0 }">{{ x.panics }}</span>
-          </div>
-        </div>
-        <p v-else class="empty">
-          No agents are attached to a live broadcast yet. Agents attach when a matching source track
-          starts publishing.
-        </p>
-      </Card>
-    </template>
-
     <template v-else>
-      <EmptyState kicker="NOT CONFIGURED" title="No in-process agents on this relay.">
-        This relay has no agents configured (or was built without an agent feature such as
-        <code>whisper</code>). Attach the Whisper captions agent by adding
-        <code>--whisper-model &lt;path/to/ggml-tiny.en.bin&gt;</code> to <code>lvqr serve</code>
-        (build with <code>--features whisper</code>). The agent emits a sibling captions track that
+      <template v-if="enabled">
+        <section class="kpis">
+          <KpiTile label="Running agents" :value="configured.length" />
+          <KpiTile label="Live attachments" :value="active.length" accent="wire" />
+        </section>
+
+        <Card v-for="a in configured" :key="a.name" :kicker="a.kind.toUpperCase()" :title="a.name">
+          <template #actions>
+            <Button variant="ghost" :loading="removing === a.name" :aria-label="`Stop ${a.name}`" @click="removeAgent(a.name)">
+              Stop
+            </Button>
+          </template>
+          <dl class="meta">
+            <template v-if="a.model">
+              <dt>Model</dt>
+              <dd class="mono">{{ a.model }}</dd>
+            </template>
+            <template v-if="a.window_ms != null">
+              <dt>Window</dt>
+              <dd class="mono">{{ a.window_ms }} ms</dd>
+            </template>
+          </dl>
+        </Card>
+
+        <Card kicker="LIVE" title="Attachments" wire>
+          <div v-if="active.length" class="atable" role="table" aria-label="Live agent attachments">
+            <div class="tr th" role="row">
+              <span role="columnheader">Agent</span>
+              <span role="columnheader">Source</span>
+              <span role="columnheader">Track</span>
+              <span role="columnheader" class="num">Fragments</span>
+              <span role="columnheader" class="num">Panics</span>
+            </div>
+            <div v-for="x in active" :key="`${x.agent}|${x.broadcast}|${x.track}`" class="tr" role="row">
+              <span role="cell"><Badge variant="tally">{{ x.agent }}</Badge></span>
+              <span role="cell" class="mono">{{ x.broadcast }}</span>
+              <span role="cell" class="mono">{{ x.track }}</span>
+              <span role="cell" class="num">{{ x.fragments_seen.toLocaleString() }}</span>
+              <span role="cell" class="num" :class="{ warn: x.panics > 0 }">{{ x.panics }}</span>
+            </div>
+          </div>
+          <p v-else class="empty">
+            No agents are attached to a live broadcast yet. Agents attach when a matching source
+            track starts publishing.
+          </p>
+        </Card>
+      </template>
+
+      <EmptyState v-else kicker="NO AGENTS" title="No agents running.">
+        Start the Whisper captions agent below by giving it a model path, or configure one at
+        startup with <code>--whisper-model &lt;path/to/ggml-tiny.en.bin&gt;</code>. The relay must be
+        built with <code>--features whisper</code>; the agent emits a sibling captions track that
         <code>@lvqr/dvr-player</code> renders through the standard HLS subtitle rendition.
       </EmptyState>
+
+      <Card kicker="START AGENT" title="Whisper captions">
+        <form class="addform" @submit.prevent="submitAdd">
+          <div class="fields">
+            <label class="grow"><span>Model path</span><input v-model="form.model" placeholder="/models/ggml-tiny.en.bin" required /></label>
+            <label><span>Window ms</span><input v-model.number="form.window_ms" type="number" min="100" /></label>
+            <Button variant="primary" type="submit" :loading="submitting">Start</Button>
+          </div>
+          <p class="note">
+            The model path is read on the relay host. Starting attaches the captions agent to new and
+            already-live broadcasts; build with <code>--features whisper</code> for this to be available.
+          </p>
+        </form>
+      </Card>
     </template>
   </div>
 </template>
@@ -173,6 +230,44 @@ const active = computed(() => state.value?.active ?? []);
   font-family: var(--font-mono);
   color: var(--ink-faint);
   font-size: 12px;
+}
+.addform .fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--s-3);
+}
+.addform label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.addform label.grow {
+  flex: 1;
+  min-width: 240px;
+}
+.addform label span {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.addform input {
+  border: 1px solid var(--chalk-hi);
+  background: var(--paper-hi);
+  padding: 6px 9px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+.addform label:not(.grow) input {
+  width: 110px;
+}
+.note {
+  margin-top: var(--s-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-muted);
 }
 code {
   font-family: var(--font-mono);

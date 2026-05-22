@@ -34,6 +34,7 @@ export {
   type AgentInfo,
   type AgentActiveStats,
   type AgentState,
+  type AddAgentRequest,
   type ArchiveTrackInfo,
   type ArchiveBroadcastInfo,
   type ArchiveState,

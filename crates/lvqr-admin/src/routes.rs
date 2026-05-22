@@ -246,6 +246,46 @@ pub enum TranscodeMutateResult {
 /// `transcode`-feature builds; `None` -> the routes return 503.
 pub type TranscodeMutateFn = Arc<dyn Fn(TranscodeMutation) -> TranscodeMutateResult + Send + Sync>;
 
+/// Body for `POST /api/v1/agents` (start an in-process agent at runtime).
+/// Today this drives the Whisper captions agent; `model` is the path to a
+/// whisper.cpp `ggml-*.bin` model and `window_ms` overrides the inference
+/// window (defaults applied server-side when omitted).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddAgentRequest {
+    pub model: String,
+    #[serde(default)]
+    pub window_ms: Option<u32>,
+}
+
+/// A runtime agent mutation requested via the agent admin routes and applied
+/// by the closure wired with [`AdminState::with_agent_mutate`]. The admin
+/// crate stays free of the agent crates: the CLI closure builds the concrete
+/// agent factory.
+#[derive(Debug, Clone)]
+pub enum AgentMutation {
+    /// Start an agent from the given request.
+    Add(AddAgentRequest),
+    /// Stop the named agent.
+    Remove(String),
+}
+
+/// Outcome of applying an [`AgentMutation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMutateResult {
+    /// The agent was started.
+    Added,
+    /// An agent of that name is already running (maps to 409).
+    Conflict,
+    /// The agent was stopped.
+    Removed,
+    /// No agent with that name is running (maps to 404).
+    NotFound,
+}
+
+/// Closure backing the agent mutation routes. Wired by the CLI on
+/// agent-feature builds (e.g. `whisper`); `None` -> the routes return 503.
+pub type AgentMutateFn = Arc<dyn Fn(AgentMutation) -> AgentMutateResult + Send + Sync>;
+
 /// In-process agent state returned by `GET /api/v1/agents`.
 ///
 /// `enabled` reflects whether the binary was built with an agent feature
@@ -434,6 +474,11 @@ pub struct AdminState {
     /// [`AdminState::with_transcode_mutate`] on `transcode`-feature builds;
     /// `None` -> the mutation routes return 503.
     transcode_mutate: Option<TranscodeMutateFn>,
+    /// Closure backing the agent mutation routes
+    /// (`POST`/`DELETE /api/v1/agents`). Populated by
+    /// [`AdminState::with_agent_mutate`] on agent-feature builds; `None` ->
+    /// the mutation routes return 503.
+    agent_mutate: Option<AgentMutateFn>,
 }
 
 impl AdminState {
@@ -485,6 +530,7 @@ impl AdminState {
             }),
             log_broadcaster: None,
             transcode_mutate: None,
+            agent_mutate: None,
         }
     }
 
@@ -588,6 +634,14 @@ impl AdminState {
     /// `transcode`-feature builds; without it the mutation routes return 503.
     pub fn with_transcode_mutate(mut self, mutate: TranscodeMutateFn) -> Self {
         self.transcode_mutate = Some(mutate);
+        self
+    }
+
+    /// Wire the agent mutation closure backing `POST`/`DELETE /api/v1/agents`.
+    /// The CLI calls this only on agent-feature builds; without it the
+    /// mutation routes return 503.
+    pub fn with_agent_mutate(mut self, mutate: AgentMutateFn) -> Self {
+        self.agent_mutate = Some(mutate);
         self
     }
 
@@ -731,7 +785,8 @@ pub fn build_router(state: AdminState) -> Router {
             get(get_transcode).post(add_transcode_rendition),
         )
         .route("/api/v1/transcode/ladders/{name}", delete(remove_transcode_rendition))
-        .route("/api/v1/agents", get(get_agents))
+        .route("/api/v1/agents", get(get_agents).post(add_agent_route))
+        .route("/api/v1/agents/{name}", delete(remove_agent_route))
         .route("/api/v1/archive", get(get_archive))
         .route(
             "/api/v1/streamkeys",
@@ -1099,6 +1154,65 @@ async fn remove_transcode_rendition(State(state): State<AdminState>, Path(name):
 /// per-attachment counters. Returns `enabled: false` when none are wired.
 async fn get_agents(State(state): State<AdminState>) -> Result<Json<AgentState>, AdminError> {
     Ok(Json((state.get_agents)()))
+}
+
+/// `POST /api/v1/agents` -- start an in-process agent at runtime. Body is an
+/// [`AddAgentRequest`]. 201 on start, 409 when an agent of that name is
+/// already running, 400 on an invalid request, 503 when agent mutation is not
+/// available (no agent feature / no runner).
+async fn add_agent_route(State(state): State<AdminState>, Json(req): Json<AddAgentRequest>) -> Response {
+    if req.model.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "model path must be non-empty" })),
+        )
+            .into_response();
+    }
+    let Some(mutate) = state.agent_mutate.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "agent mutation not available on this relay" })),
+        )
+            .into_response();
+    };
+    match mutate(AgentMutation::Add(req)) {
+        AgentMutateResult::Added => (StatusCode::CREATED, Json(json!({ "status": "started" }))).into_response(),
+        AgentMutateResult::Conflict => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "an agent with that name is already running" })),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "unexpected mutation result" })),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /api/v1/agents/{name}` -- stop a running agent. 200 on stop, 404
+/// when no such agent, 503 when agent mutation is not available.
+async fn remove_agent_route(State(state): State<AdminState>, Path(name): Path<String>) -> Response {
+    let Some(mutate) = state.agent_mutate.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "agent mutation not available on this relay" })),
+        )
+            .into_response();
+    };
+    match mutate(AgentMutation::Remove(name)) {
+        AgentMutateResult::Removed => (StatusCode::OK, Json(json!({ "status": "stopped" }))).into_response(),
+        AgentMutateResult::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no agent with that name" })),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "unexpected mutation result" })),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /api/v1/archive` -- recorded broadcasts from the DVR segment index.
@@ -2321,6 +2435,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn agent_mutate_stub() -> AgentMutateFn {
+        Arc::new(|m| match m {
+            AgentMutation::Add(r) if r.model == "dup" => AgentMutateResult::Conflict,
+            AgentMutation::Add(_) => AgentMutateResult::Added,
+            AgentMutation::Remove(n) if n == "ghost" => AgentMutateResult::NotFound,
+            AgentMutation::Remove(_) => AgentMutateResult::Removed,
+        })
+    }
+
+    fn post_agent(body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/agents")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn agent_add_503_when_unwired() {
+        let app = build_router(test_state(vec![]));
+        let r = app
+            .oneshot(post_agent(serde_json::json!({ "model": "/m/ggml.bin" })))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn agent_add_400_on_empty_model() {
+        let app = build_router(test_state(vec![]).with_agent_mutate(agent_mutate_stub()));
+        let r = app
+            .oneshot(post_agent(serde_json::json!({ "model": "" })))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn agent_add_201_and_409() {
+        let app = build_router(test_state(vec![]).with_agent_mutate(agent_mutate_stub()));
+        let ok = app
+            .clone()
+            .oneshot(post_agent(
+                serde_json::json!({ "model": "/m/ok.bin", "window_ms": 3000 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::CREATED);
+        let conflict = app
+            .oneshot(post_agent(serde_json::json!({ "model": "dup" })))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn agent_remove_200_404_503() {
+        let app = build_router(test_state(vec![]));
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/agents/captions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let app = build_router(test_state(vec![]).with_agent_mutate(agent_mutate_stub()));
+        let removed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/agents/captions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::OK);
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/agents/ghost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
