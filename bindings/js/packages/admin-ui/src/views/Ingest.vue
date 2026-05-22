@@ -4,15 +4,33 @@ import PageHeader from '@/components/ui/PageHeader.vue';
 import Card from '@/components/ui/Card.vue';
 import Button from '@/components/ui/Button.vue';
 import Icon from '@/components/ui/Icon.vue';
+import Badge from '@/components/ui/Badge.vue';
 import StreamRow from '@/components/widgets/StreamRow.vue';
 import { useStreamsStore } from '@/stores/streams';
+import { useServerInfoStore } from '@/stores/serverInfo';
 import { useConnectionStore } from '@/stores/connection';
 import { usePolling } from '@/composables/usePolling';
 
 const streams = useStreamsStore();
+const server = useServerInfoStore();
 const conn = useConnectionStore();
 
 usePolling(() => streams.fetch(), { intervalMs: 10_000 });
+usePolling(() => server.fetch(), { intervalMs: 30_000 });
+
+// Real ingest-listener inventory from `/api/v1/server-info` bound addresses.
+// `null` bound address = that listener is not enabled on this relay.
+const INGEST_PROTOCOLS = [
+  { key: 'rtmp', label: 'RTMP' },
+  { key: 'srt', label: 'SRT' },
+  { key: 'rtsp', label: 'RTSP' },
+  { key: 'whip', label: 'WHIP' },
+] as const;
+const listeners = computed(() => {
+  const bound = (server.info?.bound ?? {}) as Record<string, string | null | undefined>;
+  return INGEST_PROTOCOLS.map((p) => ({ label: p.label, addr: bound[p.key] ?? null }));
+});
+const serverVersion = computed(() => server.info?.version ?? null);
 
 const host = computed(() => {
   try {
@@ -42,6 +60,27 @@ const recipes = computed(() => [
         <span class="hint">configured via <code>lvqr serve</code></span>
       </template>
     </PageHeader>
+
+    <Card kicker="LISTENERS" title="Ingest listeners">
+      <template #actions>
+        <Badge v-if="serverVersion" variant="neutral">lvqr {{ serverVersion }}</Badge>
+      </template>
+      <div class="ltable" role="table" aria-label="Ingest listeners">
+        <div class="tr th" role="row">
+          <span role="columnheader">Protocol</span>
+          <span role="columnheader">Bound address</span>
+          <span role="columnheader">Status</span>
+        </div>
+        <div v-for="l in listeners" :key="l.label" class="tr" role="row">
+          <span role="cell" class="proto">{{ l.label }}</span>
+          <span role="cell" class="mono">{{ l.addr ?? '--' }}</span>
+          <span role="cell"><Badge :variant="l.addr ? 'ready' : 'neutral'">{{ l.addr ? 'listening' : 'disabled' }}</Badge></span>
+        </div>
+      </div>
+      <p v-if="server.error" class="hint" style="margin-top: var(--s-3)">
+        server-info unavailable: {{ server.error }}
+      </p>
+    </Card>
 
     <Card kicker="ENDPOINTS" title="Publisher recipes">
       <div class="recipe-grid">
@@ -106,6 +145,36 @@ const recipes = computed(() => [
   font-size: 12px;
   color: var(--ink);
   word-break: break-all;
+}
+.ltable {
+  display: flex;
+  flex-direction: column;
+  font-size: 13px;
+}
+.ltable .tr {
+  display: grid;
+  grid-template-columns: 1fr 2fr 1fr;
+  gap: var(--s-3);
+  align-items: center;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--chalk-lo);
+}
+.ltable .tr.th {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  border-bottom: 1px solid var(--chalk-hi);
+}
+.ltable .proto {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  color: var(--tally-deep);
+}
+.ltable .mono {
+  font-family: var(--font-mono);
+  color: var(--ink-muted);
 }
 .streams-list {
   display: flex;

@@ -3,6 +3,27 @@
 Operator admin console for [LVQR](https://github.com/virgilvox/lvqr) live
 streaming relays. Vue 3 SPA. Static deploy. Multi-relay. Themable.
 
+## Quick start
+
+```bash
+# 1. Run a relay (no auth, with a DVR archive so the Recordings view has data)
+lvqr serve --no-auth --archive-dir ./archive
+
+# 2. Run the console against it
+cd bindings/js/packages/admin-ui
+npm install
+npm run dev            # open http://localhost:5173
+
+# Production: build a static bundle and serve dist/ anywhere
+npm run build && npm run preview
+```
+
+On first load the console seeds a connection profile pointing at
+`http://localhost:8080` (override with `VITE_LVQR_RELAY_URL`, or an
+`app-config.json` at the served root). If your relay has auth enabled, paste
+an admin token into the profile via the connection drawer in the topbar.
+Add more relays there too -- the active profile drives every API call.
+
 ## What it does
 
 `@lvqr/admin-ui` is a static single-page app that talks to one or many LVQR
@@ -21,7 +42,7 @@ already exposes:
 | Stream detail | `/api/v1/streams/{name}` + `/api/v1/{slo, mesh}` | Per-broadcast tracks + SLO + mesh |
 | Recordings | `/api/v1/archive` | Recorded broadcasts; deep-links into DVR scrub |
 | DVR | embedded `<lvqr-dvr-player>` | Live HLS DVR scrub (`?broadcast=` preselect) |
-| Ingest | `/api/v1/{stats, streams}` + recipes | Publisher quickstart per protocol |
+| Ingest | `/api/v1/{server-info, streams}` + recipes | Bound-listener inventory + publisher recipes + live publishers |
 | Filters | `/api/v1/wasm-filter` | Read-only ordered slot list + per-slot counters |
 | Filter detail | `/api/v1/wasm-filter` | Per-slot drilldown |
 | Transcode | `/api/v1/transcode/ladders` | Ladder + live counters; runtime add/remove rendition |

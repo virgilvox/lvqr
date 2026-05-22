@@ -14,6 +14,7 @@ import { useStreamDetailStore } from '../../src/stores/streamDetail';
 import { useTranscodeStore } from '../../src/stores/transcode';
 import { useAgentsStore } from '../../src/stores/agents';
 import { useArchiveStore } from '../../src/stores/archive';
+import { useServerInfoStore } from '../../src/stores/serverInfo';
 
 // Sanity-test every per-resource store by stubbing the active connection's
 // LvqrAdminClient and asserting that a store fetch hits the right method.
@@ -308,6 +309,33 @@ describe('per-resource stores', () => {
     const spy = vi.fn().mockRejectedValue(new Error('HTTP 500'));
     stubClient({ archive: spy });
     const s = useArchiveStore();
+    await s.fetch();
+    expect(s.error).toContain('HTTP 500');
+  });
+
+  it('serverInfo.fetch calls client.serverInfo and exposes bound listeners', async () => {
+    const spy = vi.fn().mockResolvedValue({
+      version: '1.0.0',
+      build_features: ['rtmp'],
+      uptime_secs: 42,
+      bound: { rtmp: '0.0.0.0:1935', srt: null, rtsp: null, whip: '0.0.0.0:8443' },
+      features: { mesh_enabled: false, cluster_enabled: false, wasm_filter_chain_length: 0, auth_mode: 'noop', hmac_playback_secret_configured: false, stream_keys_enabled: true },
+      config_path: null,
+      wasm_filter_paths: [],
+    });
+    stubClient({ serverInfo: spy });
+    const s = useServerInfoStore();
+    await s.fetch();
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(s.info?.version).toBe('1.0.0');
+    expect(s.info?.bound.rtmp).toBe('0.0.0.0:1935');
+    expect(s.error).toBeNull();
+  });
+
+  it('serverInfo.fetch captures errors without throwing', async () => {
+    const spy = vi.fn().mockRejectedValue(new Error('HTTP 500'));
+    stubClient({ serverInfo: spy });
+    const s = useServerInfoStore();
     await s.fetch();
     expect(s.error).toContain('HTTP 500');
   });

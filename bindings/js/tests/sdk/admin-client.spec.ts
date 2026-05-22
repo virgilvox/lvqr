@@ -66,6 +66,16 @@ describe('LvqrAdminClient against a running lvqr', () => {
     }
   });
 
+  it('serverInfo returns a ServerInfo shape', async () => {
+    const info = await admin.serverInfo();
+    expect(typeof info.version).toBe('string');
+    expect(typeof info.uptime_secs).toBe('number');
+    expect(Array.isArray(info.build_features)).toBe(true);
+    expect(typeof info.bound).toBe('object');
+    expect(typeof info.features).toBe('object');
+    expect(Array.isArray(info.wasm_filter_paths)).toBe(true);
+  });
+
   it('streamDetail resolves null for an offline broadcast', async () => {
     // No publisher in the test harness, so any name 404s -> null.
     const detail = await admin.streamDetail('live/never-published');

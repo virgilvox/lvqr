@@ -52,7 +52,15 @@ const MOCKS: Record<string, unknown> = {
     ],
   },
   '/api/v1/wasm-filter': { enabled: false, chain_length: 0, broadcasts: [], slots: [] },
-  '/api/v1/server-info': { version: '1.0.0', uptime_secs: 42, bound: {}, features: {} },
+  '/api/v1/server-info': {
+    version: '1.0.0',
+    build_features: ['rtmp'],
+    uptime_secs: 42,
+    bound: { admin: '0.0.0.0:8080', rtmp: '0.0.0.0:1935', srt: null, rtsp: null, whip: '0.0.0.0:8443' },
+    features: { mesh_enabled: false, cluster_enabled: false, wasm_filter_chain_length: 0, auth_mode: 'noop', hmac_playback_secret_configured: false, stream_keys_enabled: true },
+    config_path: null,
+    wasm_filter_paths: [],
+  },
   '/api/v1/config-reload': { config_path: null, last_reload_at_ms: null, last_reload_kind: null, applied_keys: [], warnings: [] },
   '/api/v1/cluster/nodes': [],
   '/api/v1/cluster/broadcasts': [],
@@ -127,6 +135,13 @@ test('stream detail renders the per-track table', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Tracks' })).toBeVisible();
   await expect(page.getByText('0.mp4').first()).toBeVisible();
   await expect(page.getByText('1.mp4').first()).toBeVisible();
+});
+
+test('ingest view lists bound listeners from server-info', async ({ page }) => {
+  await page.goto('/#/ingest');
+  await expect(page.getByRole('heading', { name: 'Ingest listeners' })).toBeVisible();
+  await expect(page.getByText('0.0.0.0:1935')).toBeVisible(); // RTMP bound addr
+  await expect(page.getByText('lvqr 1.0.0')).toBeVisible();
 });
 
 test('logs view renders the live-tail shell with level filters', async ({ page }) => {

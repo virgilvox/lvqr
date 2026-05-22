@@ -121,6 +121,50 @@ export interface AgentState {
   active: AgentActiveStats[];
 }
 
+/** Bound listener addresses surfaced by `GET /api/v1/server-info`. Mirrors `lvqr_admin::BoundAddresses`. `null` means that listener is not bound. */
+export interface BoundAddresses {
+  admin?: string | null;
+  rtmp?: string | null;
+  whip?: string | null;
+  whep?: string | null;
+  hls?: string | null;
+  dash?: string | null;
+  srt?: string | null;
+  rtsp?: string | null;
+  /** MoQ relay (the QUIC/WebTransport listener; `--port`). */
+  moq?: string | null;
+  /** WebRTC signaling endpoint when mesh is enabled (shares the admin port). */
+  signal?: string | null;
+}
+
+/** Runtime feature flags surfaced by `GET /api/v1/server-info`. Mirrors `lvqr_admin::RuntimeFeatures`. */
+export interface RuntimeFeatures {
+  mesh_enabled: boolean;
+  cluster_enabled: boolean;
+  archive_dir?: string | null;
+  record_dir?: string | null;
+  wasm_filter_chain_length: number;
+  /** `"noop" | "static" | "jwt" | "jwks" | "webhook" | "multi"`; never carries token literals. */
+  auth_mode: string;
+  hmac_playback_secret_configured: boolean;
+  stream_keys_enabled: boolean;
+}
+
+/**
+ * Server introspection from `GET /api/v1/server-info`. Mirrors
+ * `lvqr_admin::ServerInfo`: build version + features, uptime, bound listener
+ * addresses, runtime feature flags, and the resolved config path.
+ */
+export interface ServerInfo {
+  version: string;
+  build_features: string[];
+  uptime_secs: number;
+  bound: BoundAddresses;
+  features: RuntimeFeatures;
+  config_path?: string | null;
+  wasm_filter_paths: string[];
+}
+
 /** Body for `POST /api/v1/agents`. Mirrors `lvqr_admin::AddAgentRequest`. */
 export interface AddAgentRequest {
   /** Path to a whisper.cpp `ggml-*.bin` model file (server-side path). */
@@ -554,6 +598,14 @@ export class LvqrAdminClient {
   /** `GET /api/v1/stats` -- aggregate relay statistics. */
   async stats(): Promise<RelayStats> {
     return this.getJson<RelayStats>('/api/v1/stats');
+  }
+
+  /**
+   * `GET /api/v1/server-info` -- build version + features, uptime, bound
+   * listener addresses, and runtime feature flags. Always 200.
+   */
+  async serverInfo(): Promise<ServerInfo> {
+    return this.getJson<ServerInfo>('/api/v1/server-info');
   }
 
   /** `GET /api/v1/streams` -- list of active broadcasts. */
