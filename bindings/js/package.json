@@ -10,6 +10,7 @@
     "test:admin-ui": "npm --workspace @lvqr/admin-ui run test:unit"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.11.3",
     "@playwright/test": "^1.49.0",
     "@types/node": "^20.0.0",
     "vitest": "^2.0.0"

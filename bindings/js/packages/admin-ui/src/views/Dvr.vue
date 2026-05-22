@@ -47,7 +47,7 @@ const streamSrc = computed(() => {
     </PageHeader>
 
     <Card kicker="CONTROLS" title="Pick a broadcast">
-      <select v-model="selected" class="picker">
+      <select v-model="selected" class="picker" aria-label="Select a broadcast to scrub">
         <option value="">- select -</option>
         <option v-for="s in streams.streams" :key="s.name" :value="s.name">{{ s.name }}</option>
       </select>

@@ -11,7 +11,7 @@ defineProps<{
   <div class="empty">
     <div class="empty-inner">
       <div v-if="kicker" class="empty-kicker">{{ kicker }}</div>
-      <h3 class="empty-title">{{ title }}</h3>
+      <h2 class="empty-title">{{ title }}</h2>
       <div v-if="$slots.default" class="empty-body">
         <slot />
       </div>

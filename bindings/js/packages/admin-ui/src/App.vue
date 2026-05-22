@@ -82,7 +82,10 @@ watch(
   <div class="app">
     <Topbar @toggle-rail="railOpen = !railOpen" @pick-connection="drawerOpen = true" />
     <Rail :open="railOpen" @close="railOpen = false" />
-    <main class="main">
+    <!-- tabindex=0: the main column is the scrollable region, so it must be
+         keyboard-focusable even on views whose content has no focusable
+         elements (e.g. an empty/disabled state). -->
+    <main class="main" tabindex="0">
       <template v-if="!conn.client">
         <div class="page-pad">
           <EmptyState kicker="WELCOME" title="Connect to a relay">

@@ -92,7 +92,7 @@ async function removeRendition(name: string) {
             <span role="columnheader">Resolution</span>
             <span role="columnheader" class="num">Video kbps</span>
             <span role="columnheader" class="num">Audio kbps</span>
-            <span role="columnheader" class="act"></span>
+            <span role="columnheader" class="act"><span class="vh">Actions</span></span>
           </div>
           <div v-for="r in renditions" :key="r.name" class="tr" role="row">
             <span role="cell"><Badge variant="tally">{{ r.name }}</Badge></span>
@@ -202,6 +202,17 @@ async function removeRendition(name: string) {
 }
 .act {
   text-align: right;
+}
+.vh {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 .addform {
   margin-top: var(--s-4);

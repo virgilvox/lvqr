@@ -11,6 +11,7 @@
 // route handler calls `route.fulfill` exactly once.
 
 import { test, expect, type Page } from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
 
 const STORAGE_KEY = 'lvqr.admin.connection.v1';
 const BASE = 'http://relay.test:8080';
@@ -150,3 +151,35 @@ test('logs view renders the live-tail shell with level filters', async ({ page }
   await expect(page.getByRole('button', { name: 'INFO' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'ERROR' })).toBeVisible();
 });
+
+// Accessibility: no axe violations across every view. color-contrast is
+// excluded -- the palette is lifted verbatim from the design system
+// (tokens.css), so contrast is an operator design-token decision, not a
+// code defect.
+const A11Y_ROUTES = [
+  '/#/',
+  '/#/streams',
+  '/#/streams/live%2Fdemo',
+  '/#/recordings',
+  '/#/dvr',
+  '/#/ingest',
+  '/#/filters',
+  '/#/transcode',
+  '/#/agents',
+  '/#/egress',
+  '/#/cluster',
+  '/#/mesh',
+  '/#/auth',
+  '/#/provenance',
+  '/#/observability',
+  '/#/logs',
+  '/#/settings',
+];
+for (const route of A11Y_ROUTES) {
+  test(`a11y: ${route} has no axe violations`, async ({ page }) => {
+    await page.goto(route);
+    await page.waitForTimeout(250);
+    const results = await new AxeBuilder({ page }).disableRules(['color-contrast']).analyze();
+    expect(results.violations, JSON.stringify(results.violations.map((v) => `${v.id}@${route}`))).toEqual([]);
+  });
+}

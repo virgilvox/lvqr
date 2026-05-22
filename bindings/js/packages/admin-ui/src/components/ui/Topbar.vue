@@ -22,7 +22,7 @@ const initials = computed(() => {
 </script>
 
 <template>
-  <div class="topbar">
+  <header class="topbar">
     <div class="tb-bg" aria-hidden="true" />
     <button class="tb-menu" aria-label="Toggle navigation" @click="$emit('toggleRail')">
       <Icon name="menu" :size="18" />
@@ -46,7 +46,7 @@ const initials = computed(() => {
       <span class="tb-avatar">{{ initials }}</span>
       <span class="tb-user-name">{{ activeLabel }}</span>
     </button>
-  </div>
+  </header>
 </template>
 
 <style scoped>
