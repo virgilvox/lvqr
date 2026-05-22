@@ -18,6 +18,7 @@ import { join } from 'node:path';
 
 const MESH_ADMIN_PORT = 18088;
 const DVR_ADMIN_PORT = 18089;
+const ADMIN_UI_PORT = 18091;
 const DVR_RTMP_PORT = 11936;
 const DVR_HLS_PORT = 18190;
 const DVR_LVQR_PORT = 14444;
@@ -53,6 +54,18 @@ export default defineConfig({
       use: {
         ...devices['Desktop Chrome'],
         baseURL: `http://127.0.0.1:${DVR_ADMIN_PORT}`,
+      },
+    },
+    {
+      // admin-ui (console buildout wave): mounts the built @lvqr/admin-ui
+      // SPA served by `vite preview` and route-mocks `/api/v1/*`, so the
+      // view-render smoke tests need no live relay. Hash-routed, so deep
+      // links are `/#/<route>`.
+      name: 'admin-ui',
+      testMatch: /admin-ui\/.*\.spec\.ts$/,
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: `http://127.0.0.1:${ADMIN_UI_PORT}`,
       },
     },
   ],
@@ -104,6 +117,20 @@ export default defineConfig({
       url: `http://127.0.0.1:${DVR_ADMIN_PORT}/healthz`,
       reuseExistingServer: false,
       timeout: 30_000,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+    {
+      // admin-ui SPA: topological build then `vite preview` of the static
+      // dist. `reuseExistingServer` so a locally pre-started preview is
+      // reused (CI starts fresh -- nothing is on the port). The build can
+      // take a while, hence the generous timeout.
+      // Bind preview to 127.0.0.1 explicitly: vite defaults to `localhost`,
+      // which resolves to ::1 on macOS while Playwright polls the IPv4 url.
+      command: `npm run build && npm run preview -w @lvqr/admin-ui -- --host 127.0.0.1 --port ${ADMIN_UI_PORT} --strictPort`,
+      url: `http://127.0.0.1:${ADMIN_UI_PORT}/`,
+      reuseExistingServer: true,
+      timeout: 180_000,
       stdout: 'pipe',
       stderr: 'pipe',
     },
