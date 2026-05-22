@@ -57,9 +57,10 @@ npm run dev
 # open http://localhost:5173/
 ```
 
-The first-run flow seeds a connection profile from
-`VITE_LVQR_RELAY_URL` (default `http://localhost:8080`). Add more relays
-via the connection drawer in the topbar (cluster icon).
+The first-run flow seeds a connection profile from the resolved default
+relay URL: `app-config.json`'s `defaultRelayUrl` if present, else
+`VITE_LVQR_RELAY_URL`, else `http://localhost:8080`. Add more relays via
+the connection drawer in the topbar.
 
 ### Static-hosted production (any host)
 
@@ -114,10 +115,16 @@ server {
 
 ### Multi-relay (one console, many relays)
 
-Each connection profile stores `{ label, baseUrl, bearerToken? }` in
+Each connection profile stores `{ id, label, baseUrl, bearerToken? }` in
 `localStorage`. Operators register relays via the topbar drawer; the
 active profile drives every API call. Profiles never round-trip to a
 backend.
+
+A profile may also carry per-protocol port overrides
+(`rtmpPort` / `whipPort` / `whepPort` / `hlsPort` / `dashPort` / `srtPort` /
+`rtspPort` / `moqPort`) for relays that bind non-default ports; the publish
+/ subscribe URL recipes honor them, falling back to the documented defaults
+otherwise.
 
 ## Theming
 
@@ -149,14 +156,18 @@ window.__LVQR_ADMIN_PLUGINS__ = [
   },
 ];
 </script>
-<script type="module" src="/admin-ui/assets/main.js"></script>
+<!-- ...then the app's own entry: the hashed assets/index-*.js that the
+     built dist/index.html references -->
 ```
 
-Each entry registers a Vue Router route + a rail entry. The `component`
-must be a Vue 3 component (`defineComponent` or compiled `.vue`); host
-pages typically pre-build their plugins as IIFE bundles attaching to
-`window`. v1.0 ships the plumbing; example plugins ship in a future
-release.
+Set `window.__LVQR_ADMIN_PLUGINS__` before the admin-ui bundle's entry
+script runs. Each entry registers a Vue Router route (`path`, keyed by `id`)
+plus a rail entry (`label`, `rail` defaulting to `"system"`, `icon`
+defaulting to `"plugin"`). The `component` must be a Vue 3 component
+(`defineComponent` or a compiled `.vue`); host pages typically pre-build
+their plugins as IIFE bundles attaching to `window`. Duplicate ids and ids
+that collide with a built-in route are skipped with a console warning. v1.0
+ships the plumbing; example plugins ship in a future release.
 
 ## Multi-relay auth model
 
