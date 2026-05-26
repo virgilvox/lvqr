@@ -53,6 +53,12 @@ const MOCKS: Record<string, unknown> = {
     ],
   },
   '/api/v1/wasm-filter': { enabled: false, chain_length: 0, broadcasts: [], slots: [] },
+  '/api/v1/ingest': {
+    listeners: [
+      { protocol: 'rtmp', addr: '0.0.0.0:1935', enabled: true },
+      { protocol: 'whip', addr: '0.0.0.0:8443', enabled: false },
+    ],
+  },
   '/api/v1/server-info': {
     version: '1.0.0',
     build_features: ['rtmp'],
@@ -138,11 +144,17 @@ test('stream detail renders the per-track table', async ({ page }) => {
   await expect(page.getByText('1.mp4').first()).toBeVisible();
 });
 
-test('ingest view lists bound listeners from server-info', async ({ page }) => {
+test('ingest view lists bound listeners with a Stop control for each enabled row', async ({ page }) => {
   await page.goto('/#/ingest');
   await expect(page.getByRole('heading', { name: 'Ingest listeners' })).toBeVisible();
-  await expect(page.getByText('0.0.0.0:1935')).toBeVisible(); // RTMP bound addr
+  // Addresses come from the live registry endpoint (`/api/v1/ingest`), not the
+  // static server-info bound block.
+  await expect(page.getByText('0.0.0.0:1935')).toBeVisible(); // rtmp enabled
+  await expect(page.getByText('0.0.0.0:8443')).toBeVisible(); // whip stopped
   await expect(page.getByText('lvqr 1.0.0')).toBeVisible();
+  // The enabled row gets a Stop button; the stopped row does not.
+  await expect(page.getByRole('button', { name: 'Stop RTMP listener' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Stop WHIP listener' })).toHaveCount(0);
 });
 
 test('logs view renders the live-tail shell with level filters', async ({ page }) => {

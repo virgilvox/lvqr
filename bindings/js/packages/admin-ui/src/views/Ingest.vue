@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import PageHeader from '@/components/ui/PageHeader.vue';
 import Card from '@/components/ui/Card.vue';
 import Button from '@/components/ui/Button.vue';
@@ -8,29 +8,57 @@ import Badge from '@/components/ui/Badge.vue';
 import StreamRow from '@/components/widgets/StreamRow.vue';
 import { useStreamsStore } from '@/stores/streams';
 import { useServerInfoStore } from '@/stores/serverInfo';
+import { useIngestStore } from '@/stores/ingest';
 import { useConnectionStore } from '@/stores/connection';
 import { usePolling } from '@/composables/usePolling';
+import { useToast } from '@/composables/useToast';
 
 const streams = useStreamsStore();
 const server = useServerInfoStore();
+const ingest = useIngestStore();
 const conn = useConnectionStore();
+const { push: pushToast } = useToast();
 
 usePolling(() => streams.fetch(), { intervalMs: 10_000 });
 usePolling(() => server.fetch(), { intervalMs: 30_000 });
+// 5s poll: a stop click already refreshes, but the tick also catches
+// operator-driven changes from another browser / curl.
+usePolling(() => ingest.fetch(), { intervalMs: 5_000 });
 
-// Real ingest-listener inventory from `/api/v1/server-info` bound addresses.
-// `null` bound address = that listener is not enabled on this relay.
-const INGEST_PROTOCOLS = [
-  { key: 'rtmp', label: 'RTMP' },
-  { key: 'srt', label: 'SRT' },
-  { key: 'rtsp', label: 'RTSP' },
-  { key: 'whip', label: 'WHIP' },
-] as const;
+// Stable display order across protocols (the registry is a hashmap so its
+// iteration order is not deterministic).
+const PROTOCOL_ORDER: Record<string, number> = { rtmp: 0, whip: 1, srt: 2, rtsp: 3 };
+const labelFor = (p: string) => p.toUpperCase();
+
+// Live listener inventory from `/api/v1/ingest` -- richer than server-info's
+// static bound addresses because each row carries its current `enabled`
+// state (flipped to false by `DELETE /api/v1/ingest/{protocol}`). The row
+// stays in the list after stop so the UI shows "rtmp stopped" rather than
+// the listener silently vanishing.
 const listeners = computed(() => {
-  const bound = (server.info?.bound ?? {}) as Record<string, string | null | undefined>;
-  return INGEST_PROTOCOLS.map((p) => ({ label: p.label, addr: bound[p.key] ?? null }));
+  const live = ingest.state?.listeners ?? [];
+  return [...live].sort((a, b) => (PROTOCOL_ORDER[a.protocol] ?? 99) - (PROTOCOL_ORDER[b.protocol] ?? 99));
 });
 const serverVersion = computed(() => server.info?.version ?? null);
+
+const pendingStop = ref<string | null>(null);
+async function stopListener(protocol: string): Promise<void> {
+  if (pendingStop.value) return;
+  // eslint-disable-next-line no-alert
+  if (!window.confirm(`Stop the ${labelFor(protocol)} listener? This is one-way until the relay restarts.`)) {
+    return;
+  }
+  pendingStop.value = protocol;
+  try {
+    await ingest.stopListener(protocol);
+    pushToast('info', `${labelFor(protocol)} listener stopped.`, 4000);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    pushToast('error', `Stop ${labelFor(protocol)} failed: ${msg}`, 6000);
+  } finally {
+    pendingStop.value = null;
+  }
+}
 
 const host = computed(() => {
   try {
@@ -70,14 +98,39 @@ const recipes = computed(() => [
           <span role="columnheader">Protocol</span>
           <span role="columnheader">Bound address</span>
           <span role="columnheader">Status</span>
+          <span role="columnheader"><span class="vh">Actions</span></span>
         </div>
-        <div v-for="l in listeners" :key="l.label" class="tr" role="row">
-          <span role="cell" class="proto">{{ l.label }}</span>
-          <span role="cell" class="mono">{{ l.addr ?? '--' }}</span>
-          <span role="cell"><Badge :variant="l.addr ? 'ready' : 'neutral'">{{ l.addr ? 'listening' : 'disabled' }}</Badge></span>
+        <div v-if="!listeners.length" class="tr empty-row" role="row">
+          <span role="cell" colspan="4" class="hint">
+            No ingest listeners bound on this relay.
+          </span>
+        </div>
+        <div v-for="l in listeners" :key="l.protocol" class="tr" role="row">
+          <span role="cell" class="proto">{{ labelFor(l.protocol) }}</span>
+          <span role="cell" class="mono">{{ l.addr }}</span>
+          <span role="cell">
+            <Badge :variant="l.enabled ? 'ready' : 'neutral'">
+              {{ l.enabled ? 'listening' : 'stopped' }}
+            </Badge>
+          </span>
+          <span role="cell" class="action">
+            <Button
+              v-if="l.enabled"
+              variant="danger"
+              :disabled="pendingStop === l.protocol"
+              :aria-label="`Stop ${labelFor(l.protocol)} listener`"
+              @click="stopListener(l.protocol)"
+            >
+              {{ pendingStop === l.protocol ? 'Stopping...' : 'Stop' }}
+            </Button>
+            <span v-else class="hint mono">requires relay restart</span>
+          </span>
         </div>
       </div>
-      <p v-if="server.error" class="hint" style="margin-top: var(--s-3)">
+      <p v-if="ingest.error" class="hint" style="margin-top: var(--s-3)">
+        ingest registry unavailable: {{ ingest.error }}
+      </p>
+      <p v-else-if="server.error" class="hint" style="margin-top: var(--s-3)">
         server-info unavailable: {{ server.error }}
       </p>
     </Card>
@@ -153,11 +206,31 @@ const recipes = computed(() => [
 }
 .ltable .tr {
   display: grid;
-  grid-template-columns: 1fr 2fr 1fr;
+  grid-template-columns: 1fr 2fr 1fr auto;
   gap: var(--s-3);
   align-items: center;
   padding: 8px 4px;
   border-bottom: 1px solid var(--chalk-lo);
+}
+.ltable .tr.empty-row {
+  grid-template-columns: 1fr;
+}
+.ltable .action {
+  display: flex;
+  justify-content: flex-end;
+}
+/* Visually-hidden label for the action column header so axe-core does not
+   flag the otherwise-empty <span role="columnheader">. */
+.vh {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 .ltable .tr.th {
   font-family: var(--font-mono);

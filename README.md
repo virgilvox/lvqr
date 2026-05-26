@@ -109,6 +109,15 @@ Every ingest produces `Fragment` records on a shared
 `FragmentBroadcasterRegistry`. Adding a new ingest protocol is a
 projection into that type, not a rewrite of the egress side.
 
+Each bound listener carries its own child cancellation token, so the
+admin console's Ingest view -- or `DELETE /api/v1/ingest/{protocol}` --
+stops just that one listener at runtime without taking down the rest
+of the server. STOP is one-way until the relay restarts (re-enabling
+needs to re-bind the socket); the inventory at `GET /api/v1/ingest`
+keeps stopped rows so the UI can show "rtmp stopped" rather than
+letting the listener silently vanish. Existing publishers stay
+connected until their own teardown; only new connections are refused.
+
 ### Egress
 
 | Protocol | Notable surface |
@@ -454,6 +463,7 @@ curl http://localhost:8080/api/v1/slo             # latency snapshot
 curl http://localhost:8080/api/v1/archive         # recorded broadcasts (with --archive-dir)
 curl http://localhost:8080/api/v1/transcode/ladders # transcode ladder + live counters
 curl http://localhost:8080/api/v1/agents          # in-process agents + attachments
+curl http://localhost:8080/api/v1/ingest          # bound ingest listeners + live enabled state
 curl http://localhost:8080/api/v1/wasm-filter     # WASM chain state
 curl http://localhost:8080/api/v1/streamkeys      # stream-key catalog
 curl http://localhost:8080/api/v1/config-reload   # hot reload status

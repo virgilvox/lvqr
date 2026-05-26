@@ -369,6 +369,51 @@ pub struct ArchiveTrackInfo {
     pub timescale: u32,
 }
 
+/// Ingest-listener inventory returned by `GET /api/v1/ingest`.
+///
+/// One entry per ingest protocol the relay actually bound at startup (RTMP /
+/// WHIP / SRT / RTSP). `addr` is the live `local_addr()` (port-0 binds are
+/// resolved to the kernel-assigned port). `enabled` is the cancellation-token
+/// state -- `true` until an operator stops it via
+/// `DELETE /api/v1/ingest/{protocol}`, `false` afterward. Stop is one-way
+/// until the relay restarts; the registry intentionally keeps the disabled
+/// row so the console can show "rtmp stopped" rather than letting the
+/// listener silently vanish.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestListenerInfo {
+    pub protocol: String,
+    pub addr: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestState {
+    pub listeners: Vec<IngestListenerInfo>,
+}
+
+/// Result of a `DELETE /api/v1/ingest/{protocol}` call. The handler maps these
+/// to HTTP status codes: `Stopped` -> 200, `AlreadyStopped` -> 200 (idempotent
+/// retry semantics: the desired end state is reached either way), `NotFound`
+/// -> 404 (no listener bound for that protocol on this relay).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum IngestStopResult {
+    Stopped { protocol: String },
+    AlreadyStopped { protocol: String },
+    NotFound,
+}
+
+/// Closure backing `GET /api/v1/ingest`. Returns a snapshot of every ingest
+/// listener the relay bound at startup, with its live enabled state. The CLI
+/// wires this from an `Arc<DashMap<String, IngestListenerEntry>>` populated
+/// at the four ingest-listener spawn sites.
+pub type IngestListenersFn = Arc<dyn Fn() -> Vec<IngestListenerInfo> + Send + Sync>;
+
+/// Closure backing `DELETE /api/v1/ingest/{protocol}`. Cancels the listener's
+/// child cancellation token, taking down the listener task without affecting
+/// any other listener or the global shutdown. Idempotent.
+pub type IngestStopFn = Arc<dyn Fn(&str) -> IngestStopResult + Send + Sync>;
+
 /// Provider for /metrics endpoint output. Returns Prometheus text-format
 /// metrics. Set up by Phase 4 (metrics).
 pub type MetricsRender = Arc<dyn Fn() -> String + Send + Sync>;
@@ -479,6 +524,14 @@ pub struct AdminState {
     /// [`AdminState::with_agent_mutate`] on agent-feature builds; `None` ->
     /// the mutation routes return 503.
     agent_mutate: Option<AgentMutateFn>,
+    /// Snapshot closure backing `GET /api/v1/ingest`. Populated by
+    /// [`AdminState::with_ingest_listeners`]; defaults to an empty-list
+    /// closure so the route returns `{"listeners": []}` on relays whose CLI
+    /// composition root has not wired the registry (e.g. embedded tests).
+    get_ingest: IngestListenersFn,
+    /// Closure backing `DELETE /api/v1/ingest/{protocol}`. Populated by
+    /// [`AdminState::with_ingest_stop`]; `None` -> the route returns 503.
+    ingest_stop: Option<IngestStopFn>,
 }
 
 impl AdminState {
@@ -531,6 +584,8 @@ impl AdminState {
             log_broadcaster: None,
             transcode_mutate: None,
             agent_mutate: None,
+            get_ingest: Arc::new(Vec::new),
+            ingest_stop: None,
         }
     }
 
@@ -662,6 +717,27 @@ impl AdminState {
         self
     }
 
+    /// Wire the ingest-listener inventory closure backing `GET /api/v1/ingest`.
+    /// The CLI composition root passes a closure that walks the shared
+    /// `IngestListenerRegistry` (one entry per ingest protocol bound at
+    /// startup) and reports each listener's bound address plus live enabled
+    /// state. Without this call the route serves `{"listeners": []}`.
+    pub fn with_ingest_listeners(mut self, f: IngestListenersFn) -> Self {
+        self.get_ingest = f;
+        self
+    }
+
+    /// Wire the ingest-listener stop closure backing
+    /// `DELETE /api/v1/ingest/{protocol}`. Cancels the listener's child
+    /// cancellation token, taking down that listener without affecting any
+    /// other listener or the global shutdown. Idempotent (a repeat DELETE on
+    /// an already-stopped listener returns 200 `already_stopped`). Without
+    /// this call the route returns 503.
+    pub fn with_ingest_stop(mut self, f: IngestStopFn) -> Self {
+        self.ingest_stop = Some(f);
+        self
+    }
+
     /// Wire the process-global log broadcaster backing the
     /// `GET /api/v1/logs` SSE live-tail route. The CLI composition root
     /// passes `lvqr_observability::log_broadcaster()`; without it the route
@@ -787,6 +863,8 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/api/v1/transcode/ladders/{name}", delete(remove_transcode_rendition))
         .route("/api/v1/agents", get(get_agents).post(add_agent_route))
         .route("/api/v1/agents/{name}", delete(remove_agent_route))
+        .route("/api/v1/ingest", get(get_ingest))
+        .route("/api/v1/ingest/{protocol}", delete(stop_ingest_route))
         .route("/api/v1/archive", get(get_archive))
         .route(
             "/api/v1/streamkeys",
@@ -1219,6 +1297,42 @@ async fn remove_agent_route(State(state): State<AdminState>, Path(name): Path<St
 /// Returns `enabled: false` when the relay was started without `--archive-dir`.
 async fn get_archive(State(state): State<AdminState>) -> Result<Json<ArchiveState>, AdminError> {
     Ok(Json((state.get_archive)()))
+}
+
+/// `GET /api/v1/ingest` -- inventory of bound ingest listeners (RTMP / WHIP /
+/// SRT / RTSP), each with its bound address and live enabled state. Returns
+/// `{"listeners": []}` when the CLI composition root has not wired the
+/// registry (embedded tests, or a future build with no ingest features).
+async fn get_ingest(State(state): State<AdminState>) -> Json<IngestState> {
+    Json(IngestState {
+        listeners: (state.get_ingest)(),
+    })
+}
+
+/// `DELETE /api/v1/ingest/{protocol}` -- cancel the named listener's child
+/// cancellation token. Stops accepting new connections without affecting any
+/// other listener or the global shutdown; in-flight publishers continue until
+/// their own teardown. Idempotent (`already_stopped` is also 200). One-way:
+/// re-enable requires a relay restart.
+async fn stop_ingest_route(State(state): State<AdminState>, Path(protocol): Path<String>) -> Response {
+    let Some(stop) = state.ingest_stop.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "ingest listener stop not available on this relay" })),
+        )
+            .into_response();
+    };
+    let proto = protocol.trim().to_ascii_lowercase();
+    match stop(&proto) {
+        result @ (IngestStopResult::Stopped { .. } | IngestStopResult::AlreadyStopped { .. }) => {
+            (StatusCode::OK, Json(result)).into_response()
+        }
+        IngestStopResult::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no ingest listener for protocol '{proto}'") })),
+        )
+            .into_response(),
+    }
 }
 
 /// Query parameters for `GET /api/v1/logs`. `token` carries the admin token
@@ -2532,6 +2646,161 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    // Slice 9b: ingest-listener inventory + stop. Mirrors the agent-CRUD tests
+    // above. The closure-driven test stub lives in this module because the
+    // production registry (an `Arc<DashMap<String, IngestListenerEntry>>`)
+    // sits in lvqr-cli; here we only need to exercise the route surface, so a
+    // pair of plain closures backed by a `Mutex<Vec<(String, String, bool)>>`
+    // is sufficient.
+    fn ingest_stubs() -> (IngestListenersFn, IngestStopFn) {
+        use std::sync::Mutex;
+        let state: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(vec![
+            ("rtmp".into(), "0.0.0.0:1935".into(), true),
+            ("whip".into(), "0.0.0.0:8443".into(), true),
+        ]));
+        let listeners_state = state.clone();
+        let listeners: IngestListenersFn = Arc::new(move || {
+            listeners_state
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(p, a, e)| IngestListenerInfo {
+                    protocol: p.clone(),
+                    addr: a.clone(),
+                    enabled: *e,
+                })
+                .collect()
+        });
+        let stop_state = state.clone();
+        let stop: IngestStopFn = Arc::new(move |proto| {
+            let mut g = stop_state.lock().unwrap();
+            for entry in g.iter_mut() {
+                if entry.0 == proto {
+                    if entry.2 {
+                        entry.2 = false;
+                        return IngestStopResult::Stopped {
+                            protocol: proto.to_string(),
+                        };
+                    } else {
+                        return IngestStopResult::AlreadyStopped {
+                            protocol: proto.to_string(),
+                        };
+                    }
+                }
+            }
+            IngestStopResult::NotFound
+        });
+        (listeners, stop)
+    }
+
+    #[tokio::test]
+    async fn ingest_route_defaults_to_empty_when_unwired() {
+        let app = build_router(test_state(vec![]));
+        let r = app
+            .oneshot(Request::builder().uri("/api/v1/ingest").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        let st: IngestState = serde_json::from_slice(&body).unwrap();
+        assert!(st.listeners.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingest_route_renders_wired_listeners() {
+        let (listeners, _stop) = ingest_stubs();
+        let app = build_router(test_state(vec![]).with_ingest_listeners(listeners));
+        let r = app
+            .oneshot(Request::builder().uri("/api/v1/ingest").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        let st: IngestState = serde_json::from_slice(&body).unwrap();
+        assert_eq!(st.listeners.len(), 2);
+        assert!(st.listeners.iter().all(|l| l.enabled));
+        assert!(
+            st.listeners
+                .iter()
+                .any(|l| l.protocol == "rtmp" && l.addr == "0.0.0.0:1935")
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_stop_503_when_unwired() {
+        let app = build_router(test_state(vec![]));
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/ingest/rtmp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn ingest_stop_idempotent_with_404_on_unknown() {
+        let (listeners, stop) = ingest_stubs();
+        let app = build_router(
+            test_state(vec![])
+                .with_ingest_listeners(listeners.clone())
+                .with_ingest_stop(stop),
+        );
+        // First stop: 200 + result=stopped + enabled flips to false on the
+        // shared registry the listener-closure reads.
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/ingest/rtmp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        // Re-stop is the same end state -- 200 + already_stopped (idempotent).
+        let again = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/ingest/rtmp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::OK);
+        // Unknown protocol -> 404.
+        let ghost = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/ingest/ghost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ghost.status(), StatusCode::NOT_FOUND);
+        // Inventory reflects the stop.
+        let listing = app
+            .oneshot(Request::builder().uri("/api/v1/ingest").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(listing.into_body(), usize::MAX).await.unwrap();
+        let st: IngestState = serde_json::from_slice(&body).unwrap();
+        let rtmp = st.listeners.iter().find(|l| l.protocol == "rtmp").unwrap();
+        assert!(!rtmp.enabled);
     }
 
     #[tokio::test]

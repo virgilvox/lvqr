@@ -205,6 +205,33 @@ export interface ArchiveState {
   recordings: ArchiveBroadcastInfo[];
 }
 
+/**
+ * One ingest-listener entry returned by `GET /api/v1/ingest`. Mirrors
+ * `lvqr_admin::IngestListenerInfo`. `enabled: true` until the operator stops
+ * the listener via `DELETE /api/v1/ingest/{protocol}`; STOP is one-way until
+ * the relay restarts (the row stays in the inventory with `enabled: false`).
+ */
+export interface IngestListenerInfo {
+  protocol: string;
+  addr: string;
+  enabled: boolean;
+}
+
+/** Ingest-listener inventory returned by `GET /api/v1/ingest`. */
+export interface IngestState {
+  listeners: IngestListenerInfo[];
+}
+
+/**
+ * Result of a `DELETE /api/v1/ingest/{protocol}` call. The HTTP status is
+ * 200 for both `stopped` and `already_stopped` (idempotent), 404 for
+ * `not_found`, 503 when the relay's CLI did not wire the registry.
+ */
+export type IngestStopResult =
+  | { result: 'stopped'; protocol: string }
+  | { result: 'already_stopped'; protocol: string }
+  | { result: 'not_found' };
+
 /** One captured log line streamed by `GET /api/v1/logs`. Mirrors `lvqr_observability::LogLine`. */
 export interface LogLine {
   /** Capture time in ms since the Unix epoch. */
@@ -707,6 +734,34 @@ export class LvqrAdminClient {
    */
   async archive(): Promise<ArchiveState> {
     return this.getJson<ArchiveState>('/api/v1/archive');
+  }
+
+  /**
+   * `GET /api/v1/ingest` -- inventory of bound ingest listeners (RTMP / WHIP /
+   * SRT / RTSP) with their live enabled state. Always 200; an empty list
+   * means the CLI composition root has not wired the registry (embedded
+   * tests, or a build with no ingest features).
+   */
+  async ingestListeners(): Promise<IngestState> {
+    return this.getJson<IngestState>('/api/v1/ingest');
+  }
+
+  /**
+   * `DELETE /api/v1/ingest/{protocol}` -- stop a bound ingest listener at
+   * runtime. The kernel socket is unbound; existing publishers stay until
+   * their own teardown, but no NEW connections are accepted. STOP is
+   * one-way: re-enabling requires a relay restart. Idempotent (a repeat
+   * call against an already-stopped protocol still resolves with
+   * `already_stopped`). Throws on non-2xx (404 unknown protocol, 503 when
+   * the relay did not wire the registry).
+   */
+  async stopIngestListener(protocol: string): Promise<IngestStopResult> {
+    const path = `/api/v1/ingest/${encodeURIComponent(protocol)}`;
+    const resp = await this.fetchWithTimeout(`${this.baseUrl}${path}`, { method: 'DELETE' });
+    if (!resp.ok) {
+      throw new Error(`DELETE ${path}: HTTP ${resp.status} ${resp.statusText}`);
+    }
+    return (await resp.json()) as IngestStopResult;
   }
 
   /**

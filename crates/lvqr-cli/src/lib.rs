@@ -210,6 +210,21 @@ fn classify_auth_mode_inner(auth_configured: bool, boot: &AuthBootSummary) -> &'
 /// The returned handle owns a background task that runs the relay, RTMP,
 /// and admin subsystems under a shared cancellation token. Use
 /// [`ServerHandle::shutdown`] for deterministic teardown.
+/// One entry in the runtime ingest-listener registry: the bound socket
+/// address (kernel-assigned port resolved if the caller passed `:0`) plus a
+/// **child** `CancellationToken` of the shared `shutdown`. Cancelling the
+/// child takes down only that listener task (the listener's `axum::serve`
+/// or protocol accept loop returns), without affecting any other listener
+/// or the global shutdown. The parent `shutdown` still cancels every child,
+/// so full-server shutdown remains a single-token operation.
+///
+/// Slice 9b: this registry backs `GET /api/v1/ingest` (snapshot the live
+/// enabled state) and `DELETE /api/v1/ingest/{protocol}` (cancel the child).
+struct IngestListenerEntry {
+    addr: std::net::SocketAddr,
+    token: CancellationToken,
+}
+
 pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // Captured up-front so `GET /api/v1/server-info` can report
     // process uptime relative to the `start()` entry point. Anchoring
@@ -263,6 +278,13 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     };
 
     let shutdown = CancellationToken::new();
+
+    // Runtime registry of per-ingest-listener child cancellation tokens
+    // (one entry per protocol bound at startup: rtmp/whip/srt/rtsp). The
+    // admin endpoints introspect + flip these. Populated below at each
+    // listener's spawn site once the bound address is known. See
+    // [`IngestListenerEntry`].
+    let ingest_listeners: Arc<dashmap::DashMap<String, IngestListenerEntry>> = Arc::new(dashmap::DashMap::new());
 
     // Auth provider: caller-provided, or fall back to open access.
     let inner_auth: SharedAuth = config
@@ -881,7 +903,18 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         (None, None)
     };
     let srt_events_clone = events.clone();
-    let srt_shutdown_token = shutdown.clone();
+    // child_token, not clone: cancelling this token takes down only the SRT
+    // listener; the parent `shutdown` still cancels it on full-server stop.
+    let srt_shutdown_token = shutdown.child_token();
+    if let Some(bound) = srt_bound {
+        ingest_listeners.insert(
+            "srt".into(),
+            IngestListenerEntry {
+                addr: bound,
+                token: srt_shutdown_token.clone(),
+            },
+        );
+    }
 
     // Optional RTSP ingest server. Publishes to the shared registry
     // alongside every other ingest protocol. When clustering is
@@ -899,7 +932,17 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         (None, None)
     };
     let rtsp_events_clone = events.clone();
-    let rtsp_shutdown_token = shutdown.clone();
+    // child_token, not clone: see srt_shutdown_token above.
+    let rtsp_shutdown_token = shutdown.child_token();
+    if let Some(bound) = rtsp_bound {
+        ingest_listeners.insert(
+            "rtsp".into(),
+            IngestListenerEntry {
+                addr: bound,
+                token: rtsp_shutdown_token.clone(),
+            },
+        );
+    }
 
     let bridge = Arc::new(bridge_builder);
     let rtmp_config = lvqr_ingest::RtmpConfig {
@@ -1424,6 +1467,48 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         None => admin_state,
     };
 
+    // Slice 9b: wire the runtime ingest-listener registry into the admin
+    // router. The snapshot closure walks the DashMap and reports each
+    // protocol's bound address plus its live `enabled` state (= the child
+    // token has not been cancelled); the stop closure flips the named
+    // child to cancelled, which the listener task observes via its
+    // `with_graceful_shutdown` / accept-loop `cancelled()` and exits.
+    // STOP is one-way until the relay restarts (binding a new listener
+    // requires re-running this composition root); the entry stays in the
+    // registry so the console can show "rtmp stopped" rather than the
+    // listener silently vanishing.
+    let listeners_for_get = ingest_listeners.clone();
+    let listeners_fn: lvqr_admin::IngestListenersFn = Arc::new(move || {
+        listeners_for_get
+            .iter()
+            .map(|kv| lvqr_admin::IngestListenerInfo {
+                protocol: kv.key().clone(),
+                addr: kv.value().addr.to_string(),
+                enabled: !kv.value().token.is_cancelled(),
+            })
+            .collect()
+    });
+    let listeners_for_stop = ingest_listeners.clone();
+    let stop_fn: lvqr_admin::IngestStopFn = Arc::new(move |protocol| {
+        let Some(entry) = listeners_for_stop.get(protocol) else {
+            return lvqr_admin::IngestStopResult::NotFound;
+        };
+        if entry.token.is_cancelled() {
+            lvqr_admin::IngestStopResult::AlreadyStopped {
+                protocol: protocol.to_string(),
+            }
+        } else {
+            entry.token.cancel();
+            tracing::info!(protocol = %protocol, addr = %entry.addr, "ingest listener stopped via admin");
+            lvqr_admin::IngestStopResult::Stopped {
+                protocol: protocol.to_string(),
+            }
+        }
+    });
+    let admin_state = admin_state
+        .with_ingest_listeners(listeners_fn)
+        .with_ingest_stop(stop_fn);
+
     // Session 146: wire the runtime stream-key store into the
     // admin router. When streamkeys_enabled is false the store is
     // None and the routes are still mounted, but list returns
@@ -1854,13 +1939,34 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // Spawn a single background task that joins relay + RTMP + admin and
     // signals the shared shutdown token if any subsystem exits early.
     let relay_shutdown = shutdown.clone();
-    let rtmp_shutdown = shutdown.clone();
+    // Ingest listeners (rtmp / whip) get **child** tokens so admin can
+    // cancel them independently; egress listeners + relay + admin keep
+    // plain clones (they are stopped only on full-server shutdown).
+    let rtmp_shutdown = shutdown.child_token();
     let admin_shutdown = shutdown.clone();
     let hls_shutdown = shutdown.clone();
     let dash_shutdown = shutdown.clone();
     let whep_shutdown = shutdown.clone();
-    let whip_shutdown = shutdown.clone();
+    let whip_shutdown = shutdown.child_token();
     let bg_shutdown_for_task = shutdown.clone();
+    // Register the two listener entries whose bind happened above:
+    // RTMP is always bound; WHIP is bound only when `--whip-addr` is set.
+    ingest_listeners.insert(
+        "rtmp".into(),
+        IngestListenerEntry {
+            addr: rtmp_bound,
+            token: rtmp_shutdown.clone(),
+        },
+    );
+    if let Some(bound) = whip_bound {
+        ingest_listeners.insert(
+            "whip".into(),
+            IngestListenerEntry {
+                addr: bound,
+                token: whip_shutdown.clone(),
+            },
+        );
+    }
     let hls_router_pair =
         hls_listener.map(|listener| (listener, hls_server.expect("hls_server set when listener is set")));
     let dash_router_pair =
@@ -1891,11 +1997,19 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
 
         let shutdown_on_exit_rtmp = bg_shutdown_for_task.clone();
         let rtmp_server_task = rtmp_server;
+        // Slice 9b: observe whether the listener exited because the operator
+        // stopped it via `DELETE /api/v1/ingest/rtmp` (child token cancelled)
+        // or because of a real error / parent shutdown. Only the latter
+        // should cascade to the global shutdown -- an operator-cancelled
+        // child must leave the rest of the server running.
+        let rtmp_child_for_check = rtmp_shutdown.clone();
         let rtmp_fut = async move {
             if let Err(e) = rtmp_server_task.run_with_listener(rtmp_listener, rtmp_shutdown).await {
                 tracing::error!(error = %e, "RTMP server error");
             }
-            shutdown_on_exit_rtmp.cancel();
+            if !rtmp_child_for_check.is_cancelled() {
+                shutdown_on_exit_rtmp.cancel();
+            }
         };
 
         let shutdown_on_exit_admin = bg_shutdown_for_task.clone();
@@ -2008,35 +2122,50 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
             // this an OPTIONS preflight returns 405 and the browser
             // blocks the publish.
             let router = lvqr_whip::router_for(server).layer(lvqr_cors_layer());
+            // Slice 9b: clone the child token before moving the original
+            // into the graceful-shutdown future, so the post-await check
+            // can ask whether we exited because the operator stopped just
+            // this listener (skip cascading) vs a real error (cascade).
+            let whip_child_for_check = whip_shutdown.clone();
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move { whip_shutdown.cancelled().await })
                 .await;
             if let Err(e) = &result {
                 tracing::error!(error = %e, "WHIP server error");
             }
-            shutdown_on_exit_whip.cancel();
+            if !whip_child_for_check.is_cancelled() {
+                shutdown_on_exit_whip.cancel();
+            }
         };
 
         let srt_shutdown = bg_shutdown_for_task.clone();
         let srt_events = srt_events_clone;
+        // Slice 9b: see RTMP block. srt_cancel goes into the server's accept
+        // loop; srt_child_for_check observes the cancellation post-await.
+        let srt_child_for_check = srt_shutdown_token.clone();
         let srt_cancel = srt_shutdown_token;
         let srt_fut = async move {
             let Some(server) = srt_server else { return };
             if let Err(e) = server.run(srt_events, srt_cancel).await {
                 tracing::error!(error = %e, "SRT server error");
             }
-            srt_shutdown.cancel();
+            if !srt_child_for_check.is_cancelled() {
+                srt_shutdown.cancel();
+            }
         };
 
         let rtsp_shutdown = bg_shutdown_for_task.clone();
         let rtsp_events = rtsp_events_clone;
+        let rtsp_child_for_check = rtsp_shutdown_token.clone();
         let rtsp_cancel = rtsp_shutdown_token;
         let rtsp_fut = async move {
             let Some(server) = rtsp_server else { return };
             if let Err(e) = server.run(rtsp_events, rtsp_cancel).await {
                 tracing::error!(error = %e, "RTSP server error");
             }
-            rtsp_shutdown.cancel();
+            if !rtsp_child_for_check.is_cancelled() {
+                rtsp_shutdown.cancel();
+            }
         };
 
         let _ = tokio::join!(
