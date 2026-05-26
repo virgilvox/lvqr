@@ -9,6 +9,7 @@ import StreamRow from '@/components/widgets/StreamRow.vue';
 import { useStreamsStore } from '@/stores/streams';
 import { useServerInfoStore } from '@/stores/serverInfo';
 import { useIngestStore } from '@/stores/ingest';
+import { useBroadcastsStore } from '@/stores/broadcasts';
 import { useConnectionStore } from '@/stores/connection';
 import { usePolling } from '@/composables/usePolling';
 import { useToast } from '@/composables/useToast';
@@ -16,6 +17,7 @@ import { useToast } from '@/composables/useToast';
 const streams = useStreamsStore();
 const server = useServerInfoStore();
 const ingest = useIngestStore();
+const broadcasts = useBroadcastsStore();
 const conn = useConnectionStore();
 const { push: pushToast } = useToast();
 
@@ -24,6 +26,9 @@ usePolling(() => server.fetch(), { intervalMs: 30_000 });
 // 5s poll: a stop click already refreshes, but the tick also catches
 // operator-driven changes from another browser / curl.
 usePolling(() => ingest.fetch(), { intervalMs: 5_000 });
+// 3s poll for live publisher sessions: faster than the listener tick because
+// publishers come and go on a per-session timescale.
+usePolling(() => broadcasts.fetch(), { intervalMs: 3_000 });
 
 // Stable display order across protocols (the registry is a hashmap so its
 // iteration order is not deterministic).
@@ -40,6 +45,38 @@ const listeners = computed(() => {
   return [...live].sort((a, b) => (PROTOCOL_ORDER[a.protocol] ?? 99) - (PROTOCOL_ORDER[b.protocol] ?? 99));
 });
 const serverVersion = computed(() => server.info?.version ?? null);
+
+// Format an ms-epoch timestamp as a session uptime string ("2m 13s").
+function uptimeFor(startedMs: number): string {
+  const secs = Math.max(0, Math.floor((Date.now() - startedMs) / 1000));
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${m}m ${s}s`;
+}
+
+const pendingKill = ref<string | null>(null);
+async function killBroadcast(name: string, protocol: string): Promise<void> {
+  if (pendingKill.value) return;
+  // eslint-disable-next-line no-alert
+  if (
+    !window.confirm(
+      `Kick the live ${protocol.toUpperCase()} publisher of "${name}"? The publisher's socket is closed; they can reconnect immediately.`,
+    )
+  ) {
+    return;
+  }
+  pendingKill.value = name;
+  try {
+    await broadcasts.stopBroadcast(name);
+    pushToast('info', `Publisher session for "${name}" killed.`, 4000);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    pushToast('error', `Kill "${name}" failed: ${msg}`, 6000);
+  } finally {
+    pendingKill.value = null;
+  }
+}
 
 const pendingStop = ref<string | null>(null);
 async function stopListener(protocol: string): Promise<void> {
@@ -150,11 +187,50 @@ const recipes = computed(() => [
       </p>
     </Card>
 
-    <Card kicker="LIVE" title="Active publishers">
+    <Card kicker="LIVE" title="Live publisher sessions">
+      <p class="hint" style="margin-bottom: var(--s-2)">
+        Per-publisher view from <code>/api/v1/broadcasts</code>. "Kick" closes the publisher's
+        socket (subscribers see end-of-stream); the publisher can reconnect immediately. Today
+        wired for RTMP; WHIP / SRT / RTSP follow.
+      </p>
+      <div class="btable" role="table" aria-label="Live publisher sessions">
+        <div class="tr th" role="row">
+          <span role="columnheader">Broadcast</span>
+          <span role="columnheader">Protocol</span>
+          <span role="columnheader">Peer</span>
+          <span role="columnheader">Uptime</span>
+          <span role="columnheader"><span class="vh">Actions</span></span>
+        </div>
+        <div v-if="!broadcasts.state?.sessions?.length" class="tr empty-row" role="row">
+          <span role="cell" class="hint">No live publisher sessions.</span>
+        </div>
+        <div v-for="b in broadcasts.state?.sessions ?? []" :key="b.broadcast" class="tr" role="row">
+          <span role="cell" class="mono">{{ b.broadcast }}</span>
+          <span role="cell" class="proto">{{ b.protocol.toUpperCase() }}</span>
+          <span role="cell" class="mono">{{ b.peer ?? '--' }}</span>
+          <span role="cell" class="mono">{{ uptimeFor(b.started_ms) }}</span>
+          <span role="cell" class="action">
+            <Button
+              variant="danger"
+              :disabled="pendingKill === b.broadcast"
+              :aria-label="`Kick publisher of ${b.broadcast}`"
+              @click="killBroadcast(b.broadcast, b.protocol)"
+            >
+              {{ pendingKill === b.broadcast ? 'Kicking...' : 'Kick' }}
+            </Button>
+          </span>
+        </div>
+      </div>
+      <p v-if="broadcasts.error" class="hint" style="margin-top: var(--s-3)">
+        broadcasts unavailable: {{ broadcasts.error }}
+      </p>
+    </Card>
+
+    <Card kicker="REGISTRY" title="Broadcasts with fragment data">
       <div class="streams-list">
         <StreamRow v-for="s in streams.streams" :key="s.name" :stream="s" />
         <p v-if="!streams.streams.length" class="empty">
-          No active publishers yet.
+          No broadcasts in the registry yet.
         </p>
       </div>
     </Card>
@@ -240,10 +316,46 @@ const recipes = computed(() => [
   color: var(--ink-faint);
   border-bottom: 1px solid var(--chalk-hi);
 }
-.ltable .proto {
+.ltable .proto,
+.btable .proto {
   font-family: var(--font-mono);
   font-weight: 700;
   color: var(--tally-deep);
+}
+.btable {
+  display: flex;
+  flex-direction: column;
+  font-size: 13px;
+}
+.btable .tr {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) 1fr minmax(0, 2fr) 1fr auto;
+  gap: var(--s-3);
+  align-items: center;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--chalk-lo);
+}
+.btable .tr.empty-row {
+  grid-template-columns: 1fr;
+}
+.btable .tr.th {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  border-bottom: 1px solid var(--chalk-hi);
+}
+.btable .action {
+  display: flex;
+  justify-content: flex-end;
+}
+.btable .mono {
+  font-family: var(--font-mono);
+  color: var(--ink-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .ltable .mono {
   font-family: var(--font-mono);

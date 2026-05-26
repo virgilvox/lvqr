@@ -40,7 +40,8 @@ pub mod cluster_routes;
 pub use config_reload_routes::{ConfigReloadFuture, ConfigReloadStatus, ConfigReloadStatusFn, ConfigReloadTriggerFn};
 pub use routes::{
     AddAgentRequest, AdminError, AdminState, AgentActiveStats, AgentInfo, AgentMutateFn, AgentMutateResult,
-    AgentMutation, AgentState, ArchiveBroadcastInfo, ArchiveState, ArchiveTrackInfo, IngestListenerInfo,
+    AgentMutation, AgentState, ArchiveBroadcastInfo, ArchiveState, ArchiveTrackInfo, BroadcastSessionInfo,
+    BroadcastSessionsFn, BroadcastSessionsState, BroadcastStopFn, BroadcastStopResult, IngestListenerInfo,
     IngestListenersFn, IngestState, IngestStopFn, IngestStopResult, MeshPeerStats, MeshState, MetricsRender,
     RenditionInfo, StreamDetailInfo, StreamInfo, TrackInfo, TranscodeActiveStats, TranscodeMutateFn,
     TranscodeMutateResult, TranscodeMutation, TranscodeState, WasmFilterBroadcastStats, WasmFilterSlotStats,

@@ -225,6 +225,21 @@ struct IngestListenerEntry {
     token: CancellationToken,
 }
 
+/// One entry in the runtime broadcast-session registry: the live publisher
+/// session for a named broadcast across whatever ingest protocol the
+/// publisher used. Slice 6: backs `GET`/`DELETE /api/v1/broadcasts`. The
+/// `token` is the per-session `CancellationToken` the ingest crate created
+/// for this publisher; cancelling it makes the read loop fall out of its
+/// `select!` and drop the publisher's socket. The entry is keyed by
+/// broadcast name -- a republish under the same name replaces the entry,
+/// so an operator DELETE never kicks a fresher session.
+struct BroadcastSessionEntry {
+    protocol: String,
+    peer: Option<std::net::SocketAddr>,
+    started_ms: u64,
+    token: CancellationToken,
+}
+
 pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // Captured up-front so `GET /api/v1/server-info` can report
     // process uptime relative to the `start()` entry point. Anchoring
@@ -285,6 +300,13 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     // listener's spawn site once the bound address is known. See
     // [`IngestListenerEntry`].
     let ingest_listeners: Arc<dashmap::DashMap<String, IngestListenerEntry>> = Arc::new(dashmap::DashMap::new());
+
+    // Slice 6: runtime registry of live publisher sessions, keyed by broadcast
+    // name. The `register`/`deregister` closures wired into each ingest crate
+    // populate this map; the admin GET/DELETE closures read + cancel it. Only
+    // RTMP is wired in this turn (the user-chosen "all four protocols" scope
+    // -- WHIP/SRT/RTSP follow in subsequent turns).
+    let broadcast_sessions: Arc<dashmap::DashMap<String, BroadcastSessionEntry>> = Arc::new(dashmap::DashMap::new());
 
     // Auth provider: caller-provided, or fall back to open access.
     let inner_auth: SharedAuth = config
@@ -948,7 +970,38 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let rtmp_config = lvqr_ingest::RtmpConfig {
         bind_addr: config.rtmp_addr,
     };
-    let rtmp_server = bridge.create_rtmp_server(rtmp_config);
+    let mut rtmp_server = bridge.create_rtmp_server(rtmp_config);
+    // Slice 6: wire the RTMP session registrar so live publishers surface in
+    // `GET /api/v1/broadcasts` and `DELETE /api/v1/broadcasts/{name}` actually
+    // kicks them (per-session cancel token closes the TCP socket via the
+    // select! arm in `handle_rtmp_session`).
+    {
+        let reg_map = broadcast_sessions.clone();
+        let dereg_map = broadcast_sessions.clone();
+        rtmp_server.set_session_registrar(lvqr_ingest::SessionRegistrar {
+            register: Arc::new(move |name, peer, token| {
+                let started_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                // A republish under the same broadcast name replaces the
+                // entry -- the old token is dropped + the new one wired,
+                // so a stale DELETE never kicks the fresher session.
+                reg_map.insert(
+                    name,
+                    BroadcastSessionEntry {
+                        protocol: "rtmp".into(),
+                        peer: Some(peer),
+                        started_ms,
+                        token,
+                    },
+                );
+            }),
+            deregister: Arc::new(move |name| {
+                dereg_map.remove(name);
+            }),
+        });
+    }
     let rtmp_listener = tokio::net::TcpListener::bind(config.rtmp_addr).await?;
     let rtmp_bound = rtmp_listener.local_addr()?;
     tracing::info!(addr = %rtmp_bound, "RTMP ingest bound");
@@ -1508,6 +1561,47 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let admin_state = admin_state
         .with_ingest_listeners(listeners_fn)
         .with_ingest_stop(stop_fn);
+
+    // Slice 6: wire the live publisher-session registry into the admin
+    // router. The snapshot closure walks the DashMap; the kill closure
+    // cancels the session's per-publisher token, which the ingest crate's
+    // read loop observes (`select!`) and tears down the publisher socket.
+    // Idempotent in the honest sense: deregister fires on session end so a
+    // repeat DELETE for the same broadcast 404s (no live session left).
+    let sessions_for_get = broadcast_sessions.clone();
+    let broadcast_list_fn: lvqr_admin::BroadcastSessionsFn = Arc::new(move || {
+        sessions_for_get
+            .iter()
+            .map(|kv| lvqr_admin::BroadcastSessionInfo {
+                broadcast: kv.key().clone(),
+                protocol: kv.value().protocol.clone(),
+                started_ms: kv.value().started_ms,
+                peer: kv.value().peer.map(|p| p.to_string()),
+            })
+            .collect()
+    });
+    let sessions_for_stop = broadcast_sessions.clone();
+    let broadcast_stop_fn: lvqr_admin::BroadcastStopFn = Arc::new(move |name| {
+        let Some(entry) = sessions_for_stop.get(name) else {
+            return lvqr_admin::BroadcastStopResult::NotFound;
+        };
+        let protocol = entry.protocol.clone();
+        entry.token.cancel();
+        // We do NOT remove the entry here -- the ingest crate's deregister
+        // closure removes it on session teardown (DeregisterGuard fires on
+        // every exit path including the cancel branch). That keeps the
+        // registry the single source of truth driven only by ingest
+        // lifecycle, not by admin-side bookkeeping.
+        drop(entry);
+        tracing::info!(broadcast = %name, %protocol, "broadcast session killed via admin");
+        lvqr_admin::BroadcastStopResult::Killed {
+            broadcast: name.to_string(),
+            protocol,
+        }
+    });
+    let admin_state = admin_state
+        .with_broadcast_sessions(broadcast_list_fn)
+        .with_broadcast_stop(broadcast_stop_fn);
 
     // Session 146: wire the runtime stream-key store into the
     // admin router. When streamkeys_enabled is false the store is

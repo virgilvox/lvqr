@@ -369,6 +369,55 @@ pub struct ArchiveTrackInfo {
     pub timescale: u32,
 }
 
+/// One live publisher-session row returned by `GET /api/v1/broadcasts`. The
+/// foundation is protocol-agnostic -- any ingest crate (rtmp_ingest, lvqr_whip,
+/// lvqr_srt, lvqr_rtsp) that wires its session registrar will surface here.
+/// Only active publisher sessions appear; broadcasts whose state lingers in
+/// the registry past the publisher's disconnect do not (the existing
+/// `GET /api/v1/streams` route is the registry-side view).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BroadcastSessionInfo {
+    /// Broadcast name the publisher claimed (`<app>/<key>` for RTMP, URL
+    /// path for WHIP, StreamId broadcast field for SRT, ANNOUNCE path for
+    /// RTSP).
+    pub broadcast: String,
+    /// Lower-case protocol tag (`"rtmp"` / `"whip"` / `"srt"` / `"rtsp"`).
+    pub protocol: String,
+    /// Session start time, in ms since the Unix epoch.
+    pub started_ms: u64,
+    /// Publisher peer address when the ingest crate captured it at accept
+    /// time; `None` when the crate has not yet been refactored to thread
+    /// the address through.
+    pub peer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BroadcastSessionsState {
+    pub sessions: Vec<BroadcastSessionInfo>,
+}
+
+/// Result of a `DELETE /api/v1/broadcasts/{name}` call. Idempotent: a repeat
+/// against an already-killed session resolves with `not_found` because no
+/// live session exists with that broadcast name. The handler maps `Killed`
+/// to 200 and `NotFound` to 404.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum BroadcastStopResult {
+    Killed { broadcast: String, protocol: String },
+    NotFound,
+}
+
+/// Closure backing `GET /api/v1/broadcasts`. Returns one entry per active
+/// publisher session across every ingest protocol whose ingest crate has
+/// wired the session registrar in `lvqr-cli`'s composition root.
+pub type BroadcastSessionsFn = Arc<dyn Fn() -> Vec<BroadcastSessionInfo> + Send + Sync>;
+
+/// Closure backing `DELETE /api/v1/broadcasts/{name}`. Cancels the session's
+/// `CancellationToken`; the ingest crate observes the cancel inside its
+/// per-session read loop and tears down the publisher socket. STOP-only --
+/// the publisher can reconnect immediately (a new session, new entry).
+pub type BroadcastStopFn = Arc<dyn Fn(&str) -> BroadcastStopResult + Send + Sync>;
+
 /// Ingest-listener inventory returned by `GET /api/v1/ingest`.
 ///
 /// One entry per ingest protocol the relay actually bound at startup (RTMP /
@@ -532,6 +581,13 @@ pub struct AdminState {
     /// Closure backing `DELETE /api/v1/ingest/{protocol}`. Populated by
     /// [`AdminState::with_ingest_stop`]; `None` -> the route returns 503.
     ingest_stop: Option<IngestStopFn>,
+    /// Snapshot closure backing `GET /api/v1/broadcasts`. Populated by
+    /// [`AdminState::with_broadcast_sessions`]; defaults to an empty-list
+    /// closure. Slice 6.
+    get_broadcasts: BroadcastSessionsFn,
+    /// Closure backing `DELETE /api/v1/broadcasts/{name}`. Populated by
+    /// [`AdminState::with_broadcast_stop`]; `None` -> the route returns 503.
+    broadcast_stop: Option<BroadcastStopFn>,
 }
 
 impl AdminState {
@@ -586,6 +642,8 @@ impl AdminState {
             agent_mutate: None,
             get_ingest: Arc::new(Vec::new),
             ingest_stop: None,
+            get_broadcasts: Arc::new(Vec::new),
+            broadcast_stop: None,
         }
     }
 
@@ -738,6 +796,30 @@ impl AdminState {
         self
     }
 
+    /// Wire the live publisher-session snapshot closure backing
+    /// `GET /api/v1/broadcasts`. Slice 6: the CLI composition root passes a
+    /// closure that walks the `Arc<DashMap<String, BroadcastSessionEntry>>`
+    /// populated by each ingest crate's session registrar (one entry per
+    /// live publisher across all wired protocols). Without this call the
+    /// route serves `{"sessions": []}`.
+    pub fn with_broadcast_sessions(mut self, f: BroadcastSessionsFn) -> Self {
+        self.get_broadcasts = f;
+        self
+    }
+
+    /// Wire the broadcast-session kill closure backing
+    /// `DELETE /api/v1/broadcasts/{name}`. Cancels the session's per-publisher
+    /// `CancellationToken`; the ingest crate observes the cancel in its
+    /// read loop and tears down the publisher socket. Idempotent in the
+    /// honest sense: a repeat call against an already-killed session
+    /// returns 404 because no live session remains with that name (it was
+    /// deregistered on the previous teardown). Without this call the route
+    /// returns 503.
+    pub fn with_broadcast_stop(mut self, f: BroadcastStopFn) -> Self {
+        self.broadcast_stop = Some(f);
+        self
+    }
+
     /// Wire the process-global log broadcaster backing the
     /// `GET /api/v1/logs` SSE live-tail route. The CLI composition root
     /// passes `lvqr_observability::log_broadcaster()`; without it the route
@@ -865,6 +947,8 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/api/v1/agents/{name}", delete(remove_agent_route))
         .route("/api/v1/ingest", get(get_ingest))
         .route("/api/v1/ingest/{protocol}", delete(stop_ingest_route))
+        .route("/api/v1/broadcasts", get(get_broadcasts))
+        .route("/api/v1/broadcasts/{name}", delete(stop_broadcast_route))
         .route("/api/v1/archive", get(get_archive))
         .route(
             "/api/v1/streamkeys",
@@ -1307,6 +1391,40 @@ async fn get_ingest(State(state): State<AdminState>) -> Json<IngestState> {
     Json(IngestState {
         listeners: (state.get_ingest)(),
     })
+}
+
+/// `GET /api/v1/broadcasts` -- live publisher sessions (one row per active
+/// publisher across every ingest protocol whose ingest crate has wired its
+/// session registrar). Returns `{"sessions": []}` when none are wired or
+/// none are live.
+async fn get_broadcasts(State(state): State<AdminState>) -> Json<BroadcastSessionsState> {
+    Json(BroadcastSessionsState {
+        sessions: (state.get_broadcasts)(),
+    })
+}
+
+/// `DELETE /api/v1/broadcasts/{name}` -- truly disconnect the live publisher
+/// session for the named broadcast. Cancels the session's per-publisher
+/// `CancellationToken`; the ingest crate observes the cancel in its read
+/// loop and tears down the publisher socket. 200 on kill, 404 when no live
+/// session exists for that broadcast (also covers the idempotent repeat
+/// case), 503 when the relay's CLI did not wire the session registry.
+async fn stop_broadcast_route(State(state): State<AdminState>, Path(name): Path<String>) -> Response {
+    let Some(stop) = state.broadcast_stop.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "broadcast stop not available on this relay" })),
+        )
+            .into_response();
+    };
+    match stop(&name) {
+        result @ BroadcastStopResult::Killed { .. } => (StatusCode::OK, Json(result)).into_response(),
+        BroadcastStopResult::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no live publisher session for broadcast '{name}'") })),
+        )
+            .into_response(),
+    }
 }
 
 /// `DELETE /api/v1/ingest/{protocol}` -- cancel the named listener's child
@@ -2801,6 +2919,156 @@ mod tests {
         let st: IngestState = serde_json::from_slice(&body).unwrap();
         let rtmp = st.listeners.iter().find(|l| l.protocol == "rtmp").unwrap();
         assert!(!rtmp.enabled);
+    }
+
+    // Slice 6: broadcast-session inventory + kill. Same closure-stubbing as
+    // the ingest-listener tests above; the production registry lives in
+    // lvqr-cli and is wired by the composition root.
+    fn broadcast_stubs() -> (BroadcastSessionsFn, BroadcastStopFn) {
+        use std::sync::Mutex;
+        let state: Arc<Mutex<Vec<BroadcastSessionInfo>>> = Arc::new(Mutex::new(vec![
+            BroadcastSessionInfo {
+                broadcast: "live/demo".into(),
+                protocol: "rtmp".into(),
+                started_ms: 1_700_000_000_000,
+                peer: Some("203.0.113.7:51234".into()),
+            },
+            BroadcastSessionInfo {
+                broadcast: "studio/cam-a".into(),
+                protocol: "whip".into(),
+                started_ms: 1_700_000_001_000,
+                peer: None,
+            },
+        ]));
+        let list_state = state.clone();
+        let list: BroadcastSessionsFn = Arc::new(move || list_state.lock().unwrap().clone());
+        let stop_state = state.clone();
+        let stop: BroadcastStopFn = Arc::new(move |name| {
+            let mut g = stop_state.lock().unwrap();
+            if let Some(pos) = g.iter().position(|s| s.broadcast == name) {
+                let entry = g.remove(pos);
+                BroadcastStopResult::Killed {
+                    broadcast: entry.broadcast,
+                    protocol: entry.protocol,
+                }
+            } else {
+                BroadcastStopResult::NotFound
+            }
+        });
+        (list, stop)
+    }
+
+    #[tokio::test]
+    async fn broadcasts_route_defaults_to_empty_when_unwired() {
+        let app = build_router(test_state(vec![]));
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/broadcasts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        let st: BroadcastSessionsState = serde_json::from_slice(&body).unwrap();
+        assert!(st.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn broadcasts_route_renders_live_sessions() {
+        let (list, _stop) = broadcast_stubs();
+        let app = build_router(test_state(vec![]).with_broadcast_sessions(list));
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/broadcasts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        let st: BroadcastSessionsState = serde_json::from_slice(&body).unwrap();
+        assert_eq!(st.sessions.len(), 2);
+        let rtmp = st.sessions.iter().find(|s| s.protocol == "rtmp").unwrap();
+        assert_eq!(rtmp.broadcast, "live/demo");
+        assert_eq!(rtmp.peer.as_deref(), Some("203.0.113.7:51234"));
+    }
+
+    #[tokio::test]
+    async fn broadcast_stop_503_when_unwired() {
+        let app = build_router(test_state(vec![]));
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/broadcasts/live%2Fdemo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn broadcast_stop_kills_then_404s_on_repeat() {
+        let (list, stop) = broadcast_stubs();
+        let app = build_router(
+            test_state(vec![])
+                .with_broadcast_sessions(list)
+                .with_broadcast_stop(stop),
+        );
+        let killed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/broadcasts/live%2Fdemo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(killed.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(killed.into_body(), usize::MAX).await.unwrap();
+        let res: BroadcastStopResult = serde_json::from_slice(&body).unwrap();
+        match res {
+            BroadcastStopResult::Killed { broadcast, protocol } => {
+                assert_eq!(broadcast, "live/demo");
+                assert_eq!(protocol, "rtmp");
+            }
+            other => panic!("expected Killed, got {other:?}"),
+        }
+        // Repeat: now 404 because the session was deregistered on the previous
+        // kill. The inventory also reflects the removal.
+        let again = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/broadcasts/live%2Fdemo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::NOT_FOUND);
+        let listing = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/broadcasts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(listing.into_body(), usize::MAX).await.unwrap();
+        let st: BroadcastSessionsState = serde_json::from_slice(&body).unwrap();
+        assert!(st.sessions.iter().all(|s| s.broadcast != "live/demo"));
     }
 
     #[tokio::test]

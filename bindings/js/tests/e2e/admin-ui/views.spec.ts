@@ -59,6 +59,11 @@ const MOCKS: Record<string, unknown> = {
       { protocol: 'whip', addr: '0.0.0.0:8443', enabled: false },
     ],
   },
+  '/api/v1/broadcasts': {
+    sessions: [
+      { broadcast: 'live/demo', protocol: 'rtmp', started_ms: Date.now() - 60_000, peer: '203.0.113.7:51234' },
+    ],
+  },
   '/api/v1/server-info': {
     version: '1.0.0',
     build_features: ['rtmp'],
@@ -155,6 +160,14 @@ test('ingest view lists bound listeners with a Stop control for each enabled row
   // The enabled row gets a Stop button; the stopped row does not.
   await expect(page.getByRole('button', { name: 'Stop RTMP listener' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Stop WHIP listener' })).toHaveCount(0);
+});
+
+test('ingest view surfaces live publisher sessions with a Kick control', async ({ page }) => {
+  await page.goto('/#/ingest');
+  await expect(page.getByRole('heading', { name: 'Live publisher sessions' })).toBeVisible();
+  await expect(page.getByText('live/demo').first()).toBeVisible();
+  await expect(page.getByText('203.0.113.7:51234')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Kick publisher of live/demo' })).toBeVisible();
 });
 
 test('logs view renders the live-tail shell with level filters', async ({ page }) => {

@@ -118,6 +118,15 @@ keeps stopped rows so the UI can show "rtmp stopped" rather than
 letting the listener silently vanish. Existing publishers stay
 connected until their own teardown; only new connections are refused.
 
+A separate route surface kicks a specific live publisher rather than
+its entire listener: `GET /api/v1/broadcasts` lists active publisher
+sessions (one row per connected publisher, with peer address and
+uptime) and `DELETE /api/v1/broadcasts/{name}` cancels that session's
+per-publisher cancel token -- the read loop drops out of its
+`select!`, the TCP socket closes, subscribers see end-of-stream. The
+publisher can reconnect immediately as a new session. Today wired for
+RTMP; WHIP / SRT / RTSP follow in subsequent slices.
+
 ### Egress
 
 | Protocol | Notable surface |
@@ -464,6 +473,7 @@ curl http://localhost:8080/api/v1/archive         # recorded broadcasts (with --
 curl http://localhost:8080/api/v1/transcode/ladders # transcode ladder + live counters
 curl http://localhost:8080/api/v1/agents          # in-process agents + attachments
 curl http://localhost:8080/api/v1/ingest          # bound ingest listeners + live enabled state
+curl http://localhost:8080/api/v1/broadcasts      # live publisher sessions (per-publisher view)
 curl http://localhost:8080/api/v1/wasm-filter     # WASM chain state
 curl http://localhost:8080/api/v1/streamkeys      # stream-key catalog
 curl http://localhost:8080/api/v1/config-reload   # hot reload status

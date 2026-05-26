@@ -206,6 +206,37 @@ export interface ArchiveState {
 }
 
 /**
+ * One live publisher-session row returned by `GET /api/v1/broadcasts`. Mirrors
+ * `lvqr_admin::BroadcastSessionInfo`. Only protocols whose ingest crate has
+ * wired its session registrar surface here (RTMP today; WHIP / SRT / RTSP
+ * land in subsequent slices).
+ */
+export interface BroadcastSessionInfo {
+  /** Broadcast name the publisher claimed (`<app>/<key>` for RTMP, URL path for WHIP, etc.). */
+  broadcast: string;
+  /** Lower-case protocol tag (`"rtmp"` / `"whip"` / `"srt"` / `"rtsp"`). */
+  protocol: string;
+  /** Session start time, in ms since the Unix epoch. */
+  started_ms: number;
+  /** Publisher peer address (`null` for ingest crates that have not yet been refactored to thread it through). */
+  peer: string | null;
+}
+
+/** Live publisher-session inventory returned by `GET /api/v1/broadcasts`. */
+export interface BroadcastSessionsState {
+  sessions: BroadcastSessionInfo[];
+}
+
+/**
+ * Result of `DELETE /api/v1/broadcasts/{name}`. 200 with `killed`, or 404
+ * with `not_found` when no live session exists for that broadcast (also
+ * covers the idempotent repeat case).
+ */
+export type BroadcastStopResult =
+  | { result: 'killed'; broadcast: string; protocol: string }
+  | { result: 'not_found' };
+
+/**
  * One ingest-listener entry returned by `GET /api/v1/ingest`. Mirrors
  * `lvqr_admin::IngestListenerInfo`. `enabled: true` until the operator stops
  * the listener via `DELETE /api/v1/ingest/{protocol}`; STOP is one-way until
@@ -734,6 +765,34 @@ export class LvqrAdminClient {
    */
   async archive(): Promise<ArchiveState> {
     return this.getJson<ArchiveState>('/api/v1/archive');
+  }
+
+  /**
+   * `GET /api/v1/broadcasts` -- live publisher sessions (one row per active
+   * publisher whose ingest crate has wired its session registrar). Always
+   * 200; an empty list when no live sessions exist or no registrar is wired.
+   */
+  async broadcasts(): Promise<BroadcastSessionsState> {
+    return this.getJson<BroadcastSessionsState>('/api/v1/broadcasts');
+  }
+
+  /**
+   * `DELETE /api/v1/broadcasts/{name}` -- truly disconnect the live publisher
+   * session for the named broadcast. The ingest crate's per-session cancel
+   * token fires, the read loop drops out of its `select!`, the publisher's
+   * TCP socket is closed, and the bridge drains the egress state.
+   * Subscribers see end-of-stream. The publisher can reconnect immediately
+   * (a new session starts a new entry). Throws on non-2xx (404 when no live
+   * session exists for that name, 503 when the CLI did not wire the
+   * registry).
+   */
+  async stopBroadcast(name: string): Promise<BroadcastStopResult> {
+    const path = `/api/v1/broadcasts/${encodeURIComponent(name)}`;
+    const resp = await this.fetchWithTimeout(`${this.baseUrl}${path}`, { method: 'DELETE' });
+    if (!resp.ok) {
+      throw new Error(`DELETE ${path}: HTTP ${resp.status} ${resp.statusText}`);
+    }
+    return (await resp.json()) as BroadcastStopResult;
   }
 
   /**

@@ -23,4 +23,4 @@ pub use bridge::RtmpMoqBridge;
 pub use protocol::RtmpIngest;
 
 #[cfg(feature = "rtmp")]
-pub use rtmp::{RtmpConfig, RtmpServer};
+pub use rtmp::{RtmpConfig, RtmpServer, SessionDeregisterFn, SessionRegisterFn, SessionRegistrar};

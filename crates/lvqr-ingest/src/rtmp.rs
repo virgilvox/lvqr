@@ -48,6 +48,31 @@ pub type AuthCallback = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 /// (see `vendor/rml_rtmp` and the session 152 close block).
 pub type Scte35Callback = Arc<dyn Fn(&str, &str, Bytes) + Send + Sync>;
 
+/// Slice 6 callback: register a live RTMP publisher session in a shared
+/// per-broadcast registry. Receives the broadcast name (`<app>/<key>`), the
+/// publisher's peer address (captured at accept time), and a
+/// `CancellationToken` clone that the registry can cancel to forcibly tear
+/// down this session via `DELETE /api/v1/broadcasts/{name}`. The token's
+/// cancellation makes the session's read loop fall out of its `select!` and
+/// drop the `TcpStream`, closing the publisher's socket.
+pub type SessionRegisterFn = Arc<dyn Fn(String, SocketAddr, CancellationToken) + Send + Sync>;
+
+/// Slice 6 callback paired with [`SessionRegisterFn`]. Removes the session
+/// from the shared registry when the session ends -- whether cleanly (TCP
+/// FIN), in error, or because the operator cancelled the per-session token.
+/// Called at most once per session.
+pub type SessionDeregisterFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Slice 6 -- a (register, deregister) pair the CLI composition root wires
+/// onto the RTMP server. Optional: when unset the server runs as before, no
+/// session is ever surfaced via `GET /api/v1/broadcasts`, and the kill
+/// route 404s for that broadcast name.
+#[derive(Clone)]
+pub struct SessionRegistrar {
+    pub register: SessionRegisterFn,
+    pub deregister: SessionDeregisterFn,
+}
+
 /// RTMP ingest server that translates RTMP streams to MoQ tracks.
 pub struct RtmpServer {
     config: RtmpConfig,
@@ -62,6 +87,11 @@ pub struct RtmpServer {
     /// SCTE-35 ad markers are silently dropped (back-compat with
     /// session 151 and earlier callers).
     on_scte35: Option<Scte35Callback>,
+    /// Slice 6: optional (register, deregister) pair for the per-publisher
+    /// session registry. The CLI sets this; tests + embedders that don't
+    /// need broadcast-stop leave it `None` and the existing behaviour is
+    /// preserved exactly.
+    session_registrar: Option<SessionRegistrar>,
 }
 
 impl RtmpServer {
@@ -86,6 +116,7 @@ impl RtmpServer {
             on_unpublish: Arc::new(on_unpublish),
             validate_publish: None,
             on_scte35: None,
+            session_registrar: None,
         }
     }
 
@@ -105,6 +136,7 @@ impl RtmpServer {
             on_unpublish,
             validate_publish: None,
             on_scte35: None,
+            session_registrar: None,
         }
     }
 
@@ -123,6 +155,16 @@ impl RtmpServer {
     /// `"scte35"` track via [`crate::publish_scte35`].
     pub fn set_scte35_callback(&mut self, cb: Scte35Callback) {
         self.on_scte35 = Some(cb);
+    }
+
+    /// Slice 6: install the per-publisher session registrar so the CLI's
+    /// shared `DashMap<broadcast, BroadcastSessionEntry>` can surface live
+    /// RTMP publishers via `GET /api/v1/broadcasts` and tear them down via
+    /// `DELETE /api/v1/broadcasts/{name}`. Without this call the RTMP
+    /// listener behaves exactly as it did before -- no session surfaces, the
+    /// kill route 404s for RTMP broadcasts.
+    pub fn set_session_registrar(&mut self, registrar: SessionRegistrar) {
+        self.session_registrar = Some(registrar);
     }
 
     pub fn config(&self) -> &RtmpConfig {
@@ -158,16 +200,19 @@ impl RtmpServer {
                     let on_unpublish = self.on_unpublish.clone();
                     let validate_publish = self.validate_publish.clone();
                     let on_scte35 = self.on_scte35.clone();
+                    let session_registrar = self.session_registrar.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_rtmp_connection(
                             stream,
+                            peer_addr,
                             on_video,
                             on_audio,
                             on_publish,
                             on_unpublish,
                             validate_publish,
                             on_scte35,
+                            session_registrar,
                         )
                         .await
                         {
@@ -190,12 +235,14 @@ impl RtmpServer {
 #[allow(clippy::too_many_arguments)]
 async fn handle_rtmp_connection(
     mut stream: TcpStream,
+    peer_addr: SocketAddr,
     on_video: MediaCallback,
     on_audio: MediaCallback,
     on_publish: StreamCallback,
     on_unpublish: StreamCallback,
     validate_publish: Option<AuthCallback>,
     on_scte35: Option<Scte35Callback>,
+    session_registrar: Option<SessionRegistrar>,
 ) -> Result<(), IngestError> {
     // Phase 1: RTMP Handshake
     let mut handshake = Handshake::new(PeerType::Server);
@@ -235,6 +282,7 @@ async fn handle_rtmp_connection(
                 // Phase 2: RTMP Session
                 return handle_rtmp_session(
                     stream,
+                    peer_addr,
                     remaining_bytes,
                     on_video,
                     on_audio,
@@ -242,9 +290,27 @@ async fn handle_rtmp_connection(
                     on_unpublish,
                     validate_publish,
                     on_scte35,
+                    session_registrar,
                 )
                 .await;
             }
+        }
+    }
+}
+
+/// RAII guard that calls the slice-6 deregister closure on any exit path of
+/// `handle_rtmp_session` (clean TCP close, error via `?`, admin-cancel
+/// return). Carries no state when no registrar is wired; carries no name
+/// until the publish handshake succeeds and the session has been registered.
+struct DeregisterGuard {
+    name: Option<String>,
+    deregister: Option<SessionDeregisterFn>,
+}
+
+impl Drop for DeregisterGuard {
+    fn drop(&mut self) {
+        if let (Some(name), Some(deregister)) = (&self.name, &self.deregister) {
+            (deregister)(name);
         }
     }
 }
@@ -253,6 +319,7 @@ async fn handle_rtmp_connection(
 #[allow(clippy::too_many_arguments)]
 async fn handle_rtmp_session(
     mut stream: TcpStream,
+    peer_addr: SocketAddr,
     remaining_bytes: Vec<u8>,
     on_video: MediaCallback,
     on_audio: MediaCallback,
@@ -260,10 +327,22 @@ async fn handle_rtmp_session(
     on_unpublish: StreamCallback,
     validate_publish: Option<AuthCallback>,
     on_scte35: Option<Scte35Callback>,
+    session_registrar: Option<SessionRegistrar>,
 ) -> Result<(), IngestError> {
     let config = ServerSessionConfig::new();
     let (mut session, initial_results) =
         ServerSession::new(config).map_err(|e| IngestError::Protocol(format!("session init error: {e:?}")))?;
+
+    // Slice 6: per-publisher cancel token. Cancelled by
+    // `DELETE /api/v1/broadcasts/{name}`; observed inside the read loop's
+    // `select!` so dropping `stream` closes the publisher's TCP socket.
+    let session_cancel = CancellationToken::new();
+    // Drop-guard so EVERY exit path of this function (clean EOF, `?`-bubbled
+    // error, admin-cancel) deregisters the session from the shared registry.
+    let mut dereg = DeregisterGuard {
+        name: None,
+        deregister: session_registrar.as_ref().map(|r| r.deregister.clone()),
+    };
 
     // Send initial server responses (chunk size, window ack, etc.)
     for result in initial_results {
@@ -295,7 +374,21 @@ async fn handle_rtmp_session(
     let mut current_key = String::new();
 
     loop {
-        let n = stream.read(&mut buf).await?;
+        // Slice 6: race the read against the per-session cancel. On cancel,
+        // drop the TcpStream (which closes the publisher's socket), call
+        // on_unpublish so the bridge drains the ActiveStream and egress sees
+        // end-of-stream, and let the `DeregisterGuard` deregister on return.
+        let n = tokio::select! {
+            biased;
+            _ = session_cancel.cancelled() => {
+                info!(%peer_addr, "RTMP publisher session cancelled by admin");
+                if !current_app.is_empty() && !current_key.is_empty() {
+                    (on_unpublish)(&current_app, &current_key);
+                }
+                return Ok(());
+            }
+            r = stream.read(&mut buf) => r?,
+        };
         if n == 0 {
             // Connection closed
             if !current_app.is_empty() && !current_key.is_empty() {
@@ -354,6 +447,16 @@ async fn handle_rtmp_session(
                             }
                         }
                         (on_publish)(app_name, stream_key);
+                        // Slice 6: surface this live publisher session to
+                        // the shared broadcast registry. Idempotent on
+                        // republish (same name) -- the registrar replaces
+                        // the entry with the new token, so a stale operator
+                        // DELETE never kicks a fresher session.
+                        if let Some(reg) = &session_registrar {
+                            let name = format!("{}/{}", app_name, stream_key);
+                            (reg.register)(name.clone(), peer_addr, session_cancel.clone());
+                            dereg.name = Some(name);
+                        }
                     }
                     ServerSessionEvent::VideoDataReceived {
                         app_name,
