@@ -190,8 +190,8 @@ const recipes = computed(() => [
     <Card kicker="LIVE" title="Live publisher sessions">
       <p class="hint" style="margin-bottom: var(--s-2)">
         Per-publisher view from <code>/api/v1/broadcasts</code>. "Kick" closes the publisher's
-        socket (subscribers see end-of-stream); the publisher can reconnect immediately. Today
-        wired for RTMP; WHIP / SRT / RTSP follow.
+        socket (subscribers see end-of-stream); the publisher can reconnect immediately. Wired
+        for every ingest protocol (RTMP / WHIP / SRT / RTSP).
       </p>
       <div class="btable" role="table" aria-label="Live publisher sessions">
         <div class="tr th" role="row">

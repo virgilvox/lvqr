@@ -124,8 +124,8 @@ sessions (one row per connected publisher, with peer address and
 uptime) and `DELETE /api/v1/broadcasts/{name}` cancels that session's
 per-publisher cancel token -- the read loop drops out of its
 `select!`, the TCP socket closes, subscribers see end-of-stream. The
-publisher can reconnect immediately as a new session. Today wired for
-RTMP; WHIP / SRT / RTSP follow in subsequent slices.
+publisher can reconnect immediately as a new session. Wired across
+all four ingest protocols (RTMP / WHIP / SRT / RTSP).
 
 ### Egress
 
