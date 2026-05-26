@@ -20,6 +20,27 @@ use srt_tokio::access::{RejectReason, ServerRejectReason};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+/// Slice 6: callback to register a live SRT publisher session in lvqr-cli's
+/// shared `Arc<DashMap<String, BroadcastSessionEntry>>`. Mirrors the RTMP
+/// `SessionRegisterFn` signature so the CLI can wire both protocols against
+/// the same registry. Receives the broadcast name, the SRT peer address
+/// captured at accept time, and a `CancellationToken` clone the registry
+/// can cancel to forcibly tear down the session.
+pub type SessionRegisterFn = Arc<dyn Fn(String, SocketAddr, CancellationToken) + Send + Sync>;
+
+/// Slice 6: paired deregister callback. Fires when the per-publisher
+/// `handle_connection` task returns, on every exit path.
+pub type SessionDeregisterFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Slice 6 -- a (register, deregister) pair the CLI composition root wires
+/// onto the SRT server. Optional: when unset the server behaves as before
+/// and no SRT session surfaces in `GET /api/v1/broadcasts`.
+#[derive(Clone)]
+pub struct SessionRegistrar {
+    pub register: SessionRegisterFn,
+    pub deregister: SessionDeregisterFn,
+}
+
 /// SRT ingest server. Bind to a UDP port, accept SRT connections,
 /// demux MPEG-TS, and emit Fragments.
 pub struct SrtIngestServer {
@@ -27,6 +48,10 @@ pub struct SrtIngestServer {
     pre_bound: Option<tokio::net::UdpSocket>,
     registry: FragmentBroadcasterRegistry,
     auth: SharedAuth,
+    /// Slice 6: optional session registrar. `None` keeps the existing
+    /// behaviour; an SRT publisher does not surface in
+    /// `GET /api/v1/broadcasts` and the kill route 404s for SRT broadcasts.
+    session_registrar: Option<SessionRegistrar>,
 }
 
 impl SrtIngestServer {
@@ -36,6 +61,7 @@ impl SrtIngestServer {
             pre_bound: None,
             registry: FragmentBroadcasterRegistry::new(),
             auth: Arc::new(NoopAuthProvider),
+            session_registrar: None,
         }
     }
 
@@ -48,6 +74,7 @@ impl SrtIngestServer {
             pre_bound: None,
             registry,
             auth: Arc::new(NoopAuthProvider),
+            session_registrar: None,
         }
     }
 
@@ -59,6 +86,15 @@ impl SrtIngestServer {
     pub fn with_auth(mut self, auth: SharedAuth) -> Self {
         self.auth = auth;
         self
+    }
+
+    /// Slice 6: install the per-publisher session registrar so the CLI's
+    /// shared broadcast registry can surface live SRT publishers via
+    /// `GET /api/v1/broadcasts` and tear them down via
+    /// `DELETE /api/v1/broadcasts/{name}`. Without this call the SRT
+    /// listener behaves exactly as it did before.
+    pub fn set_session_registrar(&mut self, registrar: SessionRegistrar) {
+        self.session_registrar = Some(registrar);
     }
 
     /// Handle to the broadcaster registry. Consumers call
@@ -87,6 +123,7 @@ impl SrtIngestServer {
             pre_bound,
             registry,
             auth,
+            session_registrar,
         } = self;
         let builder = srt_tokio::SrtListener::builder();
         let (mut listener, mut incoming) = match pre_bound {
@@ -142,10 +179,28 @@ impl SrtIngestServer {
 
                     let ev = events.clone();
                     let bc = broadcast.clone();
-                    let conn_shutdown = shutdown.clone();
+                    // Slice 6: child_token, NOT clone -- cancelling this
+                    // per-connection token (via the broadcast registry's
+                    // kill closure) must take down only this publisher,
+                    // not the whole SRT listener.
+                    let conn_shutdown = shutdown.child_token();
                     let conn_registry = registry.clone();
+                    // Slice 6: register the live publisher session BEFORE
+                    // spawning the handler so a DELETE racing the spawn
+                    // still finds the row. The registrar's `register` is
+                    // synchronous and idempotent under republish (same
+                    // broadcast name replaces).
+                    if let Some(reg) = &session_registrar {
+                        (reg.register)(bc.clone(), remote, conn_shutdown.clone());
+                    }
+                    let session_dereg = session_registrar.as_ref().map(|r| r.deregister.clone());
                     tokio::spawn(async move {
                         handle_connection(socket, &bc, &ev, &conn_registry, conn_shutdown).await;
+                        // Slice 6: deregister on every exit path (clean
+                        // socket close, shutdown propagation, kill).
+                        if let Some(dereg) = session_dereg {
+                            (dereg)(&bc);
+                        }
                     });
                 }
             }

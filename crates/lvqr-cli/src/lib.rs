@@ -918,6 +918,31 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
     let (srt_server, srt_bound) = if let Some(addr) = config.srt_addr {
         let mut server =
             lvqr_srt::SrtIngestServer::with_registry(addr, shared_registry.clone()).with_auth(auth.clone());
+        // Slice 6: wire the SRT session registrar so live SRT publishers
+        // surface in `GET /api/v1/broadcasts` and the kill route actually
+        // disconnects them.
+        let reg_map = broadcast_sessions.clone();
+        let dereg_map = broadcast_sessions.clone();
+        server.set_session_registrar(lvqr_srt::SessionRegistrar {
+            register: Arc::new(move |name, peer, token| {
+                let started_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                reg_map.insert(
+                    name,
+                    BroadcastSessionEntry {
+                        protocol: "srt".into(),
+                        peer: Some(peer),
+                        started_ms,
+                        token,
+                    },
+                );
+            }),
+            deregister: Arc::new(move |name| {
+                dereg_map.remove(name);
+            }),
+        });
         let bound = server.bind().await?;
         tracing::info!(addr = %bound, "SRT ingest bound");
         (Some(server), Some(bound))

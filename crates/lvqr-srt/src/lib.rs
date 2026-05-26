@@ -26,4 +26,4 @@
 
 pub mod ingest;
 
-pub use ingest::SrtIngestServer;
+pub use ingest::{SessionDeregisterFn, SessionRegisterFn, SessionRegistrar, SrtIngestServer};
