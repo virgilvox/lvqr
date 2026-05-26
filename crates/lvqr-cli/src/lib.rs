@@ -904,8 +904,34 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         let str0m_cfg = lvqr_whip::Str0mIngestConfig {
             host_ip: ice_host_ip_for_bind(addr),
         };
-        let answerer =
-            Arc::new(lvqr_whip::Str0mIngestAnswerer::new(str0m_cfg, sink)) as Arc<dyn lvqr_whip::SdpAnswerer>;
+        let mut answerer_concrete = lvqr_whip::Str0mIngestAnswerer::new(str0m_cfg, sink);
+        // Slice 6: wire the WHIP session registrar. The peer addr is not
+        // captured at session creation (the publisher's UDP source arrives
+        // later via str0m's poll loop), so we register with peer=None --
+        // honest about what the WHIP crate has surfaced today.
+        let reg_map = broadcast_sessions.clone();
+        let dereg_map = broadcast_sessions.clone();
+        answerer_concrete.set_session_registrar(lvqr_whip::SessionRegistrar {
+            register: Arc::new(move |name, token| {
+                let started_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                reg_map.insert(
+                    name,
+                    BroadcastSessionEntry {
+                        protocol: "whip".into(),
+                        peer: None,
+                        started_ms,
+                        token,
+                    },
+                );
+            }),
+            deregister: Arc::new(move |name| {
+                dereg_map.remove(name);
+            }),
+        });
+        let answerer = Arc::new(answerer_concrete) as Arc<dyn lvqr_whip::SdpAnswerer>;
         let server = lvqr_whip::WhipServer::with_auth_provider(answerer, auth.clone());
         (Some(server), Some(whip_bridge_arc))
     } else {
@@ -972,6 +998,32 @@ pub async fn start(config: ServeConfig) -> Result<ServerHandle> {
         if let Some(r) = rtsp_owner_resolver.clone() {
             server = server.with_owner_resolver(r);
         }
+        // Slice 6: wire the RTSP session registrar. ANNOUNCE fires the
+        // register call with the publisher's TCP peer addr (RTSP is the
+        // only ingest crate where it was already in scope at the right
+        // moment -- preserve that).
+        let reg_map = broadcast_sessions.clone();
+        let dereg_map = broadcast_sessions.clone();
+        server.set_session_registrar(lvqr_rtsp::SessionRegistrar {
+            register: Arc::new(move |name, peer, token| {
+                let started_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                reg_map.insert(
+                    name,
+                    BroadcastSessionEntry {
+                        protocol: "rtsp".into(),
+                        peer: Some(peer),
+                        started_ms,
+                        token,
+                    },
+                );
+            }),
+            deregister: Arc::new(move |name| {
+                dereg_map.remove(name);
+            }),
+        });
         let bound = server.bind().await?;
         tracing::info!(addr = %bound, "RTSP ingest bound");
         (Some(server), Some(bound))

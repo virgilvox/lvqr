@@ -30,7 +30,8 @@ use str0m::media::{Frequency, MediaKind};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::bridge::{IngestAudioSample, IngestSample, IngestSampleSink};
 use crate::server::{SdpAnswerer, SessionHandle, WhipError};
@@ -58,9 +59,32 @@ impl Default for Str0mIngestConfig {
 
 /// [`SdpAnswerer`] backed by the `str0m` crate, running the poll
 /// loop in the ingest direction.
+/// Slice 6 (WHIP half): callback to register a live WHIP publisher session
+/// in lvqr-cli's shared `Arc<DashMap<String, BroadcastSessionEntry>>`.
+/// Unlike RTMP / SRT, WHIP does not have a single canonical publisher
+/// address at session-creation time (the UDP source addr is observed
+/// later in the poll loop), so the signature omits it; the CLI
+/// adapter inserts `peer: None`.
+pub type SessionRegisterFn = Arc<dyn Fn(String, CancellationToken) + Send + Sync>;
+
+/// Slice 6 paired deregister callback. Fires on every exit path of the
+/// per-session poll loop (clean shutdown, ICE timeout, kill).
+pub type SessionDeregisterFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Slice 6 -- a (register, deregister) pair the CLI composition root wires
+/// onto the WHIP answerer. Optional: when unset the answerer behaves as
+/// before and WHIP sessions do not surface in `GET /api/v1/broadcasts`.
+#[derive(Clone)]
+pub struct SessionRegistrar {
+    pub register: SessionRegisterFn,
+    pub deregister: SessionDeregisterFn,
+}
+
 pub struct Str0mIngestAnswerer {
     config: Str0mIngestConfig,
     sink: Arc<dyn IngestSampleSink>,
+    /// Slice 6: optional session registrar. `None` keeps existing behaviour.
+    session_registrar: Option<SessionRegistrar>,
 }
 
 impl Str0mIngestAnswerer {
@@ -69,7 +93,19 @@ impl Str0mIngestAnswerer {
         INIT.get_or_init(|| {
             str0m::crypto::from_feature_flags().install_process_default();
         });
-        Self { config, sink }
+        Self {
+            config,
+            sink,
+            session_registrar: None,
+        }
+    }
+
+    /// Slice 6: install the per-publisher session registrar so the CLI's
+    /// shared broadcast registry can surface live WHIP publishers via
+    /// `GET /api/v1/broadcasts` and tear them down via
+    /// `DELETE /api/v1/broadcasts/{name}`.
+    pub fn set_session_registrar(&mut self, registrar: SessionRegistrar) {
+        self.session_registrar = Some(registrar);
     }
 }
 
@@ -142,7 +178,11 @@ impl SdpAnswerer for Str0mIngestAnswerer {
             .map_err(|e| WhipError::MalformedOffer(format!("accept_offer failed: {e}")))?;
         let answer_bytes = Bytes::from(answer.to_sdp_string());
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        // Slice 6: per-publisher cancel token. Cancelled by
+        // `DELETE /api/v1/broadcasts/{name}` (via the registrar) or by the
+        // Drop of the SessionHandle (the existing teardown path the WHIP
+        // router fires on DELETE of the session resource).
+        let cancel = CancellationToken::new();
         // Trickle ICE: candidates parsed from PATCH bodies are sent
         // here and applied inside the poll task that owns `Rtc`
         // (audit I-1). `Rtc` is `!Sync` and lives on the task; the
@@ -152,15 +192,33 @@ impl SdpAnswerer for Str0mIngestAnswerer {
         let broadcast_owned = broadcast.to_string();
         let sink = self.sink.clone();
 
-        tokio::spawn(run_session_loop(
-            rtc,
-            socket,
-            local_addr,
-            shutdown_rx,
-            trickle_rx,
-            broadcast_owned,
-            sink,
-        ));
+        // Slice 6: register the live publisher session BEFORE spawn so a
+        // racing DELETE finds the row, and arrange for deregister to fire
+        // when the poll loop exits (any path -- shutdown, ICE timeout,
+        // socket error). The deregister closure rides along with the poll
+        // task and is invoked from its tail.
+        if let Some(reg) = &self.session_registrar {
+            (reg.register)(broadcast_owned.clone(), cancel.clone());
+        }
+        let session_dereg = self.session_registrar.as_ref().map(|r| r.deregister.clone());
+        let dereg_name = broadcast_owned.clone();
+
+        let cancel_for_loop = cancel.clone();
+        tokio::spawn(async move {
+            run_session_loop(
+                rtc,
+                socket,
+                local_addr,
+                cancel_for_loop,
+                trickle_rx,
+                broadcast_owned,
+                sink,
+            )
+            .await;
+            if let Some(dereg) = session_dereg {
+                (dereg)(&dereg_name);
+            }
+        });
 
         tracing::debug!(
             broadcast = %broadcast,
@@ -169,7 +227,7 @@ impl SdpAnswerer for Str0mIngestAnswerer {
         );
 
         let handle: Box<dyn SessionHandle> = Box::new(Str0mIngestSessionHandle {
-            shutdown: Some(shutdown_tx),
+            shutdown: cancel,
             trickle: trickle_tx,
             trickle_parse_warned: AtomicBool::new(false),
         });
@@ -216,7 +274,7 @@ async fn run_session_loop(
     mut rtc: Rtc,
     socket: UdpSocket,
     local_addr: SocketAddr,
-    mut shutdown: oneshot::Receiver<()>,
+    shutdown: CancellationToken,
     mut trickle: mpsc::UnboundedReceiver<Candidate>,
     broadcast: String,
     sink: Arc<dyn IngestSampleSink>,
@@ -225,7 +283,7 @@ async fn run_session_loop(
         &mut rtc,
         &socket,
         local_addr,
-        &mut shutdown,
+        &shutdown,
         &mut trickle,
         &broadcast,
         &sink,
@@ -238,7 +296,7 @@ async fn run_session_loop_inner(
     rtc: &mut Rtc,
     socket: &UdpSocket,
     local_addr: SocketAddr,
-    shutdown: &mut oneshot::Receiver<()>,
+    shutdown: &CancellationToken,
     trickle: &mut mpsc::UnboundedReceiver<Candidate>,
     broadcast: &str,
     sink: &Arc<dyn IngestSampleSink>,
@@ -271,7 +329,7 @@ async fn run_session_loop_inner(
 
         tokio::select! {
             biased;
-            _ = &mut *shutdown => {
+            _ = shutdown.cancelled() => {
                 tracing::debug!(%broadcast, "whip session shutdown signalled");
                 return;
             }
@@ -482,7 +540,13 @@ fn forward_audio_sample(
 
 /// Per-session handle produced by [`Str0mIngestAnswerer::create_session`].
 pub struct Str0mIngestSessionHandle {
-    shutdown: Option<oneshot::Sender<()>>,
+    /// Slice 6: per-publisher cancel token. Cancelled by the WHIP router
+    /// when DELETE on the session resource drops this `Box<dyn SessionHandle>`
+    /// (via the `Drop` impl below), and also cancelled by lvqr-cli's
+    /// broadcast-stop closure cancelling the registered token clone.
+    /// Either path makes the poll loop's `select!` fall into the
+    /// `shutdown.cancelled()` arm and the session teardown.
+    shutdown: CancellationToken,
     /// Trickle ICE candidates parsed from PATCH bodies, forwarded to
     /// the poll task that owns `Rtc` (audit I-1).
     trickle: mpsc::UnboundedSender<Candidate>,
@@ -493,9 +557,12 @@ pub struct Str0mIngestSessionHandle {
 
 impl Drop for Str0mIngestSessionHandle {
     fn drop(&mut self) {
-        if let Some(tx) = self.shutdown.take() {
-            let _ = tx.send(());
-        }
+        // Cancelling an already-cancelled token is a no-op, so the same
+        // teardown path runs whether shutdown was triggered via the WHIP
+        // router's DELETE (drop fires here) or via the admin's
+        // broadcast-stop (the registered token clone was cancelled first
+        // and this drop just confirms the state).
+        self.shutdown.cancel();
     }
 }
 

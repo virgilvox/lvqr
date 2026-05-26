@@ -46,12 +46,35 @@ pub type RedirectFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Opt
 /// the resolved `NodeEndpoints`.
 pub type OwnerResolver = std::sync::Arc<dyn Fn(String) -> RedirectFuture + Send + Sync>;
 
+/// Slice 6 (RTSP half): callback to register a live RTSP publisher session
+/// in lvqr-cli's shared broadcast registry. Receives the broadcast name
+/// (the ANNOUNCE-time URL path), the publisher's TCP peer address (captured
+/// at accept time), and a `CancellationToken` clone the registry can cancel
+/// to forcibly close this RTSP TCP connection. Note: when one TCP carries
+/// multiple RTSP sessions (rare; ffmpeg/OBS/vMix all use one session per
+/// connection), cancelling the token tears down every session on that TCP.
+pub type SessionRegisterFn = Arc<dyn Fn(String, SocketAddr, CancellationToken) + Send + Sync>;
+
+/// Slice 6 paired deregister callback. Fires once per registered broadcast
+/// when the TCP connection ends (on any exit path).
+pub type SessionDeregisterFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Slice 6 -- a (register, deregister) pair the CLI composition root wires
+/// onto the RTSP server. Optional: when unset the server behaves as before.
+#[derive(Clone)]
+pub struct SessionRegistrar {
+    pub register: SessionRegisterFn,
+    pub deregister: SessionDeregisterFn,
+}
+
 pub struct RtspServer {
     addr: SocketAddr,
     pre_bound: Option<TcpListener>,
     registry: FragmentBroadcasterRegistry,
     owner_resolver: Option<OwnerResolver>,
     auth: SharedAuth,
+    /// Slice 6: optional session registrar. `None` keeps existing behaviour.
+    session_registrar: Option<SessionRegistrar>,
 }
 
 impl RtspServer {
@@ -62,6 +85,7 @@ impl RtspServer {
             registry: FragmentBroadcasterRegistry::new(),
             owner_resolver: None,
             auth: Arc::new(NoopAuthProvider),
+            session_registrar: None,
         }
     }
 
@@ -75,6 +99,7 @@ impl RtspServer {
             registry,
             owner_resolver: None,
             auth: Arc::new(NoopAuthProvider),
+            session_registrar: None,
         }
     }
 
@@ -96,6 +121,16 @@ impl RtspServer {
     pub fn with_auth(mut self, auth: SharedAuth) -> Self {
         self.auth = auth;
         self
+    }
+
+    /// Slice 6: install the per-publisher session registrar so the CLI's
+    /// shared broadcast registry can surface live RTSP publishers via
+    /// `GET /api/v1/broadcasts` and tear them down via
+    /// `DELETE /api/v1/broadcasts/{name}`. The kill cancels the
+    /// per-TCP-connection token; if a single TCP carries multiple RTSP
+    /// sessions (uncommon), every session on that TCP exits.
+    pub fn set_session_registrar(&mut self, registrar: SessionRegistrar) {
+        self.session_registrar = Some(registrar);
     }
 
     /// Handle to the broadcaster registry. Consumers call
@@ -124,6 +159,7 @@ impl RtspServer {
             registry,
             owner_resolver,
             auth,
+            session_registrar,
         } = self;
         let listener = match pre_bound {
             Some(l) => l,
@@ -146,11 +182,16 @@ impl RtspServer {
                     };
                     info!(%remote, "RTSP connection accepted");
                     let ev = events.clone();
-                    let conn_shutdown = shutdown.clone();
+                    // Slice 6: child_token, NOT clone -- cancelling this
+                    // per-connection token must take down only this RTSP
+                    // TCP, not the listener (which is what `clone` would
+                    // achieve since clones share cancellation state).
+                    let conn_shutdown = shutdown.child_token();
                     let server_addr = local_addr;
                     let conn_registry = registry.clone();
                     let conn_resolver = owner_resolver.clone();
                     let conn_auth = auth.clone();
+                    let conn_registrar = session_registrar.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(
                             socket,
@@ -161,6 +202,7 @@ impl RtspServer {
                             conn_resolver,
                             conn_auth,
                             conn_shutdown,
+                            conn_registrar,
                         )
                         .await
                         {
@@ -178,6 +220,17 @@ impl RtspServer {
 struct ConnectionState {
     sessions: HashMap<SessionId, Session>,
     server_addr: SocketAddr,
+    /// Slice 6: TCP peer captured at accept time, threaded through so
+    /// the ANNOUNCE handler can register the publisher session with
+    /// the right address (the audit found RTSP is the only ingest crate
+    /// where this is already accessible -- preserve that).
+    remote: SocketAddr,
+    /// Slice 6: optional per-connection session registrar + the broadcast
+    /// names this connection has registered so far. `registered_broadcasts`
+    /// stays in sync with ANNOUNCE; on connection teardown every entry is
+    /// deregistered so a stale row never lingers in the inventory.
+    session_registrar: Option<SessionRegistrar>,
+    registered_broadcasts: Vec<String>,
     /// Shared broadcaster registry. The DESCRIBE handler reads init
     /// bytes off broadcaster meta to synthesize an SDP response; the
     /// PLAY drain task subscribes through it to produce RTP.
@@ -198,6 +251,13 @@ struct ConnectionState {
     /// Per-connection cancel token. Cancelled when the main loop
     /// exits; observed by drain tasks so they stop promptly.
     conn_cancel: CancellationToken,
+    /// Slice 6: clone of the per-connection cancel token watched by the
+    /// main loop's `select!` (the function arg to `handle_connection`,
+    /// which is also the parent of `conn_cancel`). The broadcast
+    /// registrar registers a clone of THIS so cancelling it makes the
+    /// main loop exit -- cancelling `conn_cancel` alone would not (child
+    /// cancellation does not propagate up to parent).
+    conn_shutdown: CancellationToken,
     h264_depack: H264Depacketizer,
     hevc_depack: HevcDepacketizer,
     aac_depack: AacDepacketizer,
@@ -226,6 +286,7 @@ async fn handle_connection(
     owner_resolver: Option<OwnerResolver>,
     auth: SharedAuth,
     shutdown: CancellationToken,
+    session_registrar: Option<SessionRegistrar>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = vec![0u8; 8192];
     let mut read_buf = Vec::with_capacity(8192);
@@ -241,11 +302,15 @@ async fn handle_connection(
     let mut conn = ConnectionState {
         sessions: HashMap::new(),
         server_addr,
+        remote,
+        session_registrar,
+        registered_broadcasts: Vec::new(),
         registry: registry.clone(),
         owner_resolver,
         auth,
         writer_tx: writer_tx.clone(),
         conn_cancel: conn_cancel.clone(),
+        conn_shutdown: shutdown.clone(),
         h264_depack: H264Depacketizer::new(),
         hevc_depack: HevcDepacketizer::new(),
         aac_depack: AacDepacketizer::new(),
@@ -343,6 +408,16 @@ async fn handle_connection(
                 name: session.broadcast.clone(),
             });
             info!(broadcast = %session.broadcast, "RTSP session ended, BroadcastStopped emitted");
+        }
+    }
+
+    // Slice 6: deregister every broadcast this connection registered with
+    // the shared broadcast-session registry, on every exit path (clean
+    // close, error return from `?` above, admin-triggered cancel). Without
+    // this the inventory would leak a stale entry per disconnect.
+    if let Some(reg) = &conn.session_registrar {
+        for name in &conn.registered_broadcasts {
+            (reg.deregister)(name);
         }
     }
 
@@ -873,11 +948,28 @@ fn handle_announce(conn: &mut ConnectionState, req: &proto::Request, cseq: u32) 
     let tracks = parse_sdp_tracks(body_str);
 
     let session_id = generate_session_id();
-    let mut session = Session::new(session_id.clone(), SessionMode::Ingest, broadcast);
+    let mut session = Session::new(session_id.clone(), SessionMode::Ingest, broadcast.clone());
     session.tracks = tracks;
     conn.sessions.insert(session_id.clone(), session);
 
-    info!(session = %session_id, "RTSP ANNOUNCE accepted");
+    // Slice 6: surface the live RTSP publisher session in the shared
+    // broadcast registry. We register with `conn_cancel` (the per-TCP
+    // child token) -- cancelling it makes `handle_connection`'s main
+    // select! arm fire and tear the TCP down. Track the name on the
+    // ConnectionState so the connection-exit code below deregisters
+    // every broadcast we surfaced (handles the multi-session-per-TCP
+    // case correctly).
+    if let Some(reg) = &conn.session_registrar {
+        // Register `conn_shutdown` (the parent of `conn_cancel`). The main
+        // loop's `select!` watches the same token; cancelling it makes the
+        // loop exit and tears the TCP down. Registering `conn_cancel`
+        // (grandchild) would not work -- child cancellation does not
+        // propagate up.
+        (reg.register)(broadcast.clone(), conn.remote, conn.conn_shutdown.clone());
+        conn.registered_broadcasts.push(broadcast.clone());
+    }
+
+    info!(session = %session_id, broadcast = %broadcast, "RTSP ANNOUNCE accepted");
     Response::ok().with_cseq(cseq).with_header("Session", &session_id)
 }
 
@@ -1148,11 +1240,15 @@ mod tests {
         let conn = ConnectionState {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
+            remote: "127.0.0.1:5000".parse().unwrap(),
+            session_registrar: None,
+            registered_broadcasts: Vec::new(),
             registry: FragmentBroadcasterRegistry::new(),
             owner_resolver: None,
             auth: Arc::new(NoopAuthProvider),
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
+            conn_shutdown: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),
@@ -1213,11 +1309,15 @@ mod tests {
         let conn = ConnectionState {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
+            remote: "127.0.0.1:5000".parse().unwrap(),
+            session_registrar: None,
+            registered_broadcasts: Vec::new(),
             registry,
             owner_resolver: None,
             auth: Arc::new(NoopAuthProvider),
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
+            conn_shutdown: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),
@@ -1256,11 +1356,15 @@ mod tests {
         let mut conn = ConnectionState {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
+            remote: "127.0.0.1:5000".parse().unwrap(),
+            session_registrar: None,
+            registered_broadcasts: Vec::new(),
             registry: FragmentBroadcasterRegistry::new(),
             owner_resolver: None,
             auth: Arc::new(NoopAuthProvider),
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
+            conn_shutdown: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),
@@ -1328,11 +1432,15 @@ mod tests {
         let mut conn = ConnectionState {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
+            remote: "127.0.0.1:5000".parse().unwrap(),
+            session_registrar: None,
+            registered_broadcasts: Vec::new(),
             registry: FragmentBroadcasterRegistry::new(),
             owner_resolver: None,
             auth: Arc::new(NoopAuthProvider),
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
+            conn_shutdown: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),
@@ -1420,11 +1528,15 @@ mod tests {
         let mut conn = ConnectionState {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
+            remote: "127.0.0.1:5000".parse().unwrap(),
+            session_registrar: None,
+            registered_broadcasts: Vec::new(),
             registry: FragmentBroadcasterRegistry::new(),
             owner_resolver: None,
             auth: Arc::new(NoopAuthProvider),
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
+            conn_shutdown: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),
@@ -1513,11 +1625,15 @@ mod tests {
         ConnectionState {
             sessions: HashMap::new(),
             server_addr: "127.0.0.1:8554".parse().unwrap(),
+            remote: "127.0.0.1:5000".parse().unwrap(),
+            session_registrar: None,
+            registered_broadcasts: Vec::new(),
             registry: FragmentBroadcasterRegistry::new(),
             owner_resolver: resolver,
             auth: Arc::new(NoopAuthProvider),
             writer_tx: tokio::sync::mpsc::channel(1).0,
             conn_cancel: CancellationToken::new(),
+            conn_shutdown: CancellationToken::new(),
             h264_depack: H264Depacketizer::new(),
             hevc_depack: HevcDepacketizer::new(),
             aac_depack: AacDepacketizer::new(),

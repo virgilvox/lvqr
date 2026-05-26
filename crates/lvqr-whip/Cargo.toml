@@ -27,6 +27,7 @@ rand = { workspace = true }
 str0m = "0.18"
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

@@ -30,4 +30,7 @@ pub use depack::{annex_b_to_avcc, hevc_nal_type, split_annex_b};
 pub use lvqr_ingest::MediaCodec;
 pub use router::router as router_for;
 pub use server::{SdpAnswerer, SessionHandle, SessionId, WhipError, WhipServer};
-pub use str0m_backend::{Str0mIngestAnswerer, Str0mIngestConfig, Str0mIngestSessionHandle};
+pub use str0m_backend::{
+    SessionDeregisterFn, SessionRegisterFn, SessionRegistrar, Str0mIngestAnswerer, Str0mIngestConfig,
+    Str0mIngestSessionHandle,
+};

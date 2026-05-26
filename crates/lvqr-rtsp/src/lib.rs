@@ -37,4 +37,4 @@ pub mod sdp;
 pub mod server;
 pub mod session;
 
-pub use server::{OwnerResolver, RedirectFuture, RtspServer};
+pub use server::{OwnerResolver, RedirectFuture, RtspServer, SessionDeregisterFn, SessionRegisterFn, SessionRegistrar};
