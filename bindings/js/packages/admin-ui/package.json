@@ -1,6 +1,6 @@
 {
   "name": "@lvqr/admin-ui",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "LVQR operator admin console - Vue 3 SPA for managing one or many LVQR relays",
   "license": "MIT OR Apache-2.0",
   "author": "Moheeb Zara <hackbuildvideo@gmail.com>",
@@ -38,8 +38,8 @@
     "operator"
   ],
   "dependencies": {
-    "@lvqr/core": "1.0.0",
-    "@lvqr/dvr-player": "1.0.0",
+    "@lvqr/core": "1.1.0",
+    "@lvqr/dvr-player": "1.1.0",
     "pinia": "^2.2.0",
     "vue": "^3.5.0",
     "vue-router": "^4.4.0"

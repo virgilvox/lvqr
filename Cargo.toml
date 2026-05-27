@@ -46,7 +46,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 # LVQR is dual-licensed: AGPL-3.0-or-later for open-source use and commercial
 # terms for proprietary / SaaS deployments. See COMMERCIAL-LICENSE.md at the
