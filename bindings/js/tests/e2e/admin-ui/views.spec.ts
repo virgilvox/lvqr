@@ -142,6 +142,24 @@ test('recordings view lists archived broadcasts with a scrubber link', async ({ 
   await expect(page.getByRole('link', { name: /scrubber/i })).toBeVisible();
 });
 
+// Regression for admin-ui 1.0.0/1.1.0: `vite.config.ts` was missing
+// `compilerOptions.isCustomElement`, so the Vue compiler treated
+// `<lvqr-dvr-player>` as a Vue component and silently failed to mount the
+// DVR scrubber. The route a11y test below (the only DVR coverage) did NOT
+// catch it because it never asserts the custom element renders. This test
+// closes that gap for every `<lvqr-*>` custom element the admin-ui mounts
+// (today just the DVR scrubber; add coverage as more web components land).
+test('DVR view mounts the lvqr-dvr-player custom element', async ({ page }) => {
+  // Deep-link with `?broadcast=` so the view's query-param watcher preselects
+  // a broadcast immediately and renders the player card (it's gated on
+  // `streamSrc` which requires `selected.value` to be non-empty).
+  await page.goto('/#/dvr?broadcast=live%2Fdemo');
+  await page.waitForTimeout(200);
+  const dvr = page.locator('lvqr-dvr-player');
+  await expect(dvr).toHaveCount(1);
+  await expect(dvr).toBeVisible();
+});
+
 test('stream detail renders the per-track table', async ({ page }) => {
   await page.goto('/#/streams/live%2Fdemo');
   await expect(page.getByRole('heading', { name: 'Tracks' })).toBeVisible();
