@@ -14,6 +14,7 @@ from typing import Optional
 import httpx
 
 from .types import (
+    # v1.0.0 types
     BroadcastSummary,
     ClusterNodeView,
     ConfigEntry,
@@ -32,6 +33,30 @@ from .types import (
     WasmFilterBroadcastStats,
     WasmFilterSlotStats,
     WasmFilterState,
+    # v1.1.0 console wave types (slices 1-9b)
+    AddAgentRequest,
+    AddRenditionRequest,
+    AgentActiveStats,
+    AgentInfo,
+    AgentState,
+    ArchiveBroadcastInfo,
+    ArchiveState,
+    ArchiveTrackInfo,
+    BoundAddresses,
+    BroadcastSessionInfo,
+    BroadcastSessionsState,
+    BroadcastStopResult,
+    IngestListenerInfo,
+    IngestState,
+    IngestStopResult,
+    LogLine,
+    RenditionInfo,
+    RuntimeFeatures,
+    ServerInfo,
+    StreamDetailInfo,
+    TrackInfo,
+    TranscodeActiveStats,
+    TranscodeState,
 )
 
 
@@ -366,6 +391,217 @@ class LvqrClient:
     # get an httpx.HTTPStatusError they can catch on auth failure.
     # -----------------------------------------------------------------
 
+
+    # =================================================================
+    # v1.1.0 -- console buildout wave: read-only introspection
+    # =================================================================
+
+    def stream_detail(self, name: str) -> Optional["StreamDetailInfo"]:
+        """``GET /api/v1/streams/{name}`` -- per-broadcast detail (tracks
+        + codec + timescale + fragment counters + subscriber count +
+        lagged-skip count).
+
+        Returns ``None`` when the broadcast has no registered tracks
+        (the server returns 404 in that case; this method maps it to
+        ``None`` so callers can poll a name without 404-handling).
+
+        Other non-2xx statuses still raise ``httpx.HTTPStatusError``.
+        Slice 1 of the v1.1.0 console wave."""
+        from urllib.parse import quote
+        resp = self._client.get(f"/api/v1/streams/{quote(name, safe='')}")
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        return _stream_detail_from_json(data)
+
+    def transcode_ladders(self) -> "TranscodeState":
+        """``GET /api/v1/transcode/ladders`` -- configured renditions
+        plus live per-input transcoder stats.
+
+        Always returns 200; ``enabled=False`` when the relay was built
+        without the ``transcode`` feature OR no rendition was configured
+        at startup (older deployments + Tier 4 transcode-disabled
+        builds). Slice 2 + 7 of the v1.1.0 console wave."""
+        data = self._get_json("/api/v1/transcode/ladders")
+        return _transcode_state_from_json(data)
+
+    def add_rendition(self, req: "AddRenditionRequest") -> None:
+        """``POST /api/v1/transcode/ladders`` -- add a transcode
+        rendition at runtime against new and already-live broadcasts.
+
+        Requires a ladder configured at startup (the runner only
+        installs when ``config.transcode_renditions`` is non-empty).
+        Raises ``httpx.HTTPStatusError`` on 503 (no runner), 400
+        (invalid request), or 409 (a rendition with that name already
+        exists). Slice 7."""
+        body = {
+            "name": req.name,
+            "width": req.width,
+            "height": req.height,
+            "video_bitrate_kbps": req.video_bitrate_kbps,
+            "audio_bitrate_kbps": req.audio_bitrate_kbps,
+        }
+        resp = self._client.post("/api/v1/transcode/ladders", json=body)
+        resp.raise_for_status()
+
+    def remove_rendition(self, name: str) -> None:
+        """``DELETE /api/v1/transcode/ladders/{name}`` -- stop a
+        rendition at runtime. Drops all live drain tasks for that
+        rendition; future broadcasts won't get it.
+
+        Raises ``httpx.HTTPStatusError`` on 503 (no runner) or 404 (no
+        rendition with that name). Slice 7."""
+        from urllib.parse import quote
+        resp = self._client.delete(f"/api/v1/transcode/ladders/{quote(name, safe='')}")
+        resp.raise_for_status()
+
+    def agents(self) -> "AgentState":
+        """``GET /api/v1/agents`` -- configured in-process agents plus
+        live per-attachment counters.
+
+        Always returns 200; ``enabled=False`` when no agent is
+        configured. Slice 3 + 8 of the v1.1.0 console wave."""
+        data = self._get_json("/api/v1/agents")
+        return _agent_state_from_json(data)
+
+    def add_agent(self, req: "AddAgentRequest") -> None:
+        """``POST /api/v1/agents`` -- start an in-process agent at
+        runtime. Body is an :class:`AddAgentRequest`. Whisper agent
+        runner installs even without a startup model so agents can be
+        started from zero.
+
+        Raises ``httpx.HTTPStatusError`` on 503 (no agent feature / no
+        runner), 400 (model path empty), or 409 (agent of that name
+        already running). Slice 8."""
+        body: dict[str, object] = {"model": req.model}
+        if req.window_ms is not None:
+            body["window_ms"] = req.window_ms
+        resp = self._client.post("/api/v1/agents", json=body)
+        resp.raise_for_status()
+
+    def remove_agent(self, name: str) -> None:
+        """``DELETE /api/v1/agents/{name}`` -- stop a running agent.
+
+        Raises ``httpx.HTTPStatusError`` on 503 (no runner) or 404 (no
+        agent with that name). Slice 8."""
+        from urllib.parse import quote
+        resp = self._client.delete(f"/api/v1/agents/{quote(name, safe='')}")
+        resp.raise_for_status()
+
+    def archive(self) -> "ArchiveState":
+        """``GET /api/v1/archive`` -- recorded broadcasts from the DVR
+        segment index.
+
+        Always returns 200; ``enabled=False`` (empty list) when the
+        relay was booted without ``--archive-dir``. Slice 4."""
+        data = self._get_json("/api/v1/archive")
+        return _archive_state_from_json(data)
+
+    # =================================================================
+    # v1.1.0 -- runtime mutation (Slices 6 + 9b)
+    # =================================================================
+
+    def ingest_listeners(self) -> "IngestState":
+        """``GET /api/v1/ingest`` -- inventory of bound ingest listeners
+        (RTMP / WHIP / SRT / RTSP) with their live ``enabled`` state.
+
+        Always returns 200; an empty list means the CLI composition
+        root did not wire the registry (embedded tests or a build with
+        no ingest features). Slice 9b."""
+        data = self._get_json("/api/v1/ingest")
+        listeners = [
+            IngestListenerInfo(
+                protocol=l.get("protocol", ""),
+                addr=l.get("addr", ""),
+                enabled=bool(l.get("enabled", True)),
+            )
+            for l in data.get("listeners", [])
+        ]
+        return IngestState(listeners=listeners)
+
+    def stop_ingest_listener(self, protocol: str) -> "IngestStopResult":
+        """``DELETE /api/v1/ingest/{protocol}`` -- stop a bound ingest
+        listener at runtime. The kernel socket is unbound; existing
+        publishers stay until their own teardown, but no NEW connections
+        are accepted. STOP is one-way: re-enabling requires a relay
+        restart.
+
+        Idempotent: a repeat call against an already-stopped protocol
+        resolves with ``result="already_stopped"``.
+
+        Raises ``httpx.HTTPStatusError`` on 404 (unknown protocol) or
+        503 (registry not wired). Slice 9b."""
+        from urllib.parse import quote
+        resp = self._client.delete(f"/api/v1/ingest/{quote(protocol, safe='')}")
+        resp.raise_for_status()
+        return _ingest_stop_from_json(resp.json())
+
+    def broadcasts(self) -> "BroadcastSessionsState":
+        """``GET /api/v1/broadcasts`` -- live publisher sessions (one
+        row per active publisher across every ingest protocol whose
+        ingest crate has wired its session registrar).
+
+        Always returns 200; empty list when no live sessions exist.
+        Slice 6."""
+        data = self._get_json("/api/v1/broadcasts")
+        sessions = [
+            BroadcastSessionInfo(
+                broadcast=s.get("broadcast", ""),
+                protocol=s.get("protocol", ""),
+                started_ms=int(s.get("started_ms", 0)),
+                peer=s.get("peer"),
+            )
+            for s in data.get("sessions", [])
+        ]
+        return BroadcastSessionsState(sessions=sessions)
+
+    def stop_broadcast(self, name: str) -> "BroadcastStopResult":
+        """``DELETE /api/v1/broadcasts/{name}`` -- truly disconnect the
+        live publisher session for the named broadcast. The ingest
+        crate's per-session cancel token fires, the read loop drops out
+        of its ``select!``, the publisher's transport socket is closed,
+        and the bridge drains the egress state. Subscribers see
+        end-of-stream.
+
+        The publisher can reconnect immediately as a new session.
+
+        Raises ``httpx.HTTPStatusError`` on 404 (no live session for
+        that broadcast -- also covers the idempotent repeat case) or
+        503 (registry not wired). Slice 6."""
+        from urllib.parse import quote
+        resp = self._client.delete(f"/api/v1/broadcasts/{quote(name, safe='')}")
+        resp.raise_for_status()
+        return _broadcast_stop_from_json(resp.json())
+
+    def server_info(self) -> "ServerInfo":
+        """``GET /api/v1/server-info`` -- relay version + uptime + bound
+        listener addresses + runtime feature snapshot.
+
+        Always returns 200. Useful for dashboards (version banner,
+        feature-gated UI affordances)."""
+        data = self._get_json("/api/v1/server-info")
+        return _server_info_from_json(data)
+
+    def logs_stream_url(self) -> str:
+        """Absolute URL for the ``GET /api/v1/logs`` Server-Sent Events
+        live-tail stream.
+
+        Because the browser ``EventSource`` API cannot set an
+        ``Authorization`` header, the bearer token is appended as a
+        ``?token=`` query param. **Note:** tokens in URLs can be captured
+        by proxy / access logs -- prefer a short-lived admin token for
+        log streaming. Slice 5."""
+        from urllib.parse import quote
+        base = f"{self.base_url}/api/v1/logs"
+        # Pull token out of the httpx client's default headers (set in
+        # __init__ from the bearer_token kwarg).
+        auth = self._client.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[len("Bearer "):]
+            return f"{base}?token={quote(token, safe='')}"
+        return base
+
     def _get_json(self, path: str) -> object:
         resp = self._client.get(path)
         resp.raise_for_status()
@@ -432,4 +668,157 @@ def _cluster_node_from_json(entry: dict) -> ClusterNodeView:
         generation=entry.get("generation", 0),
         gossip_addr=entry.get("gossip_addr", ""),
         capacity=capacity,
+    )
+
+# =====================================================================
+# v1.1.0 from-JSON helpers (mirror the existing _xxx_from_json pattern)
+# =====================================================================
+
+
+def _track_info_from_json(entry: dict) -> "TrackInfo":
+    return TrackInfo(
+        track=entry.get("track", ""),
+        kind=entry.get("kind", "data"),
+        codec=entry.get("codec", ""),
+        timescale=int(entry.get("timescale", 0)),
+        fragments=int(entry.get("fragments", 0)),
+        subscribers=int(entry.get("subscribers", 0)),
+        lagged_skips=int(entry.get("lagged_skips", 0)),
+    )
+
+
+def _stream_detail_from_json(entry: dict) -> "StreamDetailInfo":
+    return StreamDetailInfo(
+        name=entry.get("name", ""),
+        subscribers=int(entry.get("subscribers", 0)),
+        tracks=[_track_info_from_json(t) for t in entry.get("tracks", [])],
+    )
+
+
+def _transcode_state_from_json(entry: dict) -> "TranscodeState":
+    return TranscodeState(
+        enabled=bool(entry.get("enabled", False)),
+        encoder=entry.get("encoder", ""),
+        renditions=[
+            RenditionInfo(
+                name=r.get("name", ""),
+                width=int(r.get("width", 0)),
+                height=int(r.get("height", 0)),
+                video_bitrate_kbps=int(r.get("video_bitrate_kbps", 0)),
+                audio_bitrate_kbps=int(r.get("audio_bitrate_kbps", 0)),
+            )
+            for r in entry.get("renditions", [])
+        ],
+        active=[
+            TranscodeActiveStats(
+                broadcast=a.get("broadcast", ""),
+                track=a.get("track", ""),
+                rendition=a.get("rendition", ""),
+                fragments_in=int(a.get("fragments_in", 0)),
+                fragments_out=int(a.get("fragments_out", 0)),
+                panics=int(a.get("panics", 0)),
+            )
+            for a in entry.get("active", [])
+        ],
+    )
+
+
+def _agent_state_from_json(entry: dict) -> "AgentState":
+    return AgentState(
+        enabled=bool(entry.get("enabled", False)),
+        agents=[
+            AgentInfo(
+                name=a.get("name", ""),
+                kind=a.get("kind", ""),
+                model=a.get("model"),
+                window_ms=a.get("window_ms"),
+            )
+            for a in entry.get("agents", [])
+        ],
+        active=[
+            AgentActiveStats(
+                agent=a.get("agent", ""),
+                broadcast=a.get("broadcast", ""),
+                track=a.get("track", ""),
+                fragments_seen=int(a.get("fragments_seen", 0)),
+                panics=int(a.get("panics", 0)),
+            )
+            for a in entry.get("active", [])
+        ],
+    )
+
+
+def _archive_state_from_json(entry: dict) -> "ArchiveState":
+    return ArchiveState(
+        enabled=bool(entry.get("enabled", False)),
+        recordings=[
+            ArchiveBroadcastInfo(
+                broadcast=r.get("broadcast", ""),
+                segment_count=int(r.get("segment_count", 0)),
+                total_bytes=int(r.get("total_bytes", 0)),
+                duration_secs=float(r.get("duration_secs", 0.0)),
+                tracks=[
+                    ArchiveTrackInfo(
+                        track=t.get("track", ""),
+                        segment_count=int(t.get("segment_count", 0)),
+                        total_bytes=int(t.get("total_bytes", 0)),
+                        duration_secs=float(t.get("duration_secs", 0.0)),
+                        timescale=int(t.get("timescale", 0)),
+                    )
+                    for t in r.get("tracks", [])
+                ],
+            )
+            for r in entry.get("recordings", [])
+        ],
+    )
+
+
+def _ingest_stop_from_json(entry: dict) -> "IngestStopResult":
+    # The server's serde enum uses `#[serde(tag = "result")]` so the
+    # response shape is `{"result": "stopped", "protocol": "rtmp"}` etc.
+    return IngestStopResult(
+        result=entry.get("result", "stopped"),
+        protocol=entry.get("protocol"),
+    )
+
+
+def _broadcast_stop_from_json(entry: dict) -> "BroadcastStopResult":
+    return BroadcastStopResult(
+        result=entry.get("result", "killed"),
+        broadcast=entry.get("broadcast"),
+        protocol=entry.get("protocol"),
+    )
+
+
+def _server_info_from_json(entry: dict) -> "ServerInfo":
+    bound_raw = entry.get("bound", {}) or {}
+    features_raw = entry.get("features", {}) or {}
+    return ServerInfo(
+        version=entry.get("version", ""),
+        build_features=list(entry.get("build_features", [])),
+        uptime_secs=int(entry.get("uptime_secs", 0)),
+        bound=BoundAddresses(
+            admin=bound_raw.get("admin"),
+            rtmp=bound_raw.get("rtmp"),
+            whip=bound_raw.get("whip"),
+            whep=bound_raw.get("whep"),
+            hls=bound_raw.get("hls"),
+            dash=bound_raw.get("dash"),
+            srt=bound_raw.get("srt"),
+            rtsp=bound_raw.get("rtsp"),
+            moq=bound_raw.get("moq"),
+            signal=bound_raw.get("signal"),
+        ),
+        features=RuntimeFeatures(
+            mesh_enabled=bool(features_raw.get("mesh_enabled", False)),
+            cluster_enabled=bool(features_raw.get("cluster_enabled", False)),
+            archive_dir=features_raw.get("archive_dir"),
+            record_dir=features_raw.get("record_dir"),
+            wasm_filter_chain_length=int(features_raw.get("wasm_filter_chain_length", 0)),
+            auth_mode=features_raw.get("auth_mode", "noop"),
+            hmac_playback_secret_configured=bool(features_raw.get("hmac_playback_secret_configured", False)),
+            stream_keys_enabled=bool(features_raw.get("stream_keys_enabled", True)),
+        ),
+        config_path=entry.get("config_path"),
+        wasm_filter_paths=list(entry.get("wasm_filter_paths", [])),
     )

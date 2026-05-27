@@ -320,3 +320,334 @@ class WasmFilterState:
     #: ``chain_length`` entries when ``enabled`` is True; empty
     #: otherwise.
     slots: list[WasmFilterSlotStats] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# v1.1.0 -- console buildout wave types
+# ---------------------------------------------------------------------------
+# Every type below mirrors a Rust serde struct in `lvqr-admin` that
+# landed in the 1.1.0 release. Field names match the JSON-on-wire encoding
+# exactly so `json.loads(body)` can be unpacked via `**kwargs`.
+
+
+@dataclass
+class TrackInfo:
+    """One track within a broadcast. Mirrors ``lvqr_admin::TrackInfo``."""
+
+    #: Track name, e.g. ``"0.mp4"`` (video) or ``"1.mp4"`` (audio).
+    track: str = ""
+    #: ``"video"`` / ``"audio"`` / ``"data"``.
+    kind: str = "data"
+    #: Codec string, e.g. ``"avc1.640028"``, ``"mp4a.40.2"``, ``"Opus"``.
+    codec: str = ""
+    #: Track timescale (Hz). 90000 for H.264 video, 48000 for Opus, etc.
+    timescale: int = 0
+    #: Total fragments observed on this track so far.
+    fragments: int = 0
+    subscribers: int = 0
+    #: Cumulative count of fragments skipped because a slow subscriber
+    #: lagged past the broadcaster channel capacity.
+    lagged_skips: int = 0
+
+
+@dataclass
+class StreamDetailInfo:
+    """Per-broadcast detail returned by ``GET /api/v1/streams/{name}``.
+    Mirrors ``lvqr_admin::StreamDetailInfo``. The endpoint returns
+    ``None`` (HTTP 404) when no track for that broadcast is registered;
+    :meth:`LvqrClient.stream_detail` returns ``None`` in that case."""
+
+    name: str = ""
+    subscribers: int = 0
+    tracks: list[TrackInfo] = field(default_factory=list)
+
+
+@dataclass
+class RenditionInfo:
+    """One configured transcode rendition. Mirrors
+    ``lvqr_admin::RenditionInfo``."""
+
+    name: str = ""
+    width: int = 0
+    height: int = 0
+    video_bitrate_kbps: int = 0
+    audio_bitrate_kbps: int = 0
+
+
+@dataclass
+class TranscodeActiveStats:
+    """Live per-input transcoder stats. Mirrors
+    ``lvqr_admin::TranscodeActiveStats``."""
+
+    broadcast: str = ""
+    track: str = ""
+    rendition: str = ""
+    fragments_in: int = 0
+    fragments_out: int = 0
+    panics: int = 0
+
+
+@dataclass
+class TranscodeState:
+    """Outer shape of ``GET /api/v1/transcode/ladders``. Mirrors
+    ``lvqr_admin::TranscodeState``. ``enabled`` is ``False`` when the
+    relay was built without the ``transcode`` feature OR no rendition
+    was configured at startup."""
+
+    enabled: bool = False
+    #: Encoder backend label: ``"software"`` / ``"videotoolbox"`` /
+    #: ``"nvenc"`` / ``"vaapi"`` / ``"qsv"``.
+    encoder: str = ""
+    renditions: list[RenditionInfo] = field(default_factory=list)
+    active: list[TranscodeActiveStats] = field(default_factory=list)
+
+
+@dataclass
+class AddRenditionRequest:
+    """Body for ``POST /api/v1/transcode/ladders``. Mirrors
+    ``lvqr_admin::RenditionInfo`` (the route accepts the same shape it
+    returns from GET).
+
+    Validation is server-side; the admin route rejects 400 on negative
+    bitrates or zero width/height."""
+
+    name: str
+    width: int
+    height: int
+    video_bitrate_kbps: int
+    audio_bitrate_kbps: int
+
+
+@dataclass
+class AgentInfo:
+    """Configured in-process agent. Mirrors ``lvqr_admin::AgentInfo``."""
+
+    name: str = ""
+    #: Display grouping, e.g. ``"captions"``.
+    kind: str = ""
+    #: Agent-specific config (set for the Whisper captions agent).
+    model: Optional[str] = None
+    window_ms: Optional[int] = None
+
+
+@dataclass
+class AgentActiveStats:
+    """Per-(agent, broadcast, track) live counters. Mirrors
+    ``lvqr_admin::AgentActiveStats``. ``panics`` non-zero flags an
+    unhealthy agent."""
+
+    agent: str = ""
+    broadcast: str = ""
+    track: str = ""
+    fragments_seen: int = 0
+    panics: int = 0
+
+
+@dataclass
+class AgentState:
+    """Outer shape of ``GET /api/v1/agents``. Mirrors
+    ``lvqr_admin::AgentState``. ``enabled`` is ``True`` only when the
+    binary was built with an agent feature (e.g. ``whisper``) AND at
+    least one agent was configured at startup; runtime-added agents do
+    not flip this flag retroactively (the wider relay knows."""
+
+    enabled: bool = False
+    agents: list[AgentInfo] = field(default_factory=list)
+    active: list[AgentActiveStats] = field(default_factory=list)
+
+
+@dataclass
+class AddAgentRequest:
+    """Body for ``POST /api/v1/agents``. Mirrors
+    ``lvqr_admin::AddAgentRequest``. ``model`` must be a non-empty file
+    path on the relay's filesystem (the admin route returns 400 on
+    empty)."""
+
+    model: str
+    window_ms: Optional[int] = None
+
+
+@dataclass
+class ArchiveTrackInfo:
+    """One recorded track within a broadcast. Mirrors
+    ``lvqr_admin::ArchiveTrackInfo``. ``duration_secs`` is the recorded
+    decode span (``(last_end - first_start) / timescale``)."""
+
+    track: str = ""
+    segment_count: int = 0
+    total_bytes: int = 0
+    duration_secs: float = 0.0
+    timescale: int = 0
+
+
+@dataclass
+class ArchiveBroadcastInfo:
+    """One recorded broadcast: its tracks plus aggregates. Mirrors
+    ``lvqr_admin::ArchiveBroadcastInfo``."""
+
+    broadcast: str = ""
+    segment_count: int = 0
+    total_bytes: int = 0
+    #: Longest track's recorded decode span.
+    duration_secs: float = 0.0
+    tracks: list[ArchiveTrackInfo] = field(default_factory=list)
+
+
+@dataclass
+class ArchiveState:
+    """Outer shape of ``GET /api/v1/archive``. Mirrors
+    ``lvqr_admin::ArchiveState``. ``enabled`` is ``True`` when the
+    relay was booted with ``--archive-dir``."""
+
+    enabled: bool = False
+    recordings: list[ArchiveBroadcastInfo] = field(default_factory=list)
+
+
+@dataclass
+class IngestListenerInfo:
+    """One bound ingest listener. Mirrors
+    ``lvqr_admin::IngestListenerInfo``. One entry per protocol the relay
+    actually bound at startup (RTMP / WHIP / SRT / RTSP). ``enabled`` is
+    ``True`` until the operator stops it via
+    ``DELETE /api/v1/ingest/{protocol}``; STOP is one-way until the
+    relay restarts."""
+
+    protocol: str = ""
+    addr: str = ""
+    enabled: bool = True
+
+
+@dataclass
+class IngestState:
+    """Ingest-listener inventory from ``GET /api/v1/ingest``. Mirrors
+    ``lvqr_admin::IngestState``."""
+
+    listeners: list[IngestListenerInfo] = field(default_factory=list)
+
+
+@dataclass
+class IngestStopResult:
+    """Result of ``DELETE /api/v1/ingest/{protocol}``. Mirrors
+    ``lvqr_admin::IngestStopResult``.
+
+    ``result`` is one of ``"stopped"`` / ``"already_stopped"`` /
+    ``"not_found"`` (the last one is also surfaced as HTTP 404 by the
+    server; the client raises in that case rather than returning this
+    variant). Idempotent: ``stopped`` and ``already_stopped`` both
+    indicate the listener is now down."""
+
+    result: Literal["stopped", "already_stopped", "not_found"] = "stopped"
+    protocol: Optional[str] = None
+
+
+@dataclass
+class BroadcastSessionInfo:
+    """One live publisher session. Mirrors
+    ``lvqr_admin::BroadcastSessionInfo``."""
+
+    #: Broadcast name the publisher claimed (``<app>/<key>`` for RTMP,
+    #: URL path for WHIP, StreamId broadcast field for SRT, ANNOUNCE
+    #: path for RTSP).
+    broadcast: str = ""
+    #: Lower-case protocol tag (``"rtmp"`` / ``"whip"`` / ``"srt"`` /
+    #: ``"rtsp"``).
+    protocol: str = ""
+    #: Session start time, in ms since the Unix epoch.
+    started_ms: int = 0
+    #: Publisher peer address when the ingest crate captured it at accept
+    #: time; ``None`` for WHIP today (UDP source addr is observed later
+    #: in the str0m poll loop, not at session creation).
+    peer: Optional[str] = None
+
+
+@dataclass
+class BroadcastSessionsState:
+    """Outer shape of ``GET /api/v1/broadcasts``. Mirrors
+    ``lvqr_admin::BroadcastSessionsState``. Only protocols whose ingest
+    crate has wired its session registrar surface here (today RTMP /
+    WHIP / SRT / RTSP all wired)."""
+
+    sessions: list[BroadcastSessionInfo] = field(default_factory=list)
+
+
+@dataclass
+class BroadcastStopResult:
+    """Result of ``DELETE /api/v1/broadcasts/{name}``. Mirrors
+    ``lvqr_admin::BroadcastStopResult``. ``killed`` -> HTTP 200;
+    ``not_found`` -> HTTP 404 (client raises). Repeat against an
+    already-killed broadcast 404s because the session deregistered on
+    the previous teardown."""
+
+    result: Literal["killed", "not_found"] = "killed"
+    broadcast: Optional[str] = None
+    protocol: Optional[str] = None
+
+
+@dataclass
+class BoundAddresses:
+    """Listener bind addresses captured at startup. Mirrors
+    ``lvqr_admin::BoundAddresses``. ``None`` for any protocol that was
+    not enabled at startup (e.g. ``srt = None`` if the relay was started
+    without ``--srt-port``)."""
+
+    admin: Optional[str] = None
+    rtmp: Optional[str] = None
+    whip: Optional[str] = None
+    whep: Optional[str] = None
+    hls: Optional[str] = None
+    dash: Optional[str] = None
+    srt: Optional[str] = None
+    rtsp: Optional[str] = None
+    moq: Optional[str] = None
+    signal: Optional[str] = None
+
+
+@dataclass
+class RuntimeFeatures:
+    """Runtime feature snapshot from ``GET /api/v1/server-info``. Mirrors
+    ``lvqr_admin::RuntimeFeatures``."""
+
+    mesh_enabled: bool = False
+    cluster_enabled: bool = False
+    archive_dir: Optional[str] = None
+    record_dir: Optional[str] = None
+    wasm_filter_chain_length: int = 0
+    #: ``"noop"`` / ``"static"`` / ``"jwt"`` / ``"jwks"`` / ``"webhook"``.
+    auth_mode: str = "noop"
+    hmac_playback_secret_configured: bool = False
+    stream_keys_enabled: bool = True
+
+
+@dataclass
+class ServerInfo:
+    """Outer shape of ``GET /api/v1/server-info``. Mirrors
+    ``lvqr_admin::server_info_routes::ServerInfo``. Snapshots the relay's
+    `ServeConfig` + bound addresses + cargo crate version + uptime."""
+
+    version: str = ""
+    #: Cargo features the binary was built with: subset of ``rtmp`` /
+    #: ``transcode`` / ``whisper`` / ``c2pa`` / ``jwks`` / ``webhook`` /
+    #: ``cluster`` / ``aac-opus`` / ``io-uring``.
+    build_features: list[str] = field(default_factory=list)
+    uptime_secs: int = 0
+    bound: BoundAddresses = field(default_factory=BoundAddresses)
+    features: RuntimeFeatures = field(default_factory=RuntimeFeatures)
+    config_path: Optional[str] = None
+    wasm_filter_paths: list[str] = field(default_factory=list)
+
+
+@dataclass
+class LogLine:
+    """One captured log line streamed by ``GET /api/v1/logs``. Mirrors
+    ``lvqr_observability::LogLine``. Streamed as ``data: <json>\\n\\n``
+    SSE events; consumers should parse each ``data:`` payload as a single
+    ``LogLine`` JSON object."""
+
+    #: Capture time in ms since the Unix epoch.
+    ts_ms: int = 0
+    #: ``"ERROR"`` / ``"WARN"`` / ``"INFO"`` / ``"DEBUG"`` / ``"TRACE"``.
+    level: str = "INFO"
+    #: Event target (usually the emitting module path).
+    target: str = ""
+    #: Rendered message plus any structured fields.
+    message: str = ""

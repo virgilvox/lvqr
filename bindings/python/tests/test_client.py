@@ -31,7 +31,7 @@ class TestPackageMetadata:
         # pyproject.toml without the test catching the skew. The two
         # diverged silently across the 0.3.2 -> 0.3.3 -> 1.0.0 wave
         # before this guard landed.
-        assert lvqr.__version__ == "1.0.0"
+        assert lvqr.__version__ == "1.1.0"
 
 
 class TestTypes:
@@ -713,3 +713,245 @@ class TestClient:
         assert status.applied_keys == ["auth"]
         mock_post.assert_called_once()
         client.close()
+
+
+# ---------------------------------------------------------------------------
+# v1.1.0 console wave tests
+# ---------------------------------------------------------------------------
+
+
+class TestV1_1_0_Types:
+    def test_track_info_defaults(self):
+        from lvqr import TrackInfo
+
+        t = TrackInfo()
+        assert t.track == ""
+        assert t.kind == "data"
+        assert t.codec == ""
+
+    def test_stream_detail_info(self):
+        from lvqr import StreamDetailInfo, TrackInfo
+
+        d = StreamDetailInfo(
+            name="live/demo",
+            subscribers=3,
+            tracks=[TrackInfo(track="0.mp4", kind="video", codec="avc1.640028", timescale=90000, fragments=42)],
+        )
+        assert d.name == "live/demo"
+        assert d.tracks[0].codec == "avc1.640028"
+
+    def test_transcode_state_defaults(self):
+        from lvqr import TranscodeState
+
+        s = TranscodeState()
+        assert s.enabled is False
+        assert s.renditions == []
+        assert s.active == []
+
+    def test_agent_state(self):
+        from lvqr import AgentInfo, AgentState
+
+        s = AgentState(
+            enabled=True,
+            agents=[AgentInfo(name="captions", kind="captions", model="/m/ggml-tiny.en.bin", window_ms=5000)],
+        )
+        assert s.enabled is True
+        assert s.agents[0].name == "captions"
+
+    def test_ingest_listener_info(self):
+        from lvqr import IngestListenerInfo
+
+        l = IngestListenerInfo(protocol="rtmp", addr="0.0.0.0:1935", enabled=True)
+        assert l.protocol == "rtmp"
+
+    def test_broadcast_session_info(self):
+        from lvqr import BroadcastSessionInfo
+
+        b = BroadcastSessionInfo(
+            broadcast="live/demo",
+            protocol="rtmp",
+            started_ms=1779848998139,
+            peer="127.0.0.1:54583",
+        )
+        assert b.broadcast == "live/demo"
+        assert b.peer == "127.0.0.1:54583"
+
+    def test_server_info_defaults(self):
+        from lvqr import BoundAddresses, RuntimeFeatures, ServerInfo
+
+        s = ServerInfo()
+        assert s.version == ""
+        assert isinstance(s.bound, BoundAddresses)
+        assert isinstance(s.features, RuntimeFeatures)
+
+
+class TestV1_1_0_Methods:
+    """Mock-driven tests for the new v1.1.0 client methods. Mirrors the
+    existing TestClient pattern (httpx mocked at the .get/.post/.delete
+    boundary)."""
+
+    def _mock_client(self, response_json, status_code=200):
+        client = LvqrClient("http://localhost:8080")
+        mock_resp = MagicMock()
+        mock_resp.status_code = status_code
+        mock_resp.json.return_value = response_json
+        mock_resp.raise_for_status = MagicMock()
+        return client, mock_resp
+
+    def test_stream_detail_returns_typed_info(self):
+        from lvqr import StreamDetailInfo
+
+        client, resp = self._mock_client({
+            "name": "live/demo",
+            "subscribers": 2,
+            "tracks": [
+                {"track": "0.mp4", "kind": "video", "codec": "avc1.640028",
+                 "timescale": 90000, "fragments": 17, "subscribers": 2, "lagged_skips": 0},
+            ],
+        })
+        with patch.object(client._client, "get", return_value=resp):
+            detail = client.stream_detail("live/demo")
+        assert isinstance(detail, StreamDetailInfo)
+        assert detail.tracks[0].codec == "avc1.640028"
+
+    def test_stream_detail_404_returns_none(self):
+        client, resp = self._mock_client({}, status_code=404)
+        # On 404 the method must NOT raise; it returns None instead.
+        with patch.object(client._client, "get", return_value=resp):
+            detail = client.stream_detail("nope")
+        assert detail is None
+
+    def test_transcode_ladders_returns_typed_state(self):
+        from lvqr import TranscodeState
+
+        client, resp = self._mock_client({
+            "enabled": True,
+            "encoder": "software",
+            "renditions": [{"name": "720p", "width": 1280, "height": 720,
+                            "video_bitrate_kbps": 2500, "audio_bitrate_kbps": 128}],
+            "active": [],
+        })
+        with patch.object(client._client, "get", return_value=resp):
+            state = client.transcode_ladders()
+        assert isinstance(state, TranscodeState)
+        assert state.enabled is True
+        assert state.renditions[0].name == "720p"
+
+    def test_agents_returns_typed_state(self):
+        from lvqr import AgentState
+
+        client, resp = self._mock_client({
+            "enabled": True,
+            "agents": [{"name": "captions", "kind": "captions",
+                        "model": "/m/ggml.bin", "window_ms": 5000}],
+            "active": [],
+        })
+        with patch.object(client._client, "get", return_value=resp):
+            state = client.agents()
+        assert isinstance(state, AgentState)
+        assert state.agents[0].window_ms == 5000
+
+    def test_archive_returns_typed_state(self):
+        from lvqr import ArchiveState
+
+        client, resp = self._mock_client({
+            "enabled": True,
+            "recordings": [{
+                "broadcast": "live/demo", "segment_count": 3, "total_bytes": 6144,
+                "duration_secs": 6.0,
+                "tracks": [{"track": "0.mp4", "segment_count": 3,
+                            "total_bytes": 6144, "duration_secs": 6.0, "timescale": 90000}],
+            }],
+        })
+        with patch.object(client._client, "get", return_value=resp):
+            state = client.archive()
+        assert isinstance(state, ArchiveState)
+        assert state.recordings[0].tracks[0].timescale == 90000
+
+    def test_ingest_listeners_returns_typed_state(self):
+        from lvqr import IngestState
+
+        client, resp = self._mock_client({
+            "listeners": [
+                {"protocol": "rtmp", "addr": "0.0.0.0:1935", "enabled": True},
+                {"protocol": "whip", "addr": "0.0.0.0:8443", "enabled": False},
+            ],
+        })
+        with patch.object(client._client, "get", return_value=resp):
+            state = client.ingest_listeners()
+        assert isinstance(state, IngestState)
+        assert len(state.listeners) == 2
+        assert state.listeners[1].enabled is False
+
+    def test_stop_ingest_listener_returns_result(self):
+        from lvqr import IngestStopResult
+
+        client, resp = self._mock_client({"result": "stopped", "protocol": "rtmp"})
+        with patch.object(client._client, "delete", return_value=resp):
+            result = client.stop_ingest_listener("rtmp")
+        assert isinstance(result, IngestStopResult)
+        assert result.result == "stopped"
+        assert result.protocol == "rtmp"
+
+    def test_broadcasts_returns_typed_state(self):
+        from lvqr import BroadcastSessionsState
+
+        client, resp = self._mock_client({
+            "sessions": [{
+                "broadcast": "live/demo", "protocol": "rtmp",
+                "started_ms": 1779848998139, "peer": "127.0.0.1:54583",
+            }],
+        })
+        with patch.object(client._client, "get", return_value=resp):
+            state = client.broadcasts()
+        assert isinstance(state, BroadcastSessionsState)
+        assert state.sessions[0].broadcast == "live/demo"
+        assert state.sessions[0].peer == "127.0.0.1:54583"
+
+    def test_stop_broadcast_returns_result(self):
+        from lvqr import BroadcastStopResult
+
+        client, resp = self._mock_client({
+            "result": "killed", "broadcast": "live/demo", "protocol": "rtmp",
+        })
+        with patch.object(client._client, "delete", return_value=resp):
+            result = client.stop_broadcast("live/demo")
+        assert isinstance(result, BroadcastStopResult)
+        assert result.result == "killed"
+        assert result.protocol == "rtmp"
+
+    def test_server_info_returns_typed_info(self):
+        from lvqr import ServerInfo
+
+        client, resp = self._mock_client({
+            "version": "1.1.0",
+            "build_features": ["whisper", "transcode"],
+            "uptime_secs": 42,
+            "bound": {"admin": "0.0.0.0:8080", "rtmp": "0.0.0.0:1935",
+                      "whip": None, "whep": None, "hls": "0.0.0.0:8888",
+                      "dash": None, "srt": None, "rtsp": None, "moq": None, "signal": None},
+            "features": {"mesh_enabled": False, "cluster_enabled": True,
+                         "archive_dir": "/tmp/lvqr-archive", "record_dir": None,
+                         "wasm_filter_chain_length": 2, "auth_mode": "noop",
+                         "hmac_playback_secret_configured": False,
+                         "stream_keys_enabled": True},
+            "config_path": None, "wasm_filter_paths": ["/tmp/a.wasm", "/tmp/b.wasm"],
+        })
+        with patch.object(client._client, "get", return_value=resp):
+            info = client.server_info()
+        assert isinstance(info, ServerInfo)
+        assert info.version == "1.1.0"
+        assert info.bound.rtmp == "0.0.0.0:1935"
+        assert info.features.cluster_enabled is True
+        assert info.features.archive_dir == "/tmp/lvqr-archive"
+        assert len(info.wasm_filter_paths) == 2
+
+    def test_logs_stream_url_appends_token(self):
+        client = LvqrClient("http://localhost:8080", bearer_token="secret-token")
+        url = client.logs_stream_url()
+        assert url == "http://localhost:8080/api/v1/logs?token=secret-token"
+
+    def test_logs_stream_url_without_token(self):
+        client = LvqrClient("http://localhost:8080")
+        url = client.logs_stream_url()
+        assert url == "http://localhost:8080/api/v1/logs"

@@ -1,9 +1,10 @@
 """LVQR - Live Video QUIC Relay Python client."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .client import LvqrClient
 from .types import (
+    # v1.0.0 types
     BroadcastSummary,
     ClusterNodeView,
     ConfigEntry,
@@ -23,10 +24,35 @@ from .types import (
     WasmFilterBroadcastStats,
     WasmFilterSlotStats,
     WasmFilterState,
+    # v1.1.0 console wave types
+    AddAgentRequest,
+    AddRenditionRequest,
+    AgentActiveStats,
+    AgentInfo,
+    AgentState,
+    ArchiveBroadcastInfo,
+    ArchiveState,
+    ArchiveTrackInfo,
+    BoundAddresses,
+    BroadcastSessionInfo,
+    BroadcastSessionsState,
+    BroadcastStopResult,
+    IngestListenerInfo,
+    IngestState,
+    IngestStopResult,
+    LogLine,
+    RenditionInfo,
+    RuntimeFeatures,
+    ServerInfo,
+    StreamDetailInfo,
+    TrackInfo,
+    TranscodeActiveStats,
+    TranscodeState,
 )
 
 __all__ = [
     "LvqrClient",
+    # v1.0.0
     "RelayStats",
     "StreamInfo",
     "StreamKey",
@@ -46,4 +72,28 @@ __all__ = [
     "WasmFilterBroadcastStats",
     "WasmFilterSlotStats",
     "WasmFilterState",
+    # v1.1.0 console wave
+    "AddAgentRequest",
+    "AddRenditionRequest",
+    "AgentActiveStats",
+    "AgentInfo",
+    "AgentState",
+    "ArchiveBroadcastInfo",
+    "ArchiveState",
+    "ArchiveTrackInfo",
+    "BoundAddresses",
+    "BroadcastSessionInfo",
+    "BroadcastSessionsState",
+    "BroadcastStopResult",
+    "IngestListenerInfo",
+    "IngestState",
+    "IngestStopResult",
+    "LogLine",
+    "RenditionInfo",
+    "RuntimeFeatures",
+    "ServerInfo",
+    "StreamDetailInfo",
+    "TrackInfo",
+    "TranscodeActiveStats",
+    "TranscodeState",
 ]
