@@ -7,7 +7,21 @@ import { fileURLToPath, URL } from 'node:url';
 // Digital Ocean App Platform, GitHub Pages). No SSR; no server
 // runtime; the UI talks to LVQR via the typed admin client only.
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [
+    // `isCustomElement` tells the Vue compiler that any tag starting with
+    // `lvqr-` (e.g. `<lvqr-dvr-player>`, `<lvqr-player>`) is a third-party
+    // custom element registered via `customElements.define`, not a Vue
+    // component to resolve. Without this Vue treats them as missing
+    // components and emits "Failed to resolve component" + the element
+    // never renders -- which broke the DVR view in admin-ui 1.0.0 / 1.1.0.
+    vue({
+      template: {
+        compilerOptions: {
+          isCustomElement: (tag) => tag.startsWith('lvqr-'),
+        },
+      },
+    }),
+  ],
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),
