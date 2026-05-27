@@ -6,6 +6,128 @@ summarises user-visible surface changes between tagged
 releases. For session-by-session engineering notes, see
 `tracking/HANDOFF.md`.
 
+## [1.1.0] - 2026-05-26
+
+The operator-console buildout wave. Every admin-ui view now reads from a
+live admin endpoint (no more placeholders), runtime CRUD for transcode
+ladders + in-process agents lands, ingest listeners get per-protocol STOP,
+live publisher sessions get per-broadcast KICK across all 4 ingest
+protocols, archive + agent + stream introspection round out the data
+plane, and an SSE log tail exposes the relay's tracing output to the
+admin console. 26 crates published to crates.io; 4 packages to npm; tag
+`v1.1.0` on the repo.
+
+### Added
+
+* **Admin -- read-only introspection**
+  * `GET /api/v1/streams/{name}` -- per-broadcast detail (tracks, codec,
+    timescale, fragment count, subscriber count, lagged-skip count).
+    `lvqr_admin::StreamDetailInfo` + `TrackInfo`.
+  * `GET /api/v1/transcode/ladders` -- configured renditions + live
+    per-input transcoder stats. `lvqr_admin::TranscodeState`.
+  * `GET /api/v1/agents` -- configured in-process agents + per-attachment
+    counters. `lvqr_admin::AgentState`.
+  * `GET /api/v1/archive` -- recorded broadcasts from the DVR segment
+    index, listed across every track. `lvqr_admin::ArchiveState`.
+  * `GET /api/v1/logs` -- Server-Sent Events live tail of the relay's
+    `tracing` output, with query-token auth (browser `EventSource` can't
+    set headers). `lvqr_observability::CaptureLayer` + ring-buffered
+    `LogBroadcaster`.
+* **Admin -- runtime CRUD**
+  * `POST` / `DELETE /api/v1/transcode/ladders[/{name}]` -- add or remove
+    a rendition at runtime against live + future broadcasts.
+    `lvqr_transcode::RunnerInner` shared-factories refactor.
+  * `POST` / `DELETE /api/v1/agents[/{name}]` -- start or stop an
+    in-process agent at runtime. Whisper agent runner installs without a
+    startup model so captions can start from zero.
+* **Admin -- runtime STOP (slice 9b)**
+  * `GET /api/v1/ingest` + `DELETE /api/v1/ingest/{protocol}` -- per-listener
+    inventory + STOP for RTMP / WHIP / SRT / RTSP. Each listener carries a
+    child cancellation token (`shutdown.child_token()`); DELETE closes the
+    OS socket without affecting any other listener or the global shutdown.
+    `lvqr_admin::{IngestListenerInfo, IngestState, IngestStopResult}`.
+* **Admin -- per-publisher KICK (slice 6)**
+  * `GET /api/v1/broadcasts` + `DELETE /api/v1/broadcasts/{name}` -- live
+    publisher sessions + KICK across all 4 ingest protocols. Per-publisher
+    `CancellationToken` cancelled by the KILL; ingest crate's read loop
+    falls out of its `select!`, the TCP/UDP socket closes, subscribers see
+    end-of-stream. Wired via a closure-injected `SessionRegistrar` pattern
+    in each ingest crate (no shared trait dep).
+    `lvqr_admin::{BroadcastSessionInfo, BroadcastSessionsState, BroadcastStopResult}`.
+* **`@lvqr/core` 1.1.0 SDK** -- typed methods for every new admin
+  endpoint: `streamDetail`, `transcodeLadders` + `addRendition` /
+  `removeRendition`, `agents` + `addAgent` / `removeAgent`, `archive`,
+  `ingestListeners` + `stopIngestListener`, `broadcasts` + `stopBroadcast`,
+  `serverInfo`, `logsStreamUrl`.
+* **`@lvqr/admin-ui` 1.1.0 / 1.1.1** -- every view backed by a live route:
+  Stream Detail tracks table, Recordings + deep-link DVR scrubber, Logs
+  SSE viewer with level chips + pause + autoscroll, Transcode + Agents
+  with runtime CRUD forms, Ingest with per-listener STOP + per-broadcast
+  KICK across all 4 protocols, Server Info banner. Automated a11y gate
+  via `@axe-core/playwright` (17-route assertion); mobile-overflow gate
+  at 390px; 27 Playwright specs total (7 view + 17 a11y + 1 responsive +
+  1 broadcast-Kick + 1 DVR-mount-regression). The 1.1.1 patch adds
+  `compilerOptions.isCustomElement` to the Vite Vue plugin so
+  `<lvqr-dvr-player>` mounts correctly (silent failure in 1.0.0/1.1.0).
+* **Composition-root infrastructure**
+  * `lvqr_observability::CaptureLayer` + process-global `LogBroadcaster`
+    -- a tracing-subscriber Layer that fans every log line onto a
+    bounded broadcast channel + ring buffer for the SSE tail.
+  * `Arc<DashMap<String, IngestListenerEntry>>` + `BroadcastSessionEntry`
+    registries in `lvqr-cli` wire the admin closure surfaces to each
+    ingest crate's per-listener / per-session cancel tokens.
+  * `SessionRegistrar` types in `lvqr-ingest` (RTMP), `lvqr-srt`,
+    `lvqr-whip` (oneshot -> CancellationToken refactor through
+    `Str0mIngestSessionHandle`), and `lvqr-rtsp` (new `conn_shutdown`
+    field on `ConnectionState` alongside `conn_cancel` to avoid the
+    grandchild-vs-parent cancellation-layering bug the integration test
+    caught on the first RTSP run).
+
+### Fixed
+
+* `@lvqr/admin-ui` 1.1.1 -- DVR view's `<lvqr-dvr-player>` custom element
+  was silently failing to mount in 1.0.0 / 1.1.0 because Vite's Vue plugin
+  lacked `compilerOptions.isCustomElement`. Reload the DVR view post-1.1.1
+  to see the scrubber render.
+
+### Documentation
+
+* `tracking/HANDOFF.md` -- comprehensive session-by-session record of the
+  wave, including a deep post-1.1.0 audit (security / lifecycle / codec /
+  docs+CI) with prioritised follow-ups.
+* `README.md` top-of-file console quick-start (`lvqr serve` + `npm install
+  && npm run dev` against `@lvqr/admin-ui`).
+* `README.md` Ingest section documents per-listener STOP + per-broadcast
+  KICK semantics; Observe section adds the new admin curl examples.
+
+### Known limitations carried over
+
+* **WHIP-published audio is Opus.** `hls.js` cannot append Opus to MSE
+  buffers; HLS playback of WHIP-sourced broadcasts will surface
+  `bufferAppendError` in the admin-ui Playback view. The HLS bridge
+  advertises `CODECS="...,opus"` correctly per RFC 8216bis -- the
+  limitation is on the JS player side. Workarounds: publish via RTMP /
+  SRT / RTSP for HLS playback, or open the master playlist in Safari
+  (native HLS supports Opus in fMP4).
+* **`lvqr` Python SDK stays at 1.0.0.** The console wave's admin
+  endpoints are mirrored in `@lvqr/core` 1.1.0 but the Python client
+  catch-up lands separately in a follow-up PyPI release.
+
+### Crates published to crates.io at 1.1.0
+
+Tier 0: `lvqr-archive`, `lvqr-auth`, `lvqr-codec`, `lvqr-core`, `lvqr-moq`,
+`lvqr-observability`. Tier 1: `lvqr-fragment`, `lvqr-signal`. Tier 2:
+`lvqr-cmaf`, `lvqr-agent`, `lvqr-record`, `lvqr-transcode`, `lvqr-wasm`,
+`lvqr-relay`, `lvqr-cluster`, `lvqr-mesh`. Tier 3: `lvqr-hls`,
+`lvqr-ingest`, `lvqr-agent-whisper`, `lvqr-admin`. Tier 4: `lvqr-whep`,
+`lvqr-whip`, `lvqr-rtsp`, `lvqr-srt`, `lvqr-dash`. Tier 5: `lvqr-cli`.
+Internal-only (not published): `lvqr-conformance`, `lvqr-soak`,
+`lvqr-test-utils`.
+
+### npm packages at 1.1.0 (admin-ui at 1.1.1)
+
+`@lvqr/core`, `@lvqr/dvr-player`, `@lvqr/player`, `@lvqr/admin-ui`.
+
 ## [1.0.0] - 2026-04-28
 
 Stability commitment for the v0.4 surface. The 0.4.2 wave (sessions

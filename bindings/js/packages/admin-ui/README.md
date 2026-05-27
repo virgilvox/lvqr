@@ -42,7 +42,7 @@ already exposes:
 | Stream detail | `/api/v1/streams/{name}` + `/api/v1/{slo, mesh}` | Per-broadcast tracks + SLO + mesh |
 | Recordings | `/api/v1/archive` | Recorded broadcasts; deep-links into DVR scrub |
 | DVR | embedded `<lvqr-dvr-player>` | Live HLS DVR scrub (`?broadcast=` preselect) |
-| Ingest | `/api/v1/{server-info, streams}` + recipes | Bound-listener inventory + publisher recipes + live publishers |
+| Ingest | `/api/v1/{ingest, broadcasts, server-info, streams}` + recipes | Bound-listener inventory with per-protocol **STOP** (slice 9b) + live publisher sessions with per-broadcast **KICK** across all 4 ingest protocols (slice 6) + publisher recipes + version badge |
 | Filters | `/api/v1/wasm-filter` | Read-only ordered slot list + per-slot counters |
 | Filter detail | `/api/v1/wasm-filter` | Per-slot drilldown |
 | Transcode | `/api/v1/transcode/ladders` | Ladder + live counters; runtime add/remove rendition |

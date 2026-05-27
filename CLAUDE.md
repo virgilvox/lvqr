@@ -36,10 +36,30 @@ Never add Claude as an author, co-author, or contributor in git commits, files, 
 - Never modify files outside `/Users/obsidian/Projects/ossuary-projects/lvqr/`
 
 ## Publishing Order (crates.io)
+
+Topologically sorted -- each tier depends only on prior tiers. 26
+publishable crates; 3 are `publish = false` (internal-only).
+
 ```
-Tier 0: lvqr-core
-Tier 1: lvqr-signal
-Tier 2: lvqr-relay, lvqr-ingest, lvqr-mesh
-Tier 3: lvqr-admin
-Tier 4: lvqr-wasm, lvqr-cli
+Tier 0 (no internal deps):
+  lvqr-archive, lvqr-auth, lvqr-codec, lvqr-core, lvqr-moq,
+  lvqr-observability
+Tier 1 (depends only on Tier 0):
+  lvqr-fragment, lvqr-signal
+Tier 2 (Tier 0 + Tier 1):
+  lvqr-cmaf, lvqr-agent, lvqr-record, lvqr-transcode, lvqr-wasm,
+  lvqr-relay, lvqr-cluster, lvqr-mesh
+Tier 3 (Tier 0-2):
+  lvqr-hls, lvqr-ingest, lvqr-agent-whisper, lvqr-admin
+Tier 4 (Tier 0-3):
+  lvqr-whep, lvqr-whip, lvqr-rtsp, lvqr-srt, lvqr-dash
+Tier 5 (the rest of the workspace):
+  lvqr-cli
 ```
+
+Internal-only (`publish = false`, do not publish):
+`lvqr-conformance`, `lvqr-soak`, `lvqr-test-utils`.
+
+When bumping the workspace version, `cargo publish -p <crate>` each
+crate in tier order; `cargo publish` waits for crates.io to index each
+upload before the next dependent crate can resolve it.
